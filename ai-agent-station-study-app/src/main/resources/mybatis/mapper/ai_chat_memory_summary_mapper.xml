@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="cn.bugstack.ai.infrastructure.dao.IAiChatMemorySummaryDao">
+
+    <resultMap id="AiChatMemorySummaryMap" type="cn.bugstack.ai.infrastructure.dao.po.AiChatMemorySummary">
+        <id     column="id"               property="id"/>
+        <result column="conversation_id"  property="conversationId"/>
+        <result column="user_id"          property="userId"/>
+        <result column="summary"          property="summary"/>
+        <result column="last_message_id"  property="lastMessageId"/>
+        <result column="version"          property="version"/>
+        <result column="summary_msg_count" property="summaryMsgCount"/>
+        <result column="detail_msg_count"  property="detailMsgCount"/>
+        <result column="created_at"       property="createdAt"/>
+        <result column="updated_at"       property="updatedAt"/>
+    </resultMap>
+
+    <select id="findByConversationId" parameterType="java.lang.String" resultMap="AiChatMemorySummaryMap">
+        SELECT id, conversation_id, user_id, summary, last_message_id, version,
+               summary_msg_count, detail_msg_count, created_at, updated_at
+        FROM ai_chat_memory_summary
+        WHERE conversation_id = #{conversationId}
+    </select>
+
+    <insert id="upsert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiChatMemorySummary">
+        INSERT INTO ai_chat_memory_summary
+            (conversation_id, user_id, summary, last_message_id, version,
+             summary_msg_count, detail_msg_count, created_at, updated_at)
+        VALUES
+            (#{conversationId}, #{userId}, #{summary}, #{lastMessageId}, #{version},
+             #{summaryMsgCount}, #{detailMsgCount}, NOW(), NOW())
+        ON DUPLICATE KEY UPDATE
+            user_id           = VALUES(user_id),
+            summary           = VALUES(summary),
+            last_message_id   = VALUES(last_message_id),
+            version           = VALUES(version),
+            summary_msg_count = VALUES(summary_msg_count),
+            detail_msg_count  = VALUES(detail_msg_count),
+            updated_at        = NOW()
+    </insert>
+
+    <delete id="deleteByConversationId" parameterType="java.lang.String">
+        DELETE FROM ai_chat_memory_summary WHERE conversation_id = #{conversationId}
+    </delete>
+
+</mapper>

@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="cn.bugstack.ai.infrastructure.dao.IAiClientSystemPromptDao">
+
+    <resultMap id="aiClientSystemPromptMap" type="cn.bugstack.ai.infrastructure.dao.po.AiClientSystemPrompt">
+        <id column="id" property="id"/>
+        <result column="prompt_id" property="promptId"/>
+        <result column="prompt_name" property="promptName"/>
+        <result column="prompt_content" property="promptContent"/>
+        <result column="description" property="description"/>
+        <result column="status" property="status"/>
+        <result column="create_time" property="createTime"/>
+        <result column="update_time" property="updateTime"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientSystemPrompt" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_client_system_prompt (
+            prompt_id, prompt_name, prompt_content, description, status, create_time, update_time
+        ) VALUES (
+            #{promptId}, #{promptName}, #{promptContent}, #{description}, #{status}, now(), now()
+        )
+    </insert>
+
+    <update id="updateById" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientSystemPrompt">
+        UPDATE ai_client_system_prompt
+        <set>
+            <if test="promptId != null and promptId != ''">prompt_id = #{promptId},</if>
+            <if test="promptName != null and promptName != ''">prompt_name = #{promptName},</if>
+            <if test="promptContent != null and promptContent != ''">prompt_content = #{promptContent},</if>
+            <if test="description != null">description = #{description},</if>
+            <if test="status != null">status = #{status},</if>
+            update_time = now()
+        </set>
+        WHERE id = #{id}
+    </update>
+
+    <update id="updateByPromptId" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientSystemPrompt">
+        UPDATE ai_client_system_prompt
+        <set>
+            <if test="promptName != null and promptName != ''">prompt_name = #{promptName},</if>
+            <if test="promptContent != null and promptContent != ''">prompt_content = #{promptContent},</if>
+            <if test="description != null">description = #{description},</if>
+            <if test="status != null">status = #{status},</if>
+            update_time = now()
+        </set>
+        WHERE prompt_id = #{promptId}
+    </update>
+
+    <delete id="deleteById" parameterType="java.lang.Long">
+        DELETE FROM ai_client_system_prompt WHERE id = #{id}
+    </delete>
+
+    <delete id="deleteByPromptId" parameterType="java.lang.String">
+        DELETE FROM ai_client_system_prompt WHERE prompt_id = #{promptId}
+    </delete>
+
+    <select id="queryById" parameterType="java.lang.Long" resultMap="aiClientSystemPromptMap">
+        SELECT id, prompt_id, prompt_name, prompt_content, description, status, create_time, update_time
+        FROM ai_client_system_prompt
+        WHERE id = #{id}
+    </select>
+
+    <select id="queryByPromptId" parameterType="java.lang.String" resultMap="aiClientSystemPromptMap">
+        SELECT id, prompt_id, prompt_name, prompt_content, description, status, create_time, update_time
+        FROM ai_client_system_prompt
+        WHERE prompt_id = #{promptId}
+    </select>
+
+    <select id="queryEnabledPrompts" resultMap="aiClientSystemPromptMap">
+        SELECT id, prompt_id, prompt_name, prompt_content, description, status, create_time, update_time
+        FROM ai_client_system_prompt
+        WHERE status = 1
+        ORDER BY create_time DESC
+    </select>
+
+    <select id="queryByPromptName" parameterType="java.lang.String" resultMap="aiClientSystemPromptMap">
+        SELECT id, prompt_id, prompt_name, prompt_content, description, status, create_time, update_time
+        FROM ai_client_system_prompt
+        WHERE prompt_name LIKE CONCAT('%', #{promptName}, '%')
+        ORDER BY create_time DESC
+    </select>
+
+    <select id="queryAll" resultMap="aiClientSystemPromptMap">
+        SELECT id, prompt_id, prompt_name, prompt_content, description, status, create_time, update_time
+        FROM ai_client_system_prompt
+        ORDER BY create_time DESC
+    </select>
+
+</mapper>

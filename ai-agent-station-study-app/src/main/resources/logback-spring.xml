@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 日志级别从低到高分为TRACE < DEBUG < INFO < WARN < ERROR < FATAL，如果设置为WARN，则低于WARN的信息都不会输出 -->
+<configuration scan="true" scanPeriod="10 seconds">
+
+    <contextName>logback</contextName>
+    <!-- name的值是变量的名称，value的值时变量定义的值。通过定义的值会被插入到logger上下文中。定义变量后，可以使“${}”来使用变量。 -->
+    <springProperty scope="context" name="log.path" source="logging.path"/>
+    <!-- Logstash TCP 目标；本地开发默认 localhost:4560，docker 内互通时用服务名 logstash。
+         字段命名避免点号：ES 会把 "foo.bar" 拆成嵌套对象，和 customFields 的同名根字段冲突 -->
+    <springProperty scope="context" name="logstashDestination" source="logging.logstash.destination" defaultValue="localhost:4560"/>
+    <springProperty scope="context" name="appName" source="spring.application.name" defaultValue="ai-agent-station-study"/>
+    <!-- 日志格式 -->
+    <conversionRule conversionWord="clr" converterClass="org.springframework.boot.logging.logback.ColorConverter"/>
+    <conversionRule conversionWord="wex"
+                    converterClass="org.springframework.boot.logging.logback.WhitespaceThrowableProxyConverter"/>
+    <conversionRule conversionWord="wEx"
+                    converterClass="org.springframework.boot.logging.logback.ExtendedWhitespaceThrowableProxyConverter"/>
+
+    <!-- 输出到控制台 -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <!-- 此日志appender是为开发使用，只配置最底级别，控制台输出的日志级别是大于或等于此级别的日志信息 -->
+        <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+            <level>info</level>
+        </filter>
+        <encoder>
+            <pattern>%d{yy-MM-dd.HH:mm:ss.SSS} [%-16t] %-5p %-22c{0}%X{ServiceId} -%X{trace-id} %m%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!--输出到文件-->
+    <!-- 时间滚动输出 level为 INFO 日志 -->
+    <appender name="INFO_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <!-- 正在记录的日志文件的路径及文件名 -->
+        <file>./data/log/log_info.log</file>
+        <!--日志文件输出格式-->
+        <encoder>
+            <pattern>%d{yy-MM-dd.HH:mm:ss.SSS} [%-16t] %-5p %-22c{0}%X{ServiceId} -%X{trace-id} %m%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+        <!-- 日志记录器的滚动策略，按日期，按大小记录 -->
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <!-- 每天日志归档路径以及格式 -->
+            <fileNamePattern>./data/log/log-info-%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <timeBasedFileNamingAndTriggeringPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedFNATP">
+                <maxFileSize>100MB</maxFileSize>
+            </timeBasedFileNamingAndTriggeringPolicy>
+            <!--日志文件保留天数-->
+            <maxHistory>15</maxHistory>
+            <totalSizeCap>10GB</totalSizeCap>
+        </rollingPolicy>
+    </appender>
+
+    <!-- 时间滚动输出 level为 ERROR 日志 -->
+    <appender name="ERROR_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <!-- 正在记录的日志文件的路径及文件名 -->
+        <file>./data/log/log_error.log</file>
+        <!--日志文件输出格式-->
+        <encoder>
+            <pattern>%d{yy-MM-dd.HH:mm:ss.SSS} [%-16t] %-5p %-22c{0}%X{ServiceId} -%X{trace-id} %m%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+        <!-- 日志记录器的滚动策略，按日期，按大小记录 -->
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <fileNamePattern>./data/log/log-error-%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <timeBasedFileNamingAndTriggeringPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedFNATP">
+                <maxFileSize>100MB</maxFileSize>
+            </timeBasedFileNamingAndTriggeringPolicy>
+            <!-- 日志文件保留天数【根据服务器预留，可自行调整】 -->
+            <maxHistory>7</maxHistory>
+            <totalSizeCap>5GB</totalSizeCap>
+        </rollingPolicy>
+        <!-- WARN 级别及以上 -->
+        <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+            <level>WARN</level>
+        </filter>
+    </appender>
+
+    <!-- Logstash JSON 结构化日志直推：MDC 字段自动序列化为顶级 JSON 字段，供 Kibana 按 traceId/sessionId/agentId 过滤聚合 -->
+    <appender name="LOGSTASH" class="net.logstash.logback.appender.LogstashTcpSocketAppender">
+        <destination>${logstashDestination}</destination>
+        <!-- 连接断开时本地缓冲，避免阻塞业务线程；TCP 恢复后重放 -->
+        <keepAliveDuration>1 minute</keepAliveDuration>
+        <reconnectionDelay>5 seconds</reconnectionDelay>
+        <writeBufferSize>16384</writeBufferSize>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <!-- 关掉默认的 context 属性序列化，避免 logback 变量（含点号的 key）被当成字段推到 ES 导致 mapping 冲突 -->
+            <includeContext>false</includeContext>
+            <!-- MDC 全部纳入（默认即全部）；显式列出仅为可读性 -->
+            <!-- requestId：MdcTraceFilter 写的业务 UUID；traceId/spanId：P1.6 后由 Micrometer Tracing 写入的 W3C 上下文 -->
+            <!-- userId/tenantId：P1.2.3 多租户隔离，MdcTraceFilter 从 X-User-Id / X-Tenant-Id header 解析 -->
+            <includeMdcKeyName>requestId</includeMdcKeyName>
+            <includeMdcKeyName>traceId</includeMdcKeyName>
+            <includeMdcKeyName>spanId</includeMdcKeyName>
+            <includeMdcKeyName>userId</includeMdcKeyName>
+            <includeMdcKeyName>tenantId</includeMdcKeyName>
+            <includeMdcKeyName>sessionId</includeMdcKeyName>
+            <includeMdcKeyName>agentId</includeMdcKeyName>
+            <includeMdcKeyName>billingScope</includeMdcKeyName>
+            <includeMdcKeyName>step</includeMdcKeyName>
+            <includeMdcKeyName>model</includeMdcKeyName>
+            <includeMdcKeyName>clientId</includeMdcKeyName>
+            <includeMdcKeyName>promptTokens</includeMdcKeyName>
+            <includeMdcKeyName>completionTokens</includeMdcKeyName>
+            <includeMdcKeyName>totalTokens</includeMdcKeyName>
+            <includeMdcKeyName>cachedTokens</includeMdcKeyName>
+            <includeMdcKeyName>latencyMs</includeMdcKeyName>
+            <includeMdcKeyName>toolName</includeMdcKeyName>
+            <includeMdcKeyName>toolLatencyMs</includeMdcKeyName>
+            <!-- 服务名作为根字段，Kibana 多服务场景下过滤用；值从 springProperty 渲染 -->
+            <customFields>{"app":"${appName}"}</customFields>
+        </encoder>
+    </appender>
+
+    <appender name="ASYNC_LOGSTASH" class="ch.qos.logback.classic.AsyncAppender">
+        <discardingThreshold>0</discardingThreshold>
+        <queueSize>4096</queueSize>
+        <neverBlock>true</neverBlock>
+        <includeCallerData>false</includeCallerData>
+        <appender-ref ref="LOGSTASH"/>
+    </appender>
+
+    <!-- 异步输出 -->
+    <appender name="ASYNC_FILE_INFO" class="ch.qos.logback.classic.AsyncAppender">
+        <!-- 队列剩余容量小于discardingThreshold,则会丢弃TRACT、DEBUG、INFO级别的日志;默认值-1,为queueSize的20%;0不丢失日志 -->
+        <discardingThreshold>0</discardingThreshold>
+        <!-- 更改默认的队列的深度,该值会影响性能.默认值为256 -->
+        <queueSize>8192</queueSize>
+        <!-- neverBlock:true 会丢失日志,但业务性能不受影响 -->
+        <neverBlock>true</neverBlock>
+        <!--是否提取调用者数据-->
+        <includeCallerData>false</includeCallerData>
+        <appender-ref ref="INFO_FILE"/>
+    </appender>
+
+    <appender name="ASYNC_FILE_ERROR" class="ch.qos.logback.classic.AsyncAppender">
+        <!-- 队列剩余容量小于discardingThreshold,则会丢弃TRACT、DEBUG、INFO级别的日志;默认值-1,为queueSize的20%;0不丢失日志 -->
+        <discardingThreshold>0</discardingThreshold>
+        <!-- 更改默认的队列的深度,该值会影响性能.默认值为256 -->
+        <queueSize>1024</queueSize>
+        <!-- neverBlock:true 会丢失日志,但业务性能不受影响 -->
+        <neverBlock>true</neverBlock>
+        <!--是否提取调用者数据-->
+        <includeCallerData>false</includeCallerData>
+        <appender-ref ref="ERROR_FILE"/>
+    </appender>
+
+    <!-- 开发环境：控制台打印 -->
+    <springProfile name="dev">
+        <logger name="com.nmys.view" level="debug"/>
+    </springProfile>
+
+    <!-- ES 7.17 未开安全认证时每个请求都会带 299 提示，REST 客户端按 warn 打出；压成 ERROR 降噪 -->
+    <logger name="org.elasticsearch.client.RestClient" level="ERROR"/>
+
+    <root level="info">
+        <appender-ref ref="CONSOLE"/>
+        <!-- 异步日志-INFO -->
+        <appender-ref ref="ASYNC_FILE_INFO"/>
+        <!-- 异步日志-ERROR -->
+        <appender-ref ref="ASYNC_FILE_ERROR"/>
+        <!-- 异步推送到 Logstash -> Elasticsearch -->
+        <appender-ref ref="ASYNC_LOGSTASH"/>
+    </root>
+
+</configuration>

@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Agent Station</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<!-- 2026-05-07：用成熟 marked.js 替换自写 renderMarkdown，避免边界 bug -->
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+  .msg-content pre { background:#1e293b; color:#e2e8f0; padding:12px; border-radius:8px; overflow-x:auto; margin:8px 0; font-size:13px; }
+  .msg-content code { background:#334155; color:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:13px; }
+  .msg-content pre code { background:transparent; padding:0; }
+  .typing::after { content:'▊'; animation: blink 1s infinite; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+  .scrollbar::-webkit-scrollbar { width:6px; }
+  .scrollbar::-webkit-scrollbar-track { background:transparent; }
+  .scrollbar::-webkit-scrollbar-thumb { background:#475569; border-radius:3px; }
+  .fade-in { animation: fadeIn 0.3s ease; }
+  @keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+  /* 2026-05-07 流式 UX：step 卡片 */
+  .step-card { border:1px solid #334155; border-radius:8px; margin:6px 0; overflow:hidden; }
+  .step-card.collapsed .step-body { display:none; }
+  .step-card.collapsed .step-head .chev { transform: rotate(-90deg); }
+  .step-head { display:flex; align-items:center; gap:8px; padding:6px 10px; background:#1e293b; cursor:pointer; user-select:none; font-size:12px; color:#94a3b8; }
+  .step-head .chev { transition: transform 0.15s; display:inline-block; width:12px; }
+  .step-head .step-name { font-weight:500; color:#cbd5e1; }
+  .step-head .step-status { margin-left:auto; font-size:11px; color:#64748b; }
+  .step-head .step-dep { font-size:10px; color:#fbbf24; background:#451a03; padding:1px 6px; border-radius:3px; border:1px solid #78350f; }
+  .step-card.pending { border-color:#1e293b; opacity:0.85; }
+  .step-card.pending .step-head { background:#0f172a; }
+  .step-card.pending .step-head .step-status::before { content:'⌛ '; }
+  .step-card.running .step-head .step-status::before { content:'⏳ '; }
+  .step-card.done .step-head .step-status::before { content:'✓ '; color:#10b981; }
+  .step-body { padding:8px 12px; background:#0f172a; font-size:13px; color:#cbd5e1; max-height:300px; overflow-y:auto; word-break:break-word; }
+  /* 2026-05-07：markdown 元素样式（深色主题，兼容 marked.js 输出的标准标签） */
+  .msg-content h1, .msg-content h2, .msg-content h3,
+  .msg-content h4, .msg-content h5, .msg-content h6,
+  .step-body h1, .step-body h2, .step-body h3,
+  .step-body h4, .step-body h5, .step-body h6 {
+    font-weight:600; color:#f1f5f9; margin:10px 0 6px; line-height:1.3;
+  }
+  .msg-content h1, .step-body h1 { font-size:1.5em; border-bottom:1px solid #334155; padding-bottom:4px; }
+  .msg-content h2, .step-body h2 { font-size:1.3em; border-bottom:1px solid #334155; padding-bottom:3px; }
+  .msg-content h3, .step-body h3 { font-size:1.15em; }
+  .msg-content h4, .step-body h4 { font-size:1.05em; }
+  .msg-content ul, .msg-content ol,
+  .step-body ul, .step-body ol { margin:6px 0 6px 22px; padding:0; }
+  .msg-content ul, .step-body ul { list-style:disc; }
+  .msg-content ol, .step-body ol { list-style:decimal; }
+  .msg-content li, .step-body li { margin:3px 0; line-height:1.5; }
+  .msg-content blockquote, .step-body blockquote {
+    border-left:3px solid #475569; padding:2px 10px; color:#94a3b8; margin:6px 0; background:#1e293b;
+  }
+  .msg-content hr, .step-body hr { border:none; border-top:1px solid #334155; margin:10px 0; }
+  .msg-content a, .step-body a { color:#60a5fa; text-decoration:underline; }
+  .msg-content a:hover, .step-body a:hover { color:#93c5fd; }
+  .msg-content table, .step-body table { border-collapse:collapse; margin:6px 0; }
+  .msg-content th, .msg-content td,
+  .step-body th, .step-body td { border:1px solid #475569; padding:4px 8px; }
+  .msg-content p, .step-body p { margin:6px 0; }
+</style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+
+<!-- ==================== LOGIN SCREEN ==================== -->
+<div id="loginScreen" class="min-h-screen flex items-center justify-center p-4">
+  <div class="w-full max-w-md">
+    <div class="text-center mb-8">
+      <h1 class="text-3xl font-bold text-white mb-2">AI Agent Station</h1>
+      <p class="text-gray-400">登录后使用完整的记忆功能</p>
+    </div>
+    <div class="bg-gray-900 rounded-2xl p-8 border border-gray-800 shadow-2xl">
+      <div class="mb-6">
+        <label class="block text-sm font-medium text-gray-300 mb-2">用户名</label>
+        <input id="loginUsername" type="text" autocomplete="username"
+          class="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition"
+          placeholder="请输入用户名">
+      </div>
+      <div class="mb-6">
+        <label class="block text-sm font-medium text-gray-300 mb-2">密码</label>
+        <input id="loginPassword" type="password" autocomplete="current-password"
+          class="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition"
+          placeholder="请输入密码"
+          onkeydown="if(event.key==='Enter')doLogin()">
+      </div>
+      <div id="loginError" class="hidden mb-4 p-3 bg-red-900/50 border border-red-700 rounded-lg text-red-300 text-sm"></div>
+      <button onclick="doLogin()" id="loginBtn"
+        class="w-full bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-medium py-3 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed">
+        登 录
+      </button>
+      <p class="text-xs text-gray-500 text-center mt-4">登录后 userId 会用于记忆系统的用户隔离</p>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== CHAT SCREEN ==================== -->
+<div id="chatScreen" class="hidden h-screen flex flex-col">
+  <!-- Header -->
+  <header class="bg-gray-900 border-b border-gray-800 px-4 py-3 flex items-center justify-between shrink-0">
+    <div class="flex items-center gap-3">
+      <span class="text-blue-400 font-bold text-lg">AI Agent Station</span>
+      <span class="text-xs bg-gray-800 text-gray-400 px-2 py-1 rounded">v2.0</span>
+    </div>
+    <div class="flex items-center gap-3">
+      <!-- Agent Selector -->
+      <select id="agentSelect" onchange="onAgentChange()"
+        class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-blue-500">
+      </select>
+      <div class="flex items-center gap-1" title="Auto模式最大执行步数">
+        <label for="maxStepInput" class="text-xs text-gray-500">步数</label>
+        <input id="maxStepInput" type="number" min="1" max="20" value="5"
+          onchange="state.maxStep=parseInt(this.value)||5"
+          class="w-12 bg-gray-800 border border-gray-700 rounded px-1.5 py-1 text-sm text-gray-200 text-center focus:outline-none focus:border-blue-500">
+      </div>
+      <span class="text-xs text-gray-500">|</span>
+      <!-- User Info -->
+      <div class="flex items-center gap-2">
+        <div class="w-7 h-7 bg-blue-600 rounded-full flex items-center justify-center text-xs font-bold" id="userAvatar"></div>
+        <span id="userDisplay" class="text-sm text-gray-300"></span>
+      </div>
+      <button onclick="showRagModal()" class="text-xs bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-1.5 rounded-lg transition">RAG 上传</button>
+      <button onclick="toggleHistory()" class="text-xs bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-1.5 rounded-lg transition">历史</button>
+      <button onclick="doLogout()" class="text-xs text-gray-500 hover:text-red-400 transition">退出</button>
+    </div>
+  </header>
+
+  <!-- Main layout: sidebar + chat -->
+  <div class="flex-1 flex overflow-hidden">
+    <!-- History Sidebar -->
+    <div id="historyPanel" class="hidden w-72 bg-gray-900 border-r border-gray-800 flex flex-col shrink-0 overflow-hidden">
+      <div class="p-3 border-b border-gray-800 flex items-center justify-between">
+        <span class="text-sm font-medium text-gray-300">历史会话</span>
+        <button onclick="toggleHistory()" class="text-gray-500 hover:text-white text-sm">&times;</button>
+      </div>
+      <div id="historyList" class="flex-1 overflow-y-auto p-2 space-y-1 scrollbar">
+        <div class="text-xs text-gray-600 text-center py-4">加载中...</div>
+      </div>
+    </div>
+
+    <!-- Chat area -->
+    <div class="flex-1 flex flex-col overflow-hidden">
+      <div id="messageArea" class="flex-1 overflow-y-auto p-4 space-y-4 scrollbar">
+        <div class="text-center text-gray-600 text-sm py-8">
+          <p class="text-4xl mb-3">🤖</p>
+          <p>选择一个 Agent，开始对话</p>
+          <p class="text-xs mt-1">登录后的对话会关联你的 userId，记忆系统将正常工作</p>
+        </div>
+      </div>
+  <div id="ragModal" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+    <div class="bg-gray-900 rounded-2xl p-6 border border-gray-700 w-full max-w-lg shadow-2xl">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-lg font-bold text-white">上传 RAG 知识库</h3>
+        <button onclick="hideRagModal()" class="text-gray-500 hover:text-white text-xl">&times;</button>
+      </div>
+      <div class="space-y-4">
+        <div>
+          <label class="block text-sm text-gray-400 mb-1">名称</label>
+          <input id="ragName" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500" placeholder="文档名称">
+        </div>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1">知识标签 (tag)</label>
+          <input id="ragTag" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500" placeholder="e.g. article, doc, manual">
+        </div>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1">文件（可多选：PDF, PPT, TXT, MD 等）</label>
+          <input id="ragFiles" type="file" multiple class="w-full text-sm text-gray-300 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-blue-600 file:text-white file:hover:bg-blue-700">
+        </div>
+        <div id="ragStatus" class="hidden text-sm"></div>
+        <button onclick="uploadRag()" id="ragUploadBtn" class="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white py-2.5 rounded-lg transition text-sm font-medium">开始上传</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Input -->
+  <div class="bg-gray-900 border-t border-gray-800 p-4 shrink-0">
+    <div class="max-w-4xl mx-auto flex gap-3">
+      <button onclick="newSession()" title="新会话"
+        class="bg-gray-800 hover:bg-gray-700 text-gray-400 px-3 py-3 rounded-lg transition text-sm shrink-0">
+        + 新会话
+      </button>
+      <textarea id="msgInput" rows="1" placeholder="输入消息..."
+        class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition resize-none"
+        onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}"
+        oninput="this.style.height='';this.style.height=Math.min(this.scrollHeight,200)+'px'"></textarea>
+      <button onclick="sendMessage()" id="sendBtn"
+        class="bg-blue-600 hover:bg-blue-700 active:bg-blue-800 disabled:opacity-50 disabled:cursor-not-allowed text-white px-6 py-3 rounded-lg transition font-medium">
+        发送
+      </button>
+    </div>
+    <div class="max-w-4xl mx-auto mt-2 flex justify-between text-xs text-gray-600">
+      <span id="sessionInfo">Session: --</span>
+      <span>Shift+Enter 换行</span>
+    </div>
+  </div>
+  </div><!-- end chat area -->
+  </div><!-- end main layout -->
+</div>
+
+<script>
+// ==================== STATE ====================
+const API = '/api/v1/agent';
+const ADMIN = '/api/v1/admin/admin-user';
+
+let state = {
+  userId: null,
+  username: null,
+  sessionId: null,
+  currentAgentId: null,
+  maxStep: 5,
+  sending: false,
+  agents: []
+};
+
+// ==================== INIT ====================
+function init() {
+  const saved = localStorage.getItem('agent_login');
+  if (saved) {
+    try {
+      const data = JSON.parse(saved);
+      if (data.userId && data.username) {
+        state.userId = data.userId;
+        state.username = data.username;
+        showChat();
+        return;
+      }
+    } catch(e) {}
+  }
+  showLogin();
+}
+
+// ==================== LOGIN ====================
+function showLogin() {
+  document.getElementById('loginScreen').style.display = 'flex';
+  document.getElementById('chatScreen').classList.add('hidden');
+}
+
+async function doLogin() {
+  const username = document.getElementById('loginUsername').value.trim();
+  const password = document.getElementById('loginPassword').value;
+  const errEl = document.getElementById('loginError');
+  const btn = document.getElementById('loginBtn');
+
+  if (!username || !password) { showLoginError('请输入用户名和密码'); return; }
+
+  btn.disabled = true; btn.textContent = '登录中...';
+  errEl.classList.add('hidden');
+
+  try {
+    const res = await fetch(ADMIN + '/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username, password})
+    });
+    const data = await res.json();
+
+    if (data.code === '0000' && data.data) {
+      state.userId = data.data.userId;
+      state.username = data.data.username;
+      localStorage.setItem('agent_login', JSON.stringify({
+        userId: data.data.userId,
+        username: data.data.username
+      }));
+      showChat();
+    } else {
+      showLoginError(data.info || '登录失败');
+    }
+  } catch(e) {
+    showLoginError('网络错误: ' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '登 录';
+  }
+}
+
+function showLoginError(msg) {
+  const el = document.getElementById('loginError');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+
+function doLogout() {
+  localStorage.removeItem('agent_login');
+  state.userId = null; state.username = null; state.sessionId = null;
+  document.getElementById('messageArea').innerHTML = '<div class="text-center text-gray-600 text-sm py-8"><p class="text-4xl mb-3">👋</p><p>已退出登录</p></div>';
+  showLogin();
+}
+
+// ==================== CHAT ====================
+async function showChat() {
+  document.getElementById('loginScreen').style.display = 'none';
+  document.getElementById('chatScreen').classList.remove('hidden');
+  document.getElementById('userDisplay').textContent = state.username;
+  document.getElementById('userAvatar').textContent = (state.username || 'U')[0].toUpperCase();
+  newSession();
+  await loadAgents();
+}
+
+async function loadAgents() {
+  try {
+    const res = await fetch(API + '/query_available_agents');
+    const data = await res.json();
+    if (data.code === '0000' && data.data) {
+      state.agents = data.data.filter(a => a.status === 1);
+      const sel = document.getElementById('agentSelect');
+      sel.innerHTML = '<option value="">自动（AI 路由选择）</option>' + state.agents.map(a =>
+        `<option value="${a.agentId}">${a.agentName} (${a.agentId})</option>`
+      ).join('');
+      if (state.agents.length > 0) {
+        // 优先选 85374287（测试Agent），否则选 4（Auto）
+        const pref = state.agents.find(a => a.agentId === '85374287')
+                  || state.agents.find(a => a.agentId === '4')
+                  || state.agents[0];
+        sel.value = pref.agentId;
+        state.currentAgentId = pref.agentId;
+      }
+    }
+  } catch(e) {
+    console.error('load agents failed:', e);
+  }
+}
+
+function onAgentChange() {
+  state.currentAgentId = document.getElementById('agentSelect').value;
+}
+
+function newSession() {
+  state.sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
+  document.getElementById('sessionInfo').textContent = 'Session: ' + state.sessionId.substring(0, 28) + '...';
+  document.getElementById('messageArea').innerHTML =
+    '<div class="text-center text-gray-600 text-sm py-8"><p class="text-4xl mb-3">🆕</p><p>新会话已开始</p></div>';
+}
+
+// ==================== SEND MESSAGE ====================
+async function sendMessage() {
+  if (state.sending) return;
+  const input = document.getElementById('msgInput');
+  const message = input.value.trim();
+  if (!message) return;
+  // aiAgentId 为空时走后端统一路由（自动模式）
+  if (!state.sessionId) newSession();
+
+  state.sending = true;
+  input.value = ''; input.style.height = '';
+  document.getElementById('sendBtn').disabled = true;
+
+  // 添加用户消息
+  addMessage('user', message);
+  // 添加 AI 占位
+  const aiMsg = addMessage('assistant', '', true);
+
+  try {
+    const res = await fetch(API + '/auto_agent', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        aiAgentId: state.currentAgentId || null,
+        message: message,
+        sessionId: state.sessionId,
+        userId: state.userId,
+        maxStep: state.maxStep
+      })
+    });
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let fullContent = '';
+
+    // 2026-05-07 流式 UX：step 卡片管理
+    // 把消息气泡改造成"步骤卡片容器 + 最终答案区"
+    const msgContent = aiMsg.querySelector('.msg-content');
+    msgContent.innerHTML = '<div class="steps-container"></div><div class="final-answer mt-2"></div>';
+    aiMsg.classList.remove('typing');
+    const stepsContainer = msgContent.querySelector('.steps-container');
+    const finalAnswerEl = msgContent.querySelector('.final-answer');
+    const stepBuffers = {}; // stepId → { card, body, buf, displayName }
+
+    function depBadgeHtml(dependsOn) {
+      if (!Array.isArray(dependsOn) || dependsOn.length === 0) return '';
+      const depNames = dependsOn.map(did => {
+        const dc = stepBuffers[did];
+        return dc ? dc.displayName : did;
+      }).join(' / ');
+      return `<span class="step-dep" title="此步骤依赖以下步骤完成后才能执行">依赖: ${escapeHtml(depNames)}</span>`;
+    }
+
+    function depPendingMessage(dependsOn) {
+      if (!Array.isArray(dependsOn) || dependsOn.length === 0) {
+        return '<span class="text-gray-500">⏳ 等待执行中...</span>';
+      }
+      const depNames = dependsOn.map(did => {
+        const dc = stepBuffers[did];
+        return dc ? dc.displayName : did;
+      }).join('、');
+      return `<span class="text-gray-500">⏳ 依赖 ${escapeHtml(depNames)} 完成后开始执行</span>`;
+    }
+
+    // 2026-05-07 DAG UX：在执行前先广播所有 step 占位卡片
+    // status: 'pending' = 等待依赖完成，'running' = 正在跑，'done' = 完成
+    function createPendingStepCard(stepId, displayName, dependsOn) {
+      const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card)');
+      if (placeholder) placeholder.remove();
+      const card = document.createElement('div');
+      card.className = 'step-card pending collapsed fade-in';
+      // pending 态：head 不显示 dep badge（badge 只在 running 后才出现）
+      card.innerHTML = `
+        <div class="step-head">
+          <span class="chev">▾</span>
+          <span class="step-name">${escapeHtml(displayName || stepId)}</span>
+          <span class="step-status">等待中</span>
+        </div>
+        <div class="step-body">${depPendingMessage(dependsOn)}</div>
+      `;
+      card.querySelector('.step-head').addEventListener('click', () => {
+        card.classList.toggle('collapsed');
+      });
+      stepsContainer.appendChild(card);
+      stepBuffers[stepId] = { card, body: card.querySelector('.step-body'), buf: '', displayName, dependsOn, status: 'pending' };
+      scrollBottom();
+      return stepBuffers[stepId];
+    }
+
+    // 一个 step 真正开始执行时调（来自 step_start 事件）：从 pending 切到 running，head 加 dep badge
+    function activateStepCard(stepId, displayName, dependsOn) {
+      let entry = stepBuffers[stepId];
+      if (!entry) {
+        // 没收到 pending（比如 fixed / auto 的单 step 路径），临时创建一张
+        const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card)');
+        if (placeholder) placeholder.remove();
+        const card = document.createElement('div');
+        card.className = 'step-card running fade-in';
+        card.innerHTML = `
+          <div class="step-head">
+            <span class="chev">▾</span>
+            <span class="step-name">${escapeHtml(displayName || stepId)}</span>
+            ${depBadgeHtml(dependsOn)}
+            <span class="step-status">进行中…</span>
+          </div>
+          <div class="step-body"></div>
+        `;
+        card.querySelector('.step-head').addEventListener('click', () => {
+          card.classList.toggle('collapsed');
+        });
+        stepsContainer.appendChild(card);
+        entry = { card, body: card.querySelector('.step-body'), buf: '', displayName, dependsOn, status: 'running' };
+        stepBuffers[stepId] = entry;
+      } else {
+        // 已有 pending 卡片 → 切到 running
+        entry.card.classList.remove('pending', 'collapsed');
+        entry.card.classList.add('running');
+        // head 注入 dep badge（dep 信息以 step_start 携带的为准，确保稳定）
+        const head = entry.card.querySelector('.step-head');
+        const oldBadge = head.querySelector('.step-dep');
+        if (oldBadge) oldBadge.remove();
+        const status = head.querySelector('.step-status');
+        const badgeHtml = depBadgeHtml(dependsOn);
+        if (badgeHtml) status.insertAdjacentHTML('beforebegin', badgeHtml);
+        status.textContent = '进行中…';
+        // 清空 body 的 "等待依赖" 占位，等接 token
+        entry.body.innerHTML = '';
+        entry.buf = '';
+        entry.dependsOn = dependsOn;
+        entry.status = 'running';
+      }
+      scrollBottom();
+      return entry;
+    }
+
+    // token 事件：必须 step_start 后才有 entry；防御性：没有就当 fixed 单 step 处理
+    function getOrCreateStepCard(stepId, displayName, dependsOn) {
+      return stepBuffers[stepId] || activateStepCard(stepId, displayName, dependsOn);
+    }
+
+    // SSE 事件状态机：跨行收集 event:/data: 字段，遇到空行触发 dispatch
+    let curEvent = 'message';
+    let curData = '';
+
+    function dispatchEvent() {
+      if (!curData) { curEvent = 'message'; return; }
+      let payload = null;
+      try { payload = JSON.parse(curData); } catch (e) { /* skip */ }
+      if (!payload) { curEvent = 'message'; curData = ''; return; }
+
+      if (curEvent === 'step_pending') {
+        // 2026-05-07 DAG UX：执行前先给所有步骤画占位卡片
+        if (!stepBuffers[payload.stepId]) {
+          createPendingStepCard(payload.stepId, payload.displayName, payload.dependsOn);
+        }
+      } else if (curEvent === 'step_start') {
+        // 真正开始执行：从 pending 切到 running（如果之前没 pending 也会自动新建）
+        activateStepCard(payload.stepId, payload.displayName, payload.dependsOn);
+      } else if (curEvent === 'token') {
+        const sid = payload.stepId || 'fixed_strategy';
+        const card = getOrCreateStepCard(sid, sid);
+        if (payload.token === '[DONE]') {
+          // streaming end marker — 全量再渲染一次确保最终态干净
+          card.body.innerHTML = renderMarkdown(card.buf);
+        } else {
+          card.buf += payload.token;
+          // 流式增量渲染：每次都重渲染累计文本（小卡片体量小，性能 OK）
+          const wasAtBottom = card.body.scrollHeight - card.body.scrollTop - card.body.clientHeight < 60;
+          card.body.innerHTML = renderMarkdown(card.buf);
+          // 只有用户在 step body 底部附近时才自动跟随
+          if (wasAtBottom) card.body.scrollTop = card.body.scrollHeight;
+        }
+      } else if (curEvent === 'step_end') {
+        const sid = payload.stepId;
+        const card = stepBuffers[sid];
+        if (card) {
+          card.card.classList.remove('running');
+          card.card.classList.add('done', 'collapsed');
+          card.card.querySelector('.step-status').textContent = payload.summary || (card.displayName + ' 已完成');
+        }
+      } else if (curEvent === 'ack') {
+        // 2026-05-07 #2 TTFT：服务器已接收，立即给视觉反馈，避免空屏几秒
+        if (!stepsContainer.querySelector('.step-card')) {
+          stepsContainer.innerHTML = '<div class="text-xs text-gray-500 px-2 py-1 fade-in">⚡ 已连接，正在分析...</div>';
+        }
+      } else if (curEvent === 'thinking') {
+        // 老的 thinking 事件，弱化显示
+        // （保留兼容，不渲染避免噪音）
+      } else if (curEvent === 'message' || curEvent === '') {
+        // 默认 data: 行（旧协议 type=summary/complete/error）
+        if (payload.type === 'summary') {
+          fullContent = payload.content || '';
+          finalAnswerEl.innerHTML = renderMarkdown(fullContent);
+        } else if (payload.type === 'error') {
+          finalAnswerEl.innerHTML = `<span class="text-red-400">❌ ${escapeHtml(payload.content || '')}</span>`;
+        } else if (payload.type === 'complete') {
+          // 全部完成；没必要做什么
+        }
+        // 其他 type（analysis_status / analysis_history / execution / etc.）忽略，已被 step 卡片取代
+      }
+      curEvent = 'message';
+      curData = '';
+    }
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) { dispatchEvent(); break; }
+      buffer += decoder.decode(value, {stream: true});
+
+      let idx;
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.substring(0, idx).replace(/\r$/, '');
+        buffer = buffer.substring(idx + 1);
+        if (line === '') {
+          // 空行 = 一个 SSE event 的结束
+          dispatchEvent();
+        } else if (line.startsWith('event: ')) {
+          curEvent = line.substring(7).trim();
+        } else if (line.startsWith('data: ')) {
+          // 同 event 多个 data 行拼接
+          curData += (curData ? '\n' : '') + line.substring(6);
+        }
+        // 其他行（id:/retry:）忽略
+      }
+    }
+    scrollBottom();
+  } catch(e) {
+    aiMsg.querySelector('.msg-content').innerHTML = `<span class="text-red-400">❌ 请求失败: ${escapeHtml(e.message)}</span>`;
+    aiMsg.classList.remove('typing');
+  } finally {
+    state.sending = false;
+    document.getElementById('sendBtn').disabled = false;
+    scrollBottom(true);
+  }
+}
+
+// ==================== HELPERS ====================
+function addMessage(role, content, isPlaceholder) {
+  const area = document.getElementById('messageArea');
+  // 移除空状态
+  const empty = area.querySelector('.text-center');
+  if (empty && !empty.classList.contains('hidden')) empty.remove();
+
+  const div = document.createElement('div');
+  div.className = 'fade-in flex gap-3 ' + (role === 'user' ? 'flex-row-reverse' : '');
+
+  const avatar = role === 'user'
+    ? `<div class="w-8 h-8 bg-blue-600 rounded-full flex items-center justify-center text-xs font-bold shrink-0">${(state.username||'U')[0].toUpperCase()}</div>`
+    : `<div class="w-8 h-8 bg-gray-700 rounded-full flex items-center justify-center text-sm shrink-0">🤖</div>`;
+
+  const bubbleClass = role === 'user'
+    ? 'bg-blue-600/20 border border-blue-600/30 rounded-2xl rounded-tr-md'
+    : 'bg-gray-800 border border-gray-700 rounded-2xl rounded-tl-md';
+
+  div.innerHTML = `
+    ${avatar}
+    <div class="${bubbleClass} px-4 py-3 max-w-[80%]">
+      <div class="text-xs text-gray-500 mb-1">${role === 'user' ? state.username : 'AI Assistant'}</div>
+      <div class="msg-content text-sm leading-relaxed ${isPlaceholder ? 'typing' : ''}">
+        ${isPlaceholder ? '<span class="text-gray-500">思考中...</span>' : renderMarkdown(content)}
+      </div>
+    </div>
+  `;
+
+  area.appendChild(div);
+  scrollBottom(true);
+  return div;
+}
+
+// 2026-05-07：用 marked.js 渲染 Markdown，保留 KaTeX 数学公式
+function renderMarkdown(text) {
+  if (!text) return '';
+  // 防御：marked 没加载成功时降级到纯文本
+  if (typeof marked === 'undefined') {
+    return escapeHtml(text).replace(/\n/g, '<br>');
+  }
+  // 1. 先把 LaTeX 块替换成占位符，避免被 marked 当成 markdown 处理
+  const latexBlocks = [];
+  let processed = text.replace(/\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)/g, (m) => {
+    latexBlocks.push(m);
+    return `@@LATEX_${latexBlocks.length - 1}@@`;
+  });
+  // 2. marked.parse：自带 GFM、代码高亮、表格、自动链接
+  let html;
+  try {
+    html = marked.parse(processed, {
+      gfm: true,
+      breaks: true,         // 单换行也转 <br>，符合聊天 UX
+      headerIds: false,
+      mangle: false
+    });
+  } catch (e) {
+    console.warn('marked parse failed', e);
+    html = escapeHtml(processed).replace(/\n/g, '<br>');
+  }
+  // 3. 还原 LaTeX 占位符并用 KaTeX 渲染
+  html = html.replace(/@@LATEX_(\d+)@@/g, (m, idx) => {
+    const raw = latexBlocks[parseInt(idx)];
+    const isBlock = raw.startsWith('\\[');
+    const tex = raw.slice(2, -2).trim();
+    try {
+      return katex.renderToString(tex, { displayMode: isBlock, throwOnError: false });
+    } catch (e) {
+      return `<code>${escapeHtml(raw)}</code>`;
+    }
+  });
+  return html;
+}
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// 智能滚动：用户在底部附近时自动跟随，手动往上翻时不强制拉回
+function isNearBottom(area) {
+  return area.scrollHeight - area.scrollTop - area.clientHeight < 120;
+}
+
+function scrollBottom(force) {
+  const area = document.getElementById('messageArea');
+  if (force || isNearBottom(area)) {
+    setTimeout(() => area.scrollTop = area.scrollHeight, 100);
+  }
+}
+
+// ==================== RAG UPLOAD ====================
+function showRagModal() {
+  document.getElementById('ragModal').classList.remove('hidden');
+  document.getElementById('ragStatus').classList.add('hidden');
+}
+function hideRagModal() {
+  document.getElementById('ragModal').classList.add('hidden');
+}
+
+async function uploadRag() {
+  const name = document.getElementById('ragName').value.trim() || 'doc_' + Date.now();
+  const tag = document.getElementById('ragTag').value.trim();
+  const files = document.getElementById('ragFiles').files;
+  const statusEl = document.getElementById('ragStatus');
+  const btn = document.getElementById('ragUploadBtn');
+
+  if (!tag) { showRagStatus('请输入知识标签', 'red'); return; }
+  if (!files.length) { showRagStatus('请选择文件', 'red'); return; }
+
+  btn.disabled = true; btn.textContent = '上传中...';
+  showRagStatus('正在上传...', 'blue');
+
+  const form = new FormData();
+  form.append('name', name);
+  form.append('tag', tag);
+  for (const f of files) form.append('files', f);
+
+  try {
+    const res = await fetch('/api/v1/admin/ai-client-rag-order/file/upload', {
+      method: 'POST',
+      headers: state.userId ? { 'X-User-Id': state.userId } : {},
+      body: form
+    });
+    const data = await res.json();
+    if (data.code === '0000') {
+      showRagStatus(`上传成功！${files.length} 个文件，userId=${state.userId || '(未登录)'}`, 'green');
+      document.getElementById('ragFiles').value = '';
+    } else {
+      showRagStatus('上传失败: ' + (data.info || '未知错误'), 'red');
+    }
+  } catch(e) {
+    showRagStatus('网络错误: ' + e.message, 'red');
+  } finally {
+    btn.disabled = false; btn.textContent = '开始上传';
+  }
+}
+
+function showRagStatus(msg, color) {
+  const el = document.getElementById('ragStatus');
+  el.textContent = msg;
+  el.className = 'text-sm p-2 rounded-lg ' + (color === 'green' ? 'bg-green-900/50 text-green-300' : color === 'red' ? 'bg-red-900/50 text-red-300' : 'bg-blue-900/50 text-blue-300');
+  el.classList.remove('hidden');
+}
+
+// ==================== HISTORY ====================
+function toggleHistory() {
+  const panel = document.getElementById('historyPanel');
+  panel.classList.toggle('hidden');
+  if (!panel.classList.contains('hidden')) loadHistory();
+}
+
+async function loadHistory() {
+  if (!state.userId) return;
+  const list = document.getElementById('historyList');
+  try {
+    const res = await fetch(`/api/v1/agent/conversations?userId=${encodeURIComponent(state.userId)}`);
+    const data = await res.json();
+    if (data.code !== '0000' || !data.data || !data.data.length) {
+      list.innerHTML = '<div class="text-xs text-gray-600 text-center py-4">暂无历史会话</div>';
+      return;
+    }
+    list.innerHTML = data.data.map(c => {
+      const preview = (c.firstMessage || '').substring(0, 30) + (c.firstMessage && c.firstMessage.length > 30 ? '...' : '');
+      const time = c.lastTime ? new Date(c.lastTime).toLocaleString('zh-CN', {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
+      const sid = (c.conversationId || '').split(':').pop() || c.conversationId;
+      const active = state.sessionId && c.conversationId && c.conversationId.endsWith(state.sessionId) ? 'border-blue-500 bg-blue-900/20' : 'border-gray-700 hover:border-gray-500';
+      return `<div onclick="loadConversation('${escapeHtml(c.conversationId)}')" class="${active} border rounded-lg p-2 cursor-pointer transition text-xs">
+        <div class="text-gray-300 truncate">${escapeHtml(preview || '(空)')}</div>
+        <div class="text-gray-500 mt-1 flex justify-between">
+          <span>${c.messageCount} 条消息</span><span>${time}</span>
+        </div>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    list.innerHTML = '<div class="text-xs text-red-400 text-center py-4">加载失败</div>';
+  }
+}
+
+// 历史分页状态：每个会话独立维护 oldestId / hasMore
+const HISTORY_PAGE_SIZE = 30;
+const historyPage = {
+  conversationId: null,
+  oldestId: null,
+  hasMore: false,
+  loading: false,
+};
+
+async function loadConversation(conversationId) {
+  // 从 conversationId 提取 sessionId
+  const parts = conversationId.split(':');
+  state.sessionId = parts[parts.length - 1];
+  document.getElementById('sessionInfo').textContent = 'Session: ' + state.sessionId.substring(0, 28) + '...';
+  document.getElementById('historyPanel').classList.add('hidden');
+
+  // 重置分页状态
+  historyPage.conversationId = conversationId;
+  historyPage.oldestId = null;
+  historyPage.hasMore = false;
+  historyPage.loading = false;
+
+  const area = document.getElementById('messageArea');
+  area.innerHTML = '<div class="text-center text-gray-500 text-sm py-4">加载中...</div>';
+
+  try {
+    const res = await fetch(`/api/v1/agent/conversation_messages?conversationId=${encodeURIComponent(conversationId)}&limit=${HISTORY_PAGE_SIZE}`);
+    const data = await res.json();
+    if (data.code !== '0000' || !data.data) {
+      area.innerHTML = '<div class="text-center text-gray-500 py-4">加载失败</div>';
+      return;
+    }
+    const payload = data.data;
+    const messages = payload.messages || [];
+
+    historyPage.oldestId = payload.oldestId || null;
+    historyPage.hasMore = !!payload.hasMore;
+
+    area.innerHTML = '';
+    // 先全部 append 消息（addMessage 会 scrollBottom，正常）
+    messages.forEach(m => {
+      addMessage(m.messageType === 'USER' ? 'user' : 'assistant', m.content, false);
+    });
+    // 再插入哨兵到顶部（避免 addMessage 内部 querySelector('.text-center') 误删它）
+    insertHistoryTopSentinel(area);
+    updateHistoryTopSentinel();
+    setupHistoryScrollWatcher();
+  } catch(e) {
+    area.innerHTML = '<div class="text-center text-red-400 py-4">加载失败</div>';
+  }
+  scrollBottom(true);
+}
+
+// 顶部哨兵：用于触发"加载更早"
+function insertHistoryTopSentinel(area) {
+  let sentinel = document.getElementById('historyTopSentinel');
+  if (!sentinel) {
+    sentinel = document.createElement('div');
+    sentinel.id = 'historyTopSentinel';
+    sentinel.className = 'text-center text-xs text-gray-500 py-2';
+  }
+  sentinel.textContent = '';
+  // 必须放在第一个子节点
+  if (area.firstChild) {
+    area.insertBefore(sentinel, area.firstChild);
+  } else {
+    area.appendChild(sentinel);
+  }
+}
+
+function updateHistoryTopSentinel() {
+  const sentinel = document.getElementById('historyTopSentinel');
+  if (!sentinel) return;
+  if (!historyPage.hasMore) {
+    sentinel.textContent = '— 没有更早的消息了 —';
+    sentinel.style.opacity = '0.5';
+  } else if (historyPage.loading) {
+    sentinel.textContent = '加载中…';
+  } else {
+    sentinel.textContent = '↑ 上滑加载更早';
+  }
+}
+
+// 监听 messageArea 滚动；滚到顶且还有更多时触发加载
+let historyScrollHandler = null;
+function setupHistoryScrollWatcher() {
+  const area = document.getElementById('messageArea');
+  if (historyScrollHandler) {
+    area.removeEventListener('scroll', historyScrollHandler);
+  }
+  historyScrollHandler = () => {
+    if (area.scrollTop <= 8 && historyPage.hasMore && !historyPage.loading) {
+      loadHistoryEarlier();
+    }
+  };
+  area.addEventListener('scroll', historyScrollHandler);
+}
+
+async function loadHistoryEarlier() {
+  if (!historyPage.conversationId || !historyPage.oldestId || !historyPage.hasMore) return;
+  historyPage.loading = true;
+  updateHistoryTopSentinel();
+
+  const area = document.getElementById('messageArea');
+  // 记录加载前的 scrollHeight，加载后用差值校正避免视觉跳动
+  const prevScrollHeight = area.scrollHeight;
+
+  try {
+    const res = await fetch(`/api/v1/agent/conversation_messages?conversationId=${encodeURIComponent(historyPage.conversationId)}&limit=${HISTORY_PAGE_SIZE}&beforeId=${historyPage.oldestId}`);
+    const data = await res.json();
+    if (data.code !== '0000' || !data.data) {
+      historyPage.loading = false;
+      updateHistoryTopSentinel();
+      return;
+    }
+    const payload = data.data;
+    const messages = payload.messages || [];
+    historyPage.oldestId = payload.oldestId || historyPage.oldestId;
+    historyPage.hasMore = !!payload.hasMore;
+
+    // prepend 到哨兵之后、原最早消息之前
+    const sentinel = document.getElementById('historyTopSentinel');
+    const fragment = document.createDocumentFragment();
+    messages.forEach(m => {
+      const node = buildMessageNode(m.messageType === 'USER' ? 'user' : 'assistant', m.content);
+      if (node) fragment.appendChild(node);
+    });
+    if (sentinel && sentinel.nextSibling) {
+      area.insertBefore(fragment, sentinel.nextSibling);
+    } else {
+      area.appendChild(fragment);
+    }
+
+    // 校正 scrollTop，让用户视觉位置不跳
+    const newScrollHeight = area.scrollHeight;
+    area.scrollTop = newScrollHeight - prevScrollHeight + area.scrollTop;
+  } catch(e) {
+    console.error('loadHistoryEarlier failed:', e);
+  } finally {
+    historyPage.loading = false;
+    updateHistoryTopSentinel();
+  }
+}
+
+// 与 addMessage 同源的 DOM 构造，但只构造不挂载、不 scroll，供 prepend 使用。
+// 改 addMessage 时记得同步这里。
+function buildMessageNode(role, content) {
+  const div = document.createElement('div');
+  div.className = 'fade-in flex gap-3 ' + (role === 'user' ? 'flex-row-reverse' : '');
+
+  const avatar = role === 'user'
+    ? `<div class="w-8 h-8 bg-blue-600 rounded-full flex items-center justify-center text-xs font-bold shrink-0">${(state.username||'U')[0].toUpperCase()}</div>`
+    : `<div class="w-8 h-8 bg-gray-700 rounded-full flex items-center justify-center text-sm shrink-0">🤖</div>`;
+
+  const bubbleClass = role === 'user'
+    ? 'bg-blue-600/20 border border-blue-600/30 rounded-2xl rounded-tr-md'
+    : 'bg-gray-800 border border-gray-700 rounded-2xl rounded-tl-md';
+
+  div.innerHTML = `
+    ${avatar}
+    <div class="${bubbleClass} px-4 py-3 max-w-[80%]">
+      <div class="text-xs text-gray-500 mb-1">${role === 'user' ? state.username : 'AI Assistant'}</div>
+      <div class="msg-content text-sm leading-relaxed">${renderMarkdown(content)}</div>
+    </div>
+  `;
+  return div;
+}
+
+// ==================== START ====================
+init();
+</script>
+</body>
+</html>

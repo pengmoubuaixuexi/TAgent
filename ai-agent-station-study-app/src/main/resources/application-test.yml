@@ -1,0 +1,35 @@
+server:
+  port: 8091
+
+# 线程池配置
+thread:
+  pool:
+    executor:
+      config:
+        core-pool-size: 20
+        max-pool-size: 50
+        keep-alive-time: 5000
+        block-queue-size: 5000
+        policy: AbortPolicy
+
+# 简化配置，禁用数据库自动配置
+spring:
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration
+      - org.mybatis.spring.boot.autoconfigure.MybatisAutoConfiguration
+  ai:
+    openai:
+      base-url: ${LLM_BASE_URL:https://api.example.com/v1}
+      api-key: ${OPENAI_API_KEY}
+    agent:
+      auto-config:
+        enabled: false
+
+# 日志
+logging:
+  level:
+    root: info
+    cn.bugstack.ai: debug
+  config: classpath:logback-spring.xml

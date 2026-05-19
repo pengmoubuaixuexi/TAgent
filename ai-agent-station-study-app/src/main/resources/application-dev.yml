@@ -1,0 +1,359 @@
+server:
+  port: 8099
+
+# 线程池配置
+thread:
+  pool:
+    executor:
+      config:
+        core-pool-size: 20
+        max-pool-size: 50
+        keep-alive-time: 5000
+        block-queue-size: 5000
+        policy: AbortPolicy
+
+# 数据库配置；启动时配置数据库资源信息
+spring:
+  application:
+    name: ai-agent-station-study
+  # Multipart 上传限制：默认 1MB/文件 10MB/请求，对 PDF / PPT 偏小，放宽到 50MB/文件
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 100MB
+  datasource:
+    mysql:
+      username: root
+      password: 123456
+      url: jdbc:mysql://127.0.0.1:13306/ai-agent-station-study?useUnicode=true&characterEncoding=utf8&autoReconnect=true&zeroDateTimeBehavior=convertToNull&serverTimezone=Asia/Shanghai&useSSL=true
+      driver-class-name: com.mysql.cj.jdbc.Driver
+      type: com.zaxxer.hikari.HikariDataSource
+      hikari:
+        pool-name: Retail_HikariCP
+        minimum-idle: 15 #最小空闲连接数量
+        idle-timeout: 180000 #空闲连接存活最大时间，默认600000（10分钟）
+        maximum-pool-size: 25 #连接池最大连接数，默认是10
+        auto-commit: true  #此属性控制从池返回的连接的默认自动提交行为,默认值：true
+        max-lifetime: 1800000 #此属性控制池中连接的最长生命周期，值0表示无限生命周期，默认1800000即30分钟
+        connection-timeout: 30000 #数据库连接超时时间,默认30秒，即30000
+        connection-test-query: SELECT 1
+    pgvector:
+      driver-class-name: org.postgresql.Driver
+      username: postgres
+      password: postgres
+      url: jdbc:postgresql://127.0.0.1:15432/ai-rag-knowledge
+      type: com.zaxxer.hikari.HikariDataSource
+      hikari:
+        maximum-pool-size: 5
+        minimum-idle: 2
+        idle-timeout: 30000
+        connection-timeout: 30000
+  # P1.2.2 Working Memory：Redis（docker-compose-environment.yml 默认 16379）
+  # 关掉 working-memory.enabled 即可让整套退化为 Noop，离线/无 Redis 环境照跑
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 16379
+      timeout: 3s
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+          max-wait: 2s
+  ai:
+    openai:
+      base-url: ${LLM_BASE_URL:https://token-plan-sgp.xiaomimimo.com/v1}
+      api-key: ${LLM_API_KEY:}
+      connect-timeout: 10s
+      read-timeout: 60s
+      chat:
+        completions-path: ${LLM_COMPLETIONS_PATH:/chat/completions}
+        options:
+          model: ${LLM_MODEL:mimo-v2.5-pro}
+      embedding:
+        embeddings-path: ${EMBEDDING_PATH:/embeddings}
+        enabled: false   # 禁用 Spring AI 自动创建的 EmbeddingModel，使用自定义 bean 走 SiliconFlow
+    agent:
+      auto-config:
+        enabled: true
+        preload-enabled: false   # 懒加载模式：启动时不预装配，首次请求时按需装配
+
+# Agent 路由前置层（P0.1.1 + P0.1.2）
+# - intent-router.client-id：意图分类用的 ChatClient（DB ai_client.client_id），推荐小模型（gpt-4o-mini / claude-haiku 角色）
+#   未配置时整个路由器 disabled，dispatch 不受影响（shadow mode skip）
+# - confidence-threshold：低于此阈值视为 UNKNOWN，由调用方决定回退
+# - live-mode：
+#     false（默认）= shadow 模式，异步分类只打点不影响 dispatch
+#     true         = 同步分类 + StrategyRouter 改写 strategy，敏感意图直接 reject
+agent:
+  llm:
+    base-url: ${LLM_BASE_URL:https://token-plan-sgp.xiaomimimo.com/v1}
+    api-key: ${LLM_API_KEY:}
+    model: ${LLM_MODEL:mimo-v2.5-pro}
+    completions-path: ${LLM_COMPLETIONS_PATH:/chat/completions}
+    embeddings-path: ${LLM_EMBEDDINGS_PATH:/embeddings}
+  mcp:
+    return-error-on-failure: true
+    github:
+      write-enabled: ${GITHUB_MCP_WRITE_ENABLED:false}
+    tool-call:
+      max-attempts: ${MCP_TOOL_CALL_MAX_ATTEMPTS:2}
+      retry-delay-ms: ${MCP_TOOL_CALL_RETRY_DELAY_MS:1000}
+  # P0.1.1 / P0.1.2：意图分类 + 策略路由
+  # client-id 指向一个轻量 ChatClient（推荐 router-small）；live-mode=true 后 dispatch 按 intent → strategy 改写
+  intent-router:
+    client-id: "router-small"
+    confidence-threshold: 0.6
+    live-mode: false
+  # 统一路由 fallback：当 LLM 路由未命中时使用的 agent_id（需确保该 agent 已启用且已装配）
+  fallback-agent-id: "8011"
+  # P0.1.4：RAG Router——闲聊跳过双库 + rerank
+  # llm-enabled=true → LlmRagRouter（一次调用同时输出路径+子查询/变体）
+  # llm-enabled=false（默认）→ HeuristicRagRouter（纯规则，零成本）
+  rag-router:
+    enabled: true
+    llm-enabled: true
+    client-id: "${agent.intent-router.client-id:router-small}"
+    min-length-chars: 4
+  # P0.2.1 + P0.2.2：ChatMemory 持久化 + 滚动摘要
+  # summarize-enabled=true：所有 advisor 共享 SummarizingChatMemory（覆盖单个 advisor 的 maxMessages）
+  # NoopConversationSummarizer 当前是默认实现 → 行为退化为"持久化滑窗"，等价 P0.2.1
+  # 后续接入真正的 LLM-based IConversationSummarizer Bean（覆盖 NoopConversationSummarizer）后摘要会真正生效
+  chat-memory:
+    summarize-enabled: true
+    max-messages: 20
+    summarize-trigger: 30
+    summarize-keep-recent: 10
+  # US-008：长期记忆 profile 检索上限（原硬编码 16）
+  memory:
+    profile-max: 64
+    # 长期记忆全局语义去重（跨 topic）：save 前用 content 找 top1 最近邻，距离 < 阈值视为同事实覆盖
+    long-term:
+      semantic-dedupe-enabled: true
+      semantic-dedupe-threshold-unique: 0.15      # fact / preference / interest 阈值
+      semantic-dedupe-threshold-cumulative: 0.10  # skill / decision 阈值（更严，避免 Java 误判为 Python）
+  # P1.4 Query Rewriting：检索前用小模型把口语化 query 改写成检索友好的陈述句
+  # client-id 复用 IntentRouter 同款 ChatClient（任务分析），不另外配
+  # 长度阈值外的 query 直接 passthrough；失败无声降级
+  query-rewriter:
+    client-id: "router-small"
+    min-length-chars: 6
+    max-length-chars: 80
+  # P1.2 Reflexion 自反思回退：Step3 FAIL → critique 回喂 Step2 重做（不进 Step1 重头来）
+  # max-retries：单 step 最大 reflexion 重试次数，防死循环
+  reflexion:
+    enabled: true
+    max-retries: 2
+  # P2.5 14.6 敏感工具白名单：逗号分隔的工具全名，命中的工具执行前需人工审批
+  sensitive-tools:
+    enabled: false
+    names: "delete_user,drop_table,truncate,delete_all,reset_password,transfer_funds"
+
+  # P2.5 14.1 Prompt Injection Defense：检测到注入时是否阻止请求（默认仅记录日志）
+  prompt-injection:
+    block-on-detect: false
+  # P2.5 14.4 Rate Limiting：按 user/session 维度限流
+  rate-limit:
+    enabled: false
+    limit-for-period: 10
+    limit-refresh-period: 1s
+    timeout-duration: 5s
+  # P2.8 17.1 Idempotency Key：幂等请求缓存，相同 key 返回首次结果
+  idempotency:
+    enabled: true
+    ttl-seconds: 3600
+  # P2.8 17.2 Event Log：步骤事件日志（LLM 调用 input/output 入库可重放）
+  event-log:
+    enabled: true
+  # P2.2 11.2 Plan DAG：flow 路径启用步骤并行执行
+  plan-dag:
+    enabled: true
+  # 2026-05-07 DAG 专用 IO 线程池，独立于 threadPoolExecutor，不和 Episodic/Intent/Dispatch 等异步链路争资源
+  # 升 JDK 21 后可在 DagExecutorConfig 里换成 newVirtualThreadPerTaskExecutor()，下游不动
+  dag-executor:
+    core-pool-size: 30
+    max-pool-size: 100
+    queue-size: 200
+    keep-alive-seconds: 60
+  # P2.4 13.1 Semantic Cache：query embedding 近邻搜索，相似度 > 阈值直接返回历史答案
+  # 需先在 ai_client_advisor 表加一行 advisor_type='SemanticCache'
+  semantic-cache:
+    enabled: true
+    min-similarity: 0.95
+  # P2.7 16.1 Token-Level Streaming：Spring AI stream() Flux<ChatClientResponse>
+  # 逐 token 发送 SSE event:token，前端实时渲染
+  # 2026-05-07：默认启用；配合 step_start / step_end 实现"步骤折叠"流式 UX
+  token-streaming:
+    enabled: true
+  # 流式调用容错：无 token 空闲超时 + 重试
+  streaming:
+    idle-timeout-seconds: 120
+    retry-max-attempts: 3
+  # P2.7 16.2 Thinking Visualization：SSE event:thinking 中间推理可视化
+  thinking-vis:
+    enabled: true
+  # P2.2 11.5 Human-in-the-Loop：敏感工具审批
+  human-approval:
+    enabled: true
+    timeout-seconds: 60
+
+  # P2.4 13.2 Token Budget：每 step 最大输出 token 数（0=不限）
+  token-budget:
+    step1-max-tokens: 2048
+    step2-max-tokens: 4096
+    step3-max-tokens: 2048
+    step4-max-tokens: 4096
+  # P2.2 11.3 Actor-Critic：Step3 Critic 用独立模型 tier 避免自评偏见
+  # enabled=true + critic-tier=medium → Step3 自动选 router-medium，和 Step2 actor 模型分家
+  actor-critic:
+    enabled: true
+    critic-tier: medium
+  # P1.2.2 Working Memory：把 step 中间产物镜像到 Redis（key=wm:{sessionId}:{step}.{name}）
+  # enabled=false → NoopWorkingMemoryService 兜底，无 Redis 环境零侵入
+  working-memory:
+    enabled: false
+    key-prefix: "wm:"
+    ttl-seconds: 3600
+  # P0.1.3 收尾：路由专用 ChatClient 池
+  # 启动时按 entries 列表构建无 advisor / tool 的纯 ChatClient，按 tier 注册到 ModelTierRegistry
+  # IntentRouter / QueryRewriter 等可把 client-id 改成这里的 id，专用 + 不污染主链路
+  router-pool:
+    enabled: true
+    base-url: ${LLM_BASE_URL:https://token-plan-sgp.xiaomimimo.com/v1}
+    api-key: ${LLM_API_KEY:}
+    entries:
+      # 2026-05-07：small 走非推理版 mimo-v2.5（router/rewrite 类轻任务，pro 思考延迟太重）
+      - { id: "router-small",  model: "${LLM_SMALL_MODEL:mimo-v2.5}",  tier: small }
+      - { id: "router-medium", model: "${LLM_MODEL:mimo-v2.5-pro}",    tier: medium }
+      - { id: "router-large",  model: "${LLM_MODEL:mimo-v2.5-pro}",    tier: large }
+    # P1.4 7.3 Contextual Retrieval：入库前用小模型为每个 chunk 生成上下文前缀，拼到正文头部（召回率 +49%）
+    # client-id 指向 router-small（已装配的小模型 ChatClient）；enabled=false 时跳过
+    rag:
+      contextual-retrieval:
+        enabled: true
+        client-id: "router-small"
+        max-chunk-chars: 2000
+  # Embedding：SiliconFlow（和 chat 分开，chat 走 mimo）
+  embedding:
+    base-url: ${EMBEDDING_BASE_URL:https://api.siliconflow.cn/v1}
+    api-key: ${EMBEDDING_API_KEY:}
+    model: ${EMBEDDING_MODEL:BAAI/bge-m3}
+    embeddings-path: ${EMBEDDING_PATH:/embeddings}
+
+  # P1.4 7.2 Cross-Encoder Rerank：provider=siliconflow 时启用 SiliconFlow Rerank API（~300ms），替代 LLM rerank（~3s）
+  # 不配 api-key 或 provider 非 siliconflow 时自动回退 LlmRerankService
+  rerank:
+    provider: siliconflow
+    api-url: ${RERANK_API_URL:${EMBEDDING_BASE_URL:https://api.siliconflow.cn/v1}/rerank}
+    api-key: ${EMBEDDING_API_KEY:}
+    model: ${RERANK_MODEL:Qwen/Qwen3-Reranker-8B}
+    timeout-seconds: 10
+
+# TAgent扳手通用组件配置
+tagent:
+  task:
+    # 任务调度配置
+    job:
+      enabled: true
+      pool-size: 5
+      thread-name-prefix: "test-tagent-task-scheduler-"
+      wait-for-tasks-to-complete-on-shutdown: true
+      await-termination-seconds: 30
+      refresh-interval: 30000
+      clean-invalid-tasks-cron: "0 0/5 * * * ?"
+
+
+# 日志
+logging:
+  level:
+    root: info
+  config: classpath:logback-spring.xml
+  logstash:
+    destination: 127.0.0.1:4560
+
+# Elasticsearch：承担 BM25 检索（亮点 3 混合检索），以及日志 sink（与 Logstash 串行）
+elasticsearch:
+  uris: http://127.0.0.1:9200
+  rag-index: ai-agent-rag
+  connect-timeout-ms: 2000
+  socket-timeout-ms: 5000
+
+# Resilience4j：LLM 调用容错（亮点 4 Part B）
+# - Retry：至多 3 次尝试；IntervalFunction 由 ResilienceConfig 代码方式配置（指数退避 + ±50% 抖动）
+# - CircuitBreaker：滑动窗口 20 次，失败率 >50% 熔断；OPEN 30s 后放 5 个探测
+# - 实例名 llmCall 必须与 @Retry(name=...)/@CircuitBreaker(name=...) 一致
+resilience4j:
+  retry:
+    instances:
+      llmCall:
+        max-attempts: 3
+        # 注意：这里不配 wait-duration。yml 的 wait-duration 会被转成一个 intervalFunction，
+        # 而 ResilienceConfig.llmCallRetryCustomizer 又会设一次 intervalFunction
+        # (指数退避 + ±50% 抖动)，两份冲突会抛 "intervalFunction was configured twice"。
+        # 让 Customizer 做唯一等待策略来源。
+        retry-exceptions:
+          - java.io.IOException
+          - java.net.SocketTimeoutException
+          - org.springframework.web.client.ResourceAccessException
+          - org.springframework.web.client.HttpServerErrorException
+        ignore-exceptions:
+          # CB 已经拒绝的请求重试毫无意义，必须忽略
+          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+          # 4xx 是调用方参数错误，重试只会继续 4xx
+          - org.springframework.web.client.HttpClientErrorException
+          - java.lang.IllegalArgumentException
+  circuitbreaker:
+    instances:
+      llmCall:
+        register-health-indicator: true
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 20
+        minimum-number-of-calls: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 5
+        automatic-transition-from-open-to-half-open-enabled: true
+
+# Actuator：暴露熔断器 / 重试 / Prometheus 观测端点
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,circuitbreakers,retries,retryevents,circuitbreakerevents,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+  health:
+    circuitbreakers:
+      enabled: true
+  # 亮点 4 Part D：Prometheus 指标暴露
+  # /actuator/prometheus 被 Prometheus scrape，Agent 通过 grafana-mcp 反查做自省诊断
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+  metrics:
+    distribution:
+      # 让 llm.call Timer 自动产出 p50/p95/p99 分位，Grafana 直接画
+      percentiles-histogram:
+        llm.call: true
+      percentiles:
+        llm.call: 0.5, 0.95, 0.99
+    tags:
+      # 多实例部署时区分来源；单机可去掉
+      application: ai-agent-station-study
+  # P1.6 OpenTelemetry：把 Servlet 请求 / WebClient / RestTemplate / Spring AI 调用自动建 span，跨 4 step 串成一条 trace
+  # 本地默认推到 Jaeger all-in-one (docs/dev-ops/docker-compose-jaeger.yml) 的 OTLP HTTP 端口 4318
+  # dev 全采样；线上环境改 0.1（10%）即可
+  tracing:
+    enabled: true
+    sampling:
+      probability: 1.0
+    propagation:
+      type: w3c
+  otlp:
+    tracing:
+      endpoint: http://127.0.0.1:4318/v1/traces
+      transport: http
+      timeout: 10s

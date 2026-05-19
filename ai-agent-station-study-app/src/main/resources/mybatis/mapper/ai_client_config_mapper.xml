@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="cn.bugstack.ai.infrastructure.dao.IAiClientConfigDao">
+
+    <resultMap id="AiClientConfigMap" type="cn.bugstack.ai.infrastructure.dao.po.AiClientConfig">
+        <id column="id" property="id"/>
+        <result column="source_type" property="sourceType"/>
+        <result column="source_id" property="sourceId"/>
+        <result column="target_type" property="targetType"/>
+        <result column="target_id" property="targetId"/>
+        <result column="ext_param" property="extParam"/>
+        <result column="status" property="status"/>
+        <result column="create_time" property="createTime"/>
+        <result column="update_time" property="updateTime"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientConfig" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_client_config (
+            source_type, source_id, target_type, target_id, ext_param, status, create_time, update_time
+        ) VALUES (
+            #{sourceType}, #{sourceId}, #{targetType}, #{targetId}, #{extParam}, #{status}, #{createTime}, #{updateTime}
+        )
+    </insert>
+
+    <update id="updateById" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientConfig">
+        UPDATE ai_client_config SET
+            source_type = #{sourceType},
+            source_id = #{sourceId},
+            target_type = #{targetType},
+            target_id = #{targetId},
+            ext_param = #{extParam},
+            status = #{status},
+            update_time = #{updateTime}
+        WHERE id = #{id}
+    </update>
+
+    <update id="updateBySourceId" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientConfig">
+        UPDATE ai_client_config SET
+            source_type = #{sourceType},
+            target_type = #{targetType},
+            target_id = #{targetId},
+            ext_param = #{extParam},
+            status = #{status},
+            update_time = #{updateTime}
+        WHERE source_id = #{sourceId}
+    </update>
+
+    <delete id="deleteById" parameterType="java.lang.Long">
+        DELETE FROM ai_client_config WHERE id = #{id}
+    </delete>
+
+    <delete id="deleteBySourceId" parameterType="java.lang.String">
+        DELETE FROM ai_client_config WHERE source_id = #{sourceId}
+    </delete>
+
+    <select id="queryById" parameterType="java.lang.Long" resultMap="AiClientConfigMap">
+        SELECT id, source_type, source_id, target_type, target_id, ext_param, status, create_time, update_time
+        FROM ai_client_config
+        WHERE id = #{id}
+    </select>
+
+    <select id="queryBySourceId" parameterType="java.lang.String" resultMap="AiClientConfigMap">
+        SELECT id, source_type, source_id, target_type, target_id, ext_param, status, create_time, update_time
+        FROM ai_client_config
+        WHERE source_id = #{sourceId}
+    </select>
+
+    <select id="queryByTargetId" parameterType="java.lang.String" resultMap="AiClientConfigMap">
+        SELECT id, source_type, source_id, target_type, target_id, ext_param, status, create_time, update_time
+        FROM ai_client_config
+        WHERE target_id = #{targetId}
+    </select>
+
+    <select id="queryBySourceTypeAndId" resultMap="AiClientConfigMap">
+        SELECT id, source_type, source_id, target_type, target_id, ext_param, status, create_time, update_time
+        FROM ai_client_config
+        WHERE source_type = #{sourceType} AND source_id = #{sourceId} AND status = 1
+    </select>
+
+    <select id="queryByTargetTypeAndId" resultMap="AiClientConfigMap">
+        SELECT id, source_type, source_id, target_type, target_id, ext_param, status, create_time, update_time
+        FROM ai_client_config
+        WHERE target_type = #{targetType} AND target_id = #{targetId}
+    </select>
+
+    <select id="queryByConditions" resultMap="AiClientConfigMap">
+        SELECT id, source_type, source_id, target_type, target_id, ext_param, status, create_time, update_time
+        FROM ai_client_config
+        WHERE source_type = #{sourceType} 
+          AND source_id = #{sourceId}
+          AND target_type = #{targetType} 
+          AND target_id = #{targetId}
+    </select>
+
+    <select id="queryEnabledConfigs" resultMap="AiClientConfigMap">
+        SELECT id, source_type, source_id, target_type, target_id, ext_param, status, create_time, update_time
+        FROM ai_client_config
+        WHERE status = 1
+        ORDER BY create_time DESC
+    </select>
+
+    <select id="queryAll" resultMap="AiClientConfigMap">
+        SELECT id, source_type, source_id, target_type, target_id, ext_param, status, create_time, update_time
+        FROM ai_client_config
+        ORDER BY create_time DESC
+    </select>
+
+</mapper>

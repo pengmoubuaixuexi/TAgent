@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8"/>
+    <title>AI Agent Station · 观测面板</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+               background: #0f1419; color: #e6edf3; }
+        header { padding: 18px 24px; border-bottom: 1px solid #21262d; display: flex; align-items: center; gap: 16px; }
+        header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+        header .muted { color: #8b949e; font-size: 13px; }
+        header .right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+        header select, header button { background: #21262d; color: #e6edf3; border: 1px solid #30363d;
+            padding: 6px 12px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+        header button:hover { background: #30363d; }
+        .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; padding: 20px 24px; }
+        .stat { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 14px 16px; }
+        .stat .label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .stat .value { font-size: 26px; font-weight: 600; margin-top: 6px; }
+        .stat .sub { color: #6e7681; font-size: 12px; margin-top: 4px; }
+        .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 0 24px 24px; }
+        .card { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 16px; }
+        .card h2 { margin: 0 0 12px; font-size: 14px; font-weight: 600; color: #e6edf3; }
+        .card .muted { color: #8b949e; font-size: 12px; font-weight: normal; margin-left: 8px; }
+        .table-wrap { padding: 0 24px 40px; }
+        table { width: 100%; border-collapse: collapse; background: #161b22; border: 1px solid #21262d; border-radius: 8px; overflow: hidden; }
+        th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #21262d; font-size: 13px; }
+        th { background: #0d1117; color: #8b949e; font-weight: 500; text-transform: uppercase; letter-spacing: 0.4px; font-size: 11px; }
+        tr:last-child td { border-bottom: none; }
+        td.num { text-align: right; font-variant-numeric: tabular-nums; }
+        .empty { color: #6e7681; padding: 24px; text-align: center; }
+        .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+        .dot.ok { background: #3fb950; } .dot.err { background: #f85149; }
+    </style>
+</head>
+<body>
+<header>
+    <h1>AI Agent Station · 观测面板</h1>
+    <span class="muted" id="status"><span class="dot ok"></span>就绪</span>
+    <div class="right">
+        <span class="muted">时间窗口</span>
+        <select id="range">
+            <option value="1">最近 1h</option>
+            <option value="6">最近 6h</option>
+            <option value="24" selected>最近 24h</option>
+            <option value="168">最近 7d</option>
+        </select>
+        <button onclick="refresh()">刷新</button>
+        <button onclick="toggleAuto()" id="autoBtn">自动刷新：关</button>
+    </div>
+</header>
+
+<div class="grid">
+    <div class="stat"><div class="label">LLM 调用数</div><div class="value" id="s-calls">–</div><div class="sub" id="s-calls-sub">&nbsp;</div></div>
+    <div class="stat"><div class="label">总 Tokens</div><div class="value" id="s-total">–</div><div class="sub" id="s-total-sub">&nbsp;</div></div>
+    <div class="stat"><div class="label">平均延迟</div><div class="value" id="s-latency">–</div><div class="sub">毫秒 / 次</div></div>
+    <div class="stat"><div class="label">活跃会话</div><div class="value" id="s-sessions">–</div><div class="sub" id="s-models-sub">&nbsp;</div></div>
+</div>
+
+<div class="charts">
+    <div class="card">
+        <h2>Token 消耗按模型<span class="muted" id="h1-sub"></span></h2>
+        <canvas id="chart-model" height="220"></canvas>
+    </div>
+    <div class="card">
+        <h2>会话 LLM 调用 Top 15<span class="muted">当前时间窗口 · sessionId 维度</span></h2>
+        <canvas id="chart-session" height="220"></canvas>
+    </div>
+</div>
+
+<div class="table-wrap">
+    <div class="card" style="padding: 0;">
+        <div style="padding: 14px 16px 0;"><h2 style="margin:0;">模型明细</h2></div>
+        <table id="tbl-model">
+            <thead><tr>
+                <th>模型</th><th>调用次数</th><th>Prompt</th><th>Completion</th><th>Total</th>
+            </tr></thead>
+            <tbody></tbody>
+        </table>
+    </div>
+</div>
+
+<div class="table-wrap">
+    <div class="card" style="padding: 0;">
+        <div style="padding: 14px 16px 0;"><h2 style="margin:0;">会话明细（当前时间窗口）</h2></div>
+        <table id="tbl-session">
+            <thead><tr>
+                <th>Session</th><th>调用次数</th><th>Total Tokens</th><th>总延迟 ms</th><th>最后活跃</th>
+            </tr></thead>
+            <tbody></tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+Chart.defaults.color = '#8b949e';
+Chart.defaults.borderColor = '#21262d';
+
+const PALETTE = ['#58a6ff', '#3fb950', '#d29922', '#f778ba', '#a371f7', '#ff7b72', '#39c5cf', '#e3b341'];
+let chartModel, chartSession, autoTimer = null;
+
+function setStatus(ok, msg) {
+    const el = document.getElementById('status');
+    el.innerHTML = `<span class="dot ${ok ? 'ok' : 'err'}"></span>${msg}`;
+}
+
+function fmtNum(n) { return (n || 0).toLocaleString(); }
+function fmtFloat(n) { return n == null ? '–' : (+n).toFixed(1); }
+
+async function fetchJson(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`${url} ${r.status}`);
+    return r.json();
+}
+
+async function refresh() {
+    const hours = +document.getElementById('range').value;
+    try {
+        const [sum, byModel, bySession] = await Promise.all([
+            fetchJson(`/api/v1/observe/summary?hours=${hours}`),
+            fetchJson(`/api/v1/observe/token-by-model?hours=${hours}`),
+            fetchJson(`/api/v1/observe/calls-by-session-today?size=15&hours=${hours}`)
+        ]);
+        renderSummary(sum.data, hours);
+        renderModel(byModel.data);
+        renderSession(bySession.data);
+        setStatus(true, `${new Date().toLocaleTimeString()} 刷新成功`);
+    } catch (e) {
+        setStatus(false, `错误: ${e.message}`);
+    }
+}
+
+function renderSummary(d, hours) {
+    if (!d) return;
+    document.getElementById('s-calls').textContent = fmtNum(d.calls);
+    document.getElementById('s-calls-sub').textContent = `过去 ${hours}h`;
+    document.getElementById('s-total').textContent = fmtNum(d.totalTokens);
+    document.getElementById('s-total-sub').textContent = `prompt ${fmtNum(d.promptTokens)} / completion ${fmtNum(d.completionTokens)}`;
+    document.getElementById('s-latency').textContent = fmtFloat(d.avgLatencyMs);
+    document.getElementById('s-sessions').textContent = fmtNum(d.uniqueSessions);
+    document.getElementById('s-models-sub').textContent = `覆盖 ${fmtNum(d.uniqueModels)} 个模型`;
+}
+
+function renderModel(d) {
+    const items = (d && d.items) || [];
+    document.getElementById('h1-sub').textContent = items.length ? `共 ${items.length} 个模型` : '';
+    const labels = items.map(x => x.model || '(unknown)');
+    const data = items.map(x => x.totalTokens);
+    const colors = labels.map((_, i) => PALETTE[i % PALETTE.length]);
+
+    if (chartModel) chartModel.destroy();
+    if (!items.length) {
+        chartModel = null;
+        const ctx = document.getElementById('chart-model');
+        const p = ctx.getContext('2d');
+        p.clearRect(0, 0, ctx.width, ctx.height);
+        p.fillStyle = '#6e7681'; p.textAlign = 'center';
+        p.fillText('暂无数据（需先触发 LLM 调用）', ctx.width / 2, ctx.height / 2);
+    } else {
+        chartModel = new Chart(document.getElementById('chart-model'), {
+            type: 'doughnut',
+            data: { labels, datasets: [{ data, backgroundColor: colors, borderWidth: 0 }] },
+            options: {
+                plugins: {
+                    legend: { position: 'right', labels: { boxWidth: 10 } },
+                    tooltip: { callbacks: { label: c => `${c.label}: ${fmtNum(c.raw)} tokens` } }
+                }
+            }
+        });
+    }
+
+    const tbody = document.querySelector('#tbl-model tbody');
+    tbody.innerHTML = items.length
+        ? items.map(x => `<tr>
+            <td>${escapeHtml(x.model)}</td>
+            <td class="num">${fmtNum(x.calls)}</td>
+            <td class="num">${fmtNum(x.promptTokens)}</td>
+            <td class="num">${fmtNum(x.completionTokens)}</td>
+            <td class="num"><b>${fmtNum(x.totalTokens)}</b></td>
+          </tr>`).join('')
+        : `<tr><td colspan="5" class="empty">暂无数据</td></tr>`;
+}
+
+function renderSession(d) {
+    const items = (d && d.items) || [];
+    const labels = items.map(x => truncate(x.sessionId, 18));
+    const data = items.map(x => x.calls);
+
+    if (chartSession) chartSession.destroy();
+    if (!items.length) {
+        chartSession = null;
+        const ctx = document.getElementById('chart-session');
+        const p = ctx.getContext('2d');
+        p.clearRect(0, 0, ctx.width, ctx.height);
+        p.fillStyle = '#6e7681'; p.textAlign = 'center';
+        p.fillText('当前时间窗口暂无会话调用', ctx.width / 2, ctx.height / 2);
+    } else {
+        chartSession = new Chart(document.getElementById('chart-session'), {
+            type: 'bar',
+            data: { labels, datasets: [{ data, backgroundColor: '#58a6ff', borderWidth: 0 }] },
+            options: {
+                indexAxis: 'y',
+                plugins: { legend: { display: false } },
+                scales: {
+                    x: { grid: { color: '#21262d' }, ticks: { precision: 0 } },
+                    y: { grid: { display: false } }
+                }
+            }
+        });
+    }
+
+    const tbody = document.querySelector('#tbl-session tbody');
+    tbody.innerHTML = items.length
+        ? items.map(x => `<tr>
+            <td><code>${escapeHtml(x.sessionId)}</code></td>
+            <td class="num">${fmtNum(x.calls)}</td>
+            <td class="num">${fmtNum(x.totalTokens)}</td>
+            <td class="num">${fmtNum(x.latencyMs)}</td>
+            <td>${escapeHtml(x.lastSeen || '')}</td>
+          </tr>`).join('')
+        : `<tr><td colspan="5" class="empty">当前时间窗口暂无会话</td></tr>`;
+}
+
+function truncate(s, n) { if (!s) return ''; return s.length > n ? s.slice(0, n) + '…' : s; }
+function escapeHtml(s) { return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function toggleAuto() {
+    const btn = document.getElementById('autoBtn');
+    if (autoTimer) { clearInterval(autoTimer); autoTimer = null; btn.textContent = '自动刷新：关'; }
+    else { autoTimer = setInterval(refresh, 10000); btn.textContent = '自动刷新：10s'; }
+}
+
+document.getElementById('range').addEventListener('change', refresh);
+refresh();
+</script>
+</body>
+</html>

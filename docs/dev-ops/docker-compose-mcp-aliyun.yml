@@ -1,0 +1,73 @@
+# /usr/local/bin/docker-compose -f /docs/dev-ops/environment/environment-docker-compose-2.4.yml up -d
+version: '3.8'
+# docker-compose -f docker-compose-mcp-aliyun.yml up -d
+# 你需要修改system为你自身系统的仓库名
+services:
+  mcp-server-csdn-app:
+    #    image: tagent/mcp-server-csdn-app:1.1
+    image: registry.cn-hangzhou.aliyuncs.com/tagent/mcp-server-csdn-app:1.1
+    container_name: mcp-server-csdn-app
+    restart: always
+    ports:
+      - "8101:8101"
+    volumes:
+      - ./log:/data/log
+    environment:
+      - TZ=PRC
+      - SERVER_PORT=8101
+      - CSDN_API_CATEGORIES=Java场景面试宝典
+      - CSDN_API_COOKIE=${CSDN_API_COOKIE}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - my-network
+
+  mcp-server-weixin-app:
+    image: registry.cn-hangzhou.aliyuncs.com/tagent/mcp-server-weixin-app:1.1
+    container_name: mcp-server-weixin-app
+    # 增加下面这一行 entrypoint
+    entrypoint: [ "java", "-jar", "/mcp-server-weixin-app.jar", "--weixin.api.app-id=${WEIXIN_API_APP_ID}", "--weixin.api.app-secret=${WEIXIN_API_APP_SECRET}", "--weixin.api.template-id=${WEIXIN_API_TEMPLATE_ID}", "--weixin.api.touser=${WEIXIN_API_TOUSER}" ]
+    environment:
+      - TZ=PRC
+      - SERVER_PORT=8102
+    restart: always
+    ports:
+      - "8102:8102"
+    volumes:
+      - ./log:/data/log
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - my-network
+
+  mcp-server-hmdp:
+    build:
+      context: ../../mcp-server-hmdp
+      dockerfile: Dockerfile
+    container_name: mcp-server-hmdp
+    restart: always
+    ports:
+      - "9000:9000"
+    environment:
+      - TZ=PRC
+      - MCP_TRANSPORT=sse
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=9000
+      - HMDP_API_URL=http://host.docker.internal:8081
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - my-network
+
+networks:
+  my-network:
+    driver: bridge

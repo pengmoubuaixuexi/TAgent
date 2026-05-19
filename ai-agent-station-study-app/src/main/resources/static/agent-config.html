@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agent 配置详情</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .card { @apply bg-white rounded-lg shadow-md p-4 mb-4; }
+        .tag { @apply inline-block px-2 py-1 text-xs rounded-full mr-2 mb-1; }
+        .tag-blue { @apply bg-blue-100 text-blue-800; }
+        .tag-green { @apply bg-green-100 text-green-800; }
+        .tag-purple { @apply bg-purple-100 text-purple-800; }
+        .tag-orange { @apply bg-orange-100 text-orange-800; }
+        .tag-gray { @apply bg-gray-100 text-gray-600; }
+        .prompt-content { @apply bg-gray-50 p-3 rounded text-sm text-gray-700 whitespace-pre-wrap max-h-40 overflow-y-auto; }
+        .step-line { @apply relative pl-8 pb-6; }
+        .step-line::before { content:''; position:absolute; left:12px; top:24px; bottom:0; width:2px; background:#e5e7eb; }
+        .step-dot { position:absolute; left:4px; top:6px; width:20px; height:20px; border-radius:50%; background:#3b82f6; display:flex; align-items:center; justify-content:center; color:white; font-size:11px; font-weight:bold; }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <div class="max-w-5xl mx-auto py-8 px-4">
+        <h1 class="text-2xl font-bold text-gray-800 mb-6">Agent 配置详情</h1>
+
+        <!-- 查询栏 -->
+        <div class="card flex items-center gap-4">
+            <input id="agentIdInput" type="text" placeholder="输入 Agent ID（如 8001）"
+                   class="flex-1 border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <button onclick="queryAgent()" class="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition">查询</button>
+            <button onclick="queryAll()" class="bg-gray-500 text-white px-4 py-2 rounded-lg hover:bg-gray-600 transition text-sm">查看全部</button>
+        </div>
+
+        <!-- Agent 列表（查看全部模式） -->
+        <div id="agentList" class="hidden card">
+            <h2 class="text-lg font-semibold mb-3">所有 Agent</h2>
+            <div id="agentListContent" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3"></div>
+        </div>
+
+        <!-- 结果区域 -->
+        <div id="result" class="hidden mt-6">
+            <!-- Agent 基本信息 -->
+            <div class="card">
+                <div class="flex items-center justify-between mb-3">
+                    <h2 class="text-xl font-bold text-gray-800" id="agentName"></h2>
+                    <span class="tag tag-blue" id="agentStrategy"></span>
+                </div>
+                <p class="text-gray-600 mb-2" id="agentDesc"></p>
+                <div class="flex gap-4 text-sm text-gray-500">
+                    <span>ID: <code id="agentId" class="bg-gray-100 px-1 rounded"></code></span>
+                    <span>渠道: <code id="agentChannel" class="bg-gray-100 px-1 rounded"></code></span>
+                    <span>状态: <span id="agentStatus"></span></span>
+                </div>
+            </div>
+
+            <!-- Client 流程 -->
+            <div class="card">
+                <h3 class="text-lg font-semibold mb-4">执行流程</h3>
+                <div id="flowSteps"></div>
+            </div>
+
+            <!-- Client 详情 -->
+            <div id="clientDetails"></div>
+        </div>
+
+        <!-- 错误提示 -->
+        <div id="error" class="hidden card border-red-300 bg-red-50 text-red-700 mt-4"></div>
+    </div>
+
+    <script>
+        const API_BASE = '/api/v1/agent';
+
+        // 回车查询
+        document.getElementById('agentIdInput').addEventListener('keydown', e => {
+            if (e.key === 'Enter') queryAgent();
+        });
+
+        // URL 参数自动查询
+        const params = new URLSearchParams(location.search);
+        if (params.get('agentId')) {
+            document.getElementById('agentIdInput').value = params.get('agentId');
+            queryAgent();
+        }
+
+        async function queryAll() {
+            try {
+                const res = await fetch(`${API_BASE}/query_available_agents`);
+                const json = await res.json();
+                if (json.code !== '0000') throw new Error(json.info);
+                const list = json.data;
+                const container = document.getElementById('agentListContent');
+                container.innerHTML = list.map(a => `
+                    <div class="border rounded-lg p-3 cursor-pointer hover:bg-blue-50 transition" onclick="document.getElementById('agentIdInput').value='${a.agentId}';queryAgent();">
+                        <div class="font-semibold text-gray-800">${a.agentName}</div>
+                        <div class="text-xs text-gray-500 mt-1">ID: ${a.agentId}</div>
+                        <div class="text-xs mt-1"><span class="tag tag-${a.strategy.includes('Fixed') ? 'green' : a.strategy.includes('Auto') ? 'blue' : 'purple'}">${formatStrategy(a.strategy)}</span></div>
+                        <div class="text-xs text-gray-500 mt-1 line-clamp-2">${a.description || ''}</div>
+                    </div>
+                `).join('');
+                document.getElementById('agentList').classList.remove('hidden');
+                document.getElementById('result').classList.add('hidden');
+                document.getElementById('error').classList.add('hidden');
+            } catch (e) {
+                showError(e.message);
+            }
+        }
+
+        async function queryAgent() {
+            const agentId = document.getElementById('agentIdInput').value.trim();
+            if (!agentId) { showError('请输入 Agent ID'); return; }
+
+            try {
+                document.getElementById('agentList').classList.add('hidden');
+                const res = await fetch(`${API_BASE}/query_agent_config/${agentId}`);
+                const json = await res.json();
+                if (json.code !== '0000') throw new Error(json.info);
+                renderConfig(json.data);
+            } catch (e) {
+                showError(e.message);
+            }
+        }
+
+        function renderConfig(data) {
+            const { agent, flowConfigs, clients, models, prompts, advisors, mcps } = data;
+
+            // Agent 基本信息
+            document.getElementById('agentName').textContent = agent.agentName;
+            document.getElementById('agentStrategy').textContent = formatStrategy(agent.strategy);
+            document.getElementById('agentDesc').textContent = agent.description || '无描述';
+            document.getElementById('agentId').textContent = agent.agentId;
+            document.getElementById('agentChannel').textContent = agent.channel || '-';
+            document.getElementById('agentStatus').innerHTML = agent.status === 1
+                ? '<span class="text-green-600 font-semibold">启用</span>'
+                : '<span class="text-red-600 font-semibold">禁用</span>';
+
+            // Client 流程步骤
+            const sorted = [...flowConfigs].sort((a, b) => a.sequence - b.sequence);
+            const flowHtml = sorted.map((fc, i) => `
+                <div class="step-line">
+                    <div class="step-dot">${fc.sequence}</div>
+                    <div class="ml-2">
+                        <span class="font-semibold text-gray-800">${fc.clientName}</span>
+                        <span class="tag tag-gray ml-2">${fc.clientType}</span>
+                        <span class="tag tag-blue ml-1">Client: ${fc.clientId}</span>
+                    </div>
+                </div>
+            `).join('');
+            document.getElementById('flowSteps').innerHTML = flowHtml || '<p class="text-gray-500">无流程配置</p>';
+
+            // Client 详情卡片
+            const clientsHtml = sorted.map(fc => {
+                const client = clients.find(c => c.clientId === fc.clientId) || {};
+                const model = models.find(m => m.modelId === client.modelId) || {};
+                const clientPrompts = prompts.filter(p => (client.promptIdList || []).includes(p.promptId));
+                const clientAdvisors = advisors.filter(a => (client.advisorIdList || []).includes(a.advisorId));
+                const clientMcps = mcps.filter(m => (client.mcpIdList || []).includes(m.mcpId) || (model.toolMcpIds || []).includes(m.mcpId));
+
+                return `
+                <div class="card border-l-4 border-blue-500">
+                    <div class="flex items-center justify-between mb-3">
+                        <h4 class="text-lg font-semibold text-gray-800">${fc.clientName}</h4>
+                        <span class="tag tag-gray">${fc.clientId}</span>
+                    </div>
+                    <p class="text-sm text-gray-500 mb-3">${client.description || ''}</p>
+
+                    <!-- Model -->
+                    <div class="mb-3">
+                        <h5 class="text-sm font-semibold text-gray-700 mb-1">Model</h5>
+                        ${model.modelId ? `
+                            <div class="bg-gray-50 rounded p-2 text-sm">
+                                <span class="font-medium">${model.modelName}</span>
+                                <span class="tag tag-purple ml-2">${model.modelType}</span>
+                                ${model.tier ? `<span class="tag tag-orange">${model.tier}</span>` : ''}
+                                <span class="text-gray-400 ml-2">ID: ${model.modelId}</span>
+                            </div>
+                        ` : '<p class="text-gray-400 text-sm">未配置</p>'}
+                    </div>
+
+                    <!-- Prompt -->
+                    <div class="mb-3">
+                        <h5 class="text-sm font-semibold text-gray-700 mb-1">Prompt</h5>
+                        ${clientPrompts.length > 0 ? clientPrompts.map(p => `
+                            <div class="mb-2">
+                                <div class="text-sm font-medium text-gray-600">${p.promptName} <span class="text-gray-400">(${p.promptId})</span></div>
+                                <div class="prompt-content">${escapeHtml(p.promptContent || '')}</div>
+                            </div>
+                        `).join('') : '<p class="text-gray-400 text-sm">未配置</p>'}
+                    </div>
+
+                    <!-- Advisor -->
+                    <div class="mb-3">
+                        <h5 class="text-sm font-semibold text-gray-700 mb-1">Advisor</h5>
+                        ${clientAdvisors.length > 0 ? clientAdvisors.map(a => `
+                            <div class="bg-gray-50 rounded p-2 text-sm mb-1">
+                                <span class="font-medium">${a.advisorName}</span>
+                                <span class="tag tag-green ml-2">${a.advisorType}</span>
+                                <span class="text-gray-400 ml-2">ID: ${a.advisorId}</span>
+                                ${a.ragAnswer ? `<div class="text-xs text-gray-500 mt-1">topK: ${a.ragAnswer.topK}, filter: ${a.ragAnswer.filterExpression || '无'}</div>` : ''}
+                                ${a.chatMemory ? `<div class="text-xs text-gray-500 mt-1">maxMessages: ${a.chatMemory.maxMessages}</div>` : ''}
+                            </div>
+                        `).join('') : '<p class="text-gray-400 text-sm">未配置</p>'}
+                    </div>
+
+                    <!-- MCP Tools -->
+                    <div>
+                        <h5 class="text-sm font-semibold text-gray-700 mb-1">MCP 工具</h5>
+                        ${clientMcps.length > 0 ? `
+                            <div class="flex flex-wrap gap-2">
+                                ${clientMcps.map(m => `
+                                    <div class="bg-blue-50 border border-blue-200 rounded-lg px-3 py-2 text-sm">
+                                        <div class="font-medium text-blue-800">${m.mcpName}</div>
+                                        <div class="text-xs text-blue-600">${m.transportType} | ID: ${m.mcpId}</div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        ` : '<p class="text-gray-400 text-sm">未配置</p>'}
+                    </div>
+                </div>
+                `;
+            }).join('');
+            document.getElementById('clientDetails').innerHTML = clientsHtml;
+
+            document.getElementById('result').classList.remove('hidden');
+            document.getElementById('error').classList.add('hidden');
+        }
+
+        function formatStrategy(s) {
+            if (!s) return '-';
+            if (s.includes('Fixed')) return 'Fixed（单轮）';
+            if (s.includes('Auto')) return 'Auto（多步自动）';
+            if (s.includes('Flow')) return 'Flow（流水线）';
+            return s;
+        }
+
+        function escapeHtml(str) {
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function showError(msg) {
+            document.getElementById('error').textContent = msg;
+            document.getElementById('error').classList.remove('hidden');
+            document.getElementById('result').classList.add('hidden');
+            document.getElementById('agentList').classList.add('hidden');
+        }
+    </script>
+</body>
+</html>

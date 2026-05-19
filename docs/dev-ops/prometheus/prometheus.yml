@@ -1,0 +1,27 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  # Node Exporter：宿主机 CPU / 内存 / 磁盘 / 网络基础指标
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets:
+          - 'node-exporter:9100'
+        labels:
+          instance: 'node-exporter'
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+
+  # 亮点 4 Part D：Spring Boot 应用自身指标
+  # - llm.call / llm.tokens：LlmMetrics 发出的业务指标
+  # - resilience4j_retry_*, resilience4j_circuitbreaker_*：由 resilience4j-micrometer 自动注册
+  # - http_server_requests, jvm_memory_*, hikaricp_*：Spring Boot Actuator 默认指标
+  # 应用在宿主机启动（端口 8099），容器内通过 host.docker.internal 回源
+  - job_name: 'ai-agent-station-study'
+    static_configs:
+      - targets:
+          - 'host.docker.internal:8099'
+        labels:
+          instance: 'ai-agent-station-study'
+    metrics_path: '/actuator/prometheus'
+    scrape_interval: 15s

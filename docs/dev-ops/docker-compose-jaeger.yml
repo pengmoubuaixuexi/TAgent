@@ -1,0 +1,30 @@
+# P1.6 OpenTelemetry：Jaeger all-in-one 收集本地开发期 trace
+# 启动：docker-compose -f docker-compose-jaeger.yml up -d
+# UI：http://localhost:16686
+# OTLP HTTP（应用推送目标，与 application-dev.yml 的 management.otlp.tracing.endpoint 对应）：http://localhost:4318/v1/traces
+version: '3.9'
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: jaeger
+    restart: unless-stopped
+    environment:
+      # 打开原生 OTLP 接收（gRPC 4317 + HTTP 4318），无需 collector 中转
+      - COLLECTOR_OTLP_ENABLED=true
+      # 内存里默认存 50000 个 trace；本地开发够用，重启即清
+      - MEMORY_MAX_TRACES=50000
+    ports:
+      # OTLP gRPC（备用）
+      - "4317:4317"
+      # OTLP HTTP（应用默认走这条）
+      - "4318:4318"
+      # Jaeger UI
+      - "16686:16686"
+      # 兼容旧 Jaeger thrift collector（保留默认开放）
+      - "14250:14250"
+    networks:
+      - my-network
+
+networks:
+  my-network:
+    driver: bridge

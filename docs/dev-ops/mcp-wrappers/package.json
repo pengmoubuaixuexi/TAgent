@@ -1,0 +1,9 @@
+{
+  "name": "mcp-wrappers",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MCP stdio wrapper + proxy bootstrap for selectively routing certain MCP servers via HTTPS_PROXY",
+  "dependencies": {
+    "undici": "^6.19.0"
+  }
+}

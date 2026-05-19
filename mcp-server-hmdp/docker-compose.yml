@@ -1,0 +1,103 @@
+version: "3.8"
+
+services:
+  # ============================================================
+  # MCP Server（Streamable HTTP 模式）
+  # ============================================================
+  mcp-server:
+    build: .
+    container_name: hmdp-mcp-server
+    ports:
+      - "9000:9000"
+    environment:
+      - MCP_TRANSPORT=sse
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=9000
+      - HMDP_API_URL=http://hm-dianping:8081
+    depends_on:
+      hm-dianping:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - hmdp-net
+
+  # ============================================================
+  # 黑马点评 Spring Boot 应用
+  # 需要先把 hm-dianping 打成 jar 包放到同目录
+  # mvn clean package -DskipTests  →  target/hm-dianping.jar
+  # ============================================================
+  hm-dianping:
+    image: eclipse-temurin:17-jre
+    container_name: hm-dianping-app
+    working_dir: /app
+    volumes:
+      - ./hm-dianping.jar:/app/hm-dianping.jar
+      - ./application-docker.yaml:/app/application.yaml
+    command: ["java", "-jar", "hm-dianping.jar", "--spring.config.location=file:/app/application.yaml"]
+    ports:
+      - "8081:8081"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/shop-type/list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - hmdp-net
+
+  # ============================================================
+  # MySQL
+  # ============================================================
+  mysql:
+    image: mysql:8.0
+    container_name: hmdp-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: hmdp
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./sql:/docker-entrypoint-initdb.d  # 初始化SQL放这里
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - hmdp-net
+
+  # ============================================================
+  # Redis
+  # ============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: hmdp-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --requirepass pt123
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "pt123", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - hmdp-net
+
+volumes:
+  mysql-data:
+  redis-data:
+
+networks:
+  hmdp-net:
+    driver: bridge

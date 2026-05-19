@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="cn.bugstack.ai.infrastructure.dao.IAiClientAdvisorDao">
+
+    <resultMap id="AiClientAdvisorMap" type="cn.bugstack.ai.infrastructure.dao.po.AiClientAdvisor">
+        <id column="id" property="id"/>
+        <result column="advisor_id" property="advisorId"/>
+        <result column="advisor_name" property="advisorName"/>
+        <result column="advisor_type" property="advisorType"/>
+        <result column="order_num" property="orderNum"/>
+        <result column="ext_param" property="extParam"/>
+        <result column="status" property="status"/>
+        <result column="create_time" property="createTime"/>
+        <result column="update_time" property="updateTime"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientAdvisor" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_client_advisor (
+            advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
+        ) VALUES (
+            #{advisorId}, #{advisorName}, #{advisorType}, #{orderNum}, #{extParam}, #{status}, #{createTime}, #{updateTime}
+        )
+    </insert>
+
+    <update id="updateById" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientAdvisor">
+        UPDATE ai_client_advisor SET
+            advisor_id = #{advisorId},
+            advisor_name = #{advisorName},
+            advisor_type = #{advisorType},
+            order_num = #{orderNum},
+            ext_param = #{extParam},
+            status = #{status},
+            update_time = #{updateTime}
+        WHERE id = #{id}
+    </update>
+
+    <update id="updateByAdvisorId" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientAdvisor">
+        UPDATE ai_client_advisor SET
+            advisor_name = #{advisorName},
+            advisor_type = #{advisorType},
+            order_num = #{orderNum},
+            ext_param = #{extParam},
+            status = #{status},
+            update_time = #{updateTime}
+        WHERE advisor_id = #{advisorId}
+    </update>
+
+    <delete id="deleteById" parameterType="java.lang.Long">
+        DELETE FROM ai_client_advisor WHERE id = #{id}
+    </delete>
+
+    <delete id="deleteByAdvisorId" parameterType="java.lang.String">
+        DELETE FROM ai_client_advisor WHERE advisor_id = #{advisorId}
+    </delete>
+
+    <select id="queryById" parameterType="java.lang.Long" resultMap="AiClientAdvisorMap">
+        SELECT id, advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
+        FROM ai_client_advisor
+        WHERE id = #{id}
+    </select>
+
+    <select id="queryByAdvisorId" parameterType="java.lang.String" resultMap="AiClientAdvisorMap">
+        SELECT id, advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
+        FROM ai_client_advisor
+        WHERE advisor_id = #{advisorId}
+    </select>
+
+    <select id="queryAll" resultMap="AiClientAdvisorMap">
+        SELECT id, advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
+        FROM ai_client_advisor
+        ORDER BY order_num ASC, create_time DESC
+    </select>
+
+    <select id="queryByStatus" parameterType="java.lang.Integer" resultMap="AiClientAdvisorMap">
+        SELECT id, advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
+        FROM ai_client_advisor
+        WHERE status = #{status}
+        ORDER BY order_num ASC, create_time DESC
+    </select>
+
+    <select id="queryByAdvisorType" parameterType="java.lang.String" resultMap="AiClientAdvisorMap">
+        SELECT id, advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
+        FROM ai_client_advisor
+        WHERE advisor_type = #{advisorType}
+        ORDER BY order_num ASC, create_time DESC
+    </select>
+
+</mapper>

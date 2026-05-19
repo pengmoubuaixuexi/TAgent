@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="cn.bugstack.ai.infrastructure.dao.IAiAgentDao">
+
+    <resultMap id="AiAgentMap" type="cn.bugstack.ai.infrastructure.dao.po.AiAgent">
+        <id column="id" property="id"/>
+        <result column="agent_id" property="agentId"/>
+        <result column="agent_name" property="agentName"/>
+        <result column="description" property="description"/>
+        <result column="channel" property="channel"/>
+        <result column="strategy" property="strategy"/>
+        <result column="status" property="status"/>
+        <result column="create_time" property="createTime"/>
+        <result column="update_time" property="updateTime"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiAgent" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_agent (
+            agent_id, agent_name, description, channel, strategy, status, create_time, update_time
+        ) VALUES (
+            #{agentId}, #{agentName}, #{description}, #{channel}, #{strategy}, #{status}, now(), now()
+        )
+    </insert>
+
+    <update id="updateById" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiAgent">
+        UPDATE ai_agent SET
+            agent_id = #{agentId},
+            agent_name = #{agentName},
+            description = #{description},
+            channel = #{channel},
+        strategy = #{strategy},
+            status = #{status},
+            update_time = #{updateTime}
+        WHERE id = #{id}
+    </update>
+
+    <update id="updateByAgentId" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiAgent">
+        UPDATE ai_agent SET
+            agent_name = #{agentName},
+            description = #{description},
+            channel = #{channel},
+            strategy = #{strategy},
+            status = #{status},
+            update_time = #{updateTime}
+        WHERE agent_id = #{agentId}
+    </update>
+
+    <delete id="deleteById" parameterType="java.lang.Long">
+        DELETE FROM ai_agent WHERE id = #{id}
+    </delete>
+
+    <delete id="deleteByAgentId" parameterType="java.lang.String">
+        DELETE FROM ai_agent WHERE agent_id = #{agentId}
+    </delete>
+
+    <select id="queryById" parameterType="java.lang.Long" resultMap="AiAgentMap">
+        SELECT id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
+        FROM ai_agent
+        WHERE id = #{id}
+    </select>
+
+    <select id="queryByAgentId" parameterType="java.lang.String" resultMap="AiAgentMap">
+        SELECT id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
+        FROM ai_agent
+        WHERE agent_id = #{agentId}
+    </select>
+
+    <select id="queryEnabledAgents" resultMap="AiAgentMap">
+        SELECT id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
+        FROM ai_agent
+        WHERE status = 1
+        ORDER BY create_time DESC
+    </select>
+
+    <select id="queryByChannel" parameterType="java.lang.String" resultMap="AiAgentMap">
+        SELECT id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
+        FROM ai_agent
+        WHERE channel = #{channel}
+        ORDER BY create_time DESC
+    </select>
+
+    <select id="queryAll" resultMap="AiAgentMap">
+        SELECT id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
+        FROM ai_agent
+        ORDER BY create_time DESC
+    </select>
+
+    <select id="queryByStrategy" resultMap="AiAgentMap">
+        SELECT id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
+        FROM ai_agent
+        WHERE strategy = #{strategy} AND status = #{status}
+        ORDER BY create_time DESC
+    </select>
+
+</mapper>

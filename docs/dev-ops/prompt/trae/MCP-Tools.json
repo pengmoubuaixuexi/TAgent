@@ -1,0 +1,101 @@
+﻿{
+  "filesystem_mcp_client": {
+    "description": "A Model Context Protocol (MCP) client that provides file system operations through stdio transport. This tool enables reading, writing, and managing files and directories on the local file system with configurable root paths for security.",
+    "params": {
+      "type": "object",
+      "properties": {
+        "root_paths": {
+          "description": "Array of root directory paths that the filesystem client can access",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": ["${USER_HOME}/Desktop"]
+        },
+        "timeout_seconds": {
+          "description": "Request timeout in seconds for MCP operations",
+          "type": "integer",
+          "default": 10
+        }
+      },
+      "required": ["root_paths"]
+    }
+  },
+  "web_search_mcp_client": {
+    "description": "A Model Context Protocol (MCP) client that provides AI-powered search capabilities through a generic search service via Server-Sent Events (SSE) transport. This tool enables intelligent web search and information retrieval.",
+    "params": {
+      "type": "object",
+      "properties": {
+        "api_key": {
+          "description": "Search service API key for authentication",
+          "type": "string"
+        },
+        "endpoint_url": {
+          "description": "Base URL for the search MCP service",
+          "type": "string",
+          "default": "https://example.com/search/mcp/"
+        },
+        "timeout_minutes": {
+          "description": "Request timeout in minutes for search operations",
+          "type": "integer",
+          "default": 360
+        }
+      },
+      "required": ["api_key"]
+    }
+  },
+  "mcp_client_initializer": {
+    "description": "Utility tool for initializing and managing MCP (Model Context Protocol) clients with different transport mechanisms including stdio and SSE (Server-Sent Events).",
+    "params": {
+      "type": "object",
+      "properties": {
+        "client_type": {
+          "description": "Type of MCP client to initialize",
+          "type": "string",
+          "enum": ["stdio", "sse"]
+        },
+        "transport_config": {
+          "description": "Configuration object for the transport layer",
+          "type": "object",
+          "properties": {
+            "command": {
+              "description": "Command to execute for stdio transport (e.g., 'npx')",
+              "type": "string"
+            },
+            "args": {
+              "description": "Arguments for the stdio command",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "url": {
+              "description": "Base URL for SSE transport",
+              "type": "string"
+            },
+            "sse_endpoint": {
+              "description": "SSE endpoint path with query parameters",
+              "type": "string"
+            }
+          }
+        },
+        "request_timeout": {
+          "description": "Timeout configuration for MCP requests",
+          "type": "object",
+          "properties": {
+            "duration": {
+              "description": "Timeout duration value",
+              "type": "integer"
+            },
+            "unit": {
+              "description": "Time unit for timeout (seconds, minutes, hours)",
+              "type": "string",
+              "enum": ["seconds", "minutes", "hours"]
+            }
+          }
+        }
+      },
+      "required": ["client_type", "transport_config"]
+    }
+  }
+}

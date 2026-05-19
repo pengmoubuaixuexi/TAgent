@@ -1,0 +1,15 @@
+# Grafana Dashboard Provisioning（启动时自动加载 ./dashboards 下的 *.json）
+# Provider 名要唯一；options.path 必须是 Grafana 容器内绝对路径
+apiVersion: 1
+
+providers:
+  - name: 'agent-default'
+    orgId: 1
+    folder: 'AI Agent'
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

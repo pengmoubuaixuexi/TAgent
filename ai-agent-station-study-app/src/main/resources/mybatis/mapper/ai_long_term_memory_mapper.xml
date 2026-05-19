@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="cn.bugstack.ai.infrastructure.dao.IAiLongTermMemoryDao">
+
+    <resultMap id="AiLongTermMemoryMap" type="cn.bugstack.ai.infrastructure.dao.po.AiLongTermMemory">
+        <id     column="id"              property="id"/>
+        <result column="memory_id"       property="memoryId"/>
+        <result column="user_id"         property="userId"/>
+        <result column="tenant_id"       property="tenantId"/>
+        <result column="topic"           property="topic"/>
+        <result column="content"         property="content"/>
+        <result column="source"          property="source"/>
+        <result column="source_session"  property="sourceSession"/>
+        <result column="access_count"    property="accessCount"/>
+        <result column="last_accessed"   property="lastAccessed"/>
+        <result column="archived"        property="archived"/>
+        <result column="created_at"      property="createdAt"/>
+        <result column="updated_at"      property="updatedAt"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiLongTermMemory" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_long_term_memory
+            (memory_id, user_id, tenant_id, topic, content, source, source_session,
+             access_count, last_accessed, archived, created_at, updated_at)
+        VALUES
+            (#{memoryId}, #{userId}, #{tenantId}, #{topic}, #{content}, #{source}, #{sourceSession},
+             #{accessCount}, #{lastAccessed}, #{archived}, NOW(), NOW())
+    </insert>
+
+    <select id="findByMemoryId" parameterType="java.lang.String" resultMap="AiLongTermMemoryMap">
+        SELECT * FROM ai_long_term_memory WHERE memory_id = #{memoryId}
+    </select>
+
+    <select id="findByUserId" resultMap="AiLongTermMemoryMap">
+        SELECT * FROM ai_long_term_memory
+        WHERE user_id = #{userId} AND archived = 0
+        ORDER BY last_accessed DESC, created_at DESC
+        LIMIT #{limit}
+    </select>
+
+    <update id="touchAccess">
+        UPDATE ai_long_term_memory
+        SET access_count = access_count + 1,
+            last_accessed = NOW()
+        WHERE memory_id = #{memoryId}
+    </update>
+
+    <update id="archive">
+        UPDATE ai_long_term_memory SET archived = 1 WHERE memory_id = #{memoryId}
+    </update>
+
+    <!-- P2.1 10.2 遗忘衰减：久未访问 + 访问次数低的记忆 -->
+    <select id="findStaleCandidates" resultMap="AiLongTermMemoryMap">
+        SELECT * FROM ai_long_term_memory
+        WHERE archived = 0
+          AND (
+              last_accessed IS NULL
+              OR (DATEDIFF(NOW(), last_accessed) > #{staleDays} AND access_count &lt; #{minAccess})
+          )
+        ORDER BY last_accessed ASC
+        LIMIT #{limit}
+    </select>
+
+    <update id="archiveByIds">
+        UPDATE ai_long_term_memory SET archived = 1
+        WHERE id IN
+        <foreach collection="ids" item="id" open="(" separator="," close=")">
+            #{id}
+        </foreach>
+    </update>
+
+    <!-- P2.1 10.3 冲突解决 -->
+    <select id="findByUserIdAndTopic" resultMap="AiLongTermMemoryMap">
+        SELECT * FROM ai_long_term_memory
+        WHERE user_id = #{userId} AND archived = 0
+          AND topic = #{topic}
+        ORDER BY created_at DESC
+        LIMIT #{limit}
+    </select>
+
+    <update id="updateContent">
+        UPDATE ai_long_term_memory
+        SET content = #{content}, updated_at = NOW()
+        WHERE memory_id = #{memoryId}
+    </update>
+
+    <!-- 获取用户所有活跃 memory_id（archived=0），用于向量检索后交叉校验 -->
+    <select id="findActiveMemoryIds" resultType="java.lang.String">
+        SELECT memory_id FROM ai_long_term_memory
+        WHERE user_id = #{userId} AND archived = 0
+    </select>
+
+    <!-- 核心记忆：access_count 作权重，最近访问有加分，按复合分数降序 -->
+    <select id="findCoreByUser" resultMap="AiLongTermMemoryMap">
+        SELECT *,
+               (access_count * 10 +
+                CASE WHEN last_accessed IS NOT NULL
+                     THEN GREATEST(0, 30 - DATEDIFF(NOW(), last_accessed))
+                     ELSE 0
+                END) AS _score
+        FROM ai_long_term_memory
+        WHERE user_id = #{userId} AND archived = 0
+        ORDER BY _score DESC
+        LIMIT #{limit}
+    </select>
+
+</mapper>

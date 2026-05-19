@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="cn.bugstack.ai.infrastructure.dao.IAiEpisodicMemoryDao">
+
+    <resultMap id="AiEpisodicMemoryMap" type="cn.bugstack.ai.infrastructure.dao.po.AiEpisodicMemory">
+        <id     column="id"                        property="id"/>
+        <result column="user_id"                   property="userId"/>
+        <result column="tenant_id"                 property="tenantId"/>
+        <result column="session_id"                property="sessionId"/>
+        <result column="topic"                     property="topic"/>
+        <result column="summary"                   property="summary"/>
+        <result column="created_at"                property="createdAt"/>
+        <result column="updated_at"                property="updatedAt"/>
+        <result column="last_summarized_msg_count" property="lastSummarizedMsgCount"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiEpisodicMemory" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_episodic_memory
+            (user_id, tenant_id, session_id, topic, summary, last_summarized_msg_count, created_at, updated_at)
+        VALUES
+            (#{userId}, #{tenantId}, #{sessionId}, #{topic}, #{summary},
+             <choose>
+                 <when test="lastSummarizedMsgCount != null">#{lastSummarizedMsgCount}</when>
+                 <otherwise>0</otherwise>
+             </choose>,
+             NOW(), NOW())
+    </insert>
+
+    <select id="findByUserId" resultMap="AiEpisodicMemoryMap">
+        SELECT * FROM ai_episodic_memory
+        WHERE user_id = #{userId}
+        ORDER BY updated_at DESC
+        LIMIT #{limit}
+    </select>
+
+    <delete id="deleteOlderThan">
+        DELETE FROM ai_episodic_memory
+        WHERE user_id = #{userId}
+          AND id NOT IN (
+              SELECT id FROM (
+                  SELECT id FROM ai_episodic_memory
+                  WHERE user_id = #{userId}
+                  ORDER BY updated_at DESC
+                  LIMIT #{keepCount}
+              ) t
+          )
+    </delete>
+
+    <select id="findBySessionId" resultMap="AiEpisodicMemoryMap">
+        SELECT * FROM ai_episodic_memory
+        WHERE session_id = #{sessionId}
+        ORDER BY updated_at DESC
+        LIMIT 1
+    </select>
+
+    <!-- 覆盖式 update：summary 整段替换；显式 SET updated_at = NOW() 兼容老 schema 没 ON UPDATE 的场景 -->
+    <update id="updateBySessionId">
+        UPDATE ai_episodic_memory
+        SET summary = #{summary}, updated_at = NOW()
+        <if test="topic != null and topic != ''">
+            , topic = #{topic}
+        </if>
+        <if test="lastSummarizedMsgCount != null">
+            , last_summarized_msg_count = #{lastSummarizedMsgCount}
+        </if>
+        WHERE session_id = #{sessionId}
+    </update>
+
+    <!-- 注意：跨会话注入按"最后使用时间"排序 → updated_at DESC，且 5 天内 -->
+    <select id="findByUserIdRecent" resultMap="AiEpisodicMemoryMap">
+        SELECT * FROM ai_episodic_memory
+        WHERE user_id = #{userId}
+          AND updated_at >= DATE_SUB(NOW(), INTERVAL #{withinDays} DAY)
+        ORDER BY updated_at DESC
+        LIMIT #{limit}
+    </select>
+
+    <!-- 用户最近 K 个会话（5 天内），但排除当前 sessionId（当前会话单独走 findBySessionId 注入） -->
+    <select id="findByUserIdExcludeSessionRecent" resultMap="AiEpisodicMemoryMap">
+        SELECT * FROM ai_episodic_memory
+        WHERE user_id = #{userId}
+          AND session_id &lt;&gt; #{excludeSessionId}
+          AND updated_at >= DATE_SUB(NOW(), INTERVAL #{withinDays} DAY)
+        ORDER BY updated_at DESC
+        LIMIT #{limit}
+    </select>
+
+</mapper>

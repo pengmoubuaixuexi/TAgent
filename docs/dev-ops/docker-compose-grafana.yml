@@ -1,0 +1,68 @@
+# Grafana MCP server https://github.com/grafana/mcp-grafana
+version: '3.9'
+# 执行脚本；docker-compose -f docker-compose-grafana-aliyun.yml up -d
+services:
+  # 数据采集
+  prometheus:
+    image: bitnami/prometheus:2.47.2
+    container_name: prometheus
+    restart: always
+    ports:
+      - 9090:9090
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - my-network
+
+  # 监控界面；
+  # 数据库配置说明，本地docker，链接非docker内的本地mysql，可以配置 host.docker.internal 或者本地IP地址。
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: grafana
+    restart: always
+    ports:
+      - 4000:4000
+    depends_on:
+      - prometheus
+    volumes:
+      - ./grafana:/etc/grafana
+    environment:
+      - GF_DATABASE_TYPE=mysql
+      - GF_DATABASE_HOST=host.docker.internal:3306
+      - GF_DATABASE_NAME=grafana
+      - GF_DATABASE_USER=root
+      - GF_DATABASE_PASSWORD=12345678
+    networks:
+      - my-network
+
+  # 监控服务 mcp https://github.com/grafana/mcp-grafana
+  grafana-mcp:
+    image: mcp/grafana
+    container_name: grafana-mcp
+    ports:
+      - "8000:8000"
+    environment:
+      - GRAFANA_URL=http://grafana:4000
+      - GRAFANA_API_KEY=${GRAFANA_API_KEY}
+    restart: unless-stopped
+    networks:
+      - my-network
+
+  # 模拟指标库
+  node-exporter:
+    image: prom/node-exporter:v1.9.1
+    container_name: node-exporter
+    restart: always
+    ports:
+      - "9100:9100"
+    volumes:
+      - /tmp:/host/tmp:ro
+    command:
+      - '--path.rootfs=/host'
+      - '--collector.textfile.directory=/host/tmp'
+    networks:
+      - my-network
+
+networks:
+  my-network:
+    driver: bridge

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="cn.bugstack.ai.infrastructure.dao.IAiParentDocumentDao">
+
+    <resultMap id="AiParentDocumentMap" type="cn.bugstack.ai.infrastructure.dao.po.AiParentDocument">
+        <id column="id" property="id"/>
+        <result column="parent_id" property="parentId"/>
+        <result column="content" property="content"/>
+        <result column="knowledge_tag" property="knowledgeTag"/>
+        <result column="source" property="source"/>
+        <result column="user_id" property="userId"/>
+        <result column="created_at" property="createdAt"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiParentDocument">
+        INSERT INTO ai_parent_document (parent_id, content, knowledge_tag, source, user_id)
+        VALUES (#{parentId}, #{content}, #{knowledgeTag}, #{source}, #{userId})
+    </insert>
+
+    <select id="findByParentId" parameterType="string" resultMap="AiParentDocumentMap">
+        SELECT * FROM ai_parent_document WHERE parent_id = #{parentId}
+    </select>
+
+    <select id="findByParentIds" resultMap="AiParentDocumentMap">
+        SELECT * FROM ai_parent_document
+        WHERE parent_id IN
+        <foreach collection="parentIds" item="pid" open="(" separator="," close=")">
+            #{pid}
+        </foreach>
+    </select>
+
+    <delete id="deleteByKnowledgeTag" parameterType="string">
+        DELETE FROM ai_parent_document WHERE knowledge_tag = #{knowledgeTag}
+    </delete>
+
+</mapper>

@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="cn.bugstack.ai.infrastructure.dao.IAiChatMemoryDao">
+
+    <resultMap id="AiChatMemoryMap" type="cn.bugstack.ai.infrastructure.dao.po.AiChatMemory">
+        <id     column="id"              property="id"/>
+        <result column="conversation_id" property="conversationId"/>
+        <result column="user_id"         property="userId"/>
+        <result column="agent_id"        property="agentId"/>
+        <result column="message_type"    property="messageType"/>
+        <result column="content"         property="content"/>
+        <result column="created_at"      property="createdAt"/>
+    </resultMap>
+
+    <select id="findConversationIds" resultType="java.lang.String">
+        SELECT DISTINCT conversation_id
+        FROM ai_chat_memory
+        ORDER BY conversation_id
+    </select>
+
+    <select id="findByConversationId" parameterType="java.lang.String" resultMap="AiChatMemoryMap">
+        SELECT id, conversation_id, user_id, agent_id, message_type, content, created_at
+        FROM ai_chat_memory
+        WHERE conversation_id = #{conversationId}
+        ORDER BY created_at ASC, id ASC
+    </select>
+
+    <insert id="insertBatch" parameterType="java.util.List" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_chat_memory (conversation_id, user_id, agent_id, message_type, content, created_at)
+        VALUES
+        <foreach collection="list" item="m" separator=",">
+            (#{m.conversationId}, #{m.userId}, #{m.agentId}, #{m.messageType}, #{m.content}, #{m.createdAt})
+        </foreach>
+    </insert>
+
+    <delete id="deleteByConversationId" parameterType="java.lang.String">
+        DELETE FROM ai_chat_memory WHERE conversation_id = #{conversationId}
+    </delete>
+
+    <!-- 用户会话列表：按 user_id 查，或 fallback 到 conversation_id LIKE -->
+    <select id="findConversationsByUserId" resultType="java.util.HashMap">
+        SELECT conversation_id AS conversationId,
+               COUNT(*) AS messageCount,
+               MAX(created_at) AS lastTime,
+               (SELECT c2.content FROM ai_chat_memory c2
+                WHERE c2.conversation_id = m.conversation_id AND c2.message_type = 'USER'
+                ORDER BY c2.created_at ASC LIMIT 1) AS firstMessage
+        FROM ai_chat_memory m
+        WHERE (user_id = #{userId} OR conversation_id LIKE CONCAT('%:', #{userId}, ':%'))
+        GROUP BY conversation_id
+        ORDER BY lastTime DESC
+        LIMIT #{limit}
+    </select>
+
+    <select id="findByConversationIdFull" parameterType="java.lang.String" resultMap="AiChatMemoryMap">
+        SELECT id, conversation_id, user_id, agent_id, message_type, content, created_at
+        FROM ai_chat_memory
+        WHERE conversation_id = #{conversationId}
+        ORDER BY created_at ASC, id ASC
+    </select>
+
+    <select id="findByConversationIdPaged" resultMap="AiChatMemoryMap">
+        SELECT id, conversation_id, user_id, agent_id, message_type, content, created_at
+        FROM ai_chat_memory
+        WHERE conversation_id = #{conversationId}
+        <if test="beforeId != null">
+            AND id &lt; #{beforeId}
+        </if>
+        ORDER BY id DESC
+        LIMIT #{limit}
+    </select>
+
+</mapper>

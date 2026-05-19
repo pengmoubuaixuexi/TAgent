@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="cn.bugstack.ai.infrastructure.dao.IAiAgentDrawConfigDao">
+
+    <resultMap id="AiAgentDrawConfigMap" type="cn.bugstack.ai.infrastructure.dao.po.AiAgentDrawConfig">
+        <id column="id" property="id"/>
+        <result column="config_id" property="configId"/>
+        <result column="config_name" property="configName"/>
+        <result column="description" property="description"/>
+        <result column="agent_id" property="agentId"/>
+        <result column="config_data" property="configData"/>
+        <result column="version" property="version"/>
+        <result column="status" property="status"/>
+        <result column="create_by" property="createBy"/>
+        <result column="update_by" property="updateBy"/>
+        <result column="create_time" property="createTime"/>
+        <result column="update_time" property="updateTime"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiAgentDrawConfig" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_agent_draw_config (
+            config_id, config_name, description, agent_id, config_data, version, status, create_by, update_by, create_time, update_time
+        ) VALUES (
+            #{configId}, #{configName}, #{description}, #{agentId}, #{configData}, #{version}, #{status}, #{createBy}, #{updateBy}, #{createTime}, #{updateTime}
+        )
+    </insert>
+
+    <update id="updateById" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiAgentDrawConfig">
+        UPDATE ai_agent_draw_config SET
+            config_id = #{configId},
+            config_name = #{configName},
+            description = #{description},
+            agent_id = #{agentId},
+            config_data = #{configData},
+            version = #{version},
+            status = #{status},
+            create_by = #{createBy},
+            update_by = #{updateBy},
+            update_time = #{updateTime}
+        WHERE id = #{id}
+    </update>
+
+    <update id="updateByConfigId" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiAgentDrawConfig">
+        UPDATE ai_agent_draw_config SET
+            config_name = #{configName},
+            description = #{description},
+            agent_id = #{agentId},
+            config_data = #{configData},
+            version = #{version},
+            status = #{status},
+            update_by = #{updateBy},
+            update_time = #{updateTime}
+        WHERE config_id = #{configId}
+    </update>
+
+    <delete id="deleteById" parameterType="java.lang.Long">
+        DELETE FROM ai_agent_draw_config WHERE id = #{id}
+    </delete>
+
+    <delete id="deleteByConfigId" parameterType="java.lang.String">
+        DELETE FROM ai_agent_draw_config WHERE config_id = #{configId}
+    </delete>
+
+    <select id="queryById" parameterType="java.lang.Long" resultMap="AiAgentDrawConfigMap">
+        SELECT id, config_id, config_name, description, agent_id, config_data, version, status, create_by, update_by, create_time, update_time
+        FROM ai_agent_draw_config
+        WHERE id = #{id}
+    </select>
+
+    <select id="queryByConfigId" parameterType="java.lang.String" resultMap="AiAgentDrawConfigMap">
+        SELECT id, config_id, config_name, description, agent_id, config_data, version, status, create_by, update_by, create_time, update_time
+        FROM ai_agent_draw_config
+        WHERE config_id = #{configId}
+    </select>
+
+    <select id="queryByAgentId" parameterType="java.lang.String" resultMap="AiAgentDrawConfigMap">
+        SELECT id, config_id, config_name, description, agent_id, config_data, version, status, create_by, update_by, create_time, update_time
+        FROM ai_agent_draw_config
+        WHERE agent_id = #{agentId}
+    </select>
+
+    <select id="queryEnabledConfigs" resultMap="AiAgentDrawConfigMap">
+        SELECT id, config_id, config_name, description, agent_id, config_data, version, status, create_by, update_by, create_time, update_time
+        FROM ai_agent_draw_config
+        WHERE status = 1
+        ORDER BY create_time DESC
+    </select>
+
+    <select id="queryByConfigName" parameterType="java.lang.String" resultMap="AiAgentDrawConfigMap">
+        SELECT id, config_id, config_name, description, agent_id, config_data, version, status, create_by, update_by, create_time, update_time
+        FROM ai_agent_draw_config
+        WHERE config_name LIKE CONCAT('%', #{configName}, '%')
+        ORDER BY create_time DESC
+    </select>
+
+    <select id="queryAll" resultMap="AiAgentDrawConfigMap">
+        SELECT id, config_id, config_name, description, agent_id, config_data, version, status, create_by, update_by, create_time, update_time
+        FROM ai_agent_draw_config
+        ORDER BY create_time DESC
+    </select>
+
+</mapper>

@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="cn.bugstack.ai.infrastructure.dao.IAiClientApiDao">
+
+    <resultMap id="AiClientApiMap" type="cn.bugstack.ai.infrastructure.dao.po.AiClientApi">
+        <id column="id" property="id"/>
+        <result column="api_id" property="apiId"/>
+        <result column="base_url" property="baseUrl"/>
+        <result column="api_key" property="apiKey"/>
+        <result column="completions_path" property="completionsPath"/>
+        <result column="embeddings_path" property="embeddingsPath"/>
+        <result column="status" property="status"/>
+        <result column="create_time" property="createTime"/>
+        <result column="update_time" property="updateTime"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientApi" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_client_api (
+            api_id, base_url, api_key, completions_path, embeddings_path, status, create_time, update_time
+        ) VALUES (
+            #{apiId}, #{baseUrl}, #{apiKey}, #{completionsPath}, #{embeddingsPath}, #{status}, #{createTime}, #{updateTime}
+        )
+    </insert>
+
+    <update id="updateById" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientApi">
+        UPDATE ai_client_api SET
+            api_id = #{apiId},
+            base_url = #{baseUrl},
+            api_key = #{apiKey},
+            completions_path = #{completionsPath},
+            embeddings_path = #{embeddingsPath},
+            status = #{status},
+            update_time = #{updateTime}
+        WHERE id = #{id}
+    </update>
+
+    <update id="updateByApiId" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientApi">
+        UPDATE ai_client_api SET
+            base_url = #{baseUrl},
+            api_key = #{apiKey},
+            completions_path = #{completionsPath},
+            embeddings_path = #{embeddingsPath},
+            status = #{status},
+            update_time = #{updateTime}
+        WHERE api_id = #{apiId}
+    </update>
+
+    <delete id="deleteById" parameterType="java.lang.Long">
+        DELETE FROM ai_client_api WHERE id = #{id}
+    </delete>
+
+    <delete id="deleteByApiId" parameterType="java.lang.String">
+        DELETE FROM ai_client_api WHERE api_id = #{apiId}
+    </delete>
+
+    <select id="queryById" parameterType="java.lang.Long" resultMap="AiClientApiMap">
+        SELECT id, api_id, base_url, api_key, completions_path, embeddings_path, status, create_time, update_time
+        FROM ai_client_api
+        WHERE id = #{id}
+    </select>
+
+    <select id="queryByApiId" parameterType="java.lang.String" resultMap="AiClientApiMap">
+        SELECT id, api_id, base_url, api_key, completions_path, embeddings_path, status, create_time, update_time
+        FROM ai_client_api
+        WHERE api_id = #{apiId}
+    </select>
+
+    <select id="queryEnabledApis" resultMap="AiClientApiMap">
+        SELECT id, api_id, base_url, api_key, completions_path, embeddings_path, status, create_time, update_time
+        FROM ai_client_api
+        WHERE status = 1
+        ORDER BY create_time DESC
+    </select>
+
+    <select id="queryAll" resultMap="AiClientApiMap">
+        SELECT id, api_id, base_url, api_key, completions_path, embeddings_path, status, create_time, update_time
+        FROM ai_client_api
+        ORDER BY create_time DESC
+    </select>
+
+</mapper>
