@@ -24,6 +24,8 @@ public class RagRouterDecision {
     public static final String PATH_FUSION = "FUSION";
     public static final String PATH_HYBRID = "HYBRID";
     public static final String PATH_SIMPLE = "SIMPLE";
+    /** A 重构：HyDE 降为 router 的一个查询策略分支——router 直接产出假想文档当检索 query */
+    public static final String PATH_HYDE = "HYDE";
 
     private boolean shouldRetrieve;
     private String path;
@@ -33,6 +35,12 @@ public class RagRouterDecision {
 
     @Builder.Default
     private List<String> variants = Collections.emptyList();
+
+    /** A 重构：SIMPLE 分支的检索 query（router 一次调用顺带改写），为空则回退原始 query */
+    private String rewrittenQuery;
+
+    /** A 重构：HYDE 分支的假想文档（router 一次调用顺带生成），为空则回退原始 query */
+    private String hypotheticalDocument;
 
     private String reason;
 

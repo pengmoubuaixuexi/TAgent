@@ -37,6 +37,13 @@
         DELETE FROM ai_chat_memory WHERE conversation_id = #{conversationId}
     </delete>
 
+    <!-- 带归属校验的删除：只能删自己的会话（归属条件与 findConversationsByUserId 一致） -->
+    <delete id="deleteByConversationIdAndUserId">
+        DELETE FROM ai_chat_memory
+        WHERE conversation_id = #{conversationId}
+          AND (user_id = #{userId} OR conversation_id LIKE CONCAT('%:', #{userId}, ':%'))
+    </delete>
+
     <!-- 用户会话列表：按 user_id 查，或 fallback 到 conversation_id LIKE -->
     <select id="findConversationsByUserId" resultType="java.util.HashMap">
         SELECT conversation_id AS conversationId,

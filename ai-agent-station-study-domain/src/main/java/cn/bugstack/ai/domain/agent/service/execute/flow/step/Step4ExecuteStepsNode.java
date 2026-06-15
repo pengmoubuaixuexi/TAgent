@@ -8,12 +8,13 @@ import cn.bugstack.ai.domain.agent.service.execute.flow.step.factory.DefaultFlow
 import cn.bugstack.ai.domain.agent.service.memory.IConversationTurnMemoryService;
 import cn.bugstack.ai.domain.agent.service.memory.episodic.IEpisodicMemoryService;
 import cn.bugstack.ai.domain.agent.service.router.AgentToolRegistry;
+import cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService;
 import cn.bugstack.ai.types.exception.BizException;
 import cn.bugstack.wrench.design.framework.tree.StrategyHandler;
 import lombok.extern.slf4j.Slf4j;
 import org.slf4j.MDC;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.prompt.ChatOptions;
+import org.springframework.ai.tool.ToolCallback;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
@@ -26,7 +27,7 @@ import java.util.regex.Pattern;
 /**
  * 第四步：按顺序执行规划步骤节点
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/8/25 10:30
  */
 @Slf4j
@@ -40,6 +41,9 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
     /** 2026-05-07：注入真实工具列表给执行 prompt */
     @jakarta.annotation.Resource
     private AgentToolRegistry agentToolRegistry;
+
+    @jakarta.annotation.Resource
+    private McpToolCatalogService mcpToolCatalogService;
 
     /**
      * 2026-05-07：DAG 并行执行专用 IO 线程池（B 方案，过渡，等 JDK 21 后换虚拟线程）。
@@ -55,23 +59,66 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
     @Autowired(required = false)
     private cn.bugstack.ai.domain.agent.service.memory.longterm.ILongTermMemoryService longTermMemoryService;
 
+    /** 立即回答可观测：打断时写一条 ai_event_log 标记行。 */
+    @Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.execute.IEventLogService eventLogService;
+
     /** 摘要触发阈值：10 轮 = 20 条消息 */
     private static final int EPISODIC_SUMMARY_THRESHOLD = 20;
     /** 节流间隔：每新增 4 条消息（= 2 轮）触发一次 */
     private static final int EPISODIC_THROTTLE_INTERVAL = 4;
 
+    /** 2026-05-28：注入给下游步骤的依赖产出最大字符数，防 token 爆炸（现在注入的是结构化「输出数据」段，比整段散文密） */
+    private static final int DEP_INJECT_MAX_CHARS = 6000;
+
+    /**
+     * step4 子步执行的系统角色：用请求级 .system() 覆盖 EXECUTOR_CLIENT 的领域人设
+     * （如 8010_p3 "旅行规划攻略编写者→输出完整逐日行程/预算/物品清单"），把每个子步钉成
+     * "只做本步、只产本步数据"，禁止提前生成完整最终交付物。
+     * 这些子步是 step2 现场生成、step3 解析出的运行时产物，DB 里无对应 prompt 行 → 只能代码兜底；
+     * 最终整合 buildFinalDeliverable 不走这里，仍用 EXECUTOR_CLIENT 的 DB 系统提示(8010_p3)产出完整交付物。
+     * Spring AI 1.0.0 请求级 .system(text) 替换 defaultSystem（非追加），故能干净盖掉领域人设。
+     */
+    private static final String SUB_STEP_EXECUTOR_SYSTEM =
+            "你是多步骤任务中的【单步执行器】。本次只负责完成下面“步骤内容”里描述的【这一个步骤】，只产出该步骤自身的结果数据。\n" +
+            "严禁提前生成完整的最终交付物（如完整行程、完整攻略、最终报告、整体汇总答案）——那是最后“整合步骤”的职责，不属于你。\n" +
+            "有可调用的工具就调用拿真实数据；没有真实工具就基于前置步骤产出/已有知识完成本步。产出聚焦本步，不要扩展到其它步骤的范围。";
+
     /** P2.2 11.2 Plan DAG：启用后独立步骤并行执行 */
     @org.springframework.beans.factory.annotation.Value("${agent.plan-dag.enabled:false}")
     private boolean planDagEnabled;
 
+    /** 立即回答：finalize 是否允许调工具（默认关）。 */
+    @org.springframework.beans.factory.annotation.Value("${agent.answer-now.finalize-tools:false}")
+    private boolean answerNowFinalizeTools;
+
+    /** 立即回答：关思考指令（单行，代码侧补换行）。 */
+    @org.springframework.beans.factory.annotation.Value("${agent.answer-now.no-think-directive:[立即作答模式] 用户已要求立即回答，请直接基于以上已有信息给出最终答案，不要再展开额外的思考或分析过程，简明扼要。}")
+    private String answerNowNoThinkDirective;
+
+    /** 立即回答 finalize 关思考：OpenAI reasoning_effort（minimal/low/medium/high）；空=不设。设到 OpenAiChatOptions，由 Spring AI 确定性序列化进 body。 */
+    @org.springframework.beans.factory.annotation.Value("${agent.no-think.reasoning-effort:}")
+    private String answerNowReasoningEffort;
+
     @Override
     public String doApply(ExecuteCommandEntity request, DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext) {
         checkCancelled(dynamicContext);
+        // 立即回答（在 step4 执行前点的）：跳过 DAG 执行，直接基于"计划 + 已有产出 + 半截思考"整合作答
+        if (dynamicContext.isFinalizeRequested()) {
+            dynamicContext.setValue("sessionId", request.getSessionId());
+            dynamicContext.setValue("dynamicMissingToolDesc", request.getDynamicMissingToolDesc());
+            dynamicContext.setValue("dynamicToolQuery", request.getMessage());
+            return finalizeNow(request, dynamicContext);
+        }
+        // 进入执行阶段：禁止引导（flow step4 不消费 steerIdea；steerExecute 据此忽略，避免无意义断流）
+        dynamicContext.setValue("flowInExecution", Boolean.TRUE);
         log.info("开始执行第四步：按顺序执行规划步骤");
 
         try {
             // 把 sessionId 暂存到 dynamicContext，executeStep / handleStepExecutionError 沿用历史约定取它发 SSE / mirror WM
             dynamicContext.setValue("sessionId", request.getSessionId());
+            dynamicContext.setValue("dynamicMissingToolDesc", request.getDynamicMissingToolDesc());
+            dynamicContext.setValue("dynamicToolQuery", request.getMessage());
 
             // 获取配置信息
             AiAgentClientFlowConfigVO aiAgentClientFlowConfigVO = dynamicContext.getAiAgentClientFlowConfigVOMap().get(AiClientTypeEnumVO.EXECUTOR_CLIENT.getCode());
@@ -97,6 +144,11 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             // 按顺序执行规划步骤
             executeStepsInOrder(executorChatClient, stepsMap, dynamicContext);
 
+            // 立即回答（在 DAG 执行途中点的）：已停止调度未启动子步，这里基于已完成产出直接整合作答
+            if (dynamicContext.isFinalizeRequested()) {
+                return finalizeNow(request, dynamicContext);
+            }
+
             // 发送SSE结果
             AutoAgentExecuteResultEntity result = AutoAgentExecuteResultEntity.createExecutionResult(
                     dynamicContext.getStep(),
@@ -106,7 +158,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             sendSseResult(dynamicContext, result);
             
             // 发送总结结果到【最终执行结果】区域
-            String finalSummary = sendSummaryResult(dynamicContext, request, executorChatClient);
+            String finalSummary = sendSummaryResult(dynamicContext, request, executorChatClient, aiAgentClientFlowConfigVO.getClientId());
             if (conversationTurnMemoryService != null) {
                 conversationTurnMemoryService.saveFinalTurn(request, finalSummary);
             }
@@ -126,9 +178,11 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             
             log.info("第四步执行完成：所有规划步骤已执行");
 
+            recordTransition("flow_step4_execute_steps", dynamicContext);
             return "所有规划步骤执行完成";
         } catch (Exception e) {
             log.error("第四步执行失败", e);
+            recordTransition("flow_step4_execute_steps_failed", dynamicContext);
             return "执行步骤失败: " + e.getMessage();
         }
     }
@@ -175,6 +229,11 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         } else {
             // 按顺序执行每个步骤
             for (Integer stepNumber : stepNumbers) {
+                // 立即回答：停止调度剩余子步，已完成的产出交给 finalizeNow 整合
+                if (dynamicContext.isFinalizeRequested()) {
+                    log.info("[AnswerNow][flow] 串行执行中收到立即回答，停止调度第{}步及之后", stepNumber);
+                    break;
+                }
                 String stepKey = "第" + stepNumber + "步";
                 String stepContent = resolveStepContent(stepsMap, stepKey);
                 if (stepContent != null) {
@@ -201,58 +260,83 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
     private void executeStepsAsDag(ChatClient executorChatClient, Map<String, String> stepsMap,
                                     List<Integer> stepNumbers, Map<Integer, Set<Integer>> deps,
                                     DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext) {
-        Set<Integer> done = new HashSet<>();
-        int safety = 0;
-        // 上下文接力交给 dagExecutor 内部统一处理（DagExecutorConfig.wrap），这里不再手动捕获
+        // 2026-05-29 依赖驱动调度（取代旧的"整层屏障"）：每个步骤"自己的依赖一完成就启动"，
+        // 不再等同层最慢的步骤。例：1、3 同为起始层，1 先完成 → 依赖 1 的 2 立刻开跑，不必等 3。
+        // 用 Kahn 拓扑序保证构建 future 时其依赖的 future 已存在；有环的节点排不进拓扑序 → 末尾串行兜底，绝不卡死。
+        // 上下文接力由 dagExecutor 内部统一处理（DagExecutorConfig.wrap）。
+        java.util.Map<Integer, CompletableFuture<Void>> futures = new java.util.HashMap<>();
 
-        while (done.size() < stepNumbers.size() && safety++ < 100) {
-            // 找出本层 ready：所有依赖都 done
-            List<Integer> ready = new ArrayList<>();
-            for (Integer n : stepNumbers) {
-                if (done.contains(n)) continue;
-                Set<Integer> d = deps.getOrDefault(n, Collections.emptySet());
-                if (done.containsAll(d)) ready.add(n);
+        // 1. Kahn 拓扑排序（仅统计落在 stepNumbers 内的依赖）
+        java.util.Map<Integer, Integer> indegree = new java.util.HashMap<>();
+        for (Integer n : stepNumbers) {
+            int cnt = 0;
+            for (Integer d : deps.getOrDefault(n, Collections.emptySet())) {
+                if (stepNumbers.contains(d)) cnt++;
             }
-            if (ready.isEmpty()) {
-                // 循环依赖或解析错误 → 把剩下的串行跑掉，不卡死
-                List<Integer> remaining = new ArrayList<>();
-                for (Integer n : stepNumbers) if (!done.contains(n)) remaining.add(n);
-                log.warn("[DAG] 检测到无法满足的依赖，剩余步骤 {} 退化为串行执行", remaining);
-                for (Integer n : remaining) {
-                    String key = "第" + n + "步";
-                    String content = resolveStepContent(stepsMap, key);
-                    if (content != null) {
-                        executeStep(executorChatClient, n, key, content, dynamicContext,
-                                deps.getOrDefault(n, Collections.emptySet()));
-                    }
-                    done.add(n);
-                }
-                break;
-            }
-            log.info("[DAG] 第 {} 层并行执行 {} 个步骤: {}", done.size(), ready.size(), ready);
-
-            // 同层并行执行：走专用 dagExecutor，不和其他异步链路争 commonPool
-            // dagExecutor 内部已有 ContextSnapshot 接力（参见 DagExecutorConfig.wrap），
-            // 这里不再额外手动捕获，避免双层包装
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
-            for (Integer stepNumber : ready) {
-                String stepKey = "第" + stepNumber + "步";
-                String stepContent = resolveStepContent(stepsMap, stepKey);
-                if (stepContent == null) continue;
-                Set<Integer> deplist = deps.getOrDefault(stepNumber, Collections.emptySet());
-                futures.add(CompletableFuture.runAsync(() -> {
-                    MDC.put("step", "flow_step4_dag_" + stepNumber);
-                    try {
-                        executeStep(executorChatClient, stepNumber, stepKey, stepContent,
-                                dynamicContext, deplist);
-                    } finally {
-                        MDC.remove("step");
-                    }
-                }, dagExecutor));
-            }
-            CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)).join();
-            done.addAll(ready);
+            indegree.put(n, cnt);
         }
+        java.util.Deque<Integer> queue = new java.util.ArrayDeque<>();
+        for (Integer n : stepNumbers) if (indegree.get(n) == 0) queue.add(n);
+        List<Integer> topoOrder = new ArrayList<>();
+        while (!queue.isEmpty()) {
+            Integer n = queue.poll();
+            topoOrder.add(n);
+            for (Integer m : stepNumbers) {
+                if (deps.getOrDefault(m, Collections.emptySet()).contains(n)) {
+                    int left = indegree.get(m) - 1;
+                    indegree.put(m, left);
+                    if (left == 0) queue.add(m);
+                }
+            }
+        }
+
+        // 2. 按拓扑序为每步建 future：allOf(依赖的 future).thenRunAsync(执行该步)。
+        //    依赖一旦全部完成就立即在 dagExecutor 上启动，无整层屏障。
+        for (Integer n : topoOrder) {
+            final Integer stepNumber = n;
+            final Set<Integer> d = deps.getOrDefault(n, Collections.emptySet());
+            CompletableFuture<?>[] depFutures = d.stream()
+                    .map(futures::get).filter(java.util.Objects::nonNull)
+                    .toArray(CompletableFuture[]::new);
+            final String stepKey = "第" + n + "步";
+            final String stepContent = resolveStepContent(stepsMap, stepKey);
+            CompletableFuture<Void> f = CompletableFuture.allOf(depFutures).thenRunAsync(() -> {
+                MDC.put("step", "flow_step4_dag_" + stepNumber);
+                try {
+                    // 立即回答：已触发则未启动的子步直接跳过，让 future 快速完成，控制权尽快回到 finalizeNow
+                    if (stepContent != null && !dynamicContext.isFinalizeRequested()) {
+                        executeStep(executorChatClient, stepNumber, stepKey, stepContent, dynamicContext, d);
+                    }
+                } catch (Exception e) {
+                    // 单步失败不阻断依赖它的后续步骤（与旧行为一致：失败也视为"完成"）
+                    log.error("[DAG] 第{}步 执行异常: {}", stepNumber, e.toString());
+                } finally {
+                    MDC.remove("step");
+                }
+            }, dagExecutor);
+            futures.put(n, f);
+            log.info("[DAG] 调度 第{}步 依赖={}（依赖完成即启动，无整层屏障）", n, d.isEmpty() ? "无" : d);
+        }
+
+        // 3. 环/无法拓扑排序的节点 → 等已调度的跑完后串行兜底，不卡死
+        List<Integer> unscheduled = new ArrayList<>();
+        for (Integer n : stepNumbers) if (!futures.containsKey(n)) unscheduled.add(n);
+        if (!unscheduled.isEmpty()) {
+            log.warn("[DAG] 检测到环/无法满足的依赖，剩余步骤 {} 退化为串行执行", unscheduled);
+            CompletableFuture.allOf(futures.values().toArray(new CompletableFuture[0])).join();
+            for (Integer n : unscheduled) {
+                String stepKey = "第" + n + "步";
+                String stepContent = resolveStepContent(stepsMap, stepKey);
+                if (stepContent != null) {
+                    executeStep(executorChatClient, n, stepKey, stepContent, dynamicContext,
+                            deps.getOrDefault(n, Collections.emptySet()));
+                }
+            }
+            return;
+        }
+
+        // 4. 等全部步骤完成（final synthesis 在 doApply 中 DAG 之后才执行）
+        CompletableFuture.allOf(futures.values().toArray(new CompletableFuture[0])).join();
     }
 
     // 旧的 executeStepsInParallel 已被 executeStepsAsDag 替代（2026-05-07）
@@ -319,12 +403,31 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             AiAgentClientFlowConfigVO execConfig = dynamicContext.getAiAgentClientFlowConfigVOMap()
                     .get(AiClientTypeEnumVO.EXECUTOR_CLIENT.getCode());
             String executorClientId = execConfig != null ? execConfig.getClientId() : null;
-            String stepExecPrompt = buildStepExecutionPrompt(stepContent, dynamicContext, dependsOnNumbers, executorClientId)
-                    + githubRepositorySearchGuidance();
-            ChatClient.ChatClientRequestSpec spec0 = executorChatClient.prompt().user(stepExecPrompt);
-            final ChatClient.ChatClientRequestSpec streamSpec = (step4MaxTokens > 0)
-                    ? spec0.options(ChatOptions.builder().maxTokens(step4MaxTokens).build())
-                    : spec0;
+            String dynamicMissingToolDesc = dynamicContext.getValue("dynamicMissingToolDesc");
+            String dynamicToolQuery = dynamicContext.getValue("dynamicToolQuery");
+            List<ToolCallback> dynamicToolCallbacks = mcpToolCatalogService != null
+                    ? mcpToolCatalogService.resolveDynamicToolCallbacks(executorClientId, dynamicMissingToolDesc, dynamicToolQuery,
+                            agentToolRegistry != null ? agentToolRegistry.getTools(executorClientId) : List.of())
+                    : List.of();
+            String stepExecPrompt = buildStepExecutionPrompt(stepContent, dynamicContext, dependsOnNumbers, executorClientId, dynamicToolCallbacks);
+            stepExecPrompt = appendCurrentTimeContext(stepExecPrompt);
+            // 子步用窄角色 system 覆盖 EXECUTOR_CLIENT 的领域人设，防每个子步都照"攻略编写者"吐整份完整攻略。
+            // 整合步(buildFinalDeliverable)不走这里，仍用 DB 的 8010_p3 产出完整交付物。
+            ChatClient.ChatClientRequestSpec spec0 = executorChatClient.prompt()
+                    .system(SUB_STEP_EXECUTOR_SYSTEM)
+                    .user(stepExecPrompt);
+            // 必须 OpenAiChatOptions：DefaultChatClientUtils 需 instanceof ToolCallingChatOptions 才注入 toolContext，
+            // 且 OpenAiChatModel.buildRequestPrompt 的 toolContext merge 把 runtime 强转 OpenAiChatOptions，
+            // 非 OpenAiChatOptions 会丢掉 toolContext(sessionId/stepLabel) → 工具线程拿不到 → 审批门失效（Step4 是 flow 工具执行步骤）。
+            org.springframework.ai.openai.OpenAiChatOptions.Builder step4OptionsBuilder =
+                    org.springframework.ai.openai.OpenAiChatOptions.builder();
+            if (step4MaxTokens > 0) {
+                step4OptionsBuilder.maxTokens(step4MaxTokens);
+            }
+            if (!dynamicToolCallbacks.isEmpty()) {
+                step4OptionsBuilder.toolCallbacks(toRequestToolCallbacks(executorClientId, dynamicToolCallbacks));
+            }
+            ChatClient.ChatClientRequestSpec streamSpec = spec0.options(step4OptionsBuilder.build());
             // 2026-05-07 流式 UX：每个子 step 独立 step_start/end，前端折叠为"执行 步骤N 已完成"
             // dependsOn 转成 stepId 集合（与 step_start 的 stepId 命名约定保持一致）
             Set<String> dependsOnStepIds = (dependsOnNumbers == null || dependsOnNumbers.isEmpty())
@@ -419,13 +522,19 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
     private String buildStepExecutionPrompt(String stepContent,
                                              DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
                                              Set<Integer> dependsOnNumbers,
-                                             String executorClientId) {
+                                             String executorClientId,
+                                             List<ToolCallback> dynamicToolCallbacks) {
         StringBuilder sb = new StringBuilder();
         sb.append("你是一个智能执行助手，需要执行以下步骤:\n\n");
 
         // 0. 真实工具列表（让 LLM 知道实际有什么工具可用，避免引用不存在的工具）
         if (executorClientId != null && agentToolRegistry != null) {
-            sb.append("**【可用工具清单】**\n").append(agentToolRegistry.describeToolsForPrompt(executorClientId)).append("\n\n");
+            sb.append("**【可用工具清单】**\n").append(agentToolRegistry.describeToolsForPrompt(executorClientId, dynamicToolCallbacks)).append("\n\n");
+            sb.append("**工具选择说明（重要）:**\n");
+            sb.append("- 【可用工具清单】是真实允许使用的工具范围；只要在清单里，就可以按本步骤目标调用。\n");
+            sb.append("- 【步骤内容】里的“使用工具/首选工具”是规划阶段给出的首选建议，不是唯一允许工具。\n");
+            sb.append("- 如果首选工具返回字段不足、失败、空结果，或无法完成本步骤目标，可以改用【可用工具清单】中的其他相关工具补足，这不算偏离步骤。\n");
+            sb.append("- 不要陷入反复思考；工具不足时请明确说明缺失信息，并基于已取得的数据输出本步骤的最佳结果。\n\n");
         }
 
         // 1. 前置依赖步骤的真实产出（关键！下游 step 必须基于这些数据继续，不要自己编）
@@ -438,8 +547,12 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                 if (depError != null && !depError.isBlank()) {
                     sb.append("（注意：第").append(depNum).append("步执行失败：").append(depError).append("）\n");
                 } else if (depResult != null && !depResult.isBlank()) {
-                    // 截断超长依赖（避免 token 爆炸），保留前 4000 字符
-                    sb.append(depResult.length() > 4000 ? depResult.substring(0, 4000) + "\n...(已截断)" : depResult);
+                    // 2026-05-28：优先注入前置步骤「输出数据」结构化段（下游真正需要的明细），
+                    // 抠不出（LLM 没按格式输出）时回退整段原文。两者都做截断防 token 爆炸。
+                    String structured = extractStepOutputData(depResult);
+                    String inject = (structured != null && !structured.isBlank()) ? structured : depResult;
+                    sb.append(inject.length() > DEP_INJECT_MAX_CHARS
+                            ? inject.substring(0, DEP_INJECT_MAX_CHARS) + "\n...(已截断)" : inject);
                 } else {
                     sb.append("（前置步骤无产出数据可参考，但本步骤仍需基于自身能力执行）");
                 }
@@ -458,20 +571,47 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         sb.append("   - 如果步骤计划提到的工具（如 web_search / summarize / run_code 等）你**没有真实可用的工具回调**，\n");
         sb.append("     必须明确说明：\"抱歉，本步骤所需的工具在当前 Agent 配置中不可用，无法执行实际工具调用，\n");
         sb.append("     仅能基于已有知识提供建议\"，然后基于通用知识直接给出答复。\n");
+        sb.append("   - 如果步骤计划提到的首选工具可用但结果不完整，可以换用其它真实可用工具补足；不要把首选工具误认为唯一工具。\n");
         sb.append("   - **严禁**伪造工具调用过程（不要写\"调用搜索引擎工具中...\"\"模拟工具返回...\"\"工具返回JSON结果\"等）\n");
         sb.append("   - **严禁**虚构工具返回数据（不要编造搜索结果列表、URL、JSON 等假数据）\n");
         sb.append("   - 如果有真工具可用并成功调用，正常使用即可\n");
         sb.append("3. 充分利用上面【前置步骤产出】里的真实数据，不要假装看不见或自己重做一遍\n");
         sb.append("4. 如果遇到问题，说明具体的错误信息\n");
-        sb.append("5. **执行完成后，必须在回复末尾明确输出执行结果，格式如下:**\n");
+        sb.append("5. **先输出给用户看的完整回答**：用清晰的 Markdown（表格/列表/说明）把本步骤成果完整、好读地呈现出来——这部分会实时展示给用户，务必保持丰富、易读，不要省略。\n");
+        sb.append("6. **再在回复末尾附结构化执行结果块**（供后续步骤机器读取）。注意：第 5 点给用户看的回答和这里的“输出数据”【两者都必须有】，不要因为下游只读“输出数据”就把上面的回答省成一坨 JSON。格式如下：\n");
         sb.append("   ```\n");
         sb.append("   === 执行结果 ===\n");
         sb.append("   状态: [成功/失败/无工具可用]\n");
-        sb.append("   结果描述: [具体的执行结果描述，或诚实说明因工具不可用提供的替代方案]\n");
-        sb.append("   输出数据: [真实的输出数据；若无工具可用则填\"基于通用知识的建议（非工具检索结果）\"]\n");
+        sb.append("   结果描述: [一句话概述本步骤做了什么、关键结论]\n");
+        sb.append("   输出数据: [本步骤产出的【完整明细数据】，结构化、可被下游步骤直接使用。\n");
+        sb.append("            必须逐条/逐项列全（如逐日数据、逐个条目、每个 URL/数值），\n");
+        sb.append("            **严禁只写\"范围/概况/趋势\"这类概括**——后续步骤只读这一段，拿不到明细就无法继续。\n");
+        sb.append("            可用 JSON 或清晰的列表/表格。若无工具可用则填\"基于通用知识的建议（非工具检索结果）\"。]\n");
         sb.append("   ```\n\n");
         sb.append("请开始执行这个步骤，并严格按照要求提供详细的执行报告和结果输出。");
         return sb.toString();
+    }
+
+    /**
+     * 2026-05-28：从一步的完整回复里抽出 "=== 执行结果 ===" 块中的「输出数据」段，
+     * 供下游步骤精确引用（而非盲截整段散文，避免把推理/展示文本也塞给下游、并防止盲截砍掉关键明细）。
+     * <p>用 lastIndexOf 定位 marker（块约定在末尾，避免命中正文里偶然出现的字样）；
+     * 找不到块或抠不出「输出数据」→ 返回 null，调用方回退用整段原文。
+     */
+    private String extractStepOutputData(String rawResult) {
+        if (rawResult == null || rawResult.isBlank()) return null;
+        int marker = rawResult.lastIndexOf("=== 执行结果 ===");
+        if (marker < 0) return null;
+        String block = rawResult.substring(marker);
+        // 输出数据是块内最后一个字段，匹配 "输出数据:" 后取到结尾（兼容全角/半角冒号）
+        Matcher m = Pattern.compile("输出数据\\s*[:：]\\s*").matcher(block);
+        if (!m.find()) return null;
+        String data = block.substring(m.end()).trim();
+        // 去掉可能的结尾代码围栏 ```
+        if (data.endsWith("```")) {
+            data = data.substring(0, data.length() - 3).trim();
+        }
+        return data.isBlank() ? null : data;
     }
     
     /**
@@ -627,9 +767,9 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
     /**
      * 发送总结结果到流式输出
      */
-    private String sendSummaryResult(DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext, ExecuteCommandEntity request, ChatClient finalWriterChatClient) {
+    private String sendSummaryResult(DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext, ExecuteCommandEntity request, ChatClient finalWriterChatClient, String finalWriterClientId) {
         String sessionId = request.getSessionId();
-        String finalDeliverable = buildFinalDeliverable(dynamicContext, request, finalWriterChatClient);
+        String finalDeliverable = buildFinalDeliverable(dynamicContext, request, finalWriterChatClient, finalWriterClientId);
         if (finalDeliverable != null && !finalDeliverable.isBlank()) {
             AutoAgentExecuteResultEntity result = AutoAgentExecuteResultEntity.createSummaryResult(finalDeliverable, sessionId);
             sendSseResult(dynamicContext, result);
@@ -665,13 +805,149 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
     /**
      * 发送完成标识到流式输出
      */
-    private String buildFinalDeliverable(DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext, ExecuteCommandEntity request, ChatClient finalWriterChatClient) {
+    /**
+     * 立即回答（flow 专用整合）：跳过/中止 DAG 执行，基于"用户问题 + 计划 + 已完成子步产出 + 半截思考"直接整合作答。
+     * 走 EXECUTOR_CLIENT 的完整整合路径（非单步执行器窄角色）；finalize-tools 开时挂常驻+补充工具并注入清单、追加关思考指令。
+     */
+    private String finalizeNow(ExecuteCommandEntity request, DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext) {
+        try {
+            AiAgentClientFlowConfigVO execConfig = dynamicContext.getAiAgentClientFlowConfigVOMap().get(AiClientTypeEnumVO.EXECUTOR_CLIENT.getCode());
+            if (execConfig == null) {
+                throw new BizException("flow agent missing flow config: " + AiClientTypeEnumVO.EXECUTOR_CLIENT.getCode()
+                        + " for agentId=" + request.getAiAgentId());
+            }
+            ChatClient client = getChatClientByClientId(execConfig.getClientId());
+            String clientId = execConfig.getClientId();
+            List<ToolCallback> dynamicToolCallbacks = resolveAgentDynamicToolCallbacks(request, clientId);
+            boolean attachTools = !dynamicToolCallbacks.isEmpty() && answerNowFinalizeTools;
+            String prompt = buildFlowAnswerNowPrompt(dynamicContext, request) + "\n\n" + answerNowNoThinkDirective;
+            // 立即回答且挂工具：把常驻+补充工具清单注入 prompt（与正常执行步一致，帮模型选对工具、防幻觉）
+            if (attachTools && dynamicAgentToolRegistry != null) {
+                prompt += "\n\n**【可用工具清单】**\n"
+                        + dynamicAgentToolRegistry.describeToolsForPrompt(clientId, dynamicToolCallbacks)
+                        + "\n如需补足信息可调用上述工具后再作答；不需要则直接作答。";
+            }
+            prompt = appendCurrentTimeContext(prompt);
+
+            // 立即回答可观测：LLM 调用前写标记行（中断点 + 改写后的完整 finalize 输入），LLM 失败也留痕。
+            if (eventLogService != null) {
+                try {
+                    String partialReasoning = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.getLatestReasoning(request.getSessionId());
+                    int doneSteps = 0;
+                    for (int i = 1; i <= 50; i++) { Object r = dynamicContext.getValue("step" + i + "Result"); if (r != null) doneSteps++; }
+                    String header = "【立即回答触发·flow】中断于 step=" + dynamicContext.getStep()
+                            + " | 已完成子步数=" + doneSteps
+                            + " | partialReasoningChars=" + (partialReasoning != null ? partialReasoning.length() : 0)
+                            + " | 打断前累计token(prompt+completion)=" + dynamicContext.cumulativePromptTokens()
+                                + "+" + dynamicContext.cumulativeCompletionTokens()
+                            + " | finalizeTools=" + answerNowFinalizeTools
+                            + "\n----- 改写后的 finalize 输入 -----\n";
+                    eventLogService.log(cn.bugstack.ai.domain.agent.service.execute.EventLogEntry.builder()
+                            .sessionId(request.getSessionId())
+                            .userId(request.getUserId())
+                            .tenantId(request.getTenantId())
+                            .agentId(request.getAiAgentId())
+                            .billingScope(cn.bugstack.ai.domain.agent.service.execute.common.LlmObservationRecorder.BILLING_SCOPE_USER_CHARGEABLE)
+                            .stepName("answer_now_triggered")
+                            .stepIndex(dynamicContext.getStep())
+                            .inputPrompt(header + prompt)
+                            .model("intervention")
+                            .latencyMs(0L)
+                            .build());
+                    log.info("[AnswerNow][flow] event_log marker written: interruptedStep={} doneSteps={}", dynamicContext.getStep(), doneSteps);
+                } catch (Exception ex) {
+                    log.debug("[AnswerNow][flow] marker log failed: {}", ex.getMessage());
+                }
+            }
+
+            ChatClient.ChatClientRequestSpec spec = client.prompt()
+                    .user(prompt)
+                    .advisors(a -> a
+                            .param(CHAT_MEMORY_CONVERSATION_ID_KEY, buildConversationId(request))
+                            .param(LTM_RETRIEVAL_QUERY_KEY, buildLtmRetrievalQuery(request, "flow-answer-now"))
+                            .param("memory_persist_final_turn", true)
+                            .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 50));
+            // 立即回答关思考(reasoning_effort 设到 options) + 工具回调；reasoning_effort 由 Spring AI 序列化进 body（确定性，绕开 filter 跨线程）。
+            boolean hasEffort = answerNowReasoningEffort != null && !answerNowReasoningEffort.isBlank();
+            if (attachTools || hasEffort) {
+                org.springframework.ai.openai.OpenAiChatOptions.Builder ob = org.springframework.ai.openai.OpenAiChatOptions.builder();
+                if (attachTools) ob.toolCallbacks(toRequestToolCallbacks(clientId, dynamicToolCallbacks));
+                if (hasEffort) ob.reasoningEffort(answerNowReasoningEffort);
+                spec = spec.options(ob.build());
+            }
+            String answer = callStepWithStreaming(spec, dynamicContext, "flow_step4_answer_now", "立即回答",
+                    prompt, request.getSessionId());
+            if (answer == null || answer.isBlank()) answer = "（当前可用信息不足，无法立即作答。）";
+            answer = stripExecutionWrapper(answer);
+
+            AutoAgentExecuteResultEntity result = AutoAgentExecuteResultEntity.createSummaryResult(answer, request.getSessionId());
+            sendSseResult(dynamicContext, result);
+            if (conversationTurnMemoryService != null) {
+                conversationTurnMemoryService.saveFinalTurn(request, answer);
+            }
+            triggerLongTermMemoryExtraction(request, answer);
+            // episodic / summary：与正常完成路径一致（之前 finalizeNow 漏了这步）
+            @SuppressWarnings("unchecked")
+            Map<String, String> __steps = (Map<String, String>) dynamicContext.getValue("stepsMap");
+            saveEpisodicMemory(request, dynamicContext, __steps != null ? __steps : Collections.emptyMap());
+            sendCompleteResult(dynamicContext, request.getSessionId());
+
+            dynamicContext.setStep(dynamicContext.getStep() + 1);
+            dynamicContext.setCompleted(true);
+            recordTransition("flow_step4_answer_now", dynamicContext);
+            log.info("[AnswerNow][flow] 立即回答整合完成 len={}", answer.length());
+            return "立即回答完成";
+        } catch (Exception e) {
+            log.error("[AnswerNow][flow] 立即回答失败", e);
+            return "立即回答失败: " + e.getMessage();
+        }
+    }
+
+    /** 立即回答（flow）：收集用户问题 + 计划(stepsMap) + 已完成子步产出 + 半截思考。 */
+    private String buildFlowAnswerNowPrompt(DefaultFlowAgentExecuteStrategyFactory.DynamicContext ctx, ExecuteCommandEntity request) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("用户在执行过程中点击了【立即回答】，要求基于目前已有的（可能不完整的）信息立刻作答。\n\n");
+        sb.append("**用户原始问题:**\n").append(ctx.getCurrentTask() != null ? ctx.getCurrentTask() : request.getMessage()).append("\n\n");
+
+        @SuppressWarnings("unchecked")
+        Map<String, String> stepsMap = (Map<String, String>) ctx.getValue("stepsMap");
+        if (stepsMap != null && !stepsMap.isEmpty()) {
+            sb.append("**已制定的执行计划（部分步骤可能尚未执行）:**\n");
+            for (Map.Entry<String, String> e : stepsMap.entrySet()) {
+                String v = e.getValue();
+                sb.append("- ").append(e.getKey()).append(": ")
+                  .append(v != null && v.length() > 200 ? v.substring(0, 200) + "..." : v).append("\n");
+            }
+            sb.append("\n");
+        }
+
+        String stepResults = collectStepResults(ctx);
+        if (stepResults != null && !stepResults.isBlank()) {
+            sb.append("**已完成步骤的真实产出:**\n").append(stepResults).append("\n\n");
+        }
+
+        String partialReasoning = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter
+                .getLatestReasoning(request.getSessionId());
+        if (partialReasoning != null && !partialReasoning.isBlank()) {
+            String pr = partialReasoning.length() > 4000 ? partialReasoning.substring(0, 4000) + "...(截断)" : partialReasoning;
+            sb.append("**你刚才正在进行的思考（被用户中断，可能为半截）:**\n").append(pr).append("\n\n");
+        }
+
+        sb.append("**要求:**\n");
+        sb.append("1. 立即基于以上信息直接回答用户原始问题，给出尽可能完整、有用的答案。\n");
+        sb.append("2. 未执行/信息不足的部分简要说明，不要编造工具结果。\n");
+        sb.append("3. 不要输出\"状态/输出数据/Step N\"等流程化内容，直接给成品答案，用清晰 Markdown。\n");
+        return sb.toString();
+    }
+
+    private String buildFinalDeliverable(DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext, ExecuteCommandEntity request, ChatClient finalWriterChatClient, String finalWriterClientId) {
         String stepResults = collectStepResults(dynamicContext);
         if (stepResults.isBlank()) {
             return null;
         }
 
-        String prompt = buildFinalSynthesisPrompt(dynamicContext, stepResults);
+        String prompt = appendCurrentTimeContext(buildFinalSynthesisPrompt(dynamicContext, stepResults));
+        List<ToolCallback> dynamicToolCallbacks = resolveAgentDynamicToolCallbacks(request, finalWriterClientId);
         // 2026-05-07 流式 UX：最终合成步骤独立 step_start/end，折叠为"最终合成 已完成"
         ChatClient.ChatClientRequestSpec specFinal = finalWriterChatClient.prompt()
                 .user(prompt)
@@ -680,6 +956,11 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                         .param(LTM_RETRIEVAL_QUERY_KEY, buildLtmRetrievalQuery(request, "flow-final-synthesis"))
                         .param("memory_persist_final_turn", true)
                         .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 50));
+        if (!dynamicToolCallbacks.isEmpty()) {
+            specFinal = specFinal.options(org.springframework.ai.openai.OpenAiChatOptions.builder()
+                    .toolCallbacks(toRequestToolCallbacks(finalWriterClientId, dynamicToolCallbacks))
+                    .build());
+        }
         String finalAnswer = callStepWithStreaming(
                 specFinal, dynamicContext, "flow_step4_final_synthesis", "最终合成",
                 prompt, request.getSessionId());

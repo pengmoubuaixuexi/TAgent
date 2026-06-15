@@ -4,24 +4,24 @@ import cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity;
 import cn.bugstack.ai.domain.agent.model.entity.ExecuteCommandEntity;
 import cn.bugstack.ai.domain.agent.model.valobj.AiAgentClientFlowConfigVO;
 import cn.bugstack.ai.domain.agent.model.valobj.enums.AiClientTypeEnumVO;
-import cn.bugstack.ai.domain.agent.model.valobj.enums.ModelTierEnumVO;
 import cn.bugstack.ai.domain.agent.service.execute.auto.step.factory.DefaultAutoAgentExecuteStrategyFactory;
-import cn.bugstack.ai.domain.agent.service.memory.longterm.ILongTermMemoryService;
+import cn.bugstack.ai.domain.agent.service.execute.common.CritiqueParser;
+import cn.bugstack.ai.domain.agent.service.execute.common.CritiqueRecord;
 import cn.bugstack.ai.types.exception.BizException;
 import cn.bugstack.wrench.design.framework.tree.StrategyHandler;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.prompt.ChatOptions;
-import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.ai.tool.ToolCallback;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
 
+
 /**
  * 质量监督节点
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/7/27 16:43
  */
 @Slf4j
@@ -36,25 +36,44 @@ public class Step3QualitySupervisorNode extends AbstractExecuteSupport {
     @Value("${agent.reflexion.max-retries:2}")
     private int reflexionMaxRetries;
 
-    /** P2.2 11.3 Actor-Critic：Step3 Critic 用独立模型 tier 避免自评偏见 */
-    @Value("${agent.actor-critic.enabled:false}")
-    private boolean actorCriticEnabled;
-
-    @Value("${agent.actor-critic.critic-tier:medium}")
-    private String criticTier;
-
     /** dynamicContext key：累计重试次数 */
     private static final String CTX_REFLEXION_RETRIES = "reflexionRetries";
     /** dynamicContext key：上次评审给的 critique（Step2 读取并融入 prompt） */
     public static final String CTX_REFLEXION_CRITIQUE = "reflexionCritique";
+    /**
+     * T11 B：上次评审给的结构化 critique（{@link CritiqueRecord}）。
+     * <p>
+     * 与 {@link #CTX_REFLEXION_CRITIQUE} 并存——前者是原始字符串（Step2 当前路径），后者是
+     * {@link CritiqueParser#parse(String)} 结果。Step2（C 阶段）可优先消费结构化版本，
+     * 解析失败/缺失时回退到字符串路径。**这条数据只增强不打断**：解析失败 record.type=OTHER + rawText=原文。
+     */
+    public static final String CTX_REFLEXION_CRITIQUE_RECORD = "reflexionCritiqueRecord";
 
-    /** 2026-05-07：Step3 critic 注入 LTM 用户事实，避免把基于历史记忆的个性化判定为"编造" */
-    @Autowired(required = false)
-    private ILongTermMemoryService longTermMemoryService;
+    /**
+     * T11 B：追加给 Step3 模型的"结构化 critique 输出"指令。
+     * <p>
+     * 不动 DB 中的 stepPrompt 配置，仅在代码层追加。原有五段中文（质量评估/问题识别/改进建议/质量评分/是否通过）
+     * 完全保留，Step2 字符串路径不受影响；末尾追加 JSON 给 {@link CritiqueParser} 解析。
+     * <p>
+     * 仅在 {@code reflexionEnabled=true} 且模型可能进入 FAIL 分支时才需要——但为简化逻辑，
+     * 只要 reflexion 开关开就追加，PASS 路径多输出几十字节不影响成本。
+     */
+    private static final String CRITIQUE_JSON_HINT =
+            "\n\n【额外输出要求 - Reflexion 结构化】\n" +
+            "如果判定为 FAIL，请在上述五段评审文字末尾追加一行 markdown JSON 代码块，格式：\n" +
+            "```json\n" +
+            "{\"type\":\"<MISSING_TOOL_CALL|WRONG_PARAM|LOGIC_INCONSISTENT|HALLUCINATION|OTHER>\"," +
+            "\"evidence\":\"<引用执行结果中的具体片段说明为什么这么判>\"," +
+            "\"suggestion\":\"<给下一轮 Step2 的可执行修复指示，不要重复原错误>\"}\n" +
+            "```\n" +
+            "PASS / OPTIMIZE 时无需输出 JSON。";
 
     @Override
     protected String doApply(ExecuteCommandEntity requestParameter, DefaultAutoAgentExecuteStrategyFactory.DynamicContext dynamicContext) throws Exception {
         checkCancelled(dynamicContext);
+        // 立即回答：跳过质量监督，直接汇总
+        String __finalize = checkFinalizeRoute(requestParameter, dynamicContext);
+        if (__finalize != null) return __finalize;
         // 第三阶段：质量监督
         log.info("\n🔍 阶段3: 质量监督检查");
         
@@ -71,40 +90,19 @@ public class Step3QualitySupervisorNode extends AbstractExecuteSupport {
                     + " for agentId=" + requestParameter.getAiAgentId());
         }
 
-        String supervisionPrompt = String.format(aiAgentClientFlowConfigVO.getStepPrompt(), requestParameter.getMessage(), executionResult);
+        String supervisionPrompt = String.format(aiAgentClientFlowConfigVO.getStepPrompt(), effectiveUserQuestion(requestParameter, dynamicContext), executionResult);
 
-        // 2026-05-07：注入 LTM 用户事实给 critic，告诉它"这些是已知的真实用户信息，不是 Step2 编的"
-        // 修复症状：Step3 看不到历史 → 把 Step2 基于 LTM 的个性化（"张伟/Java后端"）误判为编造
-        String userFactsBlock = "";
-        if (longTermMemoryService != null) {
-            try {
-                String ltmUserId = buildConversationId(requestParameter); // 与 LTM advisor 用同样的 userId 维度
-                if (requestParameter.getUserId() != null && !requestParameter.getUserId().isBlank()) {
-                    ltmUserId = requestParameter.getUserId();
-                }
-                List<String> facts = longTermMemoryService.retrieveForInjection(
-                        ltmUserId, buildLtmRetrievalQuery(requestParameter, "auto-step3-quality-check"), 5, 5);
-                if (facts != null && !facts.isEmpty()) {
-                    StringBuilder sb = new StringBuilder("\n\n【已知用户事实 — 来自长期记忆，非编造】\n");
-                    for (String f : facts) sb.append("- ").append(f).append("\n");
-                    sb.append("（评审时如执行结果引用了上述事实，不要判定为编造；只判定**未在已知事实范围内的新信息**才算编造）\n");
-                    userFactsBlock = sb.toString();
-                    log.info("[Step3-LTM] injected {} user facts into critic prompt", facts.size());
-                }
-            } catch (Exception e) {
-                log.warn("[Step3-LTM] failed to inject user facts: {}", e.getMessage());
-            }
+        // T11 B：reflexion 开关开时追加结构化 critique JSON 输出要求（不动 DB stepPrompt）
+        if (reflexionEnabled) {
+            supervisionPrompt = supervisionPrompt + CRITIQUE_JSON_HINT;
         }
-        supervisionPrompt = supervisionPrompt + userFactsBlock;
+        supervisionPrompt = appendCurrentTimeContext(supervisionPrompt);
 
-        // 获取对话客户端
-        ChatClient chatClient;
-        if (actorCriticEnabled && criticTier != null && !criticTier.isBlank()) {
-            chatClient = getChatClientByTier(ModelTierEnumVO.fromCode(criticTier), aiAgentClientFlowConfigVO.getClientId());
-            log.info("[Actor-Critic] Step3 using critic-tier={} fallback={}", criticTier, aiAgentClientFlowConfigVO.getClientId());
-        } else {
-            chatClient = getChatClientByClientId(aiAgentClientFlowConfigVO.getClientId());
-        }
+        // 获取对话客户端：直接用 QUALITY_SUPERVISOR_CLIENT 的 DB 配置。
+        // 2026-05-29：移除运行期 tier 覆盖（getChatClientByTier）。Actor-Critic 的模型分家改由 DB 控制——
+        // 给 QUALITY_SUPERVISOR_CLIENT 配一个与 step2 actor 不同的 model 即可。
+        ChatClient chatClient = getChatClientByClientId(aiAgentClientFlowConfigVO.getClientId());
+        List<ToolCallback> dynamicToolCallbacks = resolveAgentDynamicToolCallbacks(requestParameter, aiAgentClientFlowConfigVO.getClientId());
 
         // 2026-05-07 流式 UX：step_start → 流式 token → step_end（折叠为"质量评审 已完成"）
         ChatClient.ChatClientRequestSpec spec3 = chatClient
@@ -113,7 +111,15 @@ public class Step3QualitySupervisorNode extends AbstractExecuteSupport {
                         .param(CHAT_MEMORY_CONVERSATION_ID_KEY, buildConversationId(requestParameter))
                         .param(LTM_RETRIEVAL_QUERY_KEY, buildLtmRetrievalQuery(requestParameter, "auto-step3-quality-check"))
                         .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 1024));
-        if (step3MaxTokens > 0) spec3 = spec3.options(ChatOptions.builder().maxTokens(step3MaxTokens).build());
+        org.springframework.ai.openai.OpenAiChatOptions.Builder step3OptionsBuilder =
+                org.springframework.ai.openai.OpenAiChatOptions.builder();
+        if (step3MaxTokens > 0) {
+            step3OptionsBuilder.maxTokens(step3MaxTokens);
+        }
+        if (!dynamicToolCallbacks.isEmpty()) {
+            step3OptionsBuilder.toolCallbacks(toRequestToolCallbacks(aiAgentClientFlowConfigVO.getClientId(), dynamicToolCallbacks));
+        }
+        spec3 = spec3.options(step3OptionsBuilder.build());
         String supervisionResult = callStepWithStreaming(
                 spec3, dynamicContext, "step3_quality_supervisor", "质量评审", supervisionPrompt, requestParameter.getSessionId());
 
@@ -139,24 +145,33 @@ public class Step3QualitySupervisorNode extends AbstractExecuteSupport {
         } else {
             log.info("✅ 质量检查通过");
             dynamicContext.setCompleted(true);
-            // 通过即清空 reflexion 状态，避免影响后续 step
-            dynamicContext.setValue(CTX_REFLEXION_CRITIQUE, null);
-            dynamicContext.setValue(CTX_REFLEXION_RETRIES, 0);
         }
 
-        // P1.2 Reflexion：FAIL 时把 critique 喂回 Step2，不进 Step1 重头来
+        // T11 B（修正 Codex 第 35 轮指出的 OPTIMIZE 状态污染）：
+        // 唯一写入 reflexion 状态的路径：FAIL 且未超 max-retries。其余所有路径（PASS / OPTIMIZE /
+        // 达上限 / reflexion 关闭）统一 clear，避免 C 阶段 Step2 读到上一轮残留的 record。
+        boolean reflexionTriggered = false;
         if (reflexionEnabled && failed) {
             Integer retries = dynamicContext.getValue(CTX_REFLEXION_RETRIES);
             int n = retries == null ? 0 : retries;
             if (n < reflexionMaxRetries) {
+                // 双写：原字符串 critique 给 Step2 现有路径；结构化 record 给 C 阶段消费
                 dynamicContext.setValue(CTX_REFLEXION_CRITIQUE, supervisionResult);
+                CritiqueRecord record = CritiqueParser.parse(supervisionResult);
+                dynamicContext.setValue(CTX_REFLEXION_CRITIQUE_RECORD, record);
                 dynamicContext.setValue(CTX_REFLEXION_RETRIES, n + 1);
-                log.info("🔁 Reflexion 触发：第 {} 次重试，回到 Step2", n + 1);
+                log.info("🔁 Reflexion 触发：第 {} 次重试，回到 Step2 [critique.type={}, hasRawText={}]",
+                        n + 1, record.getType(), record.getRawText() != null);
+                reflexionTriggered = true;
             } else {
                 log.info("🔁 Reflexion 已达最大重试次数 {}，放弃，回到 Step1", reflexionMaxRetries);
-                dynamicContext.setValue(CTX_REFLEXION_CRITIQUE, null);
-                dynamicContext.setValue(CTX_REFLEXION_RETRIES, 0);
             }
+        }
+        if (!reflexionTriggered) {
+            // 集中清理：所有"不写入新 reflexion 状态"的路径走这里，保证 ctx 不携带旧 record/critique
+            dynamicContext.setValue(CTX_REFLEXION_CRITIQUE, null);
+            dynamicContext.setValue(CTX_REFLEXION_CRITIQUE_RECORD, null);
+            dynamicContext.setValue(CTX_REFLEXION_RETRIES, 0);
         }
         
         // 更新执行历史
@@ -177,10 +192,12 @@ public class Step3QualitySupervisorNode extends AbstractExecuteSupport {
         
         // 如果任务已完成或达到最大步数，进入总结阶段
         if (dynamicContext.isCompleted() || dynamicContext.getStep() > dynamicContext.getMaxStep()) {
+            recordTransition("step3_quality_supervisor", dynamicContext);
             return router(requestParameter, dynamicContext);
         }
-        
+
         // 否则继续下一轮执行，返回到Step1AnalyzerNode
+        recordTransition("step3_quality_supervisor", dynamicContext);
         return router(requestParameter, dynamicContext);
     }
 

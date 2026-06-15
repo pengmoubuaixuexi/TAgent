@@ -2,59 +2,64 @@ package cn.bugstack.ai.domain.agent.service.router;
 
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.tool.ToolCallback;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
- * Agent 工具注册表（2026-05-07）。
- * <p>
- * 配套：{@link ModelTierRegistry} 是 clientId → tier 的反查；本表是 clientId → 实际工具列表的反查。
- * <p>
- * <b>为什么需要</b>：
- * Spring AI 装配时通过 {@code ChatClient.builder().defaultToolCallbacks(tools)} 把工具回调注入到 ChatClient 内部，
- * 这只让"LLM 输出 tool_use 时能找到 callback 真执行"——但 prompt 构造代码（Step1/Step4）<b>看不到</b>这份工具列表。
- * 没有这份信息，prompt 只能写"基于实际工具规划"却无数据可塞，LLM 只好脑补"web_search"等不存在的工具，
- * 导致演戏式调用 + 编造结果。
- * <p>
- * <b>使用方式</b>：
- * <ul>
- *   <li>装配阶段（{@code AiClientNode}）：调 {@link #register(String, ToolCallback[])} 把 clientId 对应的工具元信息存下来</li>
- *   <li>运行时（{@code Step1McpToolsAnalysisNode} / {@code Step4ExecuteStepsNode}）：调
- *       {@link #describeToolsForPrompt(String)} 拿到可直接拼进 prompt 的工具说明文本</li>
- * </ul>
+ * Registry of tools that are actually mounted into each ChatClient.
+ *
+ * <p>Dynamic tool matching is intentionally handled by {@link McpToolCatalogService}
+ * against the persistent MCP tool catalog table. This registry only describes
+ * the current request-visible tools for prompts.
  */
 @Slf4j
 @Component
 public class AgentToolRegistry {
 
-    /** clientId → 这个 client 实际注册的工具元信息 */
     private final Map<String, List<ToolInfo>> clientTools = new ConcurrentHashMap<>();
 
-    /**
-     * 装配阶段调用：把 ChatClient 的工具列表登记进来。
-     * 重复注册同 clientId 时覆盖（支持 armory 重新装配场景）。
-     */
+    /** 装配阶段登记每个 client 的常驻工具回调本体，供 per-request 动态补工具时与之合并（见 {@link #combineWithResident}）。 */
+    private final Map<String, List<ToolCallback>> clientCallbacks = new ConcurrentHashMap<>();
+
+    @Value("${agent.mcp.tool-call.max-serial-rounds-per-client:3}")
+    private int maxSerialToolRoundsPerClient;
+
+    @Value("${agent.mcp.tool-call.parallel-enabled:true}")
+    private boolean toolCallParallelEnabled;
+
     public void register(String clientId, ToolCallback[] callbacks) {
         if (clientId == null || clientId.isBlank()) return;
         if (callbacks == null || callbacks.length == 0) {
             clientTools.put(clientId, Collections.emptyList());
+            clientCallbacks.put(clientId, Collections.emptyList());
             log.info("[ToolRegistry] register clientId={} tools=[] (no MCP tools)", clientId);
             return;
         }
+
         List<ToolInfo> list = new ArrayList<>(callbacks.length);
-        for (ToolCallback cb : callbacks) {
-            if (cb.getToolDefinition() == null) continue;
-            String name = cb.getToolDefinition().name();
-            String desc = cb.getToolDefinition().description();
-            list.add(new ToolInfo(name == null ? "" : name, desc == null ? "" : desc));
+        List<ToolCallback> callbackList = new ArrayList<>(callbacks.length);
+        Set<String> seen = new LinkedHashSet<>();
+        for (ToolCallback callback : callbacks) {
+            if (callback == null || callback.getToolDefinition() == null) continue;
+            String name = safe(callback.getToolDefinition().name());
+            if (name.isBlank() || !seen.add(name)) continue;
+            String rawDescription = safe(callback.getToolDefinition().description());
+            list.add(new ToolInfo(name, rawDescription));
+            callbackList.add(callback);
         }
         clientTools.put(clientId, Collections.unmodifiableList(list));
+        clientCallbacks.put(clientId, Collections.unmodifiableList(callbackList));
         log.info("[ToolRegistry] register clientId={} tools={}", clientId,
                 list.stream().map(ToolInfo::name).collect(Collectors.toList()));
     }
@@ -68,52 +73,124 @@ public class AgentToolRegistry {
         return !getTools(clientId).isEmpty();
     }
 
-    /**
-     * 生成可直接拼进 LLM prompt 的工具说明 Markdown 文本。
-     * <ul>
-     *   <li>有工具：列出每个工具的 name + description，并提示"只能引用这些"</li>
-     *   <li>无工具：明确告知"无工具可用，仅基于知识回答"</li>
-     * </ul>
-     */
-    public String describeToolsForPrompt(String clientId) {
-        List<ToolInfo> tools = getTools(clientId);
-        if (tools.isEmpty()) {
-            return "**当前 Agent (clientId=" + clientId + ") 没有配置任何 MCP 工具**。\n"
-                    + "你**没有任何外部工具可调用**，请仅基于 LLM 自身知识回答用户问题；"
-                    + "**禁止**虚构工具调用过程或返回数据。";
-        }
-        StringBuilder sb = new StringBuilder();
-        sb.append("**当前 Agent (clientId=").append(clientId).append(") 实际可用的 MCP 工具列表（只能引用以下工具，禁止编造其他工具名）:**\n");
-        for (ToolInfo t : tools) {
-            sb.append("- `").append(t.name()).append("`: ").append(t.description()).append("\n");
-        }
-        if (hasGithubRepositorySearchTool(tools)) {
-            sb.append("\n**GitHub repository search rules**\n");
-            sb.append("- Prefer English technical GitHub queries; do not pass broad Chinese natural-language phrases directly as the query.\n");
-            sb.append("- Translate Chinese intent into precise GitHub search syntax, for example: `spring-boot learning language:Java stars:>500`, `spring-boot examples language:Java stars:>500`, `spring-boot tutorial language:Java stars:>500`.\n");
-            sb.append("- Avoid generic Chinese poisoned keywords such as `中文`, `教程`, `资料` unless the user explicitly asks to search only Chinese repositories.\n");
-            sb.append("- Request only the first page and a small result set; `page=1` and `perPage<=10` are enough for recommendations.\n");
-        }
-        return sb.toString();
+    /** 该 client 的常驻工具回调本体（装配阶段登记）。 */
+    public List<ToolCallback> getToolCallbacks(String clientId) {
+        if (clientId == null) return Collections.emptyList();
+        return clientCallbacks.getOrDefault(clientId, Collections.emptyList());
     }
 
-    private boolean hasGithubRepositorySearchTool(List<ToolInfo> tools) {
-        if (tools == null || tools.isEmpty()) {
-            return false;
+    /**
+     * 把"路由动态补充的工具回调"与该 client 的常驻工具回调合并（常驻在前，按工具名去重）。
+     *
+     * <p>用于 per-request 的 {@code spec.options(OpenAiChatOptions.toolCallbacks(...))}：
+     * Spring AI 的 {@code ToolCallingChatOptions.mergeToolCallbacks} 在 runtime 列表非空时会
+     * <b>整体替换</b> default(常驻)工具而非取并集，所以 per-request 列表必须自带常驻工具，
+     * 否则一旦补了动态工具，agent 的常驻工具会全部丢失。
+     */
+    public List<ToolCallback> combineWithResident(String clientId, List<ToolCallback> extra) {
+        List<ToolCallback> resident = getToolCallbacks(clientId);
+        if (extra == null || extra.isEmpty()) {
+            return resident.isEmpty() ? Collections.emptyList() : new ArrayList<>(resident);
         }
-        for (ToolInfo tool : tools) {
-            if (tool != null && tool.name() != null
-                    && tool.name().toLowerCase().endsWith("search_repositories")) {
-                return true;
-            }
+        LinkedHashMap<String, ToolCallback> byName = new LinkedHashMap<>();
+        for (ToolCallback cb : resident) {
+            if (cb == null || cb.getToolDefinition() == null) continue;
+            String name = safe(cb.getToolDefinition().name());
+            if (!name.isBlank()) byName.putIfAbsent(name, cb);
         }
-        return false;
+        for (ToolCallback cb : extra) {
+            if (cb == null || cb.getToolDefinition() == null) continue;
+            String name = safe(cb.getToolDefinition().name());
+            if (!name.isBlank()) byName.putIfAbsent(name, cb);
+        }
+        return new ArrayList<>(byName.values());
     }
 
     public int totalRegisteredClients() {
         return clientTools.size();
     }
 
-    /** 工具元信息（轻量，不含 callback 本体） */
+    public String describeToolsForPrompt(String clientId) {
+        return describeToolsForPrompt(clientId, Collections.emptyList());
+    }
+
+    public String describeToolsForPrompt(String clientId, List<ToolCallback> extraCallbacks) {
+        List<ToolInfo> baseTools = getTools(clientId);
+        List<ToolInfo> extraTools = toToolInfo(extraCallbacks, baseTools);
+        List<ToolInfo> allTools = new ArrayList<>(baseTools);
+        allTools.addAll(extraTools);
+
+        if (allTools.isEmpty()) {
+            return "**当前 Agent (clientId=" + clientId + ") 没有配置任何 MCP 工具**。\n"
+                    + "你没有任何外部工具可调用，请仅基于 LLM 自身知识回答用户问题，禁止虚构工具调用过程或返回数据。";
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("**当前 Agent (clientId=").append(clientId)
+                .append(") 实际可用的 MCP 工具列表（只能引用以下工具，禁止编造其他工具名）**\n");
+        appendToolLines(sb, baseTools);
+
+        if (!extraTools.isEmpty()) {
+            sb.append("\n**本次路由动态补充的工具（仅本次请求临时可用）**\n");
+            appendToolLines(sb, extraTools);
+        }
+
+        if (hasGithubRepositorySearchTool(allTools)) {
+            sb.append("\n**GitHub 仓库搜索规则**\n");
+            sb.append("- GitHub 搜索请优先使用英文技术关键词，不要把宽泛的中文自然语言问题直接作为 query。\n");
+            sb.append("- 请把中文意图转换成精确的 GitHub 搜索语法，例如：`spring-boot learning language:Java stars:>500`、`spring-boot examples language:Java stars:>500`。\n");
+            sb.append("- 除非用户明确要求只搜中文仓库，否则避免使用 `中文`、`教程`、`资料` 这类泛化关键词。\n");
+            sb.append("- 只请求第一页和较小结果集即可；推荐 `page=1` 且 `perPage<=10`。\n");
+        }
+
+        if (maxSerialToolRoundsPerClient > 0) {
+            sb.append("\n**工具调用轮次预算**\n");
+            sb.append("- 本次 client 执行最多只能进行 ").append(maxSerialToolRoundsPerClient).append(" 轮工具调用。\n");
+            sb.append("- 一轮指 assistant 一次性发起工具调用；同一轮里即使包含多个工具调用，也只算 1 轮。\n");
+            sb.append("- 如果工具轮次已经用完，请停止继续调用工具，基于已有信息给出最佳答案；缺失的数据要明确列出，并给出保守兜底方案。\n");
+        }
+        if (maxSerialToolRoundsPerClient > 0 && toolCallParallelEnabled) {
+            sb.append("\n**并行工具调用建议**\n");
+            sb.append("- 如果多个工具调用互不依赖，请尽量在同一轮一次性发起，这样可以并行执行，并且只消耗 1 轮工具预算。\n");
+        }
+        return sb.toString();
+    }
+
+    private List<ToolInfo> toToolInfo(List<ToolCallback> callbacks, List<ToolInfo> baseTools) {
+        if (callbacks == null || callbacks.isEmpty()) return Collections.emptyList();
+        Set<String> seen = baseTools.stream().map(ToolInfo::name).collect(Collectors.toCollection(LinkedHashSet::new));
+        List<ToolInfo> result = new ArrayList<>();
+        for (ToolCallback callback : callbacks) {
+            if (callback == null || callback.getToolDefinition() == null) continue;
+            String name = safe(callback.getToolDefinition().name());
+            if (name.isBlank() || seen.contains(name)) continue;
+            seen.add(name);
+            String rawDescription = safe(callback.getToolDefinition().description());
+            result.add(new ToolInfo(name, rawDescription));
+        }
+        return result;
+    }
+
+    private void appendToolLines(StringBuilder sb, List<ToolInfo> tools) {
+        for (ToolInfo tool : tools) {
+            sb.append("- `").append(tool.name()).append("`: ").append(tool.description()).append("\n");
+        }
+    }
+
+    private boolean hasGithubRepositorySearchTool(List<ToolInfo> tools) {
+        if (tools == null || tools.isEmpty()) return false;
+        for (ToolInfo tool : tools) {
+            if (tool != null && tool.name() != null
+                    && tool.name().toLowerCase(Locale.ROOT).endsWith("search_repositories")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String safe(String value) {
+        return value == null ? "" : value;
+    }
+
     public record ToolInfo(String name, String description) {}
 }

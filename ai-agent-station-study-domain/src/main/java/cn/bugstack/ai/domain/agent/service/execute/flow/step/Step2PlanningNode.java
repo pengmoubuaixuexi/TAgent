@@ -10,13 +10,15 @@ import cn.bugstack.wrench.design.framework.tree.StrategyHandler;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.prompt.ChatOptions;
+import org.springframework.ai.tool.ToolCallback;
 import org.springframework.stereotype.Service;
+
+import java.util.List;
 
 /**
  * 步骤2：执行步骤规划节点
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/8/25 10:30
  */
 @Slf4j
@@ -29,6 +31,9 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
     @Override
     protected String doApply(ExecuteCommandEntity requestParameter, DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext) throws Exception {
         checkCancelled(dynamicContext);
+        // 立即回答：跳过规划，直接跳 Step4 整合作答
+        String __finalize = checkFinalizeRoute(requestParameter, dynamicContext);
+        if (__finalize != null) return __finalize;
         log.info("\n--- 步骤2: 执行步骤规划 ---");
 
         // 获取配置信息
@@ -40,26 +45,38 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
 
         // 获取规划客户端
         ChatClient planningChatClient = getChatClientByClientId(aiAgentClientFlowConfigVO.getClientId());
+        List<ToolCallback> dynamicToolCallbacks = resolveAgentDynamicToolCallbacks(requestParameter, aiAgentClientFlowConfigVO.getClientId());
 
-        String userRequest = dynamicContext.getCurrentTask();
         String mcpToolsAnalysis = dynamicContext.getValue("mcpToolsAnalysis");
-        
-        String planningPrompt = buildStructuredPlanningPrompt(userRequest, mcpToolsAnalysis);
-        
-        String refinedPrompt = planningPrompt + "\n\n## ⚠️ 工具映射验证反馈\n" +
-                "\n\n**请根据上述验证反馈重新生成规划，确保：**\n" +
-                "1. 只使用验证报告中列出的有效工具\n" +
-                "2. 工具名称必须完全匹配（区分大小写）\n" +
-                "3. 每个步骤明确指定使用的MCP工具\n" +
-                "4. 避免使用不存在或无效的工具"
-                + githubRepositorySearchGuidance();
+        // 引导感知：本步 prompt 包成 Supplier，userRequest 每轮实时取 currentTask（引导后已折入引导，修复"重跑仍用原始询问"）
+        final String mcpToolsAnalysisForPrompt = mcpToolsAnalysis;
+        java.util.function.Supplier<String> planningPromptSupplier = () -> {
+            String planningPrompt = buildStructuredPlanningPrompt(dynamicContext.getCurrentTask(), mcpToolsAnalysisForPrompt);
+            String refined = planningPrompt + "\n\n## ⚠️ 工具映射验证反馈\n" +
+                    "\n\n**请根据上述验证反馈重新生成规划，确保：**\n" +
+                    "1. 只使用验证报告中列出的有效工具\n" +
+                    "2. 工具名称必须完全匹配（区分大小写）\n" +
+                    "3. 每个步骤明确指定使用的MCP工具\n" +
+                    "4. 避免使用不存在或无效的工具";
+            return appendCurrentTimeContext(refined);
+        };
 
         // 2026-05-07 流式 UX：step_start → 流式 token → step_end（折叠为"步骤规划 已完成"）
-        ChatClient.ChatClientRequestSpec spec2 = planningChatClient.prompt().user(refinedPrompt);
-        if (step2MaxTokens > 0) spec2 = spec2.options(ChatOptions.builder().maxTokens(step2MaxTokens).build());
-        String planningResult = callStepWithStreaming(
-                spec2, dynamicContext, "flow_step2_planning", "步骤规划",
-                refinedPrompt, requestParameter.getSessionId());
+        org.springframework.ai.openai.OpenAiChatOptions.Builder step2OptionsBuilder =
+                org.springframework.ai.openai.OpenAiChatOptions.builder();
+        if (step2MaxTokens > 0) {
+            step2OptionsBuilder.maxTokens(step2MaxTokens);
+        }
+        if (!dynamicToolCallbacks.isEmpty()) {
+            step2OptionsBuilder.toolCallbacks(toRequestToolCallbacks(aiAgentClientFlowConfigVO.getClientId(), dynamicToolCallbacks));
+        }
+        final org.springframework.ai.openai.OpenAiChatOptions step2Opts = step2OptionsBuilder.build();
+        final ChatClient step2Client = planningChatClient;
+        // 引导回复：被打断则折入新想法重做本步（思考不关、工具不变）
+        String planningResult = callStepWithSteer(
+                p -> step2Client.prompt().user(p).options(step2Opts),
+                dynamicContext, "flow_step2_planning", "步骤规划",
+                planningPromptSupplier, requestParameter.getSessionId());
         
         log.info("执行步骤规划结果: {}", planningResult);
 
@@ -81,7 +98,8 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         
         // 更新步骤
         dynamicContext.setStep(dynamicContext.getStep() + 1);
-        
+
+        recordTransition("flow_step2_planning", dynamicContext);
         return router(requestParameter, dynamicContext);
     }
 
@@ -113,16 +131,17 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         prompt.append("## ✅ 工具映射验证要求\n");
         prompt.append("**重要提醒：** 在生成执行步骤时，必须严格遵循以下工具映射规则：\n\n");
 
-        prompt.append("### Available Tool Scope\n");
-        prompt.append("- Use only tools explicitly listed as available/valid in the MCP analysis result above.\n");
-        prompt.append("- Do not invent tools, service names, publishing destinations, notification channels, or platform actions.\n");
-        prompt.append("- Do not plan publish/share/notify steps unless the user explicitly asked to publish, share, or notify.\n");
-        prompt.append("- Do not use BaiduSearch, CSDN, Weixin/Wechat, or any platform-write tool unless it is listed as available and the user explicitly requested that action.\n");
-        prompt.append("- If no suitable external search tool is available, plan a knowledge-based answer or use the agent's own domain tools only.\n\n");
+        prompt.append("### 可用工具范围\n");
+        prompt.append("- 只能使用上方 MCP 分析结果中明确列为可用/有效的工具。\n");
+        prompt.append("- 禁止编造工具名、服务名、发布目的地、通知渠道或平台动作。\n");
+        prompt.append("- 除非用户明确要求发布、分享或通知，否则不要规划发布/分享/通知步骤。\n");
+        prompt.append("- 除非工具明确可用且用户明确要求相关动作，否则不要使用 BaiduSearch、CSDN、Weixin/Wechat 或任何平台写操作工具。\n");
+        prompt.append("- 如果没有合适的外部搜索工具，请规划基于已有知识的回答，或只使用当前 Agent 自身领域工具。\n\n");
 
         prompt.append("### 工具选择原则\n");
-        prompt.append("- **精确匹配**: 每个步骤必须使用上述工具清单中的确切函数名称\n");
-        prompt.append("- **功能对应**: 根据MCP工具分析结果中的匹配度选择最适合的工具\n");
+        prompt.append("- **精确匹配**: 每个步骤的首选工具和可替代工具都必须使用上述工具清单中的确切函数名称\n");
+        prompt.append("- **功能对应**: 根据MCP工具分析结果中的匹配度选择最适合的首选工具，并列出能补齐缺失字段的替代工具\n");
+        prompt.append("- **目标优先**: 工具是完成步骤目标的手段；如果首选工具返回字段不足，执行阶段可以改用可替代工具补足\n");
         prompt.append("- **参数完整**: 确保每个工具调用都包含必需的参数说明\n");
         prompt.append("- **依赖关系**: 考虑工具间的数据流转和依赖关系\n\n");
 
@@ -150,13 +169,15 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         prompt.append("### 第1步：[步骤描述]\n");
         prompt.append("- **优先级**: [HIGH/MEDIUM/LOW]\n");
         prompt.append("- **预估时长**: [分钟数]分钟\n");
-        prompt.append("- **使用工具**: [必须使用确切的函数名称]\n");
+        prompt.append("- **目标能力**: [本步骤真正要获取/处理/生成的能力目标，例如“获取景点POI、地址、坐标”]\n");
+        prompt.append("- **首选工具**: [优先尝试的工具函数名称；这是建议，不是唯一允许工具]\n");
+        prompt.append("- **可替代工具**: [当首选工具字段不足/失败/空结果时可补足目标的工具函数名称；没有则填“无”]\n");
         prompt.append("- **工具匹配度**: [引用MCP分析结果中的匹配度评估]\n");
         // 2026-05-07：DAG 解析依赖此格式，必须严格按指定写法（不要自由发挥）
         prompt.append("- **依赖步骤**: [严格按以下唯一格式之一填写，不要加其他文字 / 不要写\"第X步\" / 不要写\"以及/和/与\"]\n");
         prompt.append("    - 无依赖时填：`DEPENDS_ON: NONE`\n");
         prompt.append("    - 有依赖时填：`DEPENDS_ON: 1` 或 `DEPENDS_ON: 1,2,3`（纯数字 + 半角逗号，禁止其他写法）\n");
-        prompt.append("- **执行方法**: [基于MCP分析结果的具体执行策略，包含工具调用参数]\n");
+        prompt.append("- **执行方法**: [基于MCP分析结果的具体执行策略，包含首选工具参数、失败/缺字段时如何用可替代工具补足]\n");
         prompt.append("- **工具参数**: [详细的参数说明和示例值，必须包含用户原始需求中的所有相关信息]\n");
         prompt.append("- **需求传递**: [明确说明如何将用户的详细要求传递到此步骤中]\n");
         prompt.append("- **预期输出**: [期望的最终结果]\n");
@@ -169,7 +190,7 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         prompt.append("请根据用户详细请求和可用工具能力，动态生成合适的执行步骤：\n");
         prompt.append("- **需求完整性原则**: 确保用户请求中的所有详细信息都被完整保留和传递\n");
         prompt.append("- **步骤分离原则**: 每个步骤应该专注于单一功能，避免混合不同类型的操作\n");
-        prompt.append("- **工具映射原则**: 每个步骤应明确使用哪个具体的MCP工具\n");
+        prompt.append("- **工具映射原则**: 每个步骤应明确目标能力、首选工具和可替代工具；不要把首选工具写成唯一硬约束\n");
         prompt.append("- **参数传递原则**: 确保用户的详细要求能够准确传递到工具参数中\n");
         prompt.append("- **依赖关系原则**: 合理安排步骤顺序，确保前置条件得到满足\n");
         prompt.append("- **结果输出原则**: 每个步骤都应有明确的输出结果和成功标准\n\n");
@@ -191,7 +212,7 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         prompt.append("3. **步骤描述**: 每个步骤描述要清晰、具体、可执行\n");
         prompt.append("4. **优先级**: 根据步骤重要性和紧急程度设定\n");
         prompt.append("5. **时长估算**: 基于步骤复杂度合理估算\n");
-        prompt.append("6. **工具选择**: 从可用工具中选择最适合的，必须使用完整的函数名称\n");
+        prompt.append("6. **工具选择**: 从可用工具中选择最适合的首选工具，并尽量给出可替代工具；必须使用完整的函数名称\n");
         prompt.append("7. **依赖关系（关键！系统按此解析 DAG）**: 每个步骤的【依赖步骤】行必须**严格**按以下机器可读格式：\n");
         prompt.append("    - `DEPENDS_ON: NONE` （无依赖）\n");
         prompt.append("    - `DEPENDS_ON: 1`（依赖第1步）\n");
@@ -201,7 +222,7 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         prompt.append("8. **执行细节**: 提供具体可操作的方法，包含详细的参数说明和用户需求传递\n");
         prompt.append("9. **需求传递**: 确保用户的所有详细要求都能准确传递到相应的执行步骤中\n");
         prompt.append("10. **功能独立**: 确保每个步骤功能独立，避免混合不同类型的操作\n");
-        prompt.append("11. **工具映射**: 每个步骤必须明确指定使用的MCP工具函数名称\n");
+        prompt.append("11. **工具映射**: 每个步骤必须明确指定目标能力、首选工具、可替代工具；首选工具是建议，不是执行阶段唯一允许工具\n");
         prompt.append("12. **质量标准**: 设定明确的完成标准\n\n");
 
         // 7. 步骤类型指导

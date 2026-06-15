@@ -29,7 +29,7 @@ import java.util.UUID;
 /**
  * 拖拉拽
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/9/28 07:35
  */
 @Slf4j

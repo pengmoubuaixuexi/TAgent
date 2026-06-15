@@ -7,7 +7,7 @@ import lombok.NoArgsConstructor;
 
 /**
  * 知识库订单
- * @author TAgent
+ * @author Fuzhengwei bugstack.cn @小傅哥
  * 2025-05-05 20:02
  */
 @Data

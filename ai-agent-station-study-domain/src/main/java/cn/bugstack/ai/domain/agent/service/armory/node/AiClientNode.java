@@ -2,16 +2,16 @@ package cn.bugstack.ai.domain.agent.service.armory.node;
 
 import cn.bugstack.ai.domain.agent.model.entity.ArmoryCommandEntity;
 import cn.bugstack.ai.domain.agent.model.valobj.enums.AiAgentEnumVO;
-import cn.bugstack.ai.domain.agent.model.valobj.enums.ModelTierEnumVO;
-import cn.bugstack.ai.domain.agent.model.valobj.AiClientModelVO;
 import cn.bugstack.ai.domain.agent.model.valobj.AiClientSystemPromptVO;
 import cn.bugstack.ai.domain.agent.model.valobj.AiClientVO;
 import cn.bugstack.ai.domain.agent.service.armory.node.factory.DefaultArmoryStrategyFactory;
 
+import cn.bugstack.ai.domain.agent.service.armory.node.factory.element.EpisodicMemoryAdvisor;
+import cn.bugstack.ai.domain.agent.service.armory.node.factory.element.LongTermMemoryAdvisor;
+import cn.bugstack.ai.domain.agent.service.armory.node.factory.element.ReadOnlyChatMemoryAdvisor;
 import cn.bugstack.ai.domain.agent.service.execute.common.McpToolMetrics;
 import cn.bugstack.ai.domain.agent.service.execute.common.MeteredToolCallback;
 import cn.bugstack.ai.domain.agent.service.router.AgentToolRegistry;
-import cn.bugstack.ai.domain.agent.service.router.ModelTierRegistry;
 import cn.bugstack.wrench.design.framework.tree.StrategyHandler;
 import com.alibaba.fastjson.JSON;
 import io.modelcontextprotocol.client.McpSyncClient;
@@ -26,23 +26,20 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * ai agent 客户端对话对象节点
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/7/19 09:17
  */
 @Slf4j
 @Service
 public class AiClientNode extends AbstractArmorySupport {
-
-    /** P0.1.3：装配阶段把每个 ChatClient 的 model tier 写进注册表，运行时按 tier 选模型 */
-    @Resource
-    private ModelTierRegistry modelTierRegistry;
 
     /** 2026-05-07：装配阶段把每个 ChatClient 的实际工具列表登记，让 prompt 构造代码能注入真实工具信息 */
     @Resource
@@ -51,6 +48,14 @@ public class AiClientNode extends AbstractArmorySupport {
     /** P1.5.1：MCP 工具调用 metric 装饰器 */
     @Resource
     private McpToolMetrics mcpToolMetrics;
+
+    /** G1-C：人工审批 gate（可选），装配时 setter 注入到 MeteredToolCallback */
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.security.HumanApprovalGate humanApprovalGate;
+
+    /** H3-A：工具调用进度 SSE emitter，装配时 setter 注入到 MeteredToolCallback */
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.execute.common.ToolCallProgressEmitter toolCallProgressEmitter;
 
     @Value("${agent.mcp.return-error-on-failure:true}")
     private boolean returnToolErrorOnFailure;
@@ -87,8 +92,10 @@ public class AiClientNode extends AbstractArmorySupport {
         }
 
         Map<String, AiClientSystemPromptVO> systemPromptMap = dynamicContext.getValue(AiAgentEnumVO.AI_CLIENT_SYSTEM_PROMPT.getDataName());
-        // 把模型 list 转成 map 方便 O(1) 查 tier；data 阶段存的是 List<AiClientModelVO>
-        Map<String, AiClientModelVO> modelByModelId = buildModelMap(dynamicContext);
+        List<String> agentMemoryAdvisorBeanNames = collectAgentMemoryAdvisorBeanNames(aiClientList);
+        if (!agentMemoryAdvisorBeanNames.isEmpty()) {
+            log.info("[AiClientNode] agent memory advisors propagated to all clients: {}", agentMemoryAdvisorBeanNames);
+        }
 
         for (AiClientVO aiClientVO : aiClientList) {
             // 1. 预设话术
@@ -119,7 +126,8 @@ public class AiClientNode extends AbstractArmorySupport {
             // 4. advisor 顾问角色
             List<Advisor> advisors = new ArrayList<>();
             // P2.5 14.2 PII 脱敏：已改为按需通过 ai_client_advisor 表配置（type=PiiMask），不再全局硬编码
-            List<String> advisorBeanNameList = aiClientVO.getAdvisorBeanNameList();
+            List<String> advisorBeanNameList = mergeAdvisorBeanNames(
+                    aiClientVO.getAdvisorBeanNameList(), agentMemoryAdvisorBeanNames);
             for (String advisorBeanName : advisorBeanNameList) {
                 advisors.add(getBean(advisorBeanName));
             }
@@ -142,15 +150,29 @@ public class AiClientNode extends AbstractArmorySupport {
                     log.info("[AiClientNode] skip GitHub write tool={} because agent.mcp.github.write-enabled=false", toolName);
                     continue;
                 }
-                meteredToolList.add(new MeteredToolCallback(rawTool, mcpToolMetrics,
+                MeteredToolCallback metered = new MeteredToolCallback(rawTool, mcpToolMetrics,
                         returnToolErrorOnFailure, githubWriteEnabled,
                         githubSearchMaxPerPage, githubSearchMaxResultChars,
                         githubSearchCompactResultEnabled, aiSearchStripServerLlm,
-                        mcpToolCallMaxAttempts, mcpToolCallRetryDelayMs));
+                        mcpToolCallMaxAttempts, mcpToolCallRetryDelayMs);
+                metered.setHumanApprovalGate(humanApprovalGate); // G1-C
+                metered.setToolCallProgressEmitter(toolCallProgressEmitter); // H3-A
+                meteredToolList.add(metered);
             }
             // LLM 工具名大小写幻觉不再用 alias 翻倍 prompt 解决，
             // 改由自定义 ToolCallingManager 在 lookup 时做 case-insensitive 匹配（见 AiClientModelNode）。
             ToolCallback[] meteredTools = meteredToolList.toArray(new ToolCallback[]{});
+            ToolCallback[] registryTools = meteredTools;
+            boolean hasEffectiveTools = meteredTools.length > 0;
+            if (!hasEffectiveTools && chatModel.getDefaultOptions() instanceof org.springframework.ai.model.tool.ToolCallingChatOptions tco) {
+                List<ToolCallback> modelTools = tco.getToolCallbacks();
+                if (modelTools != null && !modelTools.isEmpty()) {
+                    registryTools = modelTools.toArray(new ToolCallback[]{});
+                    hasEffectiveTools = true;
+                    log.info("[AiClientNode] clientId={} client级无MCP工具，从model继承{}个工具",
+                            aiClientVO.getClientId(), registryTools.length);
+                }
+            }
 
             ChatClient chatClient = ChatClient.builder(chatModel)
                     .defaultSystem(defaultSystem.toString())
@@ -160,39 +182,49 @@ public class AiClientNode extends AbstractArmorySupport {
 
             registerBean(beanName(aiClientVO.getClientId()), ChatClient.class, chatClient);
 
-            // 2026-05-07：装配同时登记到 AgentToolRegistry，prompt 构造代码可查
-            // client 级别没有 tool_mcp 时，从 ChatModel 的 defaultOptions 继承（model 级别的 MCP 工具）
-            ToolCallback[] registryTools = meteredTools;
-            if (registryTools.length == 0 && chatModel.getDefaultOptions() instanceof org.springframework.ai.model.tool.ToolCallingChatOptions tco) {
-                List<ToolCallback> modelTools = tco.getToolCallbacks();
-                if (modelTools != null && !modelTools.isEmpty()) {
-                    registryTools = modelTools.toArray(new ToolCallback[]{});
-                    log.info("[AiClientNode] clientId={} client级无MCP工具，从model继承{}个工具", aiClientVO.getClientId(), registryTools.length);
-                }
-            }
             agentToolRegistry.register(aiClientVO.getClientId(), registryTools);
-
-            // 把 clientId 跟它的 model tier 关联起来；后续 step 就能 modelTierRegistry.pickByTier(small) 选小模型
-            AiClientModelVO modelVO = modelByModelId.get(aiClientVO.getModelId());
-            if (modelVO != null) {
-                modelTierRegistry.register(aiClientVO.getClientId(), ModelTierEnumVO.fromCode(modelVO.getTier()));
-            }
         }
 
         return router(requestParameter, dynamicContext);
     }
 
-    /** dynamicContext 里 AI_CLIENT_MODEL 存的是 List；转 Map 让 tier 查询变 O(1) */
-    @SuppressWarnings("unchecked")
-    private Map<String, AiClientModelVO> buildModelMap(DefaultArmoryStrategyFactory.DynamicContext dynamicContext) {
-        Object raw = dynamicContext.getValue(AiAgentEnumVO.AI_CLIENT_MODEL.getDataName());
-        Map<String, AiClientModelVO> result = new HashMap<>();
-        if (raw instanceof List<?>) {
-            for (Object o : (List<?>) raw) {
-                if (o instanceof AiClientModelVO m) result.put(m.getModelId(), m);
+    private List<String> collectAgentMemoryAdvisorBeanNames(List<AiClientVO> aiClientList) {
+        Set<String> names = new LinkedHashSet<>();
+        if (aiClientList == null) return new ArrayList<>();
+        for (AiClientVO aiClientVO : aiClientList) {
+            List<String> advisorBeanNameList = aiClientVO.getAdvisorBeanNameList();
+            if (advisorBeanNameList == null) continue;
+            for (String advisorBeanName : advisorBeanNameList) {
+                if (advisorBeanName == null || advisorBeanName.isBlank() || names.contains(advisorBeanName)) continue;
+                try {
+                    Object advisor = getBean(advisorBeanName);
+                    if (advisor instanceof LongTermMemoryAdvisor
+                            || advisor instanceof EpisodicMemoryAdvisor
+                            || advisor instanceof ReadOnlyChatMemoryAdvisor) {
+                        names.add(advisorBeanName);
+                    }
+                } catch (Exception e) {
+                    log.warn("[AiClientNode] advisor bean {} missing while collecting agent memory advisors: {}",
+                            advisorBeanName, e.getMessage());
+                }
             }
         }
-        return result;
+        return new ArrayList<>(names);
+    }
+
+    private List<String> mergeAdvisorBeanNames(List<String> local, List<String> agentMemory) {
+        Set<String> merged = new LinkedHashSet<>();
+        if (local != null) {
+            for (String name : local) {
+                if (name != null && !name.isBlank()) merged.add(name);
+            }
+        }
+        if (agentMemory != null) {
+            for (String name : agentMemory) {
+                if (name != null && !name.isBlank()) merged.add(name);
+            }
+        }
+        return new ArrayList<>(merged);
     }
 
     @Override

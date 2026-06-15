@@ -12,6 +12,7 @@ import cn.bugstack.ai.domain.agent.model.valobj.AiAgentVO;
 import cn.bugstack.ai.domain.agent.service.IAgentDispatchService;
 import cn.bugstack.ai.domain.agent.service.IArmoryService;
 import cn.bugstack.ai.domain.agent.service.armory.node.factory.DefaultArmoryStrategyFactory;
+import cn.bugstack.ai.domain.agent.service.security.ApprovalChannelRegistry;
 import cn.bugstack.ai.domain.agent.service.security.PiiMasker;
 import cn.bugstack.ai.types.common.Constants;
 import cn.bugstack.ai.types.enums.ResponseCode;
@@ -33,7 +34,7 @@ import java.util.List;
 /**
  * AutoAgent 自动智能对话体
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  */
 @Slf4j
 @RestController
@@ -46,6 +47,13 @@ public class AiAgentController implements IAiAgentService {
 
     @Resource
     private IArmoryService armoryService;
+
+    @Resource
+    private ApprovalChannelRegistry approvalChannelRegistry;
+
+    /** 执行干预（立即回答/引导）总开关；false 时端点拒绝、ack 不带 intervention=true，前端据此不渲染按钮。 */
+    @org.springframework.beans.factory.annotation.Value("${agent.intervention.enabled:true}")
+    private boolean interventionEnabled;
 
     @RequestMapping(value = "auto_agent", method = RequestMethod.POST)
     public ResponseBodyEmitter autoAgent(@RequestBody AutoAgentRequestDTO request, HttpServletResponse response) {
@@ -70,13 +78,21 @@ public class AiAgentController implements IAiAgentService {
 
             // 1. 创建流式输出对象
             ResponseBodyEmitter emitter = new ResponseBodyEmitter(Long.MAX_VALUE);
+            String sessionId = request != null ? request.getSessionId() : null;
+            if (sessionId != null && !sessionId.isBlank()) {
+                approvalChannelRegistry.register(sessionId, emitter);
+                emitter.onCompletion(() -> approvalChannelRegistry.unregister(sessionId, emitter));
+                emitter.onTimeout(() -> approvalChannelRegistry.unregister(sessionId, emitter));
+                emitter.onError(e -> approvalChannelRegistry.unregister(sessionId, emitter));
+            }
 
             // 2026-05-07 #2 TTFT 优化：emitter 创建后立即吐一个 ack 事件，
             // 让浏览器 Network 面板第一个 chunk 在 < 50ms 出现。后续 IntentRouter / advisor
             // 任何阻塞都不会影响"已连接"的视觉反馈，前端立刻把"思考中..."替换为已连接动画
             try {
-                String ackSid = request != null && request.getSessionId() != null ? request.getSessionId() : "";
-                emitter.send("event: ack\ndata: {\"sessionId\":\"" + ackSid + "\",\"timestamp\":"
+                String ackSid = sessionId != null ? sessionId : "";
+                emitter.send("event: ack\ndata: {\"sessionId\":\"" + ackSid + "\",\"intervention\":"
+                        + interventionEnabled + ",\"timestamp\":"
                         + System.currentTimeMillis() + "}\n\n");
             } catch (Exception ackEx) {
                 log.debug("ack 发送失败（不影响主流程）: {}", ackEx.getMessage());
@@ -288,6 +304,42 @@ public class AiAgentController implements IAiAgentService {
                 .build();
     }
 
+    /**
+     * 立即回答：中止当前 session 剩余执行，跳各模式 finalize 例程基于半成品作答。
+     * 设计见 docs/INTERVENTION_立即回答与引导回复_设计.md。
+     */
+    @RequestMapping(value = "answer_now", method = RequestMethod.POST)
+    public Response<Boolean> answerNow(@RequestBody Map<String, Object> request) {
+        if (!interventionEnabled) {
+            return Response.<Boolean>builder().code(ResponseCode.UN_ERROR.getCode()).info("干预功能未启用").data(false).build();
+        }
+        String sessionId = request != null ? (String) request.get("sessionId") : null;
+        if (sessionId == null || sessionId.isBlank()) {
+            return Response.<Boolean>builder().code(ResponseCode.UN_ERROR.getCode()).info("缺少 sessionId").data(false).build();
+        }
+        agentDispatchService.finalizeExecute(sessionId);
+        log.info("[AnswerNow] sessionId={}", sessionId);
+        return Response.<Boolean>builder().code(ResponseCode.SUCCESS.getCode()).info("已请求立即回答").data(true).build();
+    }
+
+    /**
+     * 引导回复：注入新想法，不丢弃进度，继续当前步把想法折进去。
+     */
+    @RequestMapping(value = "steer", method = RequestMethod.POST)
+    public Response<Boolean> steer(@RequestBody Map<String, Object> request) {
+        if (!interventionEnabled) {
+            return Response.<Boolean>builder().code(ResponseCode.UN_ERROR.getCode()).info("干预功能未启用").data(false).build();
+        }
+        String sessionId = request != null ? (String) request.get("sessionId") : null;
+        String idea = request != null ? (String) request.get("idea") : null;
+        if (sessionId == null || sessionId.isBlank() || idea == null || idea.isBlank()) {
+            return Response.<Boolean>builder().code(ResponseCode.UN_ERROR.getCode()).info("缺少 sessionId 或 idea").data(false).build();
+        }
+        agentDispatchService.steerExecute(sessionId, idea);
+        log.info("[Steer] sessionId={} ideaLen={}", sessionId, idea.length());
+        return Response.<Boolean>builder().code(ResponseCode.SUCCESS.getCode()).info("已提交引导").data(true).build();
+    }
+
     /** 取第一个非空非空白的字符串值 */
     private static String coalesce(String... values) {
         for (String v : values) {
@@ -321,6 +373,45 @@ public class AiAgentController implements IAiAgentService {
                     .code(ResponseCode.UN_ERROR.getCode())
                     .info(e.getMessage())
                     .data(List.of())
+                    .build();
+        }
+    }
+
+    /** 删除某个会话的全部历史消息（带归属校验：只能删自己的会话） */
+    @RequestMapping(value = "conversation", method = RequestMethod.DELETE)
+    public Response<Boolean> deleteConversation(@RequestParam("conversationId") String conversationId,
+                                                @RequestParam("userId") String userId) {
+        try {
+            if (conversationId == null || conversationId.isBlank() || userId == null || userId.isBlank()) {
+                return Response.<Boolean>builder()
+                        .code(ResponseCode.UN_ERROR.getCode())
+                        .info("conversationId 与 userId 均不能为空")
+                        .data(false)
+                        .build();
+            }
+            cn.bugstack.ai.infrastructure.dao.IAiChatMemoryDao dao =
+                    applicationContext.getBean(cn.bugstack.ai.infrastructure.dao.IAiChatMemoryDao.class);
+            int deleted = dao.deleteByConversationIdAndUserId(conversationId, userId);
+            if (deleted <= 0) {
+                // 0 行 = 会话不存在或不属于该用户，不暴露具体原因
+                return Response.<Boolean>builder()
+                        .code(ResponseCode.UN_ERROR.getCode())
+                        .info("会话不存在或无权删除")
+                        .data(false)
+                        .build();
+            }
+            log.info("删除会话历史 conversationId={} userId={} rows={}", conversationId, userId, deleted);
+            return Response.<Boolean>builder()
+                    .code(ResponseCode.SUCCESS.getCode())
+                    .info(ResponseCode.SUCCESS.getInfo())
+                    .data(true)
+                    .build();
+        } catch (Exception e) {
+            log.error("删除会话历史失败 conversationId={}", conversationId, e);
+            return Response.<Boolean>builder()
+                    .code(ResponseCode.UN_ERROR.getCode())
+                    .info(e.getMessage())
+                    .data(false)
                     .build();
         }
     }
@@ -367,6 +458,7 @@ public class AiAgentController implements IAiAgentService {
                 Map<String, Object> m = new java.util.HashMap<>();
                 m.put("id", r.getId());
                 m.put("messageType", r.getMessageType());
+                m.put("agentId", r.getAgentId());
                 // 展示点脱敏：DB 里存的是 USER + ASSISTANT 原文
                 m.put("content", PiiMasker.mask(r.getContent()));
                 m.put("createdAt", r.getCreatedAt() != null ? r.getCreatedAt().toString() : null);

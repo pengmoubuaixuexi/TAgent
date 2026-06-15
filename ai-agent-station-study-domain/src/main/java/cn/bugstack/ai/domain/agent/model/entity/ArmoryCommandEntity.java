@@ -11,7 +11,7 @@ import java.util.List;
 /**
  * 装配命令
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/6/27 07:26
  */
 @Data

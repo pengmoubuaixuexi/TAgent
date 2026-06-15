@@ -11,7 +11,7 @@ import java.io.Serializable;
 /**
  * 系统提示词配置查询请求 DTO
  *
- * @author TAgent
+ * @author bugstack虫洞栈
  * @description 系统提示词配置查询请求数据传输对象
  */
 @Data

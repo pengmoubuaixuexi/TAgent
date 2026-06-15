@@ -23,7 +23,7 @@ import java.util.stream.Collectors;
 /**
  * 知识库配置管理控制器
  *
- * @author TAgent
+ * @author bugstack虫洞栈
  * @description 知识库配置管理控制器
  */
 @Slf4j

@@ -60,7 +60,8 @@ public class PiiMaskerAdvisor implements BaseAdvisor {
         }
 
         return ChatClientRequest.builder()
-                .prompt(Prompt.builder().messages(sanitized).build())
+                // 透传 options，否则 per-request 动态工具回调会丢（见 LongTermMemoryAdvisor 同样修复）。
+                .prompt(Prompt.builder().messages(sanitized).chatOptions(request.prompt().getOptions()).build())
                 .context(request.context())
                 .build();
     }

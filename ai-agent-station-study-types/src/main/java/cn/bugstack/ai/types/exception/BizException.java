@@ -7,7 +7,7 @@ import java.io.Serial;
 
 /**
  * 业务异常
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/9/2 07:10
  */
 @EqualsAndHashCode(callSuper = true)

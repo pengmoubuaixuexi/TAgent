@@ -18,7 +18,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 /**
  * 以客户端串联，加载数据策略
  *
- * @author tagent bugstack.cn @TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/6/27 17:20
  */
 @Slf4j

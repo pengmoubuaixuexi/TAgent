@@ -119,6 +119,15 @@ public class BM25SearchService {
             payload.put("content", doc.getText());
             Object knowledge = doc.getMetadata().get("knowledge");
             if (knowledge != null) payload.put("knowledge", knowledge);
+            // H1 第 59 轮：把上传时的原始文件名/URL 也写入 ES，让 RagEvidenceEmitter
+            // 在 BM25 路径回收的 Document 上也能拿到可读 source（否则 RRF 融合时 BM25
+            // 先 putIfAbsent 占位，向量库带 source 的 Document 进不去，前端只能显示 UUID）
+            Object source = doc.getMetadata().get("source");
+            if (source != null) payload.put("source", source);
+            // 第 61 轮 Phase 2：把 LLM 生成的 parent title 也写入 ES，
+            // 让 BM25 路径回收的 child Document 直接带可读小标题（前端 source 优先级最高字段）
+            Object title = doc.getMetadata().get("title");
+            if (title != null) payload.put("title", title);
             // 多租户隔离：把上传时记录的 user_id 一并写入 ES，让 BM25 召回也能按用户过滤
             Object userId = doc.getMetadata().get("user_id");
             if (userId != null) payload.put("user_id", userId);
@@ -213,6 +222,11 @@ public class BM25SearchService {
                 String content = src.getString("content");
                 Map<String, Object> md = new HashMap<>();
                 if (src.containsKey("knowledge")) md.put("knowledge", src.getString("knowledge"));
+                // H1 第 59 轮：把 ES 里的 source 也回填到 Document.metadata，
+                // 让 RagEvidenceEmitter 能取到原始文件名（旧索引可能没有，所以 if 判一下）
+                if (src.containsKey("source")) md.put("source", src.getString("source"));
+                // 第 61 轮 Phase 2：透传 title（LLM 生成的精炼小标题），前端 source 优先级最高
+                if (src.containsKey("title")) md.put("title", src.getString("title"));
                 md.put("bm25_score", score);
                 return new Document(id, content, md);
             }).collect(Collectors.toList());

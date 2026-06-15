@@ -4,9 +4,9 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
  * 任务调度器配置属性
- * @author TAgent
+ * @author Fuzhengwei bugstack.cn @小傅哥
  */
-@ConfigurationProperties(prefix = "tagent.task.job", ignoreInvalidFields = true)
+@ConfigurationProperties(prefix = "xfg.wrench.task.job", ignoreInvalidFields = true)
 public class TaskJobAutoProperties {
 
     /** 是否启用任务调度器 */
@@ -16,7 +16,7 @@ public class TaskJobAutoProperties {
     private int poolSize = 10;
     
     /** 线程名称前缀 */
-    private String threadNamePrefix = "tagent-task-scheduler-";
+    private String threadNamePrefix = "xfg-task-scheduler-";
     
     /** 关闭时等待任务完成 */
     private boolean waitForTasksToCompleteOnShutdown = true;

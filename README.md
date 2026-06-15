@@ -1,152 +1,129 @@
 # TAgent
 
-TAgent 是一个基于 Spring Boot + DDD 分层的 AI 智能体学习平台，核心目标是把「模型调用、Agent 编排、MCP 工具、RAG 检索、记忆系统、观测与成本统计」串成一套可以本地运行、可以继续扩展的工程样例。
+TAgent 是一个基于 Spring Boot、Spring AI 和 DDD 分层构建的 AI Agent 工程实践项目。项目将模型调用、Agent 编排、MCP 工具、RAG、记忆、人工审批和可观测性组合为一套可本地运行、可继续扩展的智能体平台。
 
-本仓库是重新整理后的公开版本：已移除日志、临时报告、历史对话、个人文档、备份 SQL、浏览器状态、私有凭据和真实密钥。所有敏感配置都使用环境变量占位符。
+本仓库是脱敏后的公开版本：不包含运行日志、临时报告、历史对话、数据库备份、浏览器状态、个人文档或真实密钥。敏感配置统一通过环境变量注入。
 
-## 项目能力
+## 核心能力
 
-- Auto Agent：自动分析任务、规划步骤、调用工具、质量检查和总结输出。
-- Flow Agent：按固定步骤拆解任务，支持 DAG 并行执行。
-- RAG 检索：支持 PgVector 语义检索、Elasticsearch BM25、混合检索与 rerank。
-- 记忆系统：支持短期会话记忆、长期记忆、情节记忆和工作记忆扩展。
-- MCP 工具：支持 SSE 和 stdio 两类 MCP 工具接入。
-- 可观测性：支持日志结构化、Prometheus 指标、Grafana 看板、Jaeger Trace。
-- 安全增强：包含敏感工具审批、PII 脱敏、输出审核、幂等请求和限流能力。
+- 三种执行模式：Fixed 直接执行、Auto 自主分析与反思、Flow 规划后按 DAG 执行。
+- 运行时装配：Agent、模型、Prompt、Advisor、RAG 和 MCP 关系由数据库配置并支持热更新。
+- 动态工具补充：将 MCP 工具描述写入 PgVector，根据任务语义为已选 Agent 补充工具。
+- 工具约束：非执行步骤默认禁用工具，支持并行调用、串行轮次控制、重试、进度事件和结果证据。
+- 四层记忆：会话记忆、工作记忆、长期记忆和情节记忆，并提供摘要、去重、冲突处理与可解释证据。
+- Agentic RAG：支持查询改写、查询拆解、HyDE、向量与 BM25 混合检索、融合、rerank、父子文档和语义缓存。
+- 流式干预：执行中可发送“引导”让当前步骤纳入新想法并重做，也可“立即回答”结束剩余步骤并完成收尾。
+- 人机协同：高风险工具可通过 SSE 发起审批，用户批准或拒绝后继续执行。
+- 可观测性：结构化日志、Prometheus 指标、Grafana 页面、Jaeger Trace、LLM 成本和 MCP 调用观测。
+- 安全能力：Prompt Injection 检测、PII 脱敏、输出审核、限流、幂等和敏感工具控制。
 
-## 架构总览
+## 技术栈
 
-```mermaid
-flowchart TB
-    User["用户 / 前端页面"] --> Trigger["trigger 接口层"]
-    Trigger --> Domain["domain 领域层"]
-    Domain --> Router["策略路由 / 意图识别"]
-    Domain --> Memory["记忆系统"]
-    Domain --> Rag["RAG 检索"]
-    Domain --> Tool["MCP 工具调用"]
-    Domain --> LLM["LLM / Embedding / Rerank"]
-    Memory --> MySQL["MySQL"]
-    Memory --> Redis["Redis"]
-    Rag --> PgVector["PostgreSQL + pgvector"]
-    Rag --> ES["Elasticsearch"]
-    Tool --> MCP["MCP Servers"]
-    Trigger --> Observe["观测接口"]
-    Observe --> Grafana["Grafana / Prometheus / Jaeger"]
-```
+- Java 17
+- Spring Boot 3.4.3
+- Spring AI 1.1.7
+- MyBatis、MySQL
+- PostgreSQL + pgvector
+- Redis
+- Elasticsearch
+- MCP SSE / stdio
+- Resilience4j、Micrometer、Prometheus、Grafana、Jaeger
 
-## 模块说明
+## 模块
 
 | 模块 | 说明 |
 |---|---|
-| `ai-agent-station-study-api` | 对外接口、DTO、统一响应对象 |
-| `ai-agent-station-study-app` | Spring Boot 启动类、配置、静态页面、MyBatis 映射 |
-| `ai-agent-station-study-domain` | Agent 编排、执行策略、RAG、记忆、安全与路由逻辑 |
-| `ai-agent-station-study-infrastructure` | 数据访问、Repository、外部存储适配 |
-| `ai-agent-station-study-trigger` | HTTP Controller、任务触发、管理接口 |
-| `ai-agent-station-study-types` | 通用类型、异常、任务调度基础能力 |
-| `docs/dev-ops` | 本地部署、数据库脚本、观测组件和 MCP 配置样例 |
+| `ai-agent-station-study-api` | 对外接口、DTO 和统一响应 |
+| `ai-agent-station-study-app` | 启动入口、配置、静态页面和 MyBatis 映射 |
+| `ai-agent-station-study-domain` | Agent 编排、路由、执行、RAG、记忆、安全和工具逻辑 |
+| `ai-agent-station-study-infrastructure` | DAO、Repository、缓存和外部存储适配 |
+| `ai-agent-station-study-trigger` | HTTP Controller、任务触发和管理接口 |
+| `ai-agent-station-study-types` | 通用类型、异常和任务调度组件 |
+| `docs/dev-ops` | 部署文件、SQL 迁移、观测组件和 MCP 配置示例 |
 | `mcp-server-hmdp` / `mcp-servers` | MCP 服务示例 |
 
-## Auto Agent 执行流程
-
-```mermaid
-sequenceDiagram
-    participant U as 用户
-    participant C as AiAgentController
-    participant D as AgentDispatchService
-    participant R as UnifiedAgentRouter
-    participant A as AutoAgentExecuteStrategy
-    participant L as LLM
-    participant T as MCP Tools
-    participant M as Memory/RAG
-
-    U->>C: POST /api/v1/agent/auto_agent
-    C->>D: dispatch(agentId, message, sessionId)
-    D->>R: 判断意图和执行策略
-    R-->>D: auto / flow / fixed
-    D->>A: 执行 Auto Agent
-    A->>M: 读取上下文、记忆和检索结果
-    A->>L: Step1 分析任务
-    A->>L: Step2 规划执行
-    A->>T: 调用 MCP 工具
-    A->>L: Step3 质量检查
-    A->>L: Step4 总结输出
-    C-->>U: SSE 流式响应
-```
-
-## RAG 与记忆链路
+## 执行链路
 
 ```mermaid
 flowchart LR
-    Query["用户问题"] --> Rewrite["Query Rewrite"]
-    Rewrite --> Decide["RAG Router"]
-    Decide -->|需要检索| Hybrid["Hybrid Retriever"]
-    Decide -->|无需检索| Chat["直接进入对话"]
-    Hybrid --> Vector["PgVector 语义召回"]
-    Hybrid --> BM25["Elasticsearch BM25"]
-    Vector --> Rerank["Cross-Encoder / LLM Rerank"]
-    BM25 --> Rerank
-    Rerank --> Context["组装上下文"]
-    Context --> Agent["Agent 执行"]
-    Chat --> Agent
-    Agent --> Store["写入会话记忆 / 长期记忆 / 事件日志"]
+    User["用户请求"] --> Router["统一路由"]
+    Router --> Fixed["Fixed"]
+    Router --> Auto["Auto"]
+    Router --> Flow["Flow"]
+    Fixed --> Runtime["数据库驱动运行时"]
+    Auto --> Runtime
+    Flow --> Runtime
+    Runtime --> Memory["四层记忆"]
+    Runtime --> RAG["Agentic RAG"]
+    Runtime --> Tools["MCP 工具"]
+    Runtime --> LLM["LLM"]
+    User -->|"引导 steer"| Runtime
+    User -->|"立即回答 answer_now"| Finalize["模式收尾"]
+    Runtime --> Finalize
+    Finalize --> SSE["SSE 流式响应"]
 ```
 
-## 运行前准备
+Auto、Flow、Fixed 三种模式均已接入执行干预和统一收尾：
 
-请先启动外部依赖服务：
+- `steer`：保留已有进展，将用户补充的新想法加入当前步骤并重新执行，默认最多 3 轮。
+- `answer_now`：停止剩余规划，基于已有中间结果进入各模式的 finalize 流程。
+- 对支持关闭推理的模型，可通过 `agent.no-think.*` 注入对应请求参数。
 
-- MySQL：默认 `127.0.0.1:13306`
-- PostgreSQL + pgvector：默认 `127.0.0.1:15432`
-- Redis：默认 `127.0.0.1:16379`
-- Elasticsearch：默认 `127.0.0.1:9200`
-- Logstash：默认 `127.0.0.1:4560`
-- Jaeger OTLP：默认 `127.0.0.1:4318`
+## 准备环境
 
-敏感信息通过环境变量注入，不要写入仓库：
+默认本地依赖：
+
+- MySQL：`127.0.0.1:13306`
+- PostgreSQL + pgvector：`127.0.0.1:15432`
+- Redis：`127.0.0.1:16379`
+- Elasticsearch：`127.0.0.1:9200`
+- Logstash：`127.0.0.1:4560`
+- Jaeger OTLP：`127.0.0.1:4318`
+
+至少配置以下环境变量：
 
 ```bash
 LLM_API_KEY=your-llm-key
 EMBEDDING_API_KEY=your-embedding-key
-OPENAI_API_KEY=your-openai-compatible-key
+MYSQL_PASSWORD=your-mysql-password
+PGVECTOR_PASSWORD=your-postgres-password
+REDIS_ADMIN_USER=your-redis-admin-user
+REDIS_ADMIN_PASSWORD=your-redis-admin-password
+GRAFANA_DATABASE_PASSWORD=your-grafana-database-password
+LDAP_BIND_PASSWORD=your-ldap-bind-password
+```
+
+按需配置 MCP 凭据：
+
+```bash
 GITHUB_PERSONAL_ACCESS_TOKEN=your-github-token
 GRAFANA_API_KEY=your-grafana-key
 CSDN_API_COOKIE=your-csdn-cookie
 WEIXIN_API_APP_SECRET=your-weixin-secret
 ```
 
-## 本地构建
+数据库增量脚本位于 `docs/dev-ops/sql-migrations`。本次更新新增 `V037` 至 `V047`，包括父文档标题、Prompt 修正、MCP 工具目录、中文意图描述和工具向量表。
+
+## 构建与启动
 
 ```bash
 mvn "-Dmaven.test.skip=true" package
-```
-
-说明：项目内包含较多端到端测试和 MCP 验证测试，需要完整外部服务与私有账号环境。普通构建建议跳过测试；需要压测或验收时再单独运行指定测试类。
-
-## 本地启动
-
-```bash
 java -jar ai-agent-station-study-app/target/ai-agent-station-study-app.jar
 ```
 
-默认激活 `dev` 配置，服务端口为 `8099`。
+默认启用 `dev` 配置，服务端口为 `8099`。
 
-启动后可访问：
-
+- 首页：`http://localhost:8099/index.html`
+- Agent 配置：`http://localhost:8099/agent-config.html`
+- 系统观测：`http://localhost:8099/observe.html`
+- MCP 观测：`http://localhost:8099/observe-mcp.html`
 - 健康检查：`http://localhost:8099/actuator/health`
-- 前端页面：`http://localhost:8099/index.html`
-- Agent 配置页：`http://localhost:8099/agent-config.html`
-- 观测页：`http://localhost:8099/observe.html`
+
+项目包含依赖外部服务和私有账号环境的端到端测试。普通构建可跳过测试，验收时再运行对应测试类。
 
 ## 常用接口
 
-### 查询可用 Agent
-
-```http
-GET /api/v1/agent/query_available_agents
-```
-
-### Auto Agent 流式对话
+### 流式执行
 
 ```http
 POST /api/v1/agent/auto_agent
@@ -157,22 +134,71 @@ Accept: text/event-stream
 ```json
 {
   "aiAgentId": "3",
-  "message": "请总结一下当前系统的核心能力",
+  "message": "总结当前系统的核心能力",
   "sessionId": "session_demo_001",
   "maxStep": 5
 }
 ```
 
-响应使用 SSE 格式返回，前端可按 `data:` 行解析 JSON 内容。
+### 引导当前执行
+
+```http
+POST /api/v1/agent/steer
+Content-Type: application/json
+
+{
+  "sessionId": "session_demo_001",
+  "idea": "请重点从工程落地和风险控制角度分析"
+}
+```
+
+### 立即回答并收尾
+
+```http
+POST /api/v1/agent/answer_now
+Content-Type: application/json
+
+{
+  "sessionId": "session_demo_001"
+}
+```
+
+### 审批高风险工具
+
+```http
+POST /api/v1/agent/approval
+Content-Type: application/json
+
+{
+  "approvalId": "approval-id-from-sse",
+  "approved": true
+}
+```
+
+## 关键配置
+
+```yaml
+agent:
+  intervention:
+    enabled: true
+  steer:
+    enabled: true
+    max-rounds: 3
+  answer-now:
+    finalize-tools: true
+  mcp:
+    disable-tools-on-nonexec-steps: true
+    tool-call:
+      parallel-enabled: true
+      max-serial-rounds-per-client: 3
+  dynamic-tools:
+    infer-on-selected-agent: true
+    per-need-top-k: 2
+    max-extra-tools-per-request: 6
+```
 
 ## 安全说明
 
-公开仓库中不应包含：
+提交前请确认仓库中不包含真实 API Key、Access Token、Cookie、私钥、运行日志、个人对话、压测报告和数据库备份。公开配置应始终使用环境变量占位符。
 
-- 真实 API Key、Access Token、Cookie、私钥；
-- 本地 `.local-config`、IDE 配置、浏览器状态；
-- 运行日志、崩溃日志、压测报告；
-- 个人历史对话、面试资料、临时 Markdown；
-- 生产或个人数据库备份。
-
-本仓库已经按上述规则清理，后续提交前建议继续执行敏感信息扫描。
+更新记录见 [CHANGELOG.md](CHANGELOG.md)。

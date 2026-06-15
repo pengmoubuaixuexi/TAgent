@@ -18,7 +18,7 @@ import java.util.Map;
  * 默认绑定 Noop 实现（{@code agent.working-memory.enabled=false}）保证离线 / 无 Redis 环境零侵入；
  * 业务侧调用可无脑 put / get，不用判空。
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2026-04-26
  */
 public interface IWorkingMemoryService {

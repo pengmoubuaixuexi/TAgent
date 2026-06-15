@@ -50,15 +50,15 @@ public class LlmObservationRecorder {
                 ctx.getModel(),
                 "unknown");
         String stepName = firstNonBlank(ctx.getStepName(), "unknown_step");
-        String resolvedSessionId = firstNonBlank(ctx.getSessionId(), MDC.get("sessionId"), MDC.get("requestId"), "unknown-session");
         String billingScope = firstNonBlank(ctx.getBillingScope(), inferBillingScope(stepName));
+        String resolvedSessionId = resolveSessionBucket(ctx, stepName, billingScope);
         String resultText = firstNonBlank(ctx.getResultText(), extractResultText(response));
         boolean success = error == null && resultText != null && !resultText.isBlank();
 
         try {
-            llmMetrics.record(stepName, model, latencyMs, promptTokens, completionTokens, success);
+            llmMetrics.record(stepName, model, billingScope, latencyMs, promptTokens, completionTokens, success);
             if (cachedTokens > 0L) {
-                llmMetrics.recordCachedTokens(stepName, model, cachedTokens);
+                llmMetrics.recordCachedTokens(stepName, model, billingScope, cachedTokens);
             }
         } catch (Exception e) {
             log.debug("LLM metric record failed: {}", e.getMessage());
@@ -186,6 +186,53 @@ public class LlmObservationRecorder {
             case "unified_router", "rag_router", "query_decomposer", "query_rewriter",
                  "memory_extractor", "summarizer", "reranker" -> BILLING_SCOPE_SYSTEM_OVERHEAD;
             default -> BILLING_SCOPE_USER_CHARGEABLE;
+        };
+    }
+
+    /**
+     * 观测页的"sessionId 维度"既要看真实会话，也要能看清没有会话上下文的系统级 LLM 开销。
+     * <p>
+     * 有真实 sessionId 时保留真实会话；没有 sessionId 且属于系统开销时，按路由/检索/记忆等系统用途分桶，
+     * 避免所有后台调用都堆到 unknown-session，导致看不出到底是哪类隐形调用在消耗 token。
+     */
+    private static String resolveSessionBucket(LlmCallContext ctx, String stepName, String billingScope) {
+        String sessionId = firstNonBlank(
+                ctx != null ? ctx.getSessionId() : null,
+                MDC.get("sessionId"));
+        if (sessionId != null) {
+            return sessionId;
+        }
+
+        String systemBucket = systemBucketFor(stepName, billingScope);
+        if (systemBucket != null) {
+            return systemBucket;
+        }
+
+        return firstNonBlank(MDC.get("requestId"), "unknown-session");
+    }
+
+    private static String systemBucketFor(String stepName, String billingScope) {
+        if (!BILLING_SCOPE_SYSTEM_OVERHEAD.equals(billingScope)) {
+            return null;
+        }
+        if (stepName == null || stepName.isBlank()) {
+            return "system:overhead";
+        }
+        return switch (stepName) {
+            case "unified_router" -> "system:intent-router";
+            case "rag_router" -> "system:rag-router";
+            case "query_decomposer" -> "system:rag-query-decomposer";
+            case "query_rewriter" -> "system:rag-query-rewriter";
+            case "reranker" -> "system:rag-reranker";
+            case "memory_extractor" -> "system:memory-extractor";
+            case "summarizer" -> "system:memory-summarizer";
+            default -> {
+                String lower = stepName.toLowerCase();
+                if (lower.contains("router")) yield "system:router";
+                if (lower.contains("rag") || lower.contains("query_")) yield "system:rag";
+                if (lower.contains("memory") || lower.contains("summar")) yield "system:memory";
+                yield "system:overhead";
+            }
         };
     }
 

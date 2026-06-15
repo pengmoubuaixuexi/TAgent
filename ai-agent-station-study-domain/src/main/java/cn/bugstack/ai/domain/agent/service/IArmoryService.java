@@ -6,7 +6,7 @@ import java.util.List;
 
 /**
  * 装配接口
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/10/3 12:48
  */
 public interface IArmoryService {

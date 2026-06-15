@@ -8,7 +8,7 @@ import lombok.NoArgsConstructor;
 /**
  * AutoAgent 执行结果实体
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  */
 @Data
 @Builder

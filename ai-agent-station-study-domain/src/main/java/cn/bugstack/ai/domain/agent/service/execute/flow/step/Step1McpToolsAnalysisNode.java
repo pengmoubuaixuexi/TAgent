@@ -6,18 +6,22 @@ import cn.bugstack.ai.domain.agent.model.valobj.AiAgentClientFlowConfigVO;
 import cn.bugstack.ai.domain.agent.model.valobj.enums.AiClientTypeEnumVO;
 import cn.bugstack.ai.domain.agent.service.execute.flow.step.factory.DefaultFlowAgentExecuteStrategyFactory;
 import cn.bugstack.ai.domain.agent.service.router.AgentToolRegistry;
+import cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService;
 import cn.bugstack.ai.types.exception.BizException;
 import cn.bugstack.wrench.design.framework.tree.StrategyHandler;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.prompt.ChatOptions;
+import org.springframework.ai.tool.ToolCallback;
 import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.Set;
 
 /**
  * 步骤1：MCP工具能力分析节点
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/8/25 09:56
  */
 @Slf4j
@@ -31,9 +35,15 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
     @Resource
     private AgentToolRegistry agentToolRegistry;
 
+    @Resource
+    private McpToolCatalogService mcpToolCatalogService;
+
     @Override
     protected String doApply(ExecuteCommandEntity requestParameter, DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext) throws Exception {
         checkCancelled(dynamicContext);
+        // 立即回答：跳过分析，直接跳 Step4 整合作答
+        String __finalize = checkFinalizeRoute(requestParameter, dynamicContext);
+        if (__finalize != null) return __finalize;
         log.info("\n--- 步骤1: MCP工具能力分析（仅分析阶段，不执行用户请求） ---");
 
         // 获取配置信息
@@ -51,11 +61,16 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
         AiAgentClientFlowConfigVO executorConfig = dynamicContext.getAiAgentClientFlowConfigVOMap()
                 .get(AiClientTypeEnumVO.EXECUTOR_CLIENT.getCode());
         String executorClientId = executorConfig != null ? executorConfig.getClientId() : aiAgentClientFlowConfigVO.getClientId();
-        String toolListBlock = agentToolRegistry.describeToolsForPrompt(executorClientId);
+        List<ToolCallback> dynamicToolCallbacks = mcpToolCatalogService.resolveDynamicToolCallbacks(executorClientId,
+                requestParameter.getDynamicMissingToolDesc(), requestParameter.getMessage(),
+                agentToolRegistry != null ? agentToolRegistry.getTools(executorClientId) : List.of());
+        String toolListBlock = agentToolRegistry.describeToolsForPrompt(executorClientId, dynamicToolCallbacks);
         log.info("[Step1] inject tools for executor clientId={} hasTools={}",
                 executorClientId, agentToolRegistry.hasAnyTools(executorClientId));
 
-        String mcpAnalysisPrompt = String.format(
+        // 引导感知：本步 prompt 包成 Supplier，每轮按最新 currentTask 重建（引导后 currentTask 已折入引导，修复"重跑仍用原始询问"）
+        final String toolListBlockForPrompt = toolListBlock;
+        java.util.function.Supplier<String> mcpAnalysisPromptSupplier = () -> appendCurrentTimeContext(String.format(
                 """
                         # MCP工具能力分析任务
 
@@ -88,17 +103,30 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
                         - 提醒执行阶段（Step4）：禁止虚构工具调用过程
 
                         请基于上面给出的真实工具列表进行分析，禁止编造工具。""",
-                toolListBlock,
+                toolListBlockForPrompt,
                 dynamicContext.getCurrentTask()
-        );
-        mcpAnalysisPrompt = mcpAnalysisPrompt + githubRepositorySearchGuidance();
+        ));
 
         // 2026-05-07 流式 UX：step_start → 流式 token → step_end（折叠为"MCP 工具分析 已完成"）
-        ChatClient.ChatClientRequestSpec spec1 = mcpToolsChatClient.prompt().user(mcpAnalysisPrompt);
-        if (step1MaxTokens > 0) spec1 = spec1.options(ChatOptions.builder().maxTokens(step1MaxTokens).build());
-        String mcpToolsAnalysis = callStepWithStreaming(
-                spec1, dynamicContext, "flow_step1_mcp_tools_analysis", "MCP 工具分析",
-                mcpAnalysisPrompt, requestParameter.getSessionId());
+        org.springframework.ai.openai.OpenAiChatOptions.Builder step1OptionsBuilder =
+                org.springframework.ai.openai.OpenAiChatOptions.builder();
+        if (step1MaxTokens > 0) {
+            step1OptionsBuilder.maxTokens(step1MaxTokens);
+        }
+        if (!dynamicToolCallbacks.isEmpty()) {
+            step1OptionsBuilder.toolCallbacks(toRequestToolCallbacks(executorClientId, dynamicToolCallbacks));
+        }
+        final org.springframework.ai.openai.OpenAiChatOptions step1Opts = step1OptionsBuilder.build();
+        final ChatClient step1Client = mcpToolsChatClient;
+        // V041：把干净的用户问题传给 RAG/LTM advisor，避免它们拿整段工程化 prompt(工具目录+分析模板)做路由/检索
+        // 引导回复：被打断则折入新想法重做本步（思考不关、工具不变）；basePrompt 用 Supplier 每轮重建，
+        // RAG/LTM query 用 steerAwareRetrievalQuery 每轮实时取 currentTask（引导后即按新任务检索）
+        String mcpToolsAnalysis = callStepWithSteer(
+                p -> step1Client.prompt().user(p)
+                        .options(step1Opts)
+                        .advisors(a -> a.param(LTM_RETRIEVAL_QUERY_KEY, steerAwareRetrievalQuery(dynamicContext, requestParameter))),
+                dynamicContext, "flow_step1_mcp_tools_analysis", "MCP 工具分析",
+                mcpAnalysisPromptSupplier, requestParameter.getSessionId());
         
         log.info("MCP工具分析结果（仅分析，未执行实际操作）: {}", mcpToolsAnalysis);
 
@@ -120,7 +148,8 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
         
         // 更新步骤
         dynamicContext.setStep(dynamicContext.getStep() + 1);
-        
+
+        recordTransition("flow_step1_mcp_analysis", dynamicContext);
         return router(requestParameter, dynamicContext);
     }
 

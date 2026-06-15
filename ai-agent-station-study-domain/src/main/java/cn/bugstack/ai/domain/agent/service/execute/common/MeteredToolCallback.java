@@ -1,5 +1,6 @@
 package cn.bugstack.ai.domain.agent.service.execute.common;
 
+import cn.bugstack.ai.domain.agent.service.security.HumanApprovalGate;
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
@@ -29,6 +30,15 @@ public class MeteredToolCallback implements ToolCallback {
     private static final int GITHUB_SEARCH_MAX_DESCRIPTION_CHARS = 320;
 
     private final AtomicReference<ToolCallback> delegate;
+    /**
+     * T10 修复：构造时缓存（含 hint 的）ToolDefinition。
+     * <p>运行期 delegate 会被 {@link #refreshDelegateFromRegistry} / 重连切换成 registry 里的 raw callback，
+     * 而 T10 的 prompt hint 只活在 description 里。若 {@link #getToolDefinition()} 实时读 delegate，
+     * 切到 raw 后 hint 就丢了（LLM 之后看不到避坑提示，又开始填错参数）。工具 name/inputSchema/hint
+     * 跨重连都稳定，故构造时缓存一次、恒返回它，让「LLM 看到的 schema（稳定含 hint）」与
+     * 「执行用哪条连接（可切换）」解耦。
+     */
+    private final ToolDefinition cachedDefinition;
     private final McpToolMetrics metrics;
     private final boolean returnErrorOnFailure;
     private final boolean githubWriteEnabled;
@@ -40,6 +50,45 @@ public class MeteredToolCallback implements ToolCallback {
     private final long mcpToolCallRetryDelayMs;
     private final McpClientRegistry registry;
     private final String mcpId;
+
+    /**
+     * G1-C：Human Approval Gate（可选）。用 setter 注入避免改 6 层构造函数链。
+     * <p>
+     * 为 null → no-op 放行；非 null 才在 {@link #invoke} 前调 {@code requestApproval}。
+     * 装配点（AiClientModelNode / AiClientNode）在 new 实例后调 {@link #setHumanApprovalGate} 注入。
+     */
+    private volatile HumanApprovalGate humanApprovalGate;
+
+    public void setHumanApprovalGate(HumanApprovalGate gate) {
+        this.humanApprovalGate = gate;
+    }
+
+    /**
+     * H3-A：流式工具调用进度 emitter（可选）。setter 注入同 humanApprovalGate 模式。
+     * 为 null → 不 emit 进度事件，工具调用行为完全不变。
+     */
+    private volatile ToolCallProgressEmitter toolCallProgressEmitter;
+
+    public void setToolCallProgressEmitter(ToolCallProgressEmitter emitter) {
+        this.toolCallProgressEmitter = emitter;
+    }
+
+    /** H3-A：工具调用进度 SSE 的 status 枚举。 */
+    private static final String STATUS_SUCCESS = "success";
+    private static final String STATUS_BLOCKED = "blocked";
+    private static final String STATUS_APPROVAL_DENIED = "approval_denied";
+    private static final String STATUS_APPROVAL_TIMEOUT = "approval_timeout";
+    private static final String STATUS_APPROVAL_UNAVAILABLE = "approval_unavailable";
+    private static final String STATUS_ERROR = "error";
+
+    private static String approvalDecisionToStatus(HumanApprovalGate.Decision decision) {
+        return switch (decision) {
+            case REJECTED -> STATUS_APPROVAL_DENIED;
+            case TIMEOUT -> STATUS_APPROVAL_TIMEOUT;
+            case APPROVAL_UNAVAILABLE -> STATUS_APPROVAL_UNAVAILABLE;
+            default -> STATUS_SUCCESS;
+        };
+    }
 
     public MeteredToolCallback(ToolCallback delegate, McpToolMetrics metrics) {
         this(delegate, metrics, false);
@@ -92,6 +141,7 @@ public class MeteredToolCallback implements ToolCallback {
                                int mcpToolCallMaxAttempts, long mcpToolCallRetryDelayMs,
                                McpClientRegistry registry, String mcpId) {
         this.delegate = new AtomicReference<>(delegate);
+        this.cachedDefinition = captureDefinition(delegate);
         this.metrics = metrics;
         this.returnErrorOnFailure = returnErrorOnFailure;
         this.githubWriteEnabled = githubWriteEnabled;
@@ -105,9 +155,18 @@ public class MeteredToolCallback implements ToolCallback {
         this.mcpId = mcpId;
     }
 
+    /** 恒返回构造时缓存的（含 hint）定义；delegate 切到 raw 不影响 LLM 看到的 description（见 {@link #cachedDefinition}）。 */
     @Override
     public ToolDefinition getToolDefinition() {
-        return delegate.get().getToolDefinition();
+        return cachedDefinition != null ? cachedDefinition : delegate.get().getToolDefinition();
+    }
+
+    private static ToolDefinition captureDefinition(ToolCallback delegate) {
+        try {
+            return delegate != null ? delegate.getToolDefinition() : null;
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     @Override
@@ -119,17 +178,65 @@ public class MeteredToolCallback implements ToolCallback {
     public String call(String toolInput) {
         String name = safeName();
         String effectiveInput = normalizeToolInput(name, toolInput);
-        return invoke(name, toolInput, effectiveInput, () -> delegate.get().call(effectiveInput));
+        return invoke(name, toolInput, effectiveInput, resolveSessionId(null), resolveStepLabel(null),
+                () -> delegate.get().call(effectiveInput));
     }
 
     @Override
     public String call(String toolInput, ToolContext toolContext) {
         String name = safeName();
         String effectiveInput = normalizeToolInput(name, toolInput);
-        return invoke(name, toolInput, effectiveInput, () -> delegate.get().call(effectiveInput, toolContext));
+        return invoke(name, toolInput, effectiveInput, resolveSessionId(toolContext), resolveStepLabel(toolContext),
+                () -> delegate.get().call(effectiveInput, toolContext));
     }
 
-    private String invoke(String name, String originalInput, String effectiveInput, Invocation inv) {
+    /**
+     * 解析当前调用的 sessionId。
+     * <p>
+     * 工具调用常跑在 Reactor 流式线程 / DAG 池线程上，MDC（ThreadLocal）拿不到 sessionId
+     * （项目未开 {@code Hooks.enableAutomaticContextPropagation()}）。因此**优先从 {@link ToolContext}
+     * 读**——它是方法参数，跨任何线程模型都带得过来；调用方在 {@code spec.toolContext(Map.of("sessionId", ...))}
+     * 注入。MDC 仅作单线程同步场景的兜底。
+     * <p>
+     * sessionId 拿不到会让人工审批门退化为 {@code APPROVAL_UNAVAILABLE}（查不到 SSE 通道），高危工具被静默放行/拦截，
+     * 这正是审批弹窗不出现的根因，故这里必须可靠。
+     */
+    private String resolveSessionId(ToolContext toolContext) {
+        String fromCtx = readContext(toolContext, "sessionId");
+        String resolved = fromCtx != null ? fromCtx : MDC.get("sessionId");
+        if (resolved == null) {
+            // 定向诊断：sessionId 解析失败时打出 toolContext 实际 key，避免再盲猜
+            // （区分 toolContext 为 null / 空 / key 不符 / 走了无 context 的 call 重载）
+            String keys = (toolContext == null) ? "NO_TOOLCONTEXT(call without context)"
+                    : (toolContext.getContext() == null ? "CTX_MAP_NULL" : String.valueOf(toolContext.getContext().keySet()));
+            log.warn("[MeteredToolCallback] sessionId resolve = null; toolContext keys={}, mdcSession={}", keys, MDC.get("sessionId"));
+        }
+        return resolved;
+    }
+
+    /**
+     * 解析"这次工具调用属于哪个步骤"的人类可读标签（如"精准执行"）。
+     * <p>
+     * DAG 并行执行时多个步骤会同时发起高危工具审批，前端要靠这个标签区分"是哪个步骤要的许可"。
+     * 同 sessionId，优先 ToolContext（调用方注入 {@code stepLabel}），MDC.get("step") 兜底，都没有返 null。
+     */
+    private String resolveStepLabel(ToolContext toolContext) {
+        String fromCtx = readContext(toolContext, "stepLabel");
+        return fromCtx != null ? fromCtx : MDC.get("step");
+    }
+
+    private String readContext(ToolContext toolContext, String key) {
+        if (toolContext != null && toolContext.getContext() != null) {
+            Object v = toolContext.getContext().get(key);
+            if (v != null && !String.valueOf(v).isBlank()) {
+                return String.valueOf(v);
+            }
+        }
+        return null;
+    }
+
+    private String invoke(String name, String originalInput, String effectiveInput,
+                          String sessionId, String stepLabel, Invocation inv) {
         long start = System.currentTimeMillis();
         boolean success = false;
         RuntimeException failure = null;
@@ -138,40 +245,102 @@ public class MeteredToolCallback implements ToolCallback {
         int inputChars = effectiveInput == null ? 0 : effectiveInput.length();
         boolean inputChanged = !stringEquals(originalInput, effectiveInput);
         boolean resultLimited = false;
+        if (inputChanged) {
+            String kind = normalizeKindFor(name);
+            if (kind != null) {
+                metrics.recordNormalizeApplied(name, kind);
+            }
+        }
+        // H3-A：sessionId 已在 call() 入口经 resolveSessionId(toolContext) 解析（ToolContext 优先、MDC 兜底），
+        // 不再直接读 MDC——流式/DAG 线程上 MDC 为空会让进度事件和审批门一起失效。null/blank → emitter 内部跳过。
+        ToolCallProgressEmitter progress = this.toolCallProgressEmitter;
+        if (progress != null) {
+            progress.emitStart(sessionId, name, effectiveInput, stepLabel);
+        }
+        // H3-A：finally 阶段用此字段决定 emit end 的 status；catch 改写为 error。
+        String progressStatus = STATUS_SUCCESS;
+        // 2026-05-20：把 rawResult 提到 finally 之外，让 ES trace 拿到未经 normalize/truncate 的真实响应
+        String rawResultForTrace = null;
         try {
             if (isBlockedGithubWriteTool(name)) {
                 String result = toolBlockedResult(name);
                 rawResultChars = result.length();
                 returnedResultChars = result.length();
+                rawResultForTrace = result;
                 success = true;
+                progressStatus = STATUS_BLOCKED;
                 return result;
             }
 
-            String rawResult = runInvocation(name, inv);
+            // G1-C：高风险工具人工审批 hook。gate==null 时 no-op 放行（保护机制），
+            // 装配点未注入 gate 不应影响现有 agent 运行。审批拒绝/超时/通道缺失 → 结构化错误返 LLM 不抛异常，
+            // Agent 流程继续，LLM 可据此说明原因或换路径。
+            HumanApprovalGate gate = this.humanApprovalGate;
+            if (gate != null && gate.isEnabled()
+                    && gate.getHighRiskToolRegistry() != null
+                    && gate.getHighRiskToolRegistry().isHighRisk(name)) {
+                HumanApprovalGate.Decision decision = gate.requestApproval(sessionId, name, effectiveInput, stepLabel);
+                if (decision != HumanApprovalGate.Decision.APPROVED) {
+                    metrics.recordApprovalDenied(name, decision.name());
+                    String result = toolApprovalResult(name, decision);
+                    log.info("mcp.tool.approval.result tool={} decision={} result={}", name, decision.name(), result);
+                    rawResultChars = result.length();
+                    returnedResultChars = result.length();
+                    rawResultForTrace = result;
+                    success = true; // 业务侧"拒绝"不是错误，仍记 OK 让 latency/count 正常
+                    progressStatus = approvalDecisionToStatus(decision);
+                    return result;
+                }
+            }
+
+            // 方案A：同 mcpId 串行，防并行 step 并发写同一条 MCP 连接（高德 400 "Sending message failed"）
+            String rawResult;
+            java.util.concurrent.locks.ReentrantLock sendLock =
+                    (mcpId != null && !mcpId.isBlank()) ? mcpSendLock(mcpId) : null;
+            if (sendLock != null) sendLock.lock();
+            try {
+                refreshDelegateFromRegistry(name);
+                rawResult = runInvocation(name, inv);
+            } finally {
+                if (sendLock != null) sendLock.unlock();
+            }
             rawResultChars = rawResult == null ? 0 : rawResult.length();
+            rawResultForTrace = rawResult;
             String result = normalizeToolResult(name, rawResult);
             returnedResultChars = result == null ? 0 : result.length();
             resultLimited = returnedResultChars != rawResultChars;
             success = true;
+            progressStatus = STATUS_SUCCESS;
             return result;
         } catch (RuntimeException e) {
             failure = e;
             metrics.recordError(name, e);
+            progressStatus = STATUS_ERROR;
             if (returnErrorOnFailure) {
                 String result = toolErrorResult(name, e);
                 rawResultChars = result.length();
                 returnedResultChars = result.length();
+                rawResultForTrace = result;
                 return result;
             }
             throw e;
         } finally {
             long latency = System.currentTimeMillis() - start;
             metrics.recordCall(name, latency, success);
+            if (rawResultChars >= 0) {
+                metrics.recordResultSize(name, rawResultChars, resultLimited);
+            }
             MDC.put("toolName", name);
             MDC.put("toolLatencyMs", String.valueOf(latency));
             MDC.put("toolInputChars", String.valueOf(inputChars));
             MDC.put("toolRawResultChars", String.valueOf(rawResultChars));
             MDC.put("toolResultChars", String.valueOf(returnedResultChars));
+            // 2026-05-20：把工具调用的完整 input/output 也写到 MDC，让 Logstash 推 ES
+            //   - toolInputFull   = normalize 后真实发给 MCP server 的入参（含 page/perPage 修正、precision 修正等）
+            //   - toolResultFull  = MCP server 原始返回（未经 normalize/truncate）
+            // 两个字段都带尺寸上限：单条 ES doc 单字段约 ≤8KB，避免 GitHub search 等巨型响应撑爆 mapping
+            MDC.put("toolInputFull", abbrevForMdc(effectiveInput, 4_000));
+            MDC.put("toolResultFull", abbrevForMdc(rawResultForTrace, 8_000));
             try {
                 if (success) {
                     log.info("mcp.tool.call OK tool={} latencyMs={} inputChars={} rawResultChars={} returnedResultChars={} resultLimited={} inputChanged={}",
@@ -190,41 +359,98 @@ public class MeteredToolCallback implements ToolCallback {
                 MDC.remove("toolInputChars");
                 MDC.remove("toolRawResultChars");
                 MDC.remove("toolResultChars");
+                MDC.remove("toolInputFull");
+                MDC.remove("toolResultFull");
             }
+            // H3-A：emit 进度终态事件。放在 MDC 清理之后避免 emit 失败影响 MDC；
+            // emitter 内部对 null sessionId / null emitter / 序列化异常都吞掉，不影响调用方。
+            if (progress != null) {
+                if (STATUS_ERROR.equals(progressStatus)) {
+                    progress.emitError(sessionId, name, summarizeFailure(failure), latency, stepLabel);
+                } else {
+                    progress.emitEnd(sessionId, name, progressStatus, latency,
+                            returnedResultChars >= 0 ? returnedResultChars : 0, stepLabel);
+                }
+            }
+        }
+    }
+
+    /**
+     * 方案A：同一个 MCP server（mcpId）的工具调用进程级串行。一条 MCP（SSE）连接同时只能有 1 个在途请求，
+     * flow plan-dag 把 step1/step2 并行跑时，两个执行器各自调同一 server 会并发写同一条连接 →
+     * 高德返 400「Sending message failed」。按 mcpId 各加一把锁串行化；不同 mcpId 各自一把、互不阻塞。
+     * <p>RobustToolCallingManager 的 mcpId 分组只挡「单 step 内一批并行工具」，挡不住「两个并行 step 各自调同一 server」，
+     * 这把锁补的就是跨 step 那一层。
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.locks.ReentrantLock> MCP_SEND_LOCKS =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static java.util.concurrent.locks.ReentrantLock mcpSendLock(String mcpId) {
+        return MCP_SEND_LOCKS.computeIfAbsent(mcpId, k -> new java.util.concurrent.locks.ReentrantLock());
+    }
+
+    private void refreshDelegateFromRegistry(String name) {
+        if (registry == null || name == null || name.isBlank()) {
+            return;
+        }
+        ToolCallback current = registry.getCurrentCallback(name);
+        if (current != null && current != delegate.get()) {
+            delegate.set(current);
+            log.debug("mcp.tool.call REFRESH_DELEGATE tool={} mcpId={}", name, mcpId);
         }
     }
 
     private String runInvocation(String name, Invocation inv) {
         int maxAttempts = mcpToolCallMaxAttempts;
+        boolean firstAttemptFailed = false;
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
                 String result = inv.run();
+                if (firstAttemptFailed) {
+                    metrics.recordRecovered(name, "retry");
+                }
                 // 调用成功，记录时间戳（用于冷连接探活判断）
                 if (registry != null && mcpId != null) {
                     registry.recordSuccess(mcpId);
                 }
                 return result;
             } catch (RuntimeException e) {
-                // 超时 → 探活判断：连接活着先重试，连接死了才重建
-                // MCP SDK 0.10.0 bug: sendMessage 收到 400 时只打日志不抛异常，
-                // 导致 message endpoint 失效但 SSE 流仍活着。probe alive 不代表一定可用，
-                // 但可以先重试一次（省掉重建开销），重试失败再重建。
+                if (attempt == 1 && !firstAttemptFailed) {
+                    firstAttemptFailed = true;
+                    metrics.recordFirstAttemptFailure(name, classifyInitialFailure(e));
+                }
+                // 超时 → 探活判断：连接活着先重试，连接死了才重建。
+                // 历史背景：MCP SDK 0.10.0 时 sendMessage 收到 400「只打日志不抛异常」，message endpoint
+                // 失效但 SSE 流仍活着，只能靠「下一次调用超时 + 探活」间接发现——这套探活兜底就是为它写的。
+                // 1.1.0(mcp 0.16.0)起 400 会直接抛 ToolExecutionException（已在 isDeadClientError 归类重建），
+                // 所以本超时分支现在主要兜「工具真的慢」的 TimeoutException：探活活着=慢服务先重试，探活死了才重建。
                 if (isTimeoutError(e) && registry != null) {
                     boolean alive = registry.probeAfterTimeout(name);
+                    metrics.recordTimeoutProbe(name, alive);
                     if (alive) {
                         // 连接活着（可能是工具确实慢），先用当前连接重试一次
                         log.info("mcp.tool.call TIMEOUT_BUT_ALIVE tool={} attempt={}/{}, retrying with current connection", name, attempt, maxAttempts);
                         try {
-                            return inv.run();
+                            String result = inv.run();
+                            metrics.recordRecovered(name, "timeout_probe_alive_retry");
+                            if (mcpId != null) {
+                                registry.recordSuccess(mcpId);
+                            }
+                            return result;
                         } catch (RuntimeException retryEx) {
-                            // 重试也失败了，需要重建连接
-                            log.warn("mcp.tool.call RETRY_FAILED_AFTER_PROBE_ALIVE tool={}, will force reconnect", name);
-                            ToolCallback fresh = registry.forceReconnect(name);
+                            // 重试也失败了，需要按 timeout 自愈路径重建连接
+                            log.warn("mcp.tool.call RETRY_FAILED_AFTER_PROBE_ALIVE tool={}, will reconnect after timeout", name);
+                            ToolCallback fresh = registry.reconnectAfterTimeout(name);
                             if (fresh != null) {
                                 delegate.set(fresh);
                                 log.info("mcp.tool.call RECONNECTED_AFTER_TIMEOUT tool={}", name);
                                 try {
-                                    return inv.run();
+                                    String result = inv.run();
+                                    metrics.recordRecovered(name, "timeout_probe_alive_reconnect");
+                                    if (mcpId != null) {
+                                        registry.recordSuccess(mcpId);
+                                    }
+                                    return result;
                                 } catch (RuntimeException e3) {
                                     log.warn("mcp.tool.call RETRY_AFTER_RECONNECT tool={} error={}", name, summarizeFailure(e3));
                                     throw e3;
@@ -235,12 +461,17 @@ public class MeteredToolCallback implements ToolCallback {
                     } else {
                         // 连接已死，直接重建
                         log.warn("mcp.tool.call TIMEOUT_DEAD tool={} attempt={}/{}", name, attempt, maxAttempts);
-                        ToolCallback fresh = registry.forceReconnect(name);
+                        ToolCallback fresh = registry.reconnectAfterTimeout(name);
                         if (fresh != null) {
                             delegate.set(fresh);
                             log.info("mcp.tool.call RECONNECTED_AFTER_TIMEOUT tool={}", name);
                             try {
-                                return inv.run();
+                                String result = inv.run();
+                                metrics.recordRecovered(name, "timeout_probe_dead_reconnect");
+                                if (mcpId != null) {
+                                    registry.recordSuccess(mcpId);
+                                }
+                                return result;
                             } catch (RuntimeException e2) {
                                 log.warn("mcp.tool.call RETRY_AFTER_RECONNECT tool={} error={}", name, summarizeFailure(e2));
                                 throw e2;
@@ -249,16 +480,21 @@ public class MeteredToolCallback implements ToolCallback {
                         throw e;
                     }
                 }
-                // 死客户端（非超时类，如 Connection reset） → 尝试重建
+                // 死客户端（非超时类，如 Connection reset / 400 发送失败） → 直接重建当前 mcpId，并用新 callback 重试一次。
                 if (isDeadClientError(e) && registry != null) {
                     log.warn("mcp.tool.call DEAD_CLIENT tool={} attempt={}/{} error={}",
                             name, attempt, maxAttempts, summarizeFailure(e));
-                    ToolCallback fresh = registry.getFreshCallback(name);
+                    ToolCallback fresh = registry.forceReconnect(name);
                     if (fresh != null) {
                         delegate.set(fresh);
                         log.info("mcp.tool.call RECONNECTED tool={}, retrying with fresh delegate", name);
                         try {
-                            return inv.run();
+                            String result = inv.run();
+                            metrics.recordRecovered(name, "dead_client_reconnect");
+                            if (mcpId != null) {
+                                registry.recordSuccess(mcpId);
+                            }
+                            return result;
                         } catch (RuntimeException e2) {
                             log.warn("mcp.tool.call RETRY_AFTER_RECONNECT tool={} error={}", name, summarizeFailure(e2));
                             throw e2;
@@ -270,6 +506,7 @@ public class MeteredToolCallback implements ToolCallback {
                 if (attempt < maxAttempts && isRetryableMcpError(e)) {
                     log.warn("mcp.tool.call RETRY tool={} attempt={}/{} error={}",
                             name, attempt, maxAttempts, summarizeFailure(e));
+                    metrics.recordRetry(name, attempt);
                     try { Thread.sleep(mcpToolCallRetryDelayMs * attempt); } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                         throw e;
@@ -531,6 +768,14 @@ public class MeteredToolCallback implements ToolCallback {
         return name != null && !name.isBlank() && name.toLowerCase().contains("aisearch");
     }
 
+    /** 给 metric 用的 normalize 类别标签；null 表示该工具不触发 normalize 路径。 */
+    private String normalizeKindFor(String name) {
+        if (isGithubRepositorySearchTool(name)) return "github_per_page";
+        if (isCalculateTool(name)) return "calculate_precision";
+        if (aiSearchStripServerLlm && isAiSearchTool(name)) return "aisearch_strip";
+        return null;
+    }
+
     private String normalizeAiSearchInput(String toolInput) {
         try {
             JSONObject obj = JSON.parseObject(toolInput);
@@ -542,6 +787,20 @@ public class MeteredToolCallback implements ToolCallback {
             log.debug("aisearch input normalize skipped, input={}", abbreviateForLog(toolInput, 400));
             return toolInput;
         }
+    }
+
+    /**
+     * 给 MDC（→ ES）用的截断 helper。比 {@link #abbreviateForLog} 区别：
+     * 不做 \r\n\t 转义（让 Logstash 自己用 JSON string 编码处理），但同样把换行字面化成 \n
+     * 避免 plain text appender 把单条日志拆成多行。
+     */
+    private static String abbrevForMdc(String value, int maxChars) {
+        if (value == null || value.isEmpty()) return "";
+        String s = value;
+        if (s.length() > maxChars) {
+            s = s.substring(0, maxChars) + "...(truncated, full=" + value.length() + ")";
+        }
+        return s.replace("\r", "").replace("\n", "\\n");
     }
 
     private String abbreviateForLog(String value, int maxChars) {
@@ -567,6 +826,19 @@ public class MeteredToolCallback implements ToolCallback {
             message = e.getClass().getSimpleName();
         }
         return e.getClass().getSimpleName() + ": " + message;
+    }
+
+    private String classifyInitialFailure(RuntimeException e) {
+        if (isTimeoutError(e)) {
+            return "timeout";
+        }
+        if (isDeadClientError(e)) {
+            return "dead_client";
+        }
+        if (isRetryableMcpError(e)) {
+            return "retryable";
+        }
+        return e == null ? "unknown" : e.getClass().getSimpleName();
     }
 
     /** 判断异常是否为超时（需探活区分慢服务 vs 死连接） */
@@ -597,7 +869,14 @@ public class MeteredToolCallback implements ToolCallback {
                     || msg.contains("connection pool shut down")
                     || msg.contains("Session expired")
                     || msg.contains("No message endpoint")
-                    || msg.contains("Failed to wait for the message endpoint"))) {
+                    || msg.contains("Failed to wait for the message endpoint")
+                    // 出站 sink 已终结/连接被替换：往已关闭的 transport 发消息会瞬间(0ms)抛此异常。
+                    // 归类为死连接 → 走 forceReconnect 重建后自愈。
+                    || msg.contains("Failed to enqueue message")
+                    // 1.1.0(mcp 0.16.0)起：往 SSE 会话发消息被服务端拒（高德返
+                    // "Sending message failed with a non-OK HTTP code: 400"）会直接抛 ToolExecutionException。
+                    // 0.10.0 时这是「只 log 不抛」、靠下一次超时探活兜；现在归死连接走重建自愈。
+                    || msg.contains("Sending message failed"))) {
                 return true;
             }
             t = t.getCause();
@@ -658,7 +937,23 @@ public class MeteredToolCallback implements ToolCallback {
     private String toolBlockedResult(String name) {
         return "{\"ok\":false,\"tool\":\"" + jsonEscape(name)
                 + "\",\"blocked\":true,"
-                + "\"message\":\"GitHub write tools are disabled for this agent run. Answer directly unless the user explicitly requests GitHub write operations and agent.mcp.github.write-enabled is true.\"}";
+                + "\"message\":\"本次 agent 运行已禁用 GitHub 写工具。除非用户明确要求执行 GitHub 写操作，且 agent.mcp.github.write-enabled=true，否则请直接回答或改用只读工具。\"}";
+    }
+
+    /**
+     * G1-C：返回结构化拒绝/超时/通道缺失消息给 LLM。三种 Decision 给不同 message，让模型在下一轮
+     * Reflexion 或工具切换时能区分对待（用户主动拒绝 vs 系统侧通道问题）。
+     */
+    private String toolApprovalResult(String name, HumanApprovalGate.Decision decision) {
+        String message = switch (decision) {
+            case REJECTED -> "用户已明确拒绝本次高风险工具调用。请不要重复发起相同调用；可以向用户说明为什么需要该工具，或改用其它工具/直接回答。";
+            case TIMEOUT -> "等待用户审批超时。请不要重复发起相同调用；可以建议用户稍后重试，或改用非破坏性的替代方案。";
+            case APPROVAL_UNAVAILABLE -> "当前没有可用的人工审批通道（无活跃 SSE 会话）。该工具需要用户确认，但现在无法弹出确认请求；请跳过该工具并基于已有上下文回答，或提示用户在交互会话中重试。";
+            default -> "工具调用被拒绝：" + decision.name();
+        };
+        return "{\"ok\":false,\"tool\":\"" + jsonEscape(name)
+                + "\",\"approval\":\"" + decision.name()
+                + "\",\"message\":\"" + jsonEscape(message) + "\"}";
     }
 
     private String toolErrorResult(String name, RuntimeException e) {
@@ -668,7 +963,7 @@ public class MeteredToolCallback implements ToolCallback {
         }
         return "{\"ok\":false,\"tool\":\"" + jsonEscape(name)
                 + "\",\"error\":\"" + jsonEscape(message)
-                + "\",\"message\":\"Tool call failed. Continue without this tool or try another path.\"}";
+                + "\",\"message\":\"工具调用失败。请不要卡在该工具上，可基于已有信息继续回答，或尝试其它真实可用路径。\"}";
     }
 
     private String jsonEscape(String value) {

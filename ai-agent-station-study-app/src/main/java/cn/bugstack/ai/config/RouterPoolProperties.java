@@ -13,12 +13,11 @@ import java.util.List;
  * Intent / Strategy / Model / RAG / Tool / QueryRewriter / Summarizer 等"路由前置"类调用
  * 不需要 RAG advisor / ChatMemory / MCP 工具，仅按 tier 选模型即可。
  * <p>
- * 这里声明的每一项启动时都构建成纯 ChatClient（不挂 advisor，不挂 tool）注册到 Spring 上下文，
- * 同时写入 {@code ModelTierRegistry}，让 {@code AbstractExecuteSupport.getChatClientByTier}
- * 能真选出 small/medium/large 三档。
+ * 这里声明的每一项启动时都构建成纯 ChatClient（不挂 advisor，不挂 tool）注册到 Spring 上下文。
  * <p>
- * 用同一套 OpenAI 兼容代理（{@code spring.ai.openai.*}），所以这里只声明 model name 即可，
- * 不重复 base-url / api-key。
+ * 2026-05-29 重构：条目只声明 {@code id + tier}，模型与连接全部来自 DB 的
+ * {@code ai_client_model} / {@code ai_client_api}（RouterPoolConfig 按 tier 选 model，
+ * 空档自动升档）。不再写裸 model name，也不再有 base-url / api-key（彻底去掉 agent.llm.* 全局开关）。
  */
 @Data
 @Configuration
@@ -28,11 +27,6 @@ public class RouterPoolProperties {
     /** 是否启用路由池装配 */
     private boolean enabled = false;
 
-    /** 路由专用 API base-url；为空时回退 spring.ai.openai.base-url */
-    private String baseUrl;
-    /** 路由专用 API api-key；为空时回退 spring.ai.openai.api-key */
-    private String apiKey;
-
     /** 路由 ChatClient 条目；启动时按列表顺序构建 */
     private List<Entry> entries = new ArrayList<>();
 
@@ -40,9 +34,7 @@ public class RouterPoolProperties {
     public static class Entry {
         /** ChatClient bean 后缀；最终 bean 名 = {@code ai_client_<id>} */
         private String id;
-        /** 模型名（直接传 OpenAI 兼容代理） */
-        private String model;
-        /** small / medium / large */
+        /** small / medium / large；按此档从 DB ai_client_model 选模型，空档自动升档 */
         private String tier;
     }
 }

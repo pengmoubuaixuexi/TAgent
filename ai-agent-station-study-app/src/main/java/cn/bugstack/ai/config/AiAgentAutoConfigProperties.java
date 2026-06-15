@@ -8,7 +8,7 @@ import java.util.List;
 /**
  * AI Agent 自动装配配置属性
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/1/15 10:00
  */
 @Data

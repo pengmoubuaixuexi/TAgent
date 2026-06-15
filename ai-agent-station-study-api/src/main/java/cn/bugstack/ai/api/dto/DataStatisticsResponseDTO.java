@@ -11,7 +11,7 @@ import java.io.Serializable;
 /**
  * 数据统计响应 DTO
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * @description 数据统计响应数据传输对象
  */
 @Data

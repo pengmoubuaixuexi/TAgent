@@ -8,7 +8,7 @@ import lombok.NoArgsConstructor;
 /**
  * AI 提示词&动态规划，值对象
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/6/27 18:45
  */
 @Data

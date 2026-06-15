@@ -22,11 +22,12 @@ import org.springframework.stereotype.Service;
 import javax.annotation.Resource;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ThreadPoolExecutor;
 
 /**
  * 对话模型节点配置
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/7/5 12:43
  */
 @Slf4j
@@ -43,8 +44,17 @@ public class AiClientModelNode extends AbstractArmorySupport {
     @Resource
     private cn.bugstack.ai.domain.agent.service.execute.common.McpClientRegistry mcpClientRegistry;
 
-    @Value("${agent.llm.model:}")
-    private String llmModel;
+    /** T10：工具调用 prompt hint 注册表 */
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.execute.common.ToolPromptHintRegistry toolPromptHintRegistry;
+
+    /** G1-C：人工审批 gate（可选），装配时 setter 注入到 MeteredToolCallback */
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.security.HumanApprovalGate humanApprovalGate;
+
+    /** H3-A：工具调用进度 SSE emitter，装配时 setter 注入到 MeteredToolCallback */
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.execute.common.ToolCallProgressEmitter toolCallProgressEmitter;
 
     @Value("${agent.mcp.return-error-on-failure:true}")
     private boolean returnToolErrorOnFailure;
@@ -69,6 +79,22 @@ public class AiClientModelNode extends AbstractArmorySupport {
 
     @Value("${agent.mcp.tool-call.retry-delay-ms:1000}")
     private long mcpToolCallRetryDelayMs;
+
+    /** 工具并行执行开关；true 时同一轮 ≥2 个 tool call 并行跑 */
+    @Value("${agent.mcp.tool-call.parallel-enabled:true}")
+    private boolean toolCallParallelEnabled;
+
+    /** 单个 client 执行链路内最多允许的串行工具轮数；0 表示不限制。并行的一批 tool call 算 1 轮。 */
+    @Value("${agent.mcp.tool-call.max-serial-rounds-per-client:3}")
+    private int toolCallMaxSerialRoundsPerClient;
+
+    /** (a) 非执行步（分析/规划/质检/汇总）禁工具：开 → 这些步不向模型暴露工具定义，模型不会 tool_call；关 → 所有步保留工具（旧行为）。 */
+    @Value("${agent.mcp.disable-tools-on-nonexec-steps:true}")
+    private boolean disableToolsOnNonExecStep;
+
+    /** 并行工具执行线程池（execute() 自动 ContextSnapshot.wrap 接力 MDC），与 flow DAG step 共用 */
+    @Resource(name = "dagExecutor")
+    private ThreadPoolExecutor dagExecutor;
 
     @Override
     protected String doApply(ArmoryCommandEntity requestParameter, DefaultArmoryStrategyFactory.DynamicContext dynamicContext) throws Exception {
@@ -113,21 +139,35 @@ public class AiClientModelNode extends AbstractArmorySupport {
             for (int i = 0; i < rawCallbacks.length; i++) {
                 String toolName = rawCallbacks[i].getToolDefinition() != null ? rawCallbacks[i].getToolDefinition().name() : "";
                 String toolMcpId = mcpClientRegistry.getMcpIdForTool(toolName);
-                meteredCallbacks[i] = new MeteredToolCallback(rawCallbacks[i], mcpToolMetrics,
+                // T10：先包一层 HintedToolCallback 把 prompt hint 拼进 description，再交给 MeteredToolCallback
+                // 顺序固定：raw -> hinted -> metered。hint 命中才 wrap，命不中零开销跳过。
+                String hint = toolPromptHintRegistry != null ? toolPromptHintRegistry.getHint(toolName) : null;
+                ToolCallback hinted = (hint != null && !hint.isBlank())
+                        ? new cn.bugstack.ai.domain.agent.service.execute.common.HintedToolCallback(rawCallbacks[i], hint)
+                        : rawCallbacks[i];
+                MeteredToolCallback metered = new MeteredToolCallback(hinted, mcpToolMetrics,
                         returnToolErrorOnFailure, githubWriteEnabled,
                         githubSearchMaxPerPage, githubSearchMaxResultChars,
                         githubSearchCompactResultEnabled, aiSearchStripServerLlm,
                         mcpToolCallMaxAttempts, mcpToolCallRetryDelayMs,
                         mcpClientRegistry, toolMcpId);
+                metered.setHumanApprovalGate(humanApprovalGate); // G1-C
+                metered.setToolCallProgressEmitter(toolCallProgressEmitter); // H3-A
+                meteredCallbacks[i] = metered;
+                if (hint != null && !hint.isBlank()) {
+                    log.debug("[AiClientModelNode] applied prompt hint to tool {}: {}", toolName, hint);
+                }
             }
 
             // 实例化对话模型（如果有其他模型对接，可以使用 one-api 服务，转换为 openai 模型格式）
-            // P1.5.2：有工具时才开 parallelToolCalls，避免 OpenAI 报 'parallel_tool_calls' is only allowed when 'tools' are specified
+            // P1.5.2：只有有工具时才允许设置 parallelToolCalls，避免 OpenAI 报
+            // 'parallel_tool_calls' is only allowed when 'tools' are specified。
+            // 是否真正开启并行工具调用由 agent.mcp.tool-call.parallel-enabled 控制。
             OpenAiChatOptions.Builder optionsBuilder = OpenAiChatOptions.builder()
-                    .model(OpenAiCompatibleApiSupport.valueOrDefault(llmModel, modelVO.getModelName()))
+                    .model(modelVO.getModelName())
                     .toolCallbacks(meteredCallbacks);
             if (meteredCallbacks.length > 0) {
-                optionsBuilder.parallelToolCalls(true);
+                optionsBuilder.parallelToolCalls(toolCallParallelEnabled);
             }
             // 2026-05-08 #4：注入自定义 ToolCallingManager 解决 LLM 工具名大小写幻觉问题。
             // RobustToolCallingManager 在执行前对 ChatResponse 里的 ToolCall.name 做 case-insensitive
@@ -135,7 +175,12 @@ public class AiClientModelNode extends AbstractArmorySupport {
             org.springframework.ai.model.tool.ToolCallingManager defaultMgr =
                     org.springframework.ai.model.tool.DefaultToolCallingManager.builder().build();
             cn.bugstack.ai.domain.agent.service.execute.common.RobustToolCallingManager robustMgr =
-                    new cn.bugstack.ai.domain.agent.service.execute.common.RobustToolCallingManager(defaultMgr);
+                    new cn.bugstack.ai.domain.agent.service.execute.common.RobustToolCallingManager(
+                            defaultMgr, mcpToolMetrics, dagExecutor, toolCallParallelEnabled, mcpClientRegistry,
+                            toolCallMaxSerialRoundsPerClient);
+            // (a) 非执行步禁工具：开关开时，resolveToolDefinitions 对分析/规划/质检/汇总步返回空工具集
+            // → 模型请求无 tools 字段 → 模型不会 tool_call（从源头掐，非事后拦截）。关时所有步保留工具（旧行为）。
+            robustMgr.setDisableToolsOnNonExecStep(disableToolsOnNonExecStep);
 
             OpenAiChatModel chatModel = OpenAiChatModel.builder()
                     .openAiApi(openAiApi)

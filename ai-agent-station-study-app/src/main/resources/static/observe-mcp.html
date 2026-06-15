@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8"/>
+    <title>AI Agent Station · MCP 治理控制台</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <style>
+        * { box-sizing: border-box; }
+        :root {
+            --bg: #0f1419;
+            --panel: #161b22;
+            --panel-2: #0d1117;
+            --line: #21262d;
+            --line-2: #30363d;
+            --text: #e6edf3;
+            --muted: #8b949e;
+            --soft: #6e7681;
+            --ok: #3fb950;
+            --warn: #d29922;
+            --bad: #f85149;
+            --info: #58a6ff;
+        }
+        body {
+            margin: 0;
+            font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+            background: var(--bg);
+            color: var(--text);
+        }
+        header {
+            min-height: 64px;
+            padding: 14px 24px;
+            border-bottom: 1px solid var(--line);
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        h1 {
+            margin: 0;
+            font-size: 18px;
+            line-height: 1.25;
+            font-weight: 650;
+        }
+        .muted { color: var(--muted); font-size: 13px; }
+        .right { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+        .tabs { display: flex; gap: 6px; align-items: center; }
+        .tabs a {
+            color: var(--muted);
+            text-decoration: none;
+            border: 1px solid var(--line-2);
+            background: var(--panel);
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            line-height: 1;
+        }
+        .tabs a:hover { color: var(--text); background: #1f2630; }
+        .tabs a.active { color: var(--text); border-color: var(--info); background: rgba(88, 166, 255, 0.14); }
+        button, select, input {
+            height: 32px;
+            border: 1px solid var(--line-2);
+            border-radius: 6px;
+            background: var(--panel);
+            color: var(--text);
+            font-size: 13px;
+        }
+        button, select { padding: 0 11px; cursor: pointer; }
+        button:hover, select:hover { background: #1f2630; }
+        input { width: 220px; padding: 0 10px; outline: none; }
+        main { padding: 20px 24px 40px; }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+        .stat {
+            min-height: 106px;
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 14px 16px;
+        }
+        .stat .label {
+            color: var(--muted);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+        }
+        .stat .value {
+            margin-top: 8px;
+            font-size: 28px;
+            line-height: 1.15;
+            font-weight: 650;
+            font-variant-numeric: tabular-nums;
+        }
+        .stat .sub { margin-top: 6px; color: var(--soft); font-size: 12px; min-height: 16px; }
+        .section {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            overflow: hidden;
+            margin-top: 16px;
+        }
+        .section-head {
+            min-height: 52px;
+            padding: 13px 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            border-bottom: 1px solid var(--line);
+        }
+        .section-head h2 { margin: 0; font-size: 14px; font-weight: 650; }
+        .section-head .tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+        th, td {
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--line);
+            text-align: left;
+            font-size: 13px;
+            vertical-align: middle;
+        }
+        th {
+            background: var(--panel-2);
+            color: var(--muted);
+            font-size: 11px;
+            font-weight: 550;
+            text-transform: uppercase;
+            letter-spacing: 0.35px;
+        }
+        tr:last-child td { border-bottom: none; }
+        td.num { text-align: right; font-variant-numeric: tabular-nums; }
+        code {
+            padding: 2px 5px;
+            border: 1px solid var(--line);
+            border-radius: 5px;
+            background: var(--panel-2);
+            color: var(--text);
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 12px;
+        }
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            height: 22px;
+            padding: 0 8px;
+            border-radius: 999px;
+            border: 1px solid var(--line-2);
+            color: var(--muted);
+            background: var(--panel-2);
+            font-size: 12px;
+            white-space: nowrap;
+        }
+        .pill.ok { color: #aff5b4; border-color: rgba(63, 185, 80, 0.45); background: rgba(63, 185, 80, 0.12); }
+        .pill.warn { color: #f2cc60; border-color: rgba(210, 153, 34, 0.45); background: rgba(210, 153, 34, 0.13); }
+        .pill.bad { color: #ffb3ad; border-color: rgba(248, 81, 73, 0.45); background: rgba(248, 81, 73, 0.12); }
+        .pill.info { color: #b6e3ff; border-color: rgba(88, 166, 255, 0.45); background: rgba(88, 166, 255, 0.12); }
+        .tool-list {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            max-height: 58px;
+            overflow: auto;
+        }
+        .error-cell {
+            display: block;
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: #ffb3ad;
+        }
+        .empty { padding: 28px 12px; text-align: center; color: var(--soft); }
+        .status-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 7px;
+            background: var(--ok);
+        }
+        .status-dot.err { background: var(--bad); }
+        .nowrap { white-space: nowrap; }
+        .w-mcp { width: 14%; }
+        .w-status { width: 12%; }
+        .w-num { width: 8%; }
+        .w-tools { width: 38%; }
+        .w-tool { width: 18%; }
+        .w-error { width: 22%; }
+        @media (max-width: 980px) {
+            header { align-items: flex-start; flex-direction: column; }
+            .tabs { width: 100%; }
+            .right { margin-left: 0; width: 100%; justify-content: flex-start; }
+            main { padding: 16px; }
+            .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .section { overflow-x: auto; }
+            table { min-width: 1500px; }
+        }
+        @media (max-width: 560px) {
+            .stats { grid-template-columns: 1fr; }
+            input { width: 100%; }
+            .section-head { align-items: flex-start; flex-direction: column; }
+            .section-head .tools { width: 100%; }
+        }
+    </style>
+</head>
+<body>
+<header>
+    <div>
+        <h1>AI Agent Station · MCP 治理控制台</h1>
+        <div class="muted" id="status"><span class="status-dot"></span>等待首次刷新</div>
+    </div>
+    <nav class="tabs" aria-label="观测视图">
+        <a href="/observe.html">LLM 观测</a>
+        <a class="active" href="/observe-mcp.html">MCP 工具治理</a>
+    </nav>
+    <div class="right">
+        <span class="muted">工具窗口</span>
+        <select id="range" title="工具指标窗口">
+            <option value="1">最近 1h</option>
+            <option value="6">最近 6h</option>
+            <option value="24" selected>最近 24h</option>
+            <option value="168">最近 7d</option>
+        </select>
+        <input id="search" placeholder="搜索 MCP / 工具 / 错误" autocomplete="off"/>
+        <button id="refreshBtn" onclick="refresh()">刷新</button>
+        <button id="autoBtn" onclick="toggleAuto()">自动刷新：10s</button>
+    </div>
+</header>
+
+<main>
+    <section class="stats">
+        <div class="stat">
+            <div class="label">客户端健康</div>
+            <div class="value" id="s-clients">-</div>
+            <div class="sub" id="s-clients-sub">&nbsp;</div>
+        </div>
+        <div class="stat">
+            <div class="label">注册工具</div>
+            <div class="value" id="s-tools">-</div>
+            <div class="sub" id="s-tools-sub">&nbsp;</div>
+        </div>
+        <div class="stat">
+            <div class="label">工具调用</div>
+            <div class="value" id="s-calls">-</div>
+            <div class="sub" id="s-calls-sub">&nbsp;</div>
+        </div>
+        <div class="stat">
+            <div class="label">首败率</div>
+            <div class="value" id="s-errors">-</div>
+            <div class="sub" id="s-errors-sub">&nbsp;</div>
+        </div>
+    </section>
+
+    <section class="section">
+        <div class="section-head">
+            <div>
+                <h2>MCP 客户端健康</h2>
+                <div class="muted">来自 `/api/v1/observe/mcp-client-health`</div>
+            </div>
+            <div class="tools">
+                <span class="pill" id="generatedAt">-</span>
+            </div>
+        </div>
+        <table>
+            <thead>
+            <tr>
+                <th class="w-mcp">MCP ID</th>
+                <th class="w-status">状态</th>
+                <th class="w-num">失败</th>
+                <th class="w-num">上次成功</th>
+                <th class="w-num">上次探活</th>
+                <th class="w-num">探活成功</th>
+                <th class="w-num">熔断冷却</th>
+                <th class="w-num">重连冷却</th>
+                <th class="w-tools">注册工具</th>
+                <th class="w-error">客户端最近错误</th>
+            </tr>
+            </thead>
+            <tbody id="clientRows"></tbody>
+        </table>
+    </section>
+
+    <section class="section">
+        <div class="section-head">
+            <div>
+                <h2>MCP 工具治理明细</h2>
+                <div class="muted">来自 `/api/v1/observe/mcp-tools-status`，按调用数降序</div>
+            </div>
+            <div class="tools">
+                <span class="pill info" id="slowestTool">最慢工具 -</span>
+                <span class="pill warn" id="mostErrorTool">错误最多 -</span>
+            </div>
+        </div>
+        <table>
+            <thead>
+            <tr>
+                <th class="w-tool">工具</th>
+                <th class="w-mcp">MCP ID</th>
+                <th class="w-num">调用</th>
+                <th class="w-num">调用/min</th>
+                <th class="w-num">首败</th>
+                <th class="w-num">首败/min</th>
+                <th class="w-num">首败率</th>
+                <th class="w-num">恢复</th>
+                <th class="w-num">最终失败</th>
+                <th class="w-num">P95</th>
+                <th class="w-num">P99</th>
+                <th class="w-num">治理命中</th>
+                <th class="w-num">治理/min</th>
+                <th class="w-error">最近错误</th>
+            </tr>
+            </thead>
+            <tbody id="toolRows"></tbody>
+        </table>
+    </section>
+</main>
+
+<script>
+let autoTimer = setInterval(refresh, 10000);
+let lastClientData = null;
+let lastToolData = null;
+let rateData = null;
+
+function unwrap(payload) {
+    return payload && Object.prototype.hasOwnProperty.call(payload, 'data') ? payload.data : payload;
+}
+
+async function fetchJson(url) {
+    const response = await fetch(url, { headers: { 'Accept': 'application/json' } });
+    if (!response.ok) throw new Error(`${url} ${response.status}`);
+    return unwrap(await response.json());
+}
+
+async function refresh() {
+    const hours = document.getElementById('range').value;
+    setBusy(true);
+    try {
+        const [health, tools] = await Promise.all([
+            fetchJson('/api/v1/observe/mcp-client-health'),
+            fetchJson(`/api/v1/observe/mcp-tools-status?hours=${encodeURIComponent(hours)}`)
+        ]);
+        const nextToolData = tools || {};
+        nextToolData._localAt = Date.now();
+        lastClientData = health || {};
+        rateData = buildRateData(lastToolData, nextToolData);
+        lastToolData = nextToolData;
+        render();
+        setStatus(true, `${new Date().toLocaleTimeString()} 刷新成功`);
+    } catch (error) {
+        setStatus(false, `刷新失败：${error.message}`);
+    } finally {
+        setBusy(false);
+    }
+}
+
+function render() {
+    const query = document.getElementById('search').value.trim().toLowerCase();
+    renderSummary(lastClientData, lastToolData);
+    renderClients(filterRows((lastClientData && lastClientData.clients) || [], query, clientText));
+    renderTools(filterRows((lastToolData && lastToolData.tools) || [], query, toolText));
+}
+
+function renderSummary(health, tools) {
+    const clientSummary = (health && health.summary) || {};
+    const toolSummary = (tools && tools.summary) || {};
+    const totalClients = num(clientSummary.totalClients);
+    const aliveClients = num(clientSummary.aliveClients);
+    const circuitOpen = num(clientSummary.circuitOpenClients);
+    const totalRegisteredTools = num(clientSummary.totalRegisteredTools);
+    const clients = (health && health.clients) || [];
+    const idleClients = clients.filter(item => item && item.status === 'idle').length;
+    const deadClients = clients.filter(item => item && item.status === 'dead').length;
+    const totalCalls = num(toolSummary.totalCalls);
+    const totalErrors = num(toolSummary.totalErrors);
+    const totalFinalErrors = num(toolSummary.totalFinalErrors);
+    const totalRecovered = num(toolSummary.totalRecovered);
+    const errorRate = Number(toolSummary.avgErrorRate || 0);
+    const callsPerMin = rateData ? rateData.totalCallsPerMin : null;
+    const errorsPerMin = rateData ? rateData.totalErrorsPerMin : null;
+
+    document.getElementById('s-clients').textContent = `${aliveClients}/${totalClients}`;
+    document.getElementById('s-clients-sub').textContent =
+        `${idleClients ? `待确认 ${idleClients} 个，` : ''}死亡 ${deadClients} 个${circuitOpen ? `，熔断 ${circuitOpen} 个` : ''}`;
+    document.getElementById('s-tools').textContent = fmt(totalRegisteredTools);
+    document.getElementById('s-tools-sub').textContent = `名称校正 ${fmt(toolSummary.nameNormalizedTotal)} 次`;
+    document.getElementById('s-calls').textContent = fmt(totalCalls);
+    document.getElementById('s-calls-sub').textContent = callsPerMin == null ? `首败 ${fmt(totalErrors)} 次` : `${rate(callsPerMin)} / min`;
+    document.getElementById('s-errors').textContent = pct(errorRate);
+    document.getElementById('s-errors-sub').textContent = errorsPerMin == null
+        ? `恢复 ${fmt(totalRecovered)} 次，最终失败 ${fmt(totalFinalErrors)} 次`
+        : `首败 ${rate(errorsPerMin)} / min`;
+    document.getElementById('generatedAt').textContent = health && health.generatedAt ? `生成于 ${time(health.generatedAt)}` : '尚无快照';
+    document.getElementById('slowestTool').textContent = `最慢工具 ${toolSummary.slowestTool || '-'}`;
+    document.getElementById('mostErrorTool').textContent = `错误最多 ${toolSummary.mostErrorTool || '-'}`;
+}
+
+function renderClients(items) {
+    const tbody = document.getElementById('clientRows');
+    if (!items.length) {
+        tbody.innerHTML = '<tr><td class="empty" colspan="10">暂无 MCP 客户端快照</td></tr>';
+        return;
+    }
+    tbody.innerHTML = items.map(item => {
+        const tools = Array.isArray(item.registeredTools) ? item.registeredTools : [];
+        const lastClientError = item.lastClientError ? `${item.lastClientError.exception || ''}: ${item.lastClientError.message || ''}` : '';
+        return `<tr>
+            <td><code>${esc(item.mcpId)}</code></td>
+            <td>${statusPill(item.status)}</td>
+            <td class="num">${fmt(item.consecutiveFailures)}</td>
+            <td class="num" title="${esc(absoluteTime(item.lastSuccessAt))}">${relativeTime(item.lastSuccessAt)}</td>
+            <td class="num" title="${esc(absoluteTime(item.lastProbeAt))}">${relativeTime(item.lastProbeAt)}</td>
+            <td class="num" title="${esc(absoluteTime(item.lastProbeOkAt))}">${relativeTime(item.lastProbeOkAt)}</td>
+            <td class="num">${seconds(item.circuitCooldownRemainingSec)}</td>
+            <td class="num">${seconds(item.reconnectCooldownRemainingSec)}</td>
+            <td><div class="tool-list">${tools.length ? tools.map(t => `<span class="pill">${esc(t)}</span>`).join('') : '<span class="muted">未注册工具</span>'}</div></td>
+            <td><span class="error-cell" title="${esc(lastClientError)}">${lastClientError ? esc(lastClientError) : '<span class="muted">无</span>'}</span></td>
+        </tr>`;
+    }).join('');
+}
+
+function renderTools(items) {
+    const tbody = document.getElementById('toolRows');
+    if (!items.length) {
+        tbody.innerHTML = '<tr><td class="empty" colspan="14">暂无 MCP 工具指标。触发工具调用后这里会自动出现。</td></tr>';
+        return;
+    }
+    tbody.innerHTML = items.map(item => {
+        const governanceHits = num(item.normalizeApplied) + num(item.resultTruncated) + num(item.retries) + num(item.unknownNameHits);
+        const toolRate = rateData && rateData.tools[item.tool] ? rateData.tools[item.tool] : null;
+        const lastError = item.lastError ? `${item.lastError.exception || ''}: ${item.lastError.message || ''}` : '';
+        return `<tr>
+            <td><code>${esc(item.tool)}</code></td>
+            <td>${item.mcpId ? `<code>${esc(item.mcpId)}</code>` : '<span class="muted">unknown</span>'}</td>
+            <td class="num">${fmt(item.calls)}</td>
+            <td class="num">${toolRate ? rate(toolRate.callsPerMin) : '-'}</td>
+            <td class="num">${fmt(item.errors)}</td>
+            <td class="num">${toolRate ? rate(toolRate.errorsPerMin) : '-'}</td>
+            <td class="num">${pct(item.errorRate)}</td>
+            <td class="num" title="首次失败后通过 retry / reconnect 恢复成功">${fmt(item.recovered)}</td>
+            <td class="num" title="最终仍失败的 callback 次数">${fmt(item.finalErrors)}</td>
+            <td class="num">${ms(item.latencyP95Ms)}</td>
+            <td class="num">${ms(item.latencyP99Ms)}</td>
+            <td class="num" title="normalize + truncated + retries + unknown">${fmt(governanceHits)}</td>
+            <td class="num">${toolRate ? rate(toolRate.governancePerMin) : '-'}</td>
+            <td><span class="error-cell" title="${esc(lastError)}">${lastError ? esc(lastError) : '<span class="muted">无</span>'}</span></td>
+        </tr>`;
+    }).join('');
+}
+
+function buildRateData(previous, current) {
+    if (!previous || !previous.summary || !current || !current.summary) return null;
+    const previousAt = num(previous.generatedAt) || num(previous._localAt);
+    const currentAt = num(current.generatedAt) || num(current._localAt);
+    const intervalSec = Math.max(1, (currentAt - previousAt) / 1000);
+    if (!Number.isFinite(intervalSec) || intervalSec <= 0) return null;
+
+    const previousTools = indexTools(previous.tools || []);
+    const currentTools = current.tools || [];
+    const tools = {};
+    currentTools.forEach(item => {
+        const old = previousTools[item.tool];
+        if (!old) return;
+        const oldGovernance = governanceTotal(old);
+        const newGovernance = governanceTotal(item);
+        tools[item.tool] = {
+            callsPerMin: perMinute(num(item.calls) - num(old.calls), intervalSec),
+            errorsPerMin: perMinute(num(item.errors) - num(old.errors), intervalSec),
+            governancePerMin: perMinute(newGovernance - oldGovernance, intervalSec)
+        };
+    });
+
+    return {
+        intervalSec,
+        totalCallsPerMin: perMinute(num(current.summary.totalCalls) - num(previous.summary.totalCalls), intervalSec),
+        totalErrorsPerMin: perMinute(num(current.summary.totalErrors) - num(previous.summary.totalErrors), intervalSec),
+        tools
+    };
+}
+
+function indexTools(items) {
+    return items.reduce((acc, item) => {
+        if (item && item.tool) acc[item.tool] = item;
+        return acc;
+    }, {});
+}
+
+function governanceTotal(item) {
+    return num(item.normalizeApplied) + num(item.resultTruncated) + num(item.retries) + num(item.unknownNameHits);
+}
+
+function perMinute(delta, intervalSec) {
+    return Math.max(0, delta) * 60 / intervalSec;
+}
+
+function statusPill(status) {
+    const map = {
+        alive: ['ok', 'alive'],
+        dead: ['bad', 'dead'],
+        reconnect_cooldown: ['warn', 'reconnect cooldown'],
+        circuit_open: ['bad', 'circuit open'],
+        unknown: ['', 'unknown']
+    };
+    const item = map[status] || ['', status || 'unknown'];
+    return `<span class="pill ${item[0]}">${esc(item[1])}</span>`;
+}
+
+function filterRows(items, query, projector) {
+    if (!query) return items;
+    return items.filter(item => projector(item).includes(query));
+}
+
+function clientText(item) {
+    const error = item.lastClientError ? `${item.lastClientError.exception || ''} ${item.lastClientError.message || ''}` : '';
+    return [item.mcpId, item.status, item.lastSuccessAt, item.lastProbeAt, item.lastProbeOkAt, (item.registeredTools || []).join(' '), error].join(' ').toLowerCase();
+}
+
+function toolText(item) {
+    const error = item.lastError ? `${item.lastError.exception || ''} ${item.lastError.message || ''}` : '';
+    return [item.tool, item.mcpId, item.calls, item.errors, item.firstAttemptFailures, item.finalErrors, item.recovered,
+        item.normalizeApplied, item.resultTruncated, item.retries, item.unknownNameHits, error].join(' ').toLowerCase();
+}
+
+function toggleAuto() {
+    const btn = document.getElementById('autoBtn');
+    if (autoTimer) {
+        clearInterval(autoTimer);
+        autoTimer = null;
+        btn.textContent = '自动刷新：关';
+    } else {
+        autoTimer = setInterval(refresh, 10000);
+        btn.textContent = '自动刷新：10s';
+        refresh();
+    }
+}
+
+function setStatus(ok, message) {
+    const el = document.getElementById('status');
+    el.innerHTML = `<span class="status-dot ${ok ? '' : 'err'}"></span>${esc(message)}`;
+}
+
+function setBusy(isBusy) {
+    document.getElementById('refreshBtn').disabled = isBusy;
+}
+
+function num(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : 0;
+}
+
+function fmt(value) { return num(value).toLocaleString(); }
+function pct(value) { return `${(num(value) * 100).toFixed(1)}%`; }
+function rate(value) {
+    if (value == null) return '-';
+    const n = num(value);
+    return n >= 10 ? n.toFixed(0) : n.toFixed(1);
+}
+function ms(value) { return value == null ? '-' : `${Number(value).toFixed(1)} ms`; }
+function seconds(value) {
+    const n = num(value);
+    return n > 0 ? `${n}s` : '-';
+}
+function time(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? new Date(n).toLocaleTimeString() : '-';
+}
+function absoluteTime(value) {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? new Date(n).toLocaleString() : '从未成功调用';
+}
+function relativeTime(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return '-';
+    const diffSec = Math.max(0, (Date.now() - n) / 1000);
+    if (diffSec < 60) return `${Math.floor(diffSec)}s 前`;
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return `${diffMin}m 前`;
+    const diffHour = Math.floor(diffMin / 60);
+    if (diffHour < 24) return `${diffHour}h 前`;
+    return `${Math.floor(diffHour / 24)}d 前`;
+}
+function esc(value) {
+    return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+document.getElementById('range').addEventListener('change', refresh);
+document.getElementById('search').addEventListener('input', render);
+refresh();
+</script>
+</body>
+</html>

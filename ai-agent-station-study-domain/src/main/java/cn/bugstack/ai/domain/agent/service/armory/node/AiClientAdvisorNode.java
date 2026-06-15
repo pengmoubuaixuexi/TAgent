@@ -10,6 +10,7 @@ import cn.bugstack.ai.domain.agent.service.armory.node.factory.element.LongTermM
 import cn.bugstack.ai.domain.agent.service.armory.node.factory.element.PiiMaskerAdvisor;
 import cn.bugstack.ai.domain.agent.service.armory.node.factory.element.PromptInjectionDefenseAdvisor;
 import cn.bugstack.ai.domain.agent.service.armory.node.factory.element.RagAnswerAdvisor;
+import cn.bugstack.ai.domain.agent.service.execute.common.RagEvidenceEmitter;
 import cn.bugstack.ai.domain.agent.service.rag.HyDEService;
 import cn.bugstack.ai.domain.agent.service.rag.IQueryDecomposer;
 import cn.bugstack.ai.domain.agent.service.rag.LlmQueryDecomposer;
@@ -41,7 +42,7 @@ import java.util.List;
 /**
  * 顾问角色节点
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/7/19 08:51
  */
 @Slf4j
@@ -53,6 +54,21 @@ public class AiClientAdvisorNode extends AbstractArmorySupport {
 
     @Resource
     private AiClientNode aiClientNode;
+
+    /** H1-A：RAG 证据片段 emitter，装配时 setter 注入到 RagAnswerAdvisor */
+    @Resource
+    private RagEvidenceEmitter ragEvidenceEmitter;
+
+    /** 第 61 轮：sessionId-scoped 全局引用计数器，让 Step2 多 client 的 [1][2][3][4]... 连续累加 */
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.execute.common.SessionRefCounter sessionRefCounter;
+
+    /** H2-A：记忆证据 emitter，装配时 setter 注入到 LTM / Episodic advisor */
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.execute.common.MemoryEvidenceEmitter memoryEvidenceEmitter;
+
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.execute.common.LongTermMemoryTurnSnapshot longTermMemoryTurnSnapshot;
 
     /** 亮点 3 混合检索组件：BM25（ES） + RRF 融合；可选依赖，缺失则 RagAnswerAdvisor 回退纯向量路径 */
     @Autowired(required = false)
@@ -233,9 +249,12 @@ public class AiClientAdvisorNode extends AbstractArmorySupport {
                     .filterExpression(ragAnswer.getFilterExpression())
                     .build();
             String knowledgeTag = AiClientAdvisorTypeEnumVO.extractKnowledgeTag(ragAnswer.getFilterExpression());
-            return new RagAnswerAdvisor(vectorStore, sr,
+            RagAnswerAdvisor advisor = new RagAnswerAdvisor(vectorStore, sr,
                     hybridRetriever, rerankService, ragAnswer.getTopK(), knowledgeTag,
                     ragRouter, queryRewriter, hydeService, ragFusionService, queryDecomposer, parentDocumentService);
+            advisor.setRagEvidenceEmitter(ragEvidenceEmitter); // H1-A
+            advisor.setSessionRefCounter(sessionRefCounter);   // 第 61 轮：全局编号
+            return advisor;
         }
 
         log.info("[AdvisorNode] creating advisor type={} sharedChatMemory={} chatMemoryRepository={}",
@@ -248,6 +267,11 @@ public class AiClientAdvisorNode extends AbstractArmorySupport {
                 ltmAdvisor.setExtractionClient(routerSmall);
             }
             ltmAdvisor.setApplicationContext(applicationContext);
+            ltmAdvisor.setMemoryEvidenceEmitter(memoryEvidenceEmitter); // H2-A
+            ltmAdvisor.setTurnSnapshot(longTermMemoryTurnSnapshot);
+        }
+        if (advisor instanceof cn.bugstack.ai.domain.agent.service.armory.node.factory.element.EpisodicMemoryAdvisor epAdvisor) {
+            epAdvisor.setMemoryEvidenceEmitter(memoryEvidenceEmitter); // H2-A
         }
         return advisor;
     }

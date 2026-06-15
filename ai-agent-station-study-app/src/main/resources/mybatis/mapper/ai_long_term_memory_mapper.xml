@@ -38,24 +38,42 @@
         LIMIT #{limit}
     </select>
 
+    <!-- 召回命中累计访问 + 刷新时间。1 天节流：距上次 last_accessed 不足 24h 时 WHERE 不匹配，
+         count 与 last_accessed 同步跳过（Variant A）→ access_count 语义≈"被召回的不同天数"，
+         避免一次深聊会话把同一批记忆 count 灌高。last_accessed 为 NULL（新记忆首次召回）必计。 -->
     <update id="touchAccess">
         UPDATE ai_long_term_memory
         SET access_count = access_count + 1,
             last_accessed = NOW()
         WHERE memory_id = #{memoryId}
+          AND (last_accessed IS NULL OR TIMESTAMPDIFF(DAY, last_accessed, NOW()) &gt;= 1)
     </update>
 
     <update id="archive">
         UPDATE ai_long_term_memory SET archived = 1 WHERE memory_id = #{memoryId}
     </update>
 
-    <!-- P2.1 10.2 遗忘衰减：久未访问 + 访问次数低的记忆 -->
+    <!-- P2.1 10.2 遗忘衰减（2026-06-07 重设计）：归档阈值 = baseDays + k(topic) × min(access_count, cap)。
+         access_count 经 touchAccess 的 1 天节流后≈"被召回的不同天数"，越热宽限越久；k 按 topic 分档
+         （技能/偏好耐久给大 k，计划/情况会过期给小 k），cap 给宽限有限上界 → 取代旧的 access_count<3
+         硬阈值（破阈即永久免疫）。从未被召回（last_accessed IS NULL）以 created_at 起算，count=0 无热度
+         加成，过 baseDays 即归档（修掉旧逻辑"新记忆 last_accessed=NULL 当晚即被归档"）。
+         V041：画像槽位是稳定背景，永不归档；topic 为 NULL 的旧/异常数据按默认 k 归档。 -->
     <select id="findStaleCandidates" resultMap="AiLongTermMemoryMap">
         SELECT * FROM ai_long_term_memory
         WHERE archived = 0
+          AND (topic IS NULL OR topic NOT LIKE '画像:%')
           AND (
-              last_accessed IS NULL
-              OR (DATEDIFF(NOW(), last_accessed) > #{staleDays} AND access_count &lt; #{minAccess})
+              (last_accessed IS NULL AND DATEDIFF(NOW(), created_at) &gt; #{baseDays})
+              OR (last_accessed IS NOT NULL
+                  AND DATEDIFF(NOW(), last_accessed) &gt; #{baseDays} +
+                      (CASE
+                          WHEN topic LIKE '技能:%' OR topic LIKE '偏好:%'
+                            OR topic LIKE 'skill:%' OR topic LIKE 'preference:%' THEN #{kDurable}
+                          WHEN topic LIKE '计划:%' OR topic LIKE '情况:%'
+                            OR topic LIKE 'decision:%' THEN #{kEphemeral}
+                          ELSE #{kDefault}
+                       END) * LEAST(access_count, #{cap}))
           )
         ORDER BY last_accessed ASC
         LIMIT #{limit}
@@ -90,17 +108,13 @@
         WHERE user_id = #{userId} AND archived = 0
     </select>
 
-    <!-- 核心记忆：access_count 作权重，最近访问有加分，按复合分数降序 -->
+    <!-- 核心记忆（V041）= 用户全部"画像:"槽位：稳定背景、跨领域影响回答，全量注入，不按频率排序。
+         画像槽位是封闭清单(约13个)且单值覆盖，天然小量，故直接全取；按 topic 排序保证注入顺序稳定。 -->
     <select id="findCoreByUser" resultMap="AiLongTermMemoryMap">
-        SELECT *,
-               (access_count * 10 +
-                CASE WHEN last_accessed IS NOT NULL
-                     THEN GREATEST(0, 30 - DATEDIFF(NOW(), last_accessed))
-                     ELSE 0
-                END) AS _score
-        FROM ai_long_term_memory
+        SELECT * FROM ai_long_term_memory
         WHERE user_id = #{userId} AND archived = 0
-        ORDER BY _score DESC
+          AND topic LIKE '画像:%'
+        ORDER BY topic, access_count DESC, id DESC
         LIMIT #{limit}
     </select>
 

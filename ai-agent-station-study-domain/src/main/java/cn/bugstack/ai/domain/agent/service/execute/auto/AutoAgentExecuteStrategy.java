@@ -15,7 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 自动执行策略
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/8/5 09:49
  */
 @Slf4j
@@ -25,8 +25,15 @@ public class AutoAgentExecuteStrategy implements IExecuteStrategy {
     @Resource
     private DefaultAutoAgentExecuteStrategyFactory defaultAutoAgentExecuteStrategyFactory;
 
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.execute.common.LongTermMemoryTurnSnapshot longTermMemoryTurnSnapshot;
+
     /** per-session 活跃执行上下文，用于支持 cancelExecute() */
     private final ConcurrentHashMap<String, DefaultAutoAgentExecuteStrategyFactory.DynamicContext> activeContexts = new ConcurrentHashMap<>();
+
+    /** 第 61 轮 RAG 引用计数器；每轮入口清一次，保证引用从 [1] 起（修跨题累加成 [9][10]）。 */
+    @javax.annotation.Resource
+    private cn.bugstack.ai.domain.agent.service.execute.common.SessionRefCounter sessionRefCounter;
 
     @Override
     public void execute(ExecuteCommandEntity executeCommandEntity, ResponseBodyEmitter emitter) throws Exception {
@@ -49,6 +56,11 @@ public class AutoAgentExecuteStrategy implements IExecuteStrategy {
         // 注册到 activeContexts 以支持 cancelExecute()
         String sessionId = executeCommandEntity.getSessionId();
         if (sessionId != null) activeContexts.put(sessionId, dynamicContext);
+        // 引用计数器跨轮泄漏修复（2026-05-31）：每轮入口清一次，让引用从 [1] 起；
+        // 轮内 Step2 多 client 检索仍连续累加（[1][2] / [3][4]）。
+        if (sessionRefCounter != null && sessionId != null && !sessionId.isBlank()) {
+            sessionRefCounter.clear(sessionId);
+        }
 
         // P2.2.4 Step 取消：SSE 客户端断开 / 超时 → 设 cancelled 标记，后续 step 跳过 LLM 调用省 token
         emitter.onCompletion(dynamicContext::cancel);
@@ -69,6 +81,7 @@ public class AutoAgentExecuteStrategy implements IExecuteStrategy {
                 log.error("发送完成标识失败：{}", e.getMessage(), e);
             }
         } finally {
+            longTermMemoryTurnSnapshot.clearSession(sessionId);
             if (sessionId != null) activeContexts.remove(sessionId);
         }
     }
@@ -79,6 +92,28 @@ public class AutoAgentExecuteStrategy implements IExecuteStrategy {
         if (ctx != null) {
             ctx.cancel();
             log.info("[AutoAgent] cancelExecute called for sessionId={}", sessionId);
+        }
+    }
+
+    /** 立即回答：置 finalize 标记 + 截断当前在飞流式 call；各 step 入口/汇总节点据标记跳 finalize。 */
+    @Override
+    public void finalizeExecute(String sessionId) {
+        DefaultAutoAgentExecuteStrategyFactory.DynamicContext ctx = activeContexts.get(sessionId);
+        if (ctx != null) {
+            ctx.requestFinalize();
+            ctx.fireCancelTrigger();
+            log.info("[AutoAgent] finalizeExecute (answer-now) for sessionId={}", sessionId);
+        }
+    }
+
+    /** 引导回复：写入新想法 + 截断当前步，重跑时折进 idea。 */
+    @Override
+    public void steerExecute(String sessionId, String idea) {
+        DefaultAutoAgentExecuteStrategyFactory.DynamicContext ctx = activeContexts.get(sessionId);
+        if (ctx != null && idea != null && !idea.isBlank()) {
+            ctx.setSteerIdea(idea);
+            ctx.fireCancelTrigger();
+            log.info("[AutoAgent] steerExecute for sessionId={} ideaLen={}", sessionId, idea.length());
         }
     }
 

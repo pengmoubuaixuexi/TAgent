@@ -65,3 +65,12 @@ docs/dev-ops/test/*.log
 
 ### Credentials ###
 docs/dev-ops/mcp-credentials/
+
+### Local exports / backups ###
+tmp/
+backup/
+*.tar
+*.tar.gz
+*.zip
+*.docx
+*.pdf

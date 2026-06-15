@@ -44,8 +44,12 @@ public class EventLogService implements IEventLogService {
                     .build();
             aiEventLogDao.insert(po);
         } catch (Exception e) {
-            log.warn("EventLog insert failed: sessionId={} stepName={} model={} err={}",
-                    entry.getSessionId(), entry.getStepName(), entry.getModel(), e.getMessage());
+            // 2026-05-28：原来只打 e.getMessage()，但部分异常(如某些 DataIntegrity 包装)message 为空 → err= 空、无法定位。
+            // 改成带 inputPrompt 字符数 + 完整异常堆栈，下次插入失败一眼能看到真因（列溢出/约束/类型等）。
+            log.warn("EventLog insert failed: sessionId={} stepName={} model={} inputPromptChars={} outputChars={}",
+                    entry.getSessionId(), entry.getStepName(), entry.getModel(),
+                    entry.getInputPrompt() == null ? 0 : entry.getInputPrompt().length(),
+                    entry.getOutputText() == null ? 0 : entry.getOutputText().length(), e);
         }
     }
 }

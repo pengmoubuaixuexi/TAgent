@@ -5,6 +5,7 @@ import cn.bugstack.ai.api.dto.AiClientToolMcpQueryRequestDTO;
 import cn.bugstack.ai.api.dto.AiClientToolMcpRequestDTO;
 import cn.bugstack.ai.api.dto.AiClientToolMcpResponseDTO;
 import cn.bugstack.ai.api.response.Response;
+import cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService;
 import cn.bugstack.ai.infrastructure.dao.IAiClientToolMcpDao;
 import cn.bugstack.ai.infrastructure.dao.po.AiClientToolMcp;
 import cn.bugstack.ai.types.enums.ResponseCode;
@@ -21,7 +22,7 @@ import java.util.stream.Collectors;
 /**
  * MCP客户端配置管理控制器
  *
- * @author TAgent
+ * @author bugstack虫洞栈
  * @description MCP客户端配置管理控制器
  */
 @Slf4j
@@ -32,6 +33,9 @@ public class AiClientToolMcpAdminController implements IAiClientToolMcpAdminServ
 
     @Resource
     private IAiClientToolMcpDao aiClientToolMcpDao;
+
+    @Resource
+    private McpToolCatalogService mcpToolCatalogService;
 
     @Override
     @PostMapping("/create")
@@ -344,6 +348,51 @@ public class AiClientToolMcpAdminController implements IAiClientToolMcpAdminServ
         } catch (Exception e) {
             log.error("查询启用的MCP客户端配置失败", e);
             return Response.<List<AiClientToolMcpResponseDTO>>builder()
+                    .code(ResponseCode.UN_ERROR.getCode())
+                    .info(ResponseCode.UN_ERROR.getInfo())
+                    .data(null)
+                    .build();
+        }
+    }
+
+    @PostMapping("/tool-catalog/refresh")
+    public Response<java.util.Map<String, Object>> refreshAllMcpToolCatalog() {
+        try {
+            int toolCount = mcpToolCatalogService.refreshEnabledMcpCatalog();
+            java.util.Map<String, Object> data = new java.util.LinkedHashMap<>();
+            data.put("scope", "enabled");
+            data.put("toolCount", toolCount);
+            return Response.<java.util.Map<String, Object>>builder()
+                    .code(ResponseCode.SUCCESS.getCode())
+                    .info(ResponseCode.SUCCESS.getInfo())
+                    .data(data)
+                    .build();
+        } catch (Exception e) {
+            log.error("刷新 MCP 工具目录失败", e);
+            return Response.<java.util.Map<String, Object>>builder()
+                    .code(ResponseCode.UN_ERROR.getCode())
+                    .info(ResponseCode.UN_ERROR.getInfo())
+                    .data(null)
+                    .build();
+        }
+    }
+
+    @PostMapping("/tool-catalog/refresh/{mcpId}")
+    public Response<java.util.Map<String, Object>> refreshMcpToolCatalog(@PathVariable("mcpId") String mcpId) {
+        try {
+            int toolCount = mcpToolCatalogService.refreshMcpCatalog(mcpId);
+            java.util.Map<String, Object> data = new java.util.LinkedHashMap<>();
+            data.put("scope", "single");
+            data.put("mcpId", mcpId);
+            data.put("toolCount", toolCount);
+            return Response.<java.util.Map<String, Object>>builder()
+                    .code(ResponseCode.SUCCESS.getCode())
+                    .info(ResponseCode.SUCCESS.getInfo())
+                    .data(data)
+                    .build();
+        } catch (Exception e) {
+            log.error("刷新 MCP 工具目录失败 mcpId={}", mcpId, e);
+            return Response.<java.util.Map<String, Object>>builder()
                     .code(ResponseCode.UN_ERROR.getCode())
                     .info(ResponseCode.UN_ERROR.getInfo())
                     .data(null)

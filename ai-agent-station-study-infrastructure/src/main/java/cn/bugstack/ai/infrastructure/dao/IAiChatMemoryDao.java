@@ -22,6 +22,10 @@ public interface IAiChatMemoryDao {
 
     void deleteByConversationId(@Param("conversationId") String conversationId);
 
+    /** 带归属校验的删除：只删属于该 userId 的会话，返回删除行数（0=不属于该用户/不存在） */
+    int deleteByConversationIdAndUserId(@Param("conversationId") String conversationId,
+                                        @Param("userId") String userId);
+
     /** 查用户的会话列表：conversation_id + 消息数 + 首条用户消息预览 */
     List<java.util.Map<String, Object>> findConversationsByUserId(@Param("userId") String userId, @Param("limit") int limit);
 

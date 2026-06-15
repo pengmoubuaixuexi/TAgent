@@ -27,7 +27,7 @@ import java.util.stream.Collectors;
  * AI Agent 自动装配配置类
  * 在Spring Boot应用启动完成后，根据配置自动装配AI客户端
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/1/15 10:00
  */
 @Slf4j

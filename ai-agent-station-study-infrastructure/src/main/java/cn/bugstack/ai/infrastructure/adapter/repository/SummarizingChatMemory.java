@@ -1,6 +1,7 @@
 package cn.bugstack.ai.infrastructure.adapter.repository;
 
 import cn.bugstack.ai.domain.agent.service.memory.IConversationSummarizer;
+import cn.bugstack.ai.infrastructure.adapter.repository.cache.MemoryCacheService;
 import cn.bugstack.ai.infrastructure.dao.IAiChatMemorySummaryDao;
 import cn.bugstack.ai.infrastructure.dao.po.AiChatMemorySummary;
 import jakarta.annotation.Resource;
@@ -50,6 +51,9 @@ public class SummarizingChatMemory implements ChatMemory {
 
     @Resource
     private IAiChatMemorySummaryDao summaryDao;
+
+    @Resource
+    private MemoryCacheService memoryCache;
 
     @Resource
     private IConversationSummarizer summarizer;
@@ -105,7 +109,11 @@ public class SummarizingChatMemory implements ChatMemory {
         List<Message> raw = chatMemoryRepository.findByConversationId(conversationId);
         if (raw == null) raw = Collections.emptyList();
 
-        AiChatMemorySummary summary = summaryDao.findByConversationId(conversationId);
+        AiChatMemorySummary summary = memoryCache.getSummary(conversationId);
+        if (summary == null) {
+            summary = summaryDao.findByConversationId(conversationId);
+            if (summary != null) memoryCache.putSummary(conversationId, summary);
+        }
         int watermark = (summary != null && summary.getSummaryMsgCount() != null) ? summary.getSummaryMsgCount() : 0;
 
         // 取窗口：跳过已纳入摘要的消息，只取最近 maxMessages 条未摘要消息
@@ -133,6 +141,8 @@ public class SummarizingChatMemory implements ChatMemory {
         if (conversationId == null || conversationId.isBlank()) return;
         chatMemoryRepository.deleteByConversationId(conversationId);
         summaryDao.deleteByConversationId(conversationId);
+        memoryCache.evictChatList(conversationId);
+        memoryCache.evictSummary(conversationId);
         inFlight.remove(conversationId);
     }
 

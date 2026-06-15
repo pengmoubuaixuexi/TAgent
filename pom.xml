@@ -40,10 +40,10 @@
 
     <developers>
         <developer>
-            <name>tagent</name>
+            <name>xiaofuge</name>
             <email>184172133@qq.com</email>
-            <organization>tagent</organization>
-            <organizationUrl>https://github.com/tagent</organizationUrl>
+            <organization>fuzhengwei</organization>
+            <organizationUrl>https://github.com/fuzhengwei</organizationUrl>
         </developer>
     </developers>
 
@@ -116,21 +116,18 @@
                 <version>1.15</version>
             </dependency>
             <dependency>
-                <groupId>javax.annotation</groupId>
-                <artifactId>javax.annotation-api</artifactId>
-                <version>1.3.2</version>
-            </dependency>
-            <dependency>
                 <groupId>org.projectlombok</groupId>
                 <artifactId>lombok</artifactId>
                 <version>1.18.42</version>
             </dependency>
 
-            <!-- spring ai 1.0.0 https://central.sonatype.com/artifact/org.springframework.ai/spring-ai-bom -->
+            <!-- spring ai 1.1.7（升级中：1.0.0 → 1.1.0 → 1.1.3 → 1.1.7，逐档）https://central.sonatype.com/artifact/org.springframework.ai/spring-ai-bom
+                 1.1.x 发布 jar 仍为 Java 17 字节码（major 61，已验 spring-ai-openai 1.1.3 / 1.1.7）；
+                 release note "build requires Java 21" 指官方构建工具链，不影响 Java 17 消费方。 -->
             <dependency>
                 <groupId>org.springframework.ai</groupId>
                 <artifactId>spring-ai-bom</artifactId>
-                <version>1.0.0</version>
+                <version>1.1.7</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
@@ -162,6 +159,21 @@
                 <artifactId>elasticsearch-rest-client</artifactId>
                 <version>7.17.28</version>
             </dependency>
+
+            <!-- 扳手工程（下载后，用 idea 打开，点击 install） https://gitcode.net/KnowledgePlanet/ai-agent-station -->
+            <dependency>
+                <groupId>cn.bugstack.wrench</groupId>
+                <artifactId>xfg-wrench-bom</artifactId>
+                <version>3.0.0</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+<!--            <dependency>-->
+<!--                <groupId>cn.bugstack.wrench</groupId>-->
+<!--                <artifactId>xfg-wrench-starter-task-job</artifactId>-->
+<!--                <version>3.3.0</version>-->
+<!--            </dependency>-->
 
             <!-- 工程模块 -->
             <dependency>

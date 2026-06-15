@@ -24,21 +24,21 @@ import java.util.List;
 public class AgenticRagAdvisor implements BaseAdvisor {
 
     private static final String RAG_DECISION_PROMPT = """
-            Determine if the user's question requires searching a knowledge base (RAG) to answer accurately.
-            Reply with ONLY "YES" or "NO".
+            判断用户问题是否需要检索知识库（RAG）才能准确回答。
+            请只回答 "YES" 或 "NO"，不要输出其它内容。
 
-            Need RAG (YES):
-            - Questions about specific facts, data, documents, or technical details
-            - Questions that reference uploaded files or documents
-            - Questions requiring current or domain-specific information
+            需要检索（YES）：
+            - 涉及具体事实、数据、上传文档、业务资料或技术细节
+            - 明确引用了知识库、文件、文档、资料、手册、历史记录
+            - 需要当前知识库或特定领域信息支持
 
-            No RAG needed (NO):
-            - Simple greetings or chit-chat
-            - General knowledge questions the model can answer confidently
-            - Questions about the conversation itself
-            - Pure creative writing or brainstorming
+            不需要检索（NO）：
+            - 简单寒暄或闲聊
+            - 模型可以可靠直接回答的通用常识
+            - 关于当前对话本身的问题
+            - 纯创作、头脑风暴或开放式想法发散
 
-            User question: %s
+            用户问题：%s
             """;
 
     private final ChatClient routerClient;
@@ -109,12 +109,37 @@ public class AgenticRagAdvisor implements BaseAdvisor {
         try {
             String prompt = String.format(RAG_DECISION_PROMPT, query);
             String resp = routerClient.prompt().user(prompt).call().content();
-            if (resp != null) {
-                return resp.trim().toUpperCase().startsWith("YES");
+            Boolean decision = parseRagDecision(resp);
+            if (decision != null) {
+                return decision;
             }
+            log.debug("[AgenticRAG] 判定输出无法识别，默认检索（安全侧）: {}", resp);
         } catch (Exception e) {
             log.debug("[AgenticRAG] decision call failed, defaulting to YES: {}", e.getMessage());
         }
-        return true; // 失败默认检索（安全侧）
+        return true; // 失败 / 无法识别默认检索（安全侧）
+    }
+
+    /**
+     * 解析"是否需要检索"的判定输出，兼容中英文：
+     * <ul>
+     *   <li>需要检索 → {@code YES} / {@code 是} / {@code 需要(检索)}</li>
+     *   <li>跳过检索 → {@code NO} / {@code 否} / {@code 不需要} / {@code 无需}</li>
+     * </ul>
+     * 两者都识别不到 → 返回 {@code null}，由调用方走"安全侧默认检索"。
+     * <p>关键：中文必须<b>先判否定再认肯定</b>——"不需要"里含"需要"，顺序反了会判反。
+     */
+    private Boolean parseRagDecision(String resp) {
+        if (resp == null) return null;
+        String s = resp.trim();
+        if (s.isEmpty()) return null;
+        // 英文优先：输出契约要求只回 YES/NO
+        String upper = s.toUpperCase();
+        if (upper.startsWith("YES")) return Boolean.TRUE;
+        if (upper.startsWith("NO")) return Boolean.FALSE;
+        // 中文兜底：先排否定（"不需要"包含"需要"，必须先于肯定判断）
+        if (s.startsWith("否") || s.contains("不需要") || s.contains("无需")) return Boolean.FALSE;
+        if (s.startsWith("是") || s.contains("需要")) return Boolean.TRUE;
+        return null;
     }
 }

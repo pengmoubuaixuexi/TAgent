@@ -8,7 +8,7 @@ import java.util.List;
 
 /**
  * 智能体-客户端关联表 DAO
- * @author TAgent
+ * @author bugstack虫洞栈
  * @description 智能体-客户端关联表数据访问对象
  */
 @Mapper

@@ -11,7 +11,7 @@ import java.io.Serializable;
 /**
  * AI智能体拖拉拽配置请求DTO
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/1/20 10:00
  */
 @Data

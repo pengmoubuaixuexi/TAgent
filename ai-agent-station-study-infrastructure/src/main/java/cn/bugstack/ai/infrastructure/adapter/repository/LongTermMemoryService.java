@@ -1,5 +1,6 @@
 package cn.bugstack.ai.infrastructure.adapter.repository;
 
+import cn.bugstack.ai.domain.agent.service.memory.MemoryTopics;
 import cn.bugstack.ai.domain.agent.service.memory.conflict.IMemoryConflictResolver;
 import cn.bugstack.ai.domain.agent.service.memory.longterm.ILongTermMemoryService;
 import cn.bugstack.ai.infrastructure.dao.IAiLongTermMemoryDao;
@@ -74,7 +75,10 @@ public class LongTermMemoryService implements ILongTermMemoryService {
         return ltmStore;
     }
 
-    /** P2.1 10.3 冲突解决器；为 null 时跳过冲突检查直接保存 */
+    /**
+     * 累加 topic 的「重述 vs 互补」判定器（mem0/MemGPT 思路）。单值 topic 不用它（走确定性覆盖）。
+     * 不走 Jaccard 预检（整句中文=单 token 恒失效）；LLM 不可达时 resolver 内部 fallback=KEEP_BOTH（不丢数据）。
+     */
     @Autowired(required = false)
     private IMemoryConflictResolver conflictResolver;
 
@@ -108,6 +112,31 @@ public class LongTermMemoryService implements ILongTermMemoryService {
     @Value("${agent.memory.long-term.semantic-dedupe-threshold-cumulative:0.10}")
     private double semanticDedupeThresholdCumulative;
 
+    @Value("${agent.memory.long-term.retrieve-similarity-threshold:0.0}")
+    private double retrieveSimilarityThreshold;
+
+    /**
+     * 遗忘衰减基线（2026-06-07 重设计）：归档阈值 = baseDays + k(topic) × min(access_count, cap)。
+     * 从未被召回的记忆（last_accessed IS NULL）从 created_at 起算，count=0 无热度加成，过 baseDays 即归档。
+     */
+    @Value("${agent.memory.long-term.decay-base-days:30}")
+    private int decayBaseDays;
+
+    /**
+     * 热度宽限系数 k：access_count 经 touchAccess 的 1 天节流后≈"被召回的不同天数"，越热宽限越久。
+     * 技能/偏好（耐久）给大 k 活得久，计划/情况（会过期）给小 k 早归档，其它/未知 topic 取中间值。
+     */
+    @Value("${agent.memory.long-term.decay-k-durable:20}")
+    private int decayKDurable;
+    @Value("${agent.memory.long-term.decay-k-ephemeral:5}")
+    private int decayKEphemeral;
+    @Value("${agent.memory.long-term.decay-k-default:10}")
+    private int decayKDefault;
+
+    /** 热度宽限上界：min(access_count, cap)，给宽限期一个有限天花板，杜绝旧 count 硬阈值的"永久免疫"。 */
+    @Value("${agent.memory.long-term.decay-access-count-cap:50}")
+    private int decayCap;
+
     /** 写入向量库时统一打的 type tag，filterExpression 走它 */
     static final String META_TYPE = "long_term_memory";
 
@@ -119,72 +148,84 @@ public class LongTermMemoryService implements ILongTermMemoryService {
         }
         if (topic != null) topic = topic.toLowerCase();
         String memoryId = UUID.randomUUID().toString();
+        InheritedAccessStats inheritedAccessStats = new InheritedAccessStats();
 
-        // 1a. P2.1 10.3 冲突解决：检查同 topic 旧记忆
-        if (conflictResolver != null && topic != null && !topic.isBlank()) {
+        // 1a. 同 topic 冲突解决，按 topic 类型分两路：
+        //     单值 topic（画像/计划/情况）→ 确定性「保留最新」覆盖（封闭槽位只有一个真值，不调 LLM，抗降智）。
+        //     累加 topic（技能/偏好）→ 逐条 LLM「重述 vs 互补」判定：新事实只替换"它重述的那一条"，
+        //        其余互补事实保留（技能:Java「精通并发」与「精通SpringAI」共存）。LLM 不可达 → fallback=KEEP_BOTH。
+        //        为何要 LLM：区分"换说法的同一条"与"同主题的不同事实"是语义任务，距离阈值/Jaccard 都做不到
+        //        （两类的向量距离范围重叠；整句中文在 Jaccard 里=单 token 恒判不相似）。
+        if (topic != null && !topic.isBlank()) {
             List<AiLongTermMemory> existing = dao.findByUserIdAndTopic(userId, topic, 3);
             if (existing != null && !existing.isEmpty()) {
-                List<String> existingContents = existing.stream()
-                        .map(AiLongTermMemory::getContent)
-                        .collect(Collectors.toList());
-
-                // exact-match 短路：内容完全相同时直接 SKIP，不走 LLM 冲突解决
+                // exact-match 短路：内容完全相同时直接 SKIP（任何 topic 都适用，逐字相同不留两份）
                 for (AiLongTermMemory em : existing) {
                     if (em.getContent() != null && em.getContent().trim().equalsIgnoreCase(content.trim())) {
-                        log.info("ltm.conflict topic={} decision=SKIP (exact-match, no LLM call) existingMemoryId={}",
+                        log.info("ltm.conflict topic={} decision=SKIP (exact-match) existingMemoryId={}",
                                 topic, em.getMemoryId());
                         return em.getMemoryId();
                     }
                 }
-
-                // 相似度预检：仅对累加性主题（skill/decision）做短路，唯一性主题（role/location/preference）必须走 LLM
-                boolean anySimilar = false;
-                if (isCumulativeTopic(topic)) {
-                    for (String ec : existingContents) {
-                        if (ec != null && jaccardSimilarity(content, ec) >= 0.25) {
-                            anySimilar = true;
+                if (MemoryTopics.isSingular(topic)) {
+                    // 非降级护栏（2026-05-31）：画像是稳定身份，latest-wins 分不清"真实变更（体重80→78/搬家）"和
+                    // "抽取变水的降级（Java后端开发工程师→程序员）"。仅对画像类、且新值不长于旧值（疑似泛化）时，
+                    // 用 LLM 判一次：判为真实变更(OVERWRITE)才覆盖；判为降级/重述则保留旧值、丢弃新值。
+                    // LLM 不可达时 resolver 对单值 fallback=OVERWRITE → 退回原 latest-wins 行为，不回归。
+                    if (topic.startsWith("画像") && conflictResolver != null) {
+                        AiLongTermMemory latestOld = existing.get(0); // findByUserIdAndTopic 按 created_at DESC
+                        String oldContent = latestOld.getContent() == null ? "" : latestOld.getContent().trim();
+                        if (!oldContent.isBlank() && content.trim().length() <= oldContent.length()) {
+                            IMemoryConflictResolver.Decision d =
+                                    conflictResolver.resolve(topic, content, java.util.List.of(oldContent));
+                            if (d != IMemoryConflictResolver.Decision.OVERWRITE) {
+                                log.info("ltm.conflict topic={} decision=KEEP_OLD (singular anti-degrade) kept='{}' rejected='{}'",
+                                        topic, abbr(oldContent), abbr(content));
+                                return latestOld.getMemoryId();
+                            }
+                        }
+                    }
+                    // 单值槽位：归档全部同 topic 旧记忆、继承最高 access，保留最新一条（确定性，不调 LLM）
+                    for (AiLongTermMemory old : existing) {
+                        inheritedAccessStats.accept(old);
+                        archive(old.getMemoryId());
+                    }
+                    log.info("ltm.conflict topic={} existingCount={} decision=OVERWRITE (singular latest-wins, deterministic)",
+                            topic, existing.size());
+                } else if (conflictResolver != null) {
+                    // 累加槽位：逐条判定新事实是否重述了某条已有记忆。命中即只替换那一条，其余互补事实保留。
+                    for (AiLongTermMemory ex : existing) {
+                        if (ex.getContent() == null || ex.getContent().isBlank()) continue;
+                        IMemoryConflictResolver.Decision d =
+                                conflictResolver.resolve(topic, content, java.util.List.of(ex.getContent()));
+                        if (d == IMemoryConflictResolver.Decision.SKIP) {
+                            // 新事实已被这条已有事实覆盖，不另存
+                            log.info("ltm.conflict topic={} decision=SKIP (cumulative, subsumed by {})",
+                                    topic, ex.getMemoryId());
+                            return ex.getMemoryId();
+                        }
+                        if (d == IMemoryConflictResolver.Decision.MERGE) {
+                            // 合并进这条已有事实后仍落新记录：先归档旧向量/旧行，再用合并文本写入 MySQL + PgVector。
+                            // 只 updateContent 会让 MySQL 是新文本、PgVector 仍是旧 embedding，后续语义召回会漂移。
+                            inheritedAccessStats.accept(ex);
+                            archive(ex.getMemoryId());
+                            content = ex.getContent() + "\n" + content;
+                            log.info("ltm.conflict topic={} decision=MERGE (cumulative, replace merged {})",
+                                    topic, ex.getMemoryId());
                             break;
                         }
-                    }
-                } else {
-                    // 唯一性主题始终走 LLM 判定
-                    anySimilar = true;
-                }
-                IMemoryConflictResolver.Decision decision;
-                if (!anySimilar) {
-                    decision = IMemoryConflictResolver.Decision.KEEP_BOTH;
-                    log.info("ltm.conflict topic={} existingCount={} decision={} (similarity pre-gate, no LLM call)",
-                            topic, existing.size(), decision);
-                } else {
-                    decision = conflictResolver.resolve(topic, content, existingContents);
-                    log.info("ltm.conflict topic={} existingCount={} decision={}", topic, existing.size(), decision);
-                }
-
-                switch (decision) {
-                    case OVERWRITE -> {
-                        // 归档所有旧记忆
-                        for (AiLongTermMemory old : existing) {
-                            archive(old.getMemoryId());
+                        if (d == IMemoryConflictResolver.Decision.OVERWRITE) {
+                            // 新事实是这条的重述/更新 → 归档它、继承 access，落新记录；其余条目不动
+                            inheritedAccessStats.accept(ex);
+                            archive(ex.getMemoryId());
+                            log.info("ltm.conflict topic={} decision=OVERWRITE (cumulative, restated {})",
+                                    topic, ex.getMemoryId());
+                            break;
                         }
+                        // KEEP_BOTH → ex 是互补事实，保留，继续检查下一条
                     }
-                    case MERGE -> {
-                        // 保留最近一条，把新旧内容合并
-                        AiLongTermMemory newest = existing.get(0);
-                        String merged = newest.getContent() + "\n" + content;
-                        dao.updateContent(newest.getMemoryId(), merged);
-                        // 归档其他旧记忆
-                        for (int i = 1; i < existing.size(); i++) {
-                            archive(existing.get(i).getMemoryId());
-                        }
-                        // 合并后跳过新 save（已合并到旧记录）
-                        return memoryId;
-                    }
-                    case SKIP -> {
-                        // 新内容已覆盖，不保存
-                        return null;
-                    }
-                    case KEEP_BOTH -> { /* fall through - 保存新记录 */ }
                 }
+                // 累加且 conflictResolver==null：直接落新记录共存（KEEP_BOTH 语义）
             }
         }
 
@@ -207,6 +248,7 @@ public class LongTermMemoryService implements ILongTermMemoryService {
                         log.info("ltm.semantic-dedupe userId={} oldTopic={} newTopic={} distance={} threshold={} → OVERWRITE oldMemoryId={}",
                                 userId, oldTopic, topic, String.format("%.4f", distance), threshold, oldMemoryId);
                         if (oldMemoryId != null && !oldMemoryId.isBlank()) {
+                            inheritedAccessStats.accept(dao.findByMemoryId(oldMemoryId));
                             archive(oldMemoryId);  // PG delete + MySQL archived=1
                         }
                     }
@@ -227,8 +269,8 @@ public class LongTermMemoryService implements ILongTermMemoryService {
                 .content(content)
                 .source(source == null ? "auto" : source)
                 .sourceSession(sessionId)
-                .accessCount(0)
-                .lastAccessed(null)
+                .accessCount(inheritedAccessStats.accessCount)
+                .lastAccessed(inheritedAccessStats.lastAccessed)
                 .archived(0)
                 .build();
         dao.insert(po);
@@ -280,14 +322,24 @@ public class LongTermMemoryService implements ILongTermMemoryService {
         SearchRequest req;
         try {
             Filter.Expression parsed = new FilterExpressionTextParser().parse(filterExpr);
-            req = SearchRequest.builder()
-                    .query(embeddingQuery)
-                    .topK(topK)
-                    .filterExpression(parsed)
-                    .build();
+            req = retrieveSimilarityThreshold > 0
+                    ? SearchRequest.builder()
+                            .query(embeddingQuery)
+                            .topK(topK)
+                            .similarityThreshold(retrieveSimilarityThreshold)
+                            .filterExpression(parsed)
+                            .build()
+                    : SearchRequest.builder()
+                            .query(embeddingQuery)
+                            .topK(topK)
+                            .filterExpression(parsed)
+                            .build();
         } catch (Exception e) {
             log.warn("ltm.retrieve filter parse failed, fallback to no-filter: {}", e.getMessage());
-            req = SearchRequest.builder().query(embeddingQuery).topK(topK).build();
+            req = retrieveSimilarityThreshold > 0
+                    ? SearchRequest.builder().query(embeddingQuery).topK(topK)
+                            .similarityThreshold(retrieveSimilarityThreshold).build()
+                    : SearchRequest.builder().query(embeddingQuery).topK(topK).build();
         }
 
         List<Document> docs = getVectorStore().similaritySearch(req);
@@ -337,6 +389,13 @@ public class LongTermMemoryService implements ILongTermMemoryService {
                 : semanticDedupeThresholdUnique;
     }
 
+    /** 日志用：截断 + 去换行，避免长内容刷屏。 */
+    private static String abbr(String s) {
+        if (s == null) return "";
+        String t = s.replace("\n", " ").trim();
+        return t.length() > 40 ? t.substring(0, 40) + "…" : t;
+    }
+
     @Override
     public void archive(String memoryId) {
         if (memoryId == null || memoryId.isBlank()) return;
@@ -364,20 +423,23 @@ public class LongTermMemoryService implements ILongTermMemoryService {
     @Override
     public List<String> retrieveForInjection(String userId, String query, int coreN, int relevantK) {
         if (userId == null || userId.isBlank()) return Collections.emptyList();
-        if (coreN <= 0) coreN = 5;
+        // 核心记忆 = 全部画像槽位（封闭清单约13个），给足上限确保全取
+        if (coreN <= 0) coreN = 20;
         if (relevantK <= 0) relevantK = 5;
 
         LinkedHashMap<String, String> dedup = new LinkedHashMap<>();
         int coreCount = 0;
 
-        // 1. 核心记忆：按 access_count * 10 + recency_bonus 排序
+        // 1. 核心记忆 = 全部画像槽位（mapper 已按 topic, access_count DESC 排）。
+        //    同一画像 topic 只注入一条（防御历史重复数据，留最热的那条），避免画像被冗余撑爆。
         List<AiLongTermMemory> core = dao.findCoreByUser(userId, coreN);
         if (core != null) {
+            java.util.Set<String> seenCoreTopics = new java.util.HashSet<>();
             for (AiLongTermMemory m : core) {
-                if (m.getContent() != null && !m.getContent().isBlank()) {
-                    dedup.putIfAbsent(m.getContent(), m.getTopic());
-                    coreCount++;
-                }
+                if (m.getContent() == null || m.getContent().isBlank()) continue;
+                if (m.getTopic() != null && !seenCoreTopics.add(m.getTopic())) continue;
+                dedup.putIfAbsent(m.getContent(), m.getTopic());
+                coreCount++;
             }
         }
 
@@ -388,9 +450,11 @@ public class LongTermMemoryService implements ILongTermMemoryService {
                 if (relevant != null) {
                     for (Document d : relevant) {
                         String content = d.getText();
-                        if (content != null && !content.isBlank()) {
-                            dedup.putIfAbsent(content, (String) d.getMetadata().get("topic"));
-                        }
+                        if (content == null || content.isBlank()) continue;
+                        String topic = (String) d.getMetadata().get("topic");
+                        // 画像槽位已由核心记忆全量注入，语义路跳过，不占用相关记忆名额
+                        if (topic != null && topic.startsWith("画像")) continue;
+                        dedup.putIfAbsent(content, topic);
                     }
                 }
             } catch (Exception e) {
@@ -416,12 +480,13 @@ public class LongTermMemoryService implements ILongTermMemoryService {
     }
 
     @Override
-    public int runDecay(int staleDays, int minAccess, int limit) {
-        if (staleDays <= 0) staleDays = 30;
-        if (minAccess <= 0) minAccess = 3;
+    public int runDecay(int limit) {
         if (limit <= 0 || limit > 500) limit = 100;
+        int baseDays = decayBaseDays <= 0 ? 30 : decayBaseDays;
+        int cap = decayCap <= 0 ? 50 : decayCap;
 
-        List<AiLongTermMemory> candidates = dao.findStaleCandidates(staleDays, minAccess, limit);
+        List<AiLongTermMemory> candidates = dao.findStaleCandidates(
+                baseDays, decayKDurable, decayKEphemeral, decayKDefault, cap, limit);
         if (candidates == null || candidates.isEmpty()) {
             log.debug("ltm.decay: no stale candidates found");
             return 0;
@@ -442,9 +507,33 @@ public class LongTermMemoryService implements ILongTermMemoryService {
             try { getVectorStore().delete(List.of(memId)); } catch (Exception ignored) {}
         }
 
-        log.info("ltm.decay archived staleDays={} minAccess={} archived={}/{}",
-                staleDays, minAccess, ids.size(), candidates.size());
+        log.info("ltm.decay archived baseDays={} kDurable={} kEphemeral={} kDefault={} cap={} archived={}/{}",
+                baseDays, decayKDurable, decayKEphemeral, decayKDefault, cap, ids.size(), candidates.size());
         return ids.size();
+    }
+
+    private static class InheritedAccessStats {
+        private int accessCount;
+        private LocalDateTime lastAccessed;
+
+        private void accept(AiLongTermMemory memory) {
+            if (memory == null) return;
+            int candidateCount = memory.getAccessCount() == null ? 0 : memory.getAccessCount();
+            LocalDateTime candidateLastAccessed = memory.getLastAccessed();
+            if (candidateCount > accessCount) {
+                accessCount = candidateCount;
+                lastAccessed = candidateLastAccessed;
+                return;
+            }
+            if (candidateCount == accessCount && isAfter(candidateLastAccessed, lastAccessed)) {
+                lastAccessed = candidateLastAccessed;
+            }
+        }
+
+        private static boolean isAfter(LocalDateTime candidate, LocalDateTime current) {
+            if (candidate == null) return false;
+            return current == null || candidate.isAfter(current);
+        }
     }
 
     private static String abbreviate(String s, int max) {
@@ -470,47 +559,16 @@ public class LongTermMemoryService implements ILongTermMemoryService {
         return limited;
     }
 
-    /** 累加性主题（skill/decision + 常见技术名）：同一主题下可以有多个不同记忆，如 skill:Java + skill:Python */
+    /**
+     * 累加性主题：同一主题下可以有多个不同记忆共存（如 技能:Java + 技能:Python）。
+     * 受控词表（V041）：
+     *   累加（共存，不覆盖）= 技能:/偏好:（兼容旧 skill:/preference:）
+     *   单值（新值覆盖旧值）= 画像:/计划:/情况:（兼容旧 fact:/decision:）
+     *   未知主题默认按累加处理，避免误覆盖删除数据。
+     */
     static boolean isCumulativeTopic(String topic) {
-        if (topic == null) return true;
-        String t = topic.toLowerCase();
-        if (t.startsWith("skill") || t.startsWith("decision")) return true;
-        // 无前缀但明显是技术/工具名 → 按累加处理
-        return COMMON_SKILL_TOPICS.contains(t);
+        // 统一委托共享分类法，避免与 LlmMemoryConflictResolver 各写一份导致漂移
+        return MemoryTopics.isCumulative(topic);
     }
 
-    /** 常见的技能/技术 topic 名称（LLM 可能不按 category:subject 格式产出） */
-    private static final java.util.Set<String> COMMON_SKILL_TOPICS = java.util.Set.of(
-            "python", "java", "javascript", "typescript", "go", "rust", "c++", "c#",
-            "ruby", "php", "swift", "kotlin", "scala", "r", "matlab", "dart",
-            "django", "fastapi", "flask", "spring", "spring_boot", "springboot",
-            "react", "vue", "angular", "node.js", "nodejs", "express",
-            "postgresql", "mysql", "redis", "mongodb", "elasticsearch", "kafka",
-            "docker", "kubernetes", "aws", "azure", "gcp",
-            "microservice_development", "microservices", "backend_development",
-            "frontend_development", "devops", "machine_learning", "data_science"
-    );
-
-    /** Jaccard 相似度：词集合的交集大小 / 并集大小，用于预检两段内容是否"说的是同一件事" */
-    static double jaccardSimilarity(String a, String b) {
-        if (a == null || b == null) return 0.0;
-        java.util.Set<String> setA = tokenize(a);
-        java.util.Set<String> setB = tokenize(b);
-        if (setA.isEmpty() && setB.isEmpty()) return 0.0;
-        java.util.Set<String> intersection = new java.util.HashSet<>(setA);
-        intersection.retainAll(setB);
-        java.util.Set<String> union = new java.util.HashSet<>(setA);
-        union.addAll(setB);
-        return union.isEmpty() ? 0.0 : (double) intersection.size() / union.size();
-    }
-
-    private static java.util.Set<String> tokenize(String s) {
-        java.util.Set<String> tokens = new java.util.HashSet<>();
-        for (String word : s.toLowerCase().split("[^a-zA-Z0-9\\u4e00-\\u9fff]+")) {
-            if (!word.isBlank() && word.length() > 1) {
-                tokens.add(word);
-            }
-        }
-        return tokens;
-    }
 }

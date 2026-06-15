@@ -29,7 +29,7 @@ import java.util.Map;
 /**
  * MCP客户端配置节点
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/7/5 12:48
  */
 @Slf4j
@@ -55,11 +55,20 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
 
         for (AiClientToolMcpVO mcpVO : aiClientToolMcpList) {
             try {
+                // 治本：装配复用。该 mcpId 已被其它 agent 装配过且连接仍在册 → 直接复用，
+                // 不再 createMcpSyncClient + registerBean。删旧建新会 close 旧连接，孤儿化
+                // 已装配 agent 缓存的 ToolCallback（下次调用瞬间抛 "Failed to enqueue message"）。
+                // 连接若已死，由业务路径(getFreshCallback/forceReconnect)负责重建，不在装配期处理。
+                if (mcpClientRegistry.hasClient(mcpVO.getMcpId())) {
+                    log.info("[McpReuse] mcpId={} name={} 复用已注册连接，跳过重建", mcpVO.getMcpId(), mcpVO.getMcpName());
+                    continue;
+                }
+
                 // 创建 MCP 服务
                 McpSyncClient mcpSyncClient = createMcpSyncClient(mcpVO);
 
                 // 注册 MCP 对象
-                registerBean(beanName(mcpVO.getMcpId()), McpSyncClient.class, mcpSyncClient);
+                registerMcpBean(mcpVO.getMcpId(), mcpSyncClient);
 
                 // 注册到 McpClientRegistry（用于 SSE 断连后自动重建）
                 mcpClientRegistry.register(mcpVO.getMcpId(), mcpVO, mcpSyncClient, this::createMcpSyncClient);
@@ -88,13 +97,17 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
         return AiAgentEnumVO.AI_CLIENT_TOOL_MCP.getDataName();
     }
 
+    public void registerMcpBean(String mcpId, McpSyncClient mcpSyncClient) {
+        registerBean(beanName(mcpId), McpSyncClient.class, mcpSyncClient);
+    }
+
     public McpSyncClient createMcpSyncClient(AiClientToolMcpVO aiClientToolMcpVO) {
         String transportType = aiClientToolMcpVO.getTransportType();
 
         switch (transportType) {
             case "sse" -> {
                 AiClientToolMcpVO.TransportConfigSse transportConfigSse = aiClientToolMcpVO.getTransportConfigSse();
-                // http://127.0.0.1:9999/sse?apikey=DElk89iu8Ehhnbu
+                // Example: http://127.0.0.1:9999/sse?apikey=${MCP_API_KEY}
                 String originalBaseUri = transportConfigSse.getBaseUri();
                 String baseUri;
                 String sseEndpoint;
@@ -135,7 +148,7 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
                         .env(envMap)
                         .build();
 
-                var mcpClient = McpClient.sync(new StdioClientTransport(stdioParams))
+                var mcpClient = McpClient.sync(new StdioClientTransport(stdioParams, new io.modelcontextprotocol.json.jackson2.JacksonMcpJsonMapperSupplier().get()))
                         .requestTimeout(Duration.ofSeconds(aiClientToolMcpVO.getRequestTimeout())).build();
                 var init_stdio = mcpClient.initialize();
 

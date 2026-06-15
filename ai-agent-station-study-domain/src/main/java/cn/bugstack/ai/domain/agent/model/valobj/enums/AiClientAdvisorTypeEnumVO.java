@@ -27,7 +27,7 @@ import java.util.Map;
 /**
  * 顾问类型枚举
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/7/19 09:02
  */
 @Getter

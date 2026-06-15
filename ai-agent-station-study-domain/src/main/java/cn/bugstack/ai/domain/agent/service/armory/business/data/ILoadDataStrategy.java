@@ -6,7 +6,7 @@ import cn.bugstack.ai.domain.agent.service.armory.node.factory.DefaultArmoryStra
 /**
  * 数据加载策略
  *
- * @author tagent bugstack.cn @TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/6/27 17:16
  */
 public interface ILoadDataStrategy {

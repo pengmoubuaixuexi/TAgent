@@ -19,6 +19,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ThreadPoolExecutor;
 
 /**
  * 健壮版 {@link ToolCallingManager}：解决 LLM 工具名大小写幻觉问题。
@@ -46,14 +48,94 @@ import java.util.Set;
 public class RobustToolCallingManager implements ToolCallingManager {
 
     private final ToolCallingManager delegate;
+    private final McpToolMetrics metrics;
+    /** 并行执行用的 IO 线程池（dagExecutor，execute() 自动 ContextSnapshot.wrap 接力 MDC）；null → 退化串行 */
+    private final ThreadPoolExecutor toolExecutor;
+    /** 并行开关；false 或 toolExecutor==null → 一律委托 delegate 串行执行 */
+    private final boolean parallelEnabled;
+    /** 单个 client 执行链路内最多允许的串行工具轮数；<=0 表示不限制。并行的一批 tool call 算 1 轮。 */
+    private final int maxSerialToolRoundsPerClient;
+    /**
+     * 方案A：toolName → mcpId 映射，用于把并行批次按 MCP server 分组——同一个 McpSyncClient 连接不是并发安全的
+     * （Reactor Sinks 要求串行发送，并发会 "Failed to enqueue message" / "Unexpected response for unknown id"），
+     * 所以同组（同连接）串行、不同组（不同连接）并行。null → 全部归一组，退化串行。
+     */
+    private final McpClientRegistry mcpClientRegistry;
+
+    /**
+     * true：非执行步（分析/规划/质检/汇总）不向模型暴露任何工具定义——{@link #resolveToolDefinitions} 直接返回空，
+     * 模型请求体里就<b>没有</b> {@code tools} 字段，<b>模型从源头不会发起 tool_call</b>（不是"调用后拦截"）。执行步不受影响。
+     * 由 {@code agent.mcp.disable-tools-on-nonexec-steps} 控制，{@code AiClientModelNode} 装配时 set。
+     */
+    private volatile boolean disableToolsOnNonExecStep = false;
+
+    public void setDisableToolsOnNonExecStep(boolean v) {
+        this.disableToolsOnNonExecStep = v;
+    }
 
     public RobustToolCallingManager(ToolCallingManager delegate) {
+        this(delegate, null, null, false, null, 0);
+    }
+
+    public RobustToolCallingManager(ToolCallingManager delegate, McpToolMetrics metrics) {
+        this(delegate, metrics, null, false, null, 0);
+    }
+
+    public RobustToolCallingManager(ToolCallingManager delegate, McpToolMetrics metrics,
+                                    ThreadPoolExecutor toolExecutor, boolean parallelEnabled) {
+        this(delegate, metrics, toolExecutor, parallelEnabled, null, 0);
+    }
+
+    public RobustToolCallingManager(ToolCallingManager delegate, McpToolMetrics metrics,
+                                    ThreadPoolExecutor toolExecutor, boolean parallelEnabled,
+                                    McpClientRegistry mcpClientRegistry) {
+        this(delegate, metrics, toolExecutor, parallelEnabled, mcpClientRegistry, 0);
+    }
+
+    public RobustToolCallingManager(ToolCallingManager delegate, McpToolMetrics metrics,
+                                    ThreadPoolExecutor toolExecutor, boolean parallelEnabled,
+                                    McpClientRegistry mcpClientRegistry, int maxSerialToolRoundsPerClient) {
         this.delegate = delegate;
+        this.metrics = metrics;
+        this.toolExecutor = toolExecutor;
+        this.parallelEnabled = parallelEnabled;
+        this.mcpClientRegistry = mcpClientRegistry;
+        this.maxSerialToolRoundsPerClient = maxSerialToolRoundsPerClient;
     }
 
     @Override
     public List<ToolDefinition> resolveToolDefinitions(ToolCallingChatOptions options) {
+        if (disableToolsOnNonExecStep && isNonExecStep(options)) {
+            // 非执行步：不暴露工具定义 → 请求无 tools 字段 → 模型根本不会 tool_call（从源头掐掉，非事后拦截）
+            return List.of();
+        }
         return delegate.resolveToolDefinitions(options);
+    }
+
+    /**
+     * 当前请求是否属于"非执行步"（分析/规划/质检/汇总）。判定依据：{@code callStepWithStreaming} 注入到
+     * ToolContext 的 {@code stepLabel}(=各步中文 displayName，如"需求分析/质量评审/步骤规划/最终总结/MCP 工具分析")；
+     * 取不到再退 MDC {@code "step"}(stepId)；都取不到 → 保守按执行步放行（识别不出时不误伤执行步/fixed）。
+     * 执行步含"执行/回答/最终合成"或对应 stepId 片段，其余即非执行步。与 E2E earlyStepToolCallCount 口径一致。
+     */
+    private boolean isNonExecStep(ToolCallingChatOptions options) {
+        String label = null;
+        if (options != null && options.getToolContext() != null) {
+            Object v = options.getToolContext().get("stepLabel");
+            if (v != null) label = String.valueOf(v);
+        }
+        if (label == null || label.isBlank()) {
+            label = org.slf4j.MDC.get("step");
+        }
+        if (label == null || label.isBlank()) {
+            return false;
+        }
+        String s = label.toLowerCase();
+        boolean executor = s.contains("执行") || s.contains("回答") || s.contains("最终合成")
+                || s.contains("precision_executor") || s.contains("execute_step")
+                || s.contains("execute_steps") || s.contains("final_synthesis")
+                || s.contains("fixed") || s.contains("response");
+        return !executor;
     }
 
     @Override
@@ -78,7 +160,178 @@ public class RobustToolCallingManager implements ToolCallingManager {
             return buildUnknownToolErrorResult(prompt, normalized, unknownNames, caseMap);
         }
 
+        if (maxSerialToolRoundsPerClient > 0) {
+            Generation toolGen = firstGenerationWithToolCalls(normalized);
+            int priorRounds = countPriorToolRounds(prompt);
+            int currentCalls = toolGen != null && toolGen.getOutput() != null
+                    ? toolGen.getOutput().getToolCalls().size() : 0;
+            // 当前这批 tool calls 无论有几个，都是同一轮 assistant response；并行批量调用只算 1 个串行轮次。
+            int nextRound = currentCalls > 0 ? 1 : 0;
+            if (priorRounds + nextRound > maxSerialToolRoundsPerClient) {
+                log.warn("[RobustToolMgr] serial tool round limit exceeded priorRounds={} currentCalls={} maxRounds={}, returning cap error",
+                        priorRounds, currentCalls, maxSerialToolRoundsPerClient);
+                return buildToolCallRoundLimitResult(prompt, normalized, priorRounds, currentCalls, maxSerialToolRoundsPerClient);
+            }
+        }
+
+        // 并行执行：同一 assistant message 含 ≥2 个 tool call 时 fan-out 到 toolExecutor。
+        // N≤1 / 开关关 / 无池 → 走 delegate 串行（覆盖绝大多数逐工具调用，零改动零风险）。
+        if (parallelEnabled && toolExecutor != null) {
+            Generation toolGen = firstGenerationWithToolCalls(normalized);
+            if (toolGen != null && toolGen.getOutput() != null
+                    && toolGen.getOutput().getToolCalls().size() >= 2) {
+                return executeInParallel(prompt, normalized, toolGen);
+            }
+        }
+
         return delegate.executeToolCalls(prompt, normalized);
+    }
+
+    /** 统计当前 client 执行链路已经走过多少个串行工具轮次；一条 ToolResponseMessage 代表一轮，可含多条并行响应。 */
+    private int countPriorToolRounds(Prompt prompt) {
+        int count = 0;
+        if (prompt == null || prompt.getInstructions() == null) return 0;
+        for (Message message : prompt.getInstructions()) {
+            if (message instanceof ToolResponseMessage trm && trm.getResponses() != null && !trm.getResponses().isEmpty()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /** 取第一个含 tool call 的 Generation（与 buildUnknownToolErrorResult 取法一致，通常只有一个）。 */
+    private Generation firstGenerationWithToolCalls(ChatResponse chatResponse) {
+        for (Generation gen : chatResponse.getResults()) {
+            if (gen.getOutput() != null && gen.getOutput().hasToolCalls()) {
+                return gen;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 并行版执行：把 N 个 tool call 切成 N 个单工具 ChatResponse，各自委托 {@link #delegate}（复用其
+     * ToolContext 构建 / callback 查找 / 错误处理 / metric），并行跑在 toolExecutor 上，再按原序合并成
+     * 一个 {@link ToolResponseMessage}。组装结构照搬 {@link #buildUnknownToolErrorResult}。
+     * <p>
+     * MDC（sessionId / userId / stepLabel）靠 toolExecutor(dagExecutor) 的 execute() ContextSnapshot.wrap
+     * 自动接力到 worker 线程——审批 gate / metric / Reactor 上下文才不丢。
+     * <p>
+     * returnDirect 固定 false：本 manager 仅装配给 MCP 工具模型，MCP 工具恒非 returnDirect。
+     */
+    private ToolExecutionResult executeInParallel(Prompt prompt, ChatResponse normalized, Generation toolGen) {
+        AssistantMessage fullAm = toolGen.getOutput();
+        List<AssistantMessage.ToolCall> calls = fullAm.getToolCalls();
+
+        // 方案A：按 MCP server 分组。同一连接非并发安全 → 同组串行；不同连接 → 组间并行。
+        java.util.LinkedHashMap<String, List<Integer>> groups = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < calls.size(); i++) {
+            groups.computeIfAbsent(resolveMcpGroupKey(calls.get(i).name()), k -> new ArrayList<>()).add(i);
+        }
+
+        // 全在同一个 MCP server（或无法识别 mcpId）→ 没有可安全并行的，退回 delegate 原生串行（零风险、零自定义合并）。
+        if (groups.size() <= 1) {
+            log.debug("[RobustToolMgr] {} tool calls in one MCP group, executing serially via delegate", calls.size());
+            return delegate.executeToolCalls(prompt, normalized);
+        }
+
+        // 组间并行：每个 group 一个 task，task 内部按原顺序串行跑该连接的工具；结果写回原始 index 槽位。
+        ToolResponseMessage.ToolResponse[] ordered = new ToolResponseMessage.ToolResponse[calls.size()];
+        List<CompletableFuture<Void>> futures = new ArrayList<>(groups.size());
+        for (List<Integer> indices : groups.values()) {
+            futures.add(CompletableFuture.runAsync(() -> {
+                for (int idx : indices) {
+                    AssistantMessage.ToolCall tc = calls.get(idx);
+                    try {
+                        ordered[idx] = executeSingleToolCall(prompt, normalized, toolGen, tc);
+                    } catch (Exception e) {
+                        log.warn("[RobustToolMgr] tool '{}' failed: {}", tc.name(), e.getMessage());
+                        ordered[idx] = new ToolResponseMessage.ToolResponse(
+                                tc.id(), tc.name(), "工具执行失败（tool execution failed）：" + e.getMessage()
+                                + "。请不要重复同样的无效调用，可基于已有信息回答，或改用其它真实可用工具。");
+                    }
+                }
+            }, toolExecutor));
+        }
+        for (CompletableFuture<Void> f : futures) {
+            try {
+                f.join();
+            } catch (Exception e) {
+                log.warn("[RobustToolMgr] tool group join failed: {}", e.getMessage());
+            }
+        }
+
+        // 按原 tool call 顺序组装（模型靠 tool_call_id 匹配，顺序稳定更稳）
+        List<ToolResponseMessage.ToolResponse> responses = new ArrayList<>(calls.size());
+        for (int i = 0; i < calls.size(); i++) {
+            responses.add(ordered[i] != null ? ordered[i]
+                    : new ToolResponseMessage.ToolResponse(calls.get(i).id(), calls.get(i).name(), ""));
+        }
+
+        log.info("[RobustToolMgr] parallel executed {} tool calls across {} MCP groups", calls.size(), groups.size());
+
+        List<Message> conversationHistory = new ArrayList<>(prompt.getInstructions());
+        conversationHistory.add(fullAm);
+        conversationHistory.add(ToolResponseMessage.builder().responses(responses).metadata(Map.of()).build());
+        return ToolExecutionResult.builder()
+                .conversationHistory(conversationHistory)
+                .returnDirect(false)
+                .build();
+    }
+
+    /** toolName → 分组键：优先用 mcpId（同连接一组）；拿不到时归到统一兜底组（保守串行）。 */
+    private String resolveMcpGroupKey(String toolName) {
+        if (mcpClientRegistry != null && toolName != null) {
+            try {
+                String mcpId = mcpClientRegistry.getMcpIdForTool(toolName);
+                if (mcpId != null && !mcpId.isBlank()) return mcpId;
+            } catch (Exception ignored) {
+            }
+        }
+        return "__no_mcp_id__";
+    }
+
+    /**
+     * 执行单个 tool call：构建只含该 ToolCall 的 ChatResponse，委托 delegate 执行，
+     * 从结果 conversationHistory 末尾的 ToolResponseMessage 取出对应那条响应。
+     */
+    private ToolResponseMessage.ToolResponse executeSingleToolCall(
+            Prompt prompt, ChatResponse normalized, Generation toolGen, AssistantMessage.ToolCall tc) {
+        AssistantMessage fullAm = toolGen.getOutput();
+        AssistantMessage singleAm = AssistantMessage.builder()
+                .content(fullAm.getText())
+                .properties(fullAm.getMetadata())
+                .toolCalls(List.of(tc))
+                .media(fullAm.getMedia())
+                .build();
+        Generation singleGen = new Generation(singleAm, toolGen.getMetadata());
+        ChatResponse single = new ChatResponse(List.of(singleGen), normalized.getMetadata());
+
+        ToolExecutionResult result = delegate.executeToolCalls(prompt, single);
+        return extractToolResponse(result, tc);
+    }
+
+    /** 从 delegate 结果的 conversationHistory 末尾 ToolResponseMessage 取出 tc 对应（按 id 匹配，退化取首条）的响应。 */
+    private ToolResponseMessage.ToolResponse extractToolResponse(ToolExecutionResult result, AssistantMessage.ToolCall tc) {
+        if (result != null && result.conversationHistory() != null) {
+            List<Message> history = result.conversationHistory();
+            for (int i = history.size() - 1; i >= 0; i--) {
+                if (history.get(i) instanceof ToolResponseMessage trm) {
+                    List<ToolResponseMessage.ToolResponse> rs = trm.getResponses();
+                    if (rs != null && !rs.isEmpty()) {
+                        if (tc.id() != null) {
+                            for (ToolResponseMessage.ToolResponse r : rs) {
+                                if (tc.id().equals(r.id())) return r;
+                            }
+                        }
+                        return rs.get(0);
+                    }
+                    break;
+                }
+            }
+        }
+        log.warn("[RobustToolMgr] no tool response extracted for '{}', returning empty", tc.name());
+        return new ToolResponseMessage.ToolResponse(tc.id(), tc.name(), "");
     }
 
     /**
@@ -96,7 +349,9 @@ public class RobustToolCallingManager implements ToolCallingManager {
             if (gen.getOutput() == null || !gen.getOutput().hasToolCalls()) continue;
             for (AssistantMessage.ToolCall tc : gen.getOutput().getToolCalls()) {
                 if (tc.name() != null && !realNames.contains(tc.name())) {
-                    unknown.add(tc.name());
+                    if (unknown.add(tc.name()) && metrics != null) {
+                        metrics.recordUnknownToolName(tc.name());
+                    }
                 }
             }
         }
@@ -114,9 +369,9 @@ public class RobustToolCallingManager implements ToolCallingManager {
         for (Map.Entry<String, String> e : caseMap.entrySet()) {
             toolList.append("- ").append(e.getValue()).append("\n");
         }
-        String errorData = "Error: Tool(s) not found: " + unknownNames
-                + ". You must ONLY use tools from the registered list below. Do NOT fabricate tool names.\n"
-                + "Available tools:\n" + toolList;
+        String errorData = "工具不存在（tool not found）：" + unknownNames
+                + "。你只能使用下面已注册的真实工具名，禁止编造工具名。\n"
+                + "可用工具：\n" + toolList;
 
         // 取 AssistantMessage（含 toolCalls）用于构建 conversationHistory
         AssistantMessage assistantMessage = null;
@@ -141,7 +396,46 @@ public class RobustToolCallingManager implements ToolCallingManager {
         if (assistantMessage != null) {
             conversationHistory.add(assistantMessage);
         }
-        conversationHistory.add(new ToolResponseMessage(responses));
+        conversationHistory.add(ToolResponseMessage.builder().responses(responses).metadata(Map.of()).build());
+
+        return ToolExecutionResult.builder()
+                .conversationHistory(conversationHistory)
+                .returnDirect(false)
+                .build();
+    }
+
+    /**
+     * 工具调用次数超过上限时，不再真实执行工具，而是把结构化错误返回给模型，要求其基于已有信息收束。
+     */
+    private ToolExecutionResult buildToolCallRoundLimitResult(
+            Prompt prompt, ChatResponse chatResponse, int priorRounds, int currentCalls, int maxRounds) {
+        AssistantMessage assistantMessage = null;
+        for (Generation gen : chatResponse.getResults()) {
+            if (gen.getOutput() != null && gen.getOutput().hasToolCalls()) {
+                assistantMessage = gen.getOutput();
+                break;
+            }
+        }
+
+        String errorData = "工具调用轮次预算已用完（tool call budget exceeded）。"
+                + "本次 client 执行已经使用 " + priorRounds + " 轮工具调用，"
+                + "当前请求又尝试在新一轮中调用 " + currentCalls + " 个工具，"
+                + "但最多只允许 " + maxRounds + " 轮。"
+                + "请立刻停止继续调用工具，基于已经收集到的信息给出最佳答案。"
+                + "如果关键数据缺失，请明确列出缺失字段，并提供保守兜底方案。";
+
+        List<ToolResponseMessage.ToolResponse> responses = new ArrayList<>();
+        if (assistantMessage != null) {
+            for (AssistantMessage.ToolCall tc : assistantMessage.getToolCalls()) {
+                responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(), errorData));
+            }
+        }
+
+        List<Message> conversationHistory = new ArrayList<>(prompt.getInstructions());
+        if (assistantMessage != null) {
+            conversationHistory.add(assistantMessage);
+        }
+        conversationHistory.add(ToolResponseMessage.builder().responses(responses).metadata(Map.of()).build());
 
         return ToolExecutionResult.builder()
                 .conversationHistory(conversationHistory)
@@ -194,6 +488,9 @@ public class RobustToolCallingManager implements ToolCallingManager {
                 String mapped = caseMap.get(origName.toLowerCase());
                 if (mapped != null) {
                     log.info("[RobustToolMgr] normalize tool name '{}' -> '{}'", origName, mapped);
+                    if (metrics != null) {
+                        metrics.recordNameNormalized(origName, mapped);
+                    }
                     normCalls.add(new AssistantMessage.ToolCall(tc.id(), tc.type(), mapped, tc.arguments()));
                     genChanged = true;
                 } else {
@@ -203,12 +500,12 @@ public class RobustToolCallingManager implements ToolCallingManager {
                 }
             }
             if (genChanged) {
-                AssistantMessage normAm = new AssistantMessage(
-                        am.getText(),
-                        am.getMetadata(),
-                        normCalls,
-                        am.getMedia()
-                );
+                AssistantMessage normAm = AssistantMessage.builder()
+                        .content(am.getText())
+                        .properties(am.getMetadata())
+                        .toolCalls(normCalls)
+                        .media(am.getMedia())
+                        .build();
                 rebuilt.add(new Generation(normAm, gen.getMetadata()));
                 anyChanged = true;
             } else {
@@ -218,4 +515,5 @@ public class RobustToolCallingManager implements ToolCallingManager {
         if (!anyChanged) return original;
         return new ChatResponse(rebuilt, original.getMetadata());
     }
+
 }

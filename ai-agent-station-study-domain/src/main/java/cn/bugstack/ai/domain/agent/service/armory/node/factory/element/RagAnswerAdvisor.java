@@ -1,6 +1,8 @@
 package cn.bugstack.ai.domain.agent.service.armory.node.factory.element;
 
 import cn.bugstack.ai.domain.agent.model.valobj.RagRouterDecision;
+import cn.bugstack.ai.domain.agent.service.execute.common.RagEvidenceEmitter;
+import cn.bugstack.ai.domain.agent.service.execute.common.SessionRefCounter;
 import cn.bugstack.ai.domain.agent.service.rag.hybrid.HybridRetriever;
 import cn.bugstack.ai.domain.agent.service.rag.hybrid.IRerankService;
 import cn.bugstack.ai.domain.agent.service.router.IQueryRewriter;
@@ -59,6 +61,26 @@ public class RagAnswerAdvisor implements BaseAdvisor {
     private final IQueryDecomposer queryDecomposer;
     /** P2.3 12.4 Parent Document Retriever；为 null 时不换 parent */
     private final IParentDocumentService parentDocumentService;
+
+    /**
+     * H1-A：RAG 证据片段 emitter（可选）。setter 注入避免改构造链。
+     * null → 不 emit 任何 SSE 事件，advisor 行为完全不变。装配点（AiClientAdvisorNode）在 new 实例后调
+     * {@link #setRagEvidenceEmitter} 注入。
+     */
+    private volatile RagEvidenceEmitter ragEvidenceEmitter;
+
+    /**
+     * 第 61 轮新增：sessionId 维度全局引用计数器。null → 每次从 [1] 编号（旧行为）。
+     */
+    private volatile SessionRefCounter sessionRefCounter;
+
+    public void setRagEvidenceEmitter(RagEvidenceEmitter emitter) {
+        this.ragEvidenceEmitter = emitter;
+    }
+
+    public void setSessionRefCounter(SessionRefCounter sessionRefCounter) {
+        this.sessionRefCounter = sessionRefCounter;
+    }
 
     public RagAnswerAdvisor(VectorStore vectorStore, SearchRequest searchRequest) {
         this(vectorStore, searchRequest, null, null, 0, null, null, null, null, null, null);
@@ -142,7 +164,7 @@ public class RagAnswerAdvisor implements BaseAdvisor {
         this.ragFusionService = ragFusionService;
         this.queryDecomposer = queryDecomposer;
         this.parentDocumentService = parentDocumentService;
-        this.userTextAdvise = "\nContext information is below, surrounded by ---------------------\n\n---------------------\n{question_answer_context}\n---------------------\n\nGiven the context and provided history information and not prior knowledge,\nreply to the user comment. If the answer is not in the context, inform\nthe user that you can't answer the question.\n";
+        this.userTextAdvise = "\n下面是本次检索到的知识库上下文，位于分隔线之间：\n\n---------------------\n{question_answer_context}\n---------------------\n\n请优先依据这些上下文和已有对话历史回答用户问题，不要编造资料中没有的信息。\n如果资料不足以回答，请明确说明“当前知识库资料不足”，并列出你能确认的部分和缺失的信息。\n";
     }
 
     @Override
@@ -151,15 +173,24 @@ public class RagAnswerAdvisor implements BaseAdvisor {
 
         String userText = chatClientRequest.prompt().getUserMessage().getText();
 
-        // P1.4 Query Rewriting：仅替换检索 query，不动用户原话；rewriter 失败/未配置无声降级
-        String searchQuery = (queryRewriter != null) ? queryRewriter.rewrite(userText) : userText;
-
-        // P2.3 12.1 HyDE：生成假想答案用作检索 query（比口语 query 语义更丰富）
-        if (hydeService != null) {
-            String hydeQuery = hydeService.generateHypotheticalDocument(searchQuery);
-            if (hydeQuery != null) searchQuery = hydeQuery;
+        // V041：flow/auto 节点会把工具目录 + 分析模板拼进 user message，污染 RAG 路由与检索。
+        // 若节点传入了干净的用户问题(ltm_retrieval_query)，就用【记忆背景 + 干净问题】做路由/检索，剥掉工具脚手架。
+        // 记忆背景 = LTM/EPI advisor 注入块（它们以 "--------" 分隔，取最后一个分隔符之前的内容）。
+        // 【关键修复】只有 retrievalQuery（路由/检索/rerank）用这个干净版；发给 LLM 的 UserMessage 必须用原始 userText。
+        // 旧实现把 userText 本身改写成干净问题，导致有检索命中时（下方 new UserMessage(userText)）把 "--------" 之后的
+        // 整段工程化 prompt（工具清单/分析模板等）一并丢弃 —— Step1 这类步骤的模型因此根本看不到工具列表，只剩干净问题+RAG 结果。
+        String retrievalQuery = userText;
+        Object cleanQObj = context.get(LongTermMemoryAdvisor.RETRIEVAL_QUERY_CONTEXT_KEY);
+        if (cleanQObj != null && StringUtils.hasText(cleanQObj.toString())) {
+            String cleanQuestion = cleanQObj.toString().trim();
+            int lastSep = userText.lastIndexOf("--------");
+            String memoryBackground = lastSep > 0 ? userText.substring(0, lastSep).trim() : "";
+            retrievalQuery = memoryBackground.isEmpty()
+                    ? cleanQuestion
+                    : memoryBackground + "\n\n--------\n" + cleanQuestion;
         }
 
+        // A 重构：去掉无条件 queryRewriter + 无条件 HyDE，统一交给 RAG Router 一次决策出查询策略。
         // 构建 filter expression：DB 配置的 knowledge tag + MDC 里的 userId（如有）
         // 用 Filter.Expression 树直接 AND，不走 toString → parse（Spring AI Filter.Expression 是 record，
         // 默认 toString 输出 "Expression[type=EQ, left=...]"，不是 FilterExpressionTextParser 能识别的 DSL）
@@ -175,84 +206,104 @@ public class RagAnswerAdvisor implements BaseAdvisor {
                     : new Filter.Expression(Filter.ExpressionType.AND, filterExpr, userIdExpr);
         }
 
-        SearchRequest searchRequestToUse = SearchRequest.from(this.searchRequest).query(searchQuery).filterExpression(filterExpr).build();
-
         List<Document> documents;
         // P2.3 12.3 Agentic RAG：上游 AgenticRagAdvisor.before() 写入了 skip 标志 → 直接跳过检索
         Object agenticSkip = context.get(cn.bugstack.ai.domain.agent.service.rag.agentic.AgenticRagAdvisor.CTX_SKIP_RAG);
         if (Boolean.TRUE.equals(agenticSkip)) {
             documents = List.of();
         } else {
-            // P0.1.4 + P2.3：RAG Router 一次决策（LlmRagRouter 输出路径+子查询/变体，HeuristicRagRouter 仅布尔）
+            // A 三层模型：① 要不要检索 → ② 查询策略（router 一次决策 4 选 1，载荷一并产出）→ ③ 引擎自适应。
+            // HYBRID（旧值/兜底）与未知策略统一按 SIMPLE 单 query 检索；引擎层（hybrid/纯向量）在下游 helper 决定。
             RagRouterDecision decision = (ragRouter != null)
-                    ? ragRouter.decide(userText)
+                    ? ragRouter.decide(retrievalQuery)
                     : RagRouterDecision.retrieve();
+            String path = decision.getPath();
 
             if (!decision.isShouldRetrieve()) {
                 documents = List.of();
                 log.info("rag-router skip: reason={}", decision.getReason());
             }
-            // LlmRagRouter 已拆好子查询 → 直接用，跳过 queryDecomposer
-            else if (RagRouterDecision.PATH_DECOMPOSE.equals(decision.getPath())
-                    && !decision.getSubQueries().isEmpty()) {
-                documents = retrieveForSubQueries(searchRequestToUse, decision.getSubQueries(), userText);
+            // ② DECOMPOSE：router 已给子查询 → 并行检索 + 合并 + rerank
+            else if (RagRouterDecision.PATH_DECOMPOSE.equals(path) && !decision.getSubQueries().isEmpty()) {
+                SearchRequest baseSr = SearchRequest.from(this.searchRequest).filterExpression(filterExpr).build();
+                documents = retrieveForSubQueries(baseSr, decision.getSubQueries(), retrievalQuery);
             }
-            // LlmRagRouter 已生成变体 → 直接并行检索+RRF，跳过 RagFusionService.generateVariants()
-            else if (RagRouterDecision.PATH_FUSION.equals(decision.getPath())
-                    && !decision.getVariants().isEmpty()
+            // ② FUSION：router 已给变体 → 并行检索 + RRF + rerank
+            else if (RagRouterDecision.PATH_FUSION.equals(path) && !decision.getVariants().isEmpty()
                     && ragFusionService != null && ragFusionService.isAvailable()) {
+                SearchRequest baseSr = SearchRequest.from(this.searchRequest).query(retrievalQuery).filterExpression(filterExpr).build();
                 List<Document> fused = ragFusionService.fusedRetrieveWithVariants(
-                        searchQuery, decision.getVariants(), searchRequestToUse, rerankTopN);
+                        retrievalQuery, decision.getVariants(), baseSr, rerankTopN);
                 documents = (rerankService != null && !fused.isEmpty())
-                        ? rerankService.rerank(userText, fused, rerankTopN)
+                        ? rerankService.rerank(retrievalQuery, fused, rerankTopN)
                         : fused;
             }
-            // 以下为 HeuristicRagRouter 路径（无 LLM 预拆/预生成），走原分立调用
-            else if (queryDecomposer != null && queryDecomposer.shouldDecompose(userText)) {
-                List<String> subQueries = queryDecomposer.decompose(userText);
-                documents = retrieveForSubQueries(searchRequestToUse, subQueries, userText);
-            } else if (ragFusionService != null && ragFusionService.isAvailable()) {
-                List<Document> fused = ragFusionService.fusedRetrieve(searchQuery, searchRequestToUse, rerankTopN);
-                documents = (rerankService != null && !fused.isEmpty())
-                        ? rerankService.rerank(userText, fused, rerankTopN)
-                        : fused;
-            } else if (hybridRetriever != null) {
-                int candidatePool = Math.max(searchRequestToUse.getTopK() * 3, rerankTopN);
-                List<Document> fused = hybridRetriever.retrieve(searchQuery, searchRequestToUse, knowledgeTag, candidatePool);
-                documents = (rerankService != null)
-                        ? rerankService.rerank(userText, fused, rerankTopN)
-                        : fused.subList(0, Math.min(rerankTopN, fused.size()));
-            } else {
-                documents = this.vectorStore.similaritySearch(searchRequestToUse);
+            // ② SIMPLE / HYDE / HYBRID(兜底)：单 query 检索，检索 query 取自 router 载荷
+            else {
+                String searchQuery;
+                if (RagRouterDecision.PATH_HYDE.equals(path) && StringUtils.hasText(decision.getHypotheticalDocument())) {
+                    searchQuery = decision.getHypotheticalDocument();
+                } else if (StringUtils.hasText(decision.getRewrittenQuery())) {
+                    searchQuery = decision.getRewrittenQuery();
+                } else {
+                    searchQuery = retrievalQuery;
+                }
+                documents = retrieveSingleQuery(searchQuery, filterExpr, retrievalQuery);
             }
         }
         context.put("qa_retrieved_documents", documents);
 
         // P2.3 12.4 Parent Document Retriever：用检索到的小块 child 换出大块 parent 喂 LLM
+        // 第 61 轮修：原 resolveParents 返回 List<String> + new Document(text) 会丢光 source/knowledge metadata，
+        // 导致前端引用依据卡片走 doc.getId() fallback 显示 UUID。改用 resolveParentDocuments 保留 metadata。
         if (parentDocumentService != null && !documents.isEmpty()) {
-            List<String> parentTexts = parentDocumentService.resolveParents(documents);
-            if (!parentTexts.isEmpty()) {
-                documents = parentTexts.stream()
-                        .map(text -> new Document(text))
-                        .collect(Collectors.toList());
+            List<Document> parentDocs = parentDocumentService.resolveParentDocuments(documents);
+            if (!parentDocs.isEmpty()) {
+                documents = parentDocs;
                 context.put("qa_retrieved_documents", documents);
             }
         }
 
-        // P2.3 12.6 Citation：给每个文档编号，模型回答时可引用 [1][2]
+        // P2.3 12.6 Citation：给每个文档编号，模型回答时可引用 [N][N+1]
+        // 第 61 轮：用 SessionRefCounter 做 sessionId-scoped 全局编号 —— Step2 多 client 各自触发 RAG
+        // 时，编号跨 client 累加（client A 用 [1][2]、client B 用 [3][4]）；前端 append 渲染对应
+        // 一张大卡片，模型答案中的 [N] 跟前端卡片中第 N 条 evidence 严格一一对应
+        String sessionId = resolveSessionIdForEvidence(chatClientRequest.context());
+        int startRef = (sessionRefCounter != null)
+                ? sessionRefCounter.advance(sessionId, documents.size())
+                : 1;
         StringBuilder docContextBuilder = new StringBuilder();
         Map<Integer, String> citationMap = new HashMap<>();
         for (int i = 0; i < documents.size(); i++) {
-            int ref = i + 1;
+            int ref = startRef + i;
             docContextBuilder.append("[").append(ref).append("] ").append(documents.get(i).getText()).append("\n\n");
             citationMap.put(ref, documents.get(i).getId() != null ? documents.get(i).getId() : "doc-" + ref);
         }
         String documentContext = docContextBuilder.toString();
-        // 追加引用指令
+        // 追加引用指令 —— 编号必须跟 documentContext 第一项对齐（不一定是 [1] 起）
         if (!documents.isEmpty()) {
-            documentContext = "When answering, cite relevant sources using [1], [2], etc.\n\n---\n" + documentContext;
+            int endRef = startRef + documents.size() - 1;
+            String citeHint = (documents.size() == 1)
+                    ? "回答时请在使用到该资料的位置标注引用编号 [" + startRef + "]。"
+                    : "回答时请在使用到对应资料的位置标注引用编号，引用范围为 [" + startRef + "] 到 [" + endRef + "]。";
+            documentContext = citeHint + "\n\n---\n" + documentContext;
         }
         context.put("qa_citation_map", citationMap);
+
+        // H1-A: emit rag_evidence SSE event 给前端展示检索依据。advisor 失败不能影响主回答
+        // —— emitter 内部已 try/catch 兜底；此处再外层 try 保险，确保任何异常都不传播
+        // 第 61 轮：传 startRef，前端基于这个 ref 渲染 [startRef]..[startRef+n-1]，跟模型答案一致
+        try {
+            if (ragEvidenceEmitter != null && !documents.isEmpty()) {
+                List<Map<String, Object>> evidenceSnippets = ragEvidenceEmitter.buildEvidenceSnippets(documents, startRef);
+                if (!evidenceSnippets.isEmpty()) {
+                    context.put("qa_evidence_snippets", evidenceSnippets);
+                }
+                ragEvidenceEmitter.emitEvidence(sessionId, documents, startRef);
+            }
+        } catch (Exception emitEx) {
+            log.debug("[RagAnswerAdvisor] evidence emit skipped: {}", emitEx.toString());
+        }
 
         Map<String, Object> advisedUserParams = new HashMap(chatClientRequest.context());
         advisedUserParams.put("question_answer_context", documentContext);
@@ -274,17 +325,17 @@ public class RagAnswerAdvisor implements BaseAdvisor {
             if (sysMsg != null) messages.add(sysMsg);
         }
         // RAG 上下文作为独立 SystemMessage
-        String ragContextMsg = "Context information is below, surrounded by ---------------------\n\n"
+        String ragContextMsg = "下面是本次检索到的知识库上下文，位于分隔线之间：\n\n"
                 + "---------------------\n" + documentContext + "---------------------\n\n"
-                + "Given the context and provided history information and not prior knowledge, "
-                + "reply to the user comment. If the answer is not in the context, "
-                + "inform the user that you can't answer the question.\n";
+                + "请优先依据这些上下文和已有对话历史回答用户问题，不要编造资料中没有的信息。"
+                + "如果资料不足以回答，请明确说明“当前知识库资料不足”，并列出你能确认的部分和缺失的信息。\n";
         messages.add(new SystemMessage(ragContextMsg));
         // 保持原始 UserMessage 不变
         messages.add(new UserMessage(userText));
 
         return ChatClientRequest.builder()
-                .prompt(Prompt.builder().messages(messages).build())
+                // 透传 options，否则 per-request 动态工具回调会丢（见 LongTermMemoryAdvisor 同样修复）。
+                .prompt(Prompt.builder().messages(messages).chatOptions(originalPrompt != null ? originalPrompt.getOptions() : null).build())
                 .context(advisedUserParams)
                 .build();
     }
@@ -312,6 +363,29 @@ public class RagAnswerAdvisor implements BaseAdvisor {
         return BaseAdvisor.super.adviseStream(chatClientRequest, streamAdvisorChain);
     }
 
+    /**
+     * H1-A：从 advisor context / MDC 拿 sessionId 用于 SSE emit。
+     * 优先级：MDC sessionId → context["chat_memory_conversation_id"] 的末段 → null。
+     * chat_memory_conversation_id 可能是 tenant:user:session 的复合键，SSE registry 使用原始 sessionId。
+     */
+    private String resolveSessionIdForEvidence(Map<String, Object> context) {
+        String mdcSid = org.slf4j.MDC.get("sessionId");
+        if (mdcSid != null && !mdcSid.isBlank()) return mdcSid;
+        if (context != null) {
+            Object sid = context.get("chat_memory_conversation_id");
+            String sessionId = extractSessionIdFromConversationId(sid == null ? null : String.valueOf(sid));
+            if (sessionId != null && !sessionId.isBlank()) return sessionId;
+        }
+        return null;
+    }
+
+    private String extractSessionIdFromConversationId(String conversationId) {
+        if (conversationId == null || conversationId.isBlank()) return null;
+        String trimmed = conversationId.trim();
+        int idx = trimmed.lastIndexOf(':');
+        return idx >= 0 && idx + 1 < trimmed.length() ? trimmed.substring(idx + 1) : trimmed;
+    }
+
     @Override
     public int getOrder() {
         return 0;
@@ -324,6 +398,22 @@ public class RagAnswerAdvisor implements BaseAdvisor {
 
     protected Filter.Expression doGetFilterExpression(Map<String, Object> context) {
         return context.containsKey("qa_filter_expression") && StringUtils.hasText(context.get("qa_filter_expression").toString()) ? (new FilterExpressionTextParser()).parse(context.get("qa_filter_expression").toString()) : this.searchRequest.getFilterExpression();
+    }
+
+    /**
+     * A 重构：单 query 检索的引擎层（③）——hybridRetriever 在则走 hybrid(BM25+向量+RRF)，否则纯向量；
+     * 末尾统一 rerank。SIMPLE / HYDE / HYBRID(兜底) 三个查询策略共用。
+     */
+    private List<Document> retrieveSingleQuery(String query, Filter.Expression filterExpr, String userText) {
+        SearchRequest sr = SearchRequest.from(this.searchRequest).query(query).filterExpression(filterExpr).build();
+        if (hybridRetriever != null) {
+            int candidatePool = Math.max(sr.getTopK() * 3, rerankTopN);
+            List<Document> fused = hybridRetriever.retrieve(query, sr, knowledgeTag, candidatePool);
+            return (rerankService != null)
+                    ? rerankService.rerank(userText, fused, rerankTopN)
+                    : fused.subList(0, Math.min(rerankTopN, fused.size()));
+        }
+        return this.vectorStore.similaritySearch(sr);
     }
 
     /**

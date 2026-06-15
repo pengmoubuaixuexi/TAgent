@@ -1,11 +1,12 @@
 package cn.bugstack.ai.domain.agent.service.memory.conflict;
 
+import cn.bugstack.ai.domain.agent.service.memory.MemoryTopics;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.ApplicationContext;
 import org.springframework.stereotype.Service;
 
 import java.util.Collections;
@@ -14,8 +15,11 @@ import java.util.List;
 /**
  * LLM 驱动的记忆冲突解决器（P2.1 10.3）。
  * <p>
- * 用 router-small 判断新旧记忆冲突是否需要覆盖/合并/跳过。
- * LLM 失败时默认 KEEP_BOTH（不丢数据）。
+ * 用 router-small 判断新旧记忆冲突是否需要覆盖/合并/跳过。主题分类法统一走 {@link MemoryTopics}。
+ * <p>
+ * 注意：单值主题（画像/计划/情况）的覆盖已在 {@code LongTermMemoryService.save()} 内做确定性处理、
+ * 不再依赖本解析器；本类主要服务累加主题（技能/偏好）的 KEEP_BOTH/MERGE 判定。
+ * LLM 失败时按主题类型 fallback（单值→OVERWRITE、累加→KEEP_BOTH，不丢数据）。
  */
 @Slf4j
 @Service
@@ -23,51 +27,58 @@ import java.util.List;
 public class LlmMemoryConflictResolver implements IMemoryConflictResolver {
 
     private static final String CONFLICT_PROMPT = """
-            You are a memory conflict resolver. Given a topic, new memory, and existing memories,
-            decide how to handle the new information.
+            你是用户长期记忆的冲突判定器。给定主题(topic)、一条新记忆、若干条同主题旧记忆，判断如何处理新信息。
 
-            IMPORTANT: Most memories are ADDITIVE, not contradictory. Two skills (e.g., "knows Python"
-            and "knows Java") are both true — the user simply has multiple skills. Only OVERWRITE when
-            the new info makes the old info definitively FALSE.
+            重要：大多数记忆是「累加」而非「矛盾」。不同技能（技能:Java 和 技能:Python）都成立——
+            用户同时拥有多项技能。只有当新信息使旧信息「明确不再为真」时才 OVERWRITE。
 
-            Examples — CUMULATIVE topics (skill:* / decision:*):
-            - skill:Java: "knows Python" + "knows Java" → KEEP_BOTH (user knows both)
-            - skill:Database: "uses MySQL" + "uses PostgreSQL" → KEEP_BOTH (user uses both)
-            - skill:Framework: "knows Spring Boot" + "specializes in Spring Security" → MERGE
+            主题分两类，规则不同：
+            - 累加类：技能:* / 偏好:*（同前缀不同主体可共存）。默认 KEEP_BOTH。
+              例：技能:Java + 技能:Python → KEEP_BOTH（两项技能都会）。
+              例：技能:Spring "了解Spring Boot" + "专精Spring Security" → MERGE（同主题补充）。
+            - 单值类：画像:*（姓名/职业/城市/收入/体重等封闭槽位）/ 计划:* / 情况:*
+              （同一主题同时只有一个值成立）。新值与旧值不同 → OVERWRITE。
+              例：画像:职业 "是Python工程师" → "是Java工程师" → OVERWRITE（职业变了）。
+              例：画像:常驻城市 "在北京" → "搬到上海" → OVERWRITE（搬家了）。
+              例：画像:税前月收入 "15000元" → "18000元" → OVERWRITE（涨薪）。
+              但：若新值只是旧值的【更泛化、信息更少】的复述（不是真的变了），回 SKIP，保留信息更全的旧值：
+              例：画像:职业 "Java后端开发工程师" → "程序员" → SKIP（"程序员"更泛，旧值更具体，别降级）。
+              例：画像:职业 "Java后端开发工程师" → "用户是一名Java开发" → SKIP（同一职业、信息更少）。
+            - 仅当新信息与旧信息逐字相同时才 SKIP。
 
-            Examples — SINGULAR topics (fact:role / fact:location / fact:company / preference:*):
-            - fact:role: "is a Python engineer" + "is a Java engineer" → OVERWRITE (changed role)
-            - fact:role: "is a junior developer" + "is now a senior developer" → OVERWRITE (promotion)
-            - fact:location: "lives in Beijing" + "moved to Shanghai" → OVERWRITE (relocated)
-            - fact:company: "works at Company A" + "joined Company B" → OVERWRITE (changed jobs)
-            - preference:answer_style: "prefers long answers" + "wants short answers" → OVERWRITE
-
-            CRITICAL — Topic type determines the rule:
-            - skill:* and decision:* are CUMULATIVE (many can coexist). Default to KEEP_BOTH.
-              Example: skill:Java + skill:Python → KEEP_BOTH (user knows both).
-            - fact:role, fact:location, fact:company are SINGULAR (only one at a time). OVERWRITE
-              when the new value differs. Example: "is a Python engineer" → "is a Java engineer" → OVERWRITE.
-            - preference:* is SINGULAR. OVERWRITE when user preference clearly changed.
-            - Other fact:* topics: judge by content — if additive, KEEP_BOTH; if contradictory, OVERWRITE.
-            - Only SKIP if new info is verbatim identical to existing.
-
-            Topic: %s
-            New: %s
-            Existing:
+            主题: %s
+            新记忆: %s
+            旧记忆:
             %s
 
-            Reply with only one word: OVERWRITE, MERGE, KEEP_BOTH, or SKIP.""";
-    // router-small is assembled by RouterPoolConfig
-    @Autowired(required = false)
-    @Qualifier("aiClient_router-small")
-    private ChatClient chatClient;
+            只回复一个词：OVERWRITE、MERGE、KEEP_BOTH 或 SKIP。""";
+    // router-small 由 RouterPoolConfig 在 armory 阶段动态注册（bean 名 ai_client_router-small），
+    // 时序上可能晚于本 @Service 构造，故首次使用时从 ApplicationContext 懒取（对齐 LongTermMemoryAdvisor）。
+    // 历史 bug：曾用 @Qualifier("aiClient_router-small")（camelCase 拼错）永远注入不到 → chatClient 恒 null → 永远 fallback。
+    @Autowired
+    private ApplicationContext applicationContext;
+    private volatile ChatClient chatClient;
+
+    private ChatClient chatClient() {
+        ChatClient local = chatClient;
+        if (local == null && applicationContext != null) {
+            try {
+                local = applicationContext.getBean("ai_client_router-small", ChatClient.class);
+                chatClient = local;
+            } catch (Exception e) {
+                log.debug("memory.conflict: router-small ChatClient 尚未就绪: {}", e.getMessage());
+            }
+        }
+        return local;
+    }
 
     @Override
     public Decision resolve(String topic, String newContent, List<String> existingContents) {
         if (existingContents == null || existingContents.isEmpty()) {
             return Decision.KEEP_BOTH;
         }
-        if (chatClient == null) {
+        ChatClient client = chatClient();
+        if (client == null) {
             Decision fallback = isSingularTopic(topic) ? Decision.OVERWRITE : Decision.KEEP_BOTH;
             log.debug("memory.conflict: no router-small ChatClient, default {}", fallback);
             return fallback;
@@ -89,7 +100,7 @@ public class LlmMemoryConflictResolver implements IMemoryConflictResolver {
 
         String raw;
         try {
-            raw = chatClient.prompt(new Prompt(prompt)).call().content();
+            raw = client.prompt(new Prompt(prompt)).call().content();
         } catch (Exception e) {
             Decision fallback = isSingularTopic(topic) ? Decision.OVERWRITE : Decision.KEEP_BOTH;
             log.debug("memory.conflict LLM call failed, fallback {}: {}", fallback, e.getMessage());
@@ -110,19 +121,9 @@ public class LlmMemoryConflictResolver implements IMemoryConflictResolver {
         return fallback;
     }
 
-    /** 唯一性主题：同一时间只有一个值成立，变更时应该覆盖而非保留两份 */
+    /** 唯一性主题：同一主题同时只有一个值成立，变更时覆盖而非保留两份。
+     *  统一委托 {@link MemoryTopics}（中文 V041 词表），杜绝与 LongTermMemoryService 的分类法漂移。 */
     static boolean isSingularTopic(String topic) {
-        if (topic == null) return false;
-        String t = topic.toLowerCase();
-        // 带前缀的精确匹配
-        if (t.startsWith("preference")) return true;
-        if (t.startsWith("fact:role") || t.startsWith("fact:location")
-                || t.startsWith("fact:company") || t.startsWith("fact:name")) return true;
-        // 无前缀的常见唯一性主题
-        return t.equals("role") || t.equals("location") || t.equals("company")
-                || t.equals("name") || t.equals("full_name") || t.equals("username")
-                || t.equals("job") || t.equals("occupation") || t.equals("position")
-                || t.equals("title") || t.equals("employer") || t.equals("address")
-                || t.contains("_role") || t.contains("_location") || t.contains("_name");
+        return MemoryTopics.isSingular(topic);
     }
 }

@@ -19,7 +19,7 @@ import static cn.bugstack.ai.domain.agent.model.valobj.enums.AiAgentEnumVO.*;
 /**
  * AiAgent 仓储服务
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/6/28 18:09
  */
 @Slf4j
@@ -60,10 +60,16 @@ public class AgentRepository implements IAgentRepository {
     private IAiClientToolMcpDao aiClientToolMcpDao;
 
     @Resource
+    private IAiMcpToolCatalogDao aiMcpToolCatalogDao;
+
+    @Resource
     private org.springframework.jdbc.core.JdbcTemplate jdbcTemplate;
 
     @Resource
     private IAiChatMemoryDao aiChatMemoryDao;
+
+    @Resource
+    private cn.bugstack.ai.infrastructure.adapter.repository.cache.MemoryCacheService memoryCache;
 
     @Resource
     private org.springframework.data.redis.core.StringRedisTemplate stringRedisTemplate;
@@ -207,29 +213,8 @@ public class AgentRepository implements IAgentRepository {
                                         .requestTimeout(toolMcp.getRequestTimeout())
                                         .build();
 
-                                String transportConfig = toolMcp.getTransportConfig();
-                                String transportType = toolMcp.getTransportType();
-
-                                try {
-                                    if ("sse".equals(transportType)) {
-                                        // 解析SSE配置
-                                        ObjectMapper objectMapper = new ObjectMapper();
-                                        AiClientToolMcpVO.TransportConfigSse transportConfigSse = objectMapper.readValue(transportConfig, AiClientToolMcpVO.TransportConfigSse.class);
-                                        mcpVO.setTransportConfigSse(transportConfigSse);
-                                    } else if ("stdio".equals(transportType)) {
-                                        // 解析STDIO配置
-                                        Map<String, AiClientToolMcpVO.TransportConfigStdio.Stdio> stdio = JSON.parseObject(transportConfig,
-                                                new TypeReference<>() {
-                                                });
-
-                                        AiClientToolMcpVO.TransportConfigStdio transportConfigStdio = new AiClientToolMcpVO.TransportConfigStdio();
-                                        transportConfigStdio.setStdio(stdio);
-
-                                        mcpVO.setTransportConfigStdio(transportConfigStdio);
-                                    }
-                                } catch (Exception e) {
-                                    log.error("解析传输配置失败: {}", e.getMessage(), e);
-                                }
+                                // 复用 parseMcpTransportConfig 解析 sse/stdio；保持原语义：无论解析成功与否都加入结果
+                                parseMcpTransportConfig(toolMcp, mcpVO);
                                 result.add(mcpVO);
                             }
                         }
@@ -239,6 +224,105 @@ public class AgentRepository implements IAgentRepository {
         }
 
         return result;
+    }
+
+    @Override
+    public AiClientToolMcpVO queryAiClientToolMcpVOByMcpId(String mcpId) {
+        if (mcpId == null || mcpId.isBlank()) {
+            return null;
+        }
+        AiClientToolMcp toolMcp = aiClientToolMcpDao.queryByMcpId(mcpId);
+        if (toolMcp == null || toolMcp.getStatus() == null || toolMcp.getStatus() != 1) {
+            return null;
+        }
+        return toMcpVO(toolMcp);
+    }
+
+    @Override
+    public List<AiClientToolMcpVO> queryEnabledAiClientToolMcpVOList() {
+        List<AiClientToolMcp> toolMcps = aiClientToolMcpDao.queryEnabledMcps();
+        if (toolMcps == null || toolMcps.isEmpty()) {
+            return List.of();
+        }
+        List<AiClientToolMcpVO> result = new ArrayList<>(toolMcps.size());
+        for (AiClientToolMcp toolMcp : toolMcps) {
+            if (toolMcp == null) continue;
+            AiClientToolMcpVO mcpVO = toMcpVO(toolMcp);
+            if (mcpVO != null) {
+                result.add(mcpVO);
+            }
+        }
+        return result;
+    }
+
+    @Override
+    public List<AiMcpToolCatalogVO> queryEnabledMcpToolCatalog() {
+        return toCatalogVOList(aiMcpToolCatalogDao.queryEnabled());
+    }
+
+    @Override
+    public List<AiMcpToolCatalogVO> queryMcpToolCatalogByMcpId(String mcpId) {
+        if (mcpId == null || mcpId.isBlank()) {
+            return List.of();
+        }
+        return toCatalogVOList(aiMcpToolCatalogDao.queryByMcpId(mcpId));
+    }
+
+    private List<AiMcpToolCatalogVO> toCatalogVOList(List<AiMcpToolCatalog> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return List.of();
+        }
+        List<AiMcpToolCatalogVO> result = new ArrayList<>(rows.size());
+        for (AiMcpToolCatalog row : rows) {
+            result.add(AiMcpToolCatalogVO.builder()
+                    .id(row.getId())
+                    .mcpId(row.getMcpId())
+                    .mcpName(row.getMcpName())
+                    .toolName(row.getToolName())
+                    .toolDescription(row.getToolDescription())
+                    .toolDescriptionZh(row.getToolDescriptionZh())
+                    .toolIntentZh(row.getToolIntentZh())
+                    .inputSchemaJson(row.getInputSchemaJson())
+                    .enabled(row.getEnabled())
+                    .lastSeenAt(row.getLastSeenAt())
+                    .createTime(row.getCreateTime())
+                    .updateTime(row.getUpdateTime())
+                    .build());
+        }
+        return result;
+    }
+
+    @Override
+    public void upsertMcpToolCatalog(List<AiMcpToolCatalogVO> catalogList) {
+        if (catalogList == null || catalogList.isEmpty()) {
+            return;
+        }
+        List<AiMcpToolCatalog> rows = new ArrayList<>(catalogList.size());
+        for (AiMcpToolCatalogVO vo : catalogList) {
+            if (vo == null || vo.getMcpId() == null || vo.getToolName() == null) continue;
+            rows.add(AiMcpToolCatalog.builder()
+                    .mcpId(vo.getMcpId())
+                    .mcpName(vo.getMcpName())
+                    .toolName(vo.getToolName())
+                    .toolDescription(vo.getToolDescription())
+                    .toolDescriptionZh(vo.getToolDescriptionZh())
+                    .toolIntentZh(vo.getToolIntentZh())
+                    .inputSchemaJson(vo.getInputSchemaJson())
+                    .enabled(vo.getEnabled() == null ? 1 : vo.getEnabled())
+                    .lastSeenAt(vo.getLastSeenAt() == null ? java.time.LocalDateTime.now() : vo.getLastSeenAt())
+                    .build());
+        }
+        if (!rows.isEmpty()) {
+            aiMcpToolCatalogDao.upsertBatch(rows);
+        }
+    }
+
+    @Override
+    public void deleteMcpToolCatalog(String mcpId, List<String> toolNames) {
+        if (mcpId == null || mcpId.isBlank() || toolNames == null || toolNames.isEmpty()) {
+            return;
+        }
+        aiMcpToolCatalogDao.deleteByMcpIdAndToolNames(mcpId, toolNames);
     }
 
     @Override
@@ -507,6 +591,25 @@ public class AgentRepository implements IAgentRepository {
     }
 
     @Override
+    public List<AiClientModelVO> queryEnabledAiClientModelVOList() {
+        List<AiClientModelVO> result = new ArrayList<>();
+        List<AiClientModel> models = aiClientModelDao.queryEnabledModels();
+        if (models == null) {
+            return result;
+        }
+        for (AiClientModel model : models) {
+            result.add(AiClientModelVO.builder()
+                    .modelId(model.getModelId())
+                    .apiId(model.getApiId())
+                    .modelName(model.getModelName())
+                    .modelType(model.getModelType())
+                    .tier(model.getTier())
+                    .build());
+        }
+        return result;
+    }
+
+    @Override
     public Map<String, AiAgentClientFlowConfigVO> queryAiAgentClientFlowConfig(String aiAgentId) {
         if (aiAgentId == null || aiAgentId.trim().isEmpty()) {
             return Map.of();
@@ -699,20 +802,29 @@ public class AgentRepository implements IAgentRepository {
 
     @Override
     public int countChatMemoryByConversationId(String conversationId) {
+        // 1) 旧 msg_count 缓存：仍保留作为 Step4 episodic 节流的最快路径
         String redisKey = "episodic:msg_count:" + conversationId;
         try {
             String cached = stringRedisTemplate.opsForValue().get(redisKey);
             if (cached != null) {
-                // 续期：每次读取都刷新 TTL 1 小时
                 stringRedisTemplate.expire(redisKey, java.time.Duration.ofHours(1));
                 return Integer.parseInt(cached);
             }
         } catch (Exception e) {
-            log.debug("Redis get failed for {}, fallback to DB: {}", redisKey, e.getMessage());
+            log.debug("Redis get failed for {}, fallback to list cache: {}", redisKey, e.getMessage());
         }
-        // cache miss → 查 DB → 写缓存
-        List<AiChatMemory> rows = aiChatMemoryDao.findByConversationId(conversationId);
-        int count = rows == null ? 0 : rows.size();
+        // 2) chat_memory 列表缓存：能复用就别再查 DB
+        List<AiChatMemory> cachedList = memoryCache.getChatList(conversationId);
+        int count;
+        if (cachedList != null) {
+            count = cachedList.size();
+        } else {
+            List<AiChatMemory> rows = aiChatMemoryDao.findByConversationId(conversationId);
+            count = rows == null ? 0 : rows.size();
+            if (rows != null && !rows.isEmpty()) {
+                memoryCache.putChatList(conversationId, rows);
+            }
+        }
         try {
             stringRedisTemplate.opsForValue().set(redisKey, String.valueOf(count), java.time.Duration.ofHours(1));
         } catch (Exception e) {
@@ -733,7 +845,13 @@ public class AgentRepository implements IAgentRepository {
 
     @Override
     public List<String> findChatMemoryTextsByConversationId(String conversationId) {
-        List<AiChatMemory> rows = aiChatMemoryDao.findByConversationId(conversationId);
+        List<AiChatMemory> rows = memoryCache.getChatList(conversationId);
+        if (rows == null) {
+            rows = aiChatMemoryDao.findByConversationId(conversationId);
+            if (rows != null && !rows.isEmpty()) {
+                memoryCache.putChatList(conversationId, rows);
+            }
+        }
         if (rows == null || rows.isEmpty()) return List.of();
         List<String> texts = new ArrayList<>(rows.size());
         for (AiChatMemory r : rows) {
@@ -743,6 +861,48 @@ public class AgentRepository implements IAgentRepository {
             }
         }
         return texts;
+    }
+
+    private AiClientToolMcpVO toMcpVO(AiClientToolMcp toolMcp) {
+        AiClientToolMcpVO mcpVO = AiClientToolMcpVO.builder()
+                .mcpId(toolMcp.getMcpId())
+                .mcpName(toolMcp.getMcpName())
+                .transportType(toolMcp.getTransportType())
+                .transportConfig(toolMcp.getTransportConfig())
+                .requestTimeout(toolMcp.getRequestTimeout())
+                .build();
+        return parseMcpTransportConfig(toolMcp, mcpVO) ? mcpVO : null;
+    }
+
+    private boolean parseMcpTransportConfig(AiClientToolMcp toolMcp, AiClientToolMcpVO mcpVO) {
+        String transportConfig = toolMcp.getTransportConfig();
+        String transportType = toolMcp.getTransportType() == null ? "" : toolMcp.getTransportType().trim().toLowerCase(Locale.ROOT);
+        try {
+            if (transportConfig == null || transportConfig.isBlank()) {
+                log.warn("skip mcp config: empty transport_config mcpId={} name={}", toolMcp.getMcpId(), toolMcp.getMcpName());
+                return false;
+            }
+            ObjectMapper objectMapper = new ObjectMapper();
+            if ("sse".equals(transportType)) {
+                AiClientToolMcpVO.TransportConfigSse transportConfigSse = objectMapper.readValue(transportConfig, AiClientToolMcpVO.TransportConfigSse.class);
+                mcpVO.setTransportConfigSse(transportConfigSse);
+                return true;
+            } else if ("stdio".equals(transportType)) {
+                Map<String, AiClientToolMcpVO.TransportConfigStdio.Stdio> stdio = objectMapper.readValue(transportConfig,
+                        new com.fasterxml.jackson.core.type.TypeReference<>() {});
+                AiClientToolMcpVO.TransportConfigStdio transportConfigStdio = new AiClientToolMcpVO.TransportConfigStdio();
+                transportConfigStdio.setStdio(stdio);
+                mcpVO.setTransportConfigStdio(transportConfigStdio);
+                return true;
+            }
+            log.warn("skip mcp config: unsupported transport_type mcpId={} name={} type={}",
+                    toolMcp.getMcpId(), toolMcp.getMcpName(), toolMcp.getTransportType());
+            return false;
+        } catch (Exception e) {
+            log.warn("skip mcp config: parse transport config failed mcpId={} name={} type={} error={}",
+                    toolMcp.getMcpId(), toolMcp.getMcpName(), toolMcp.getTransportType(), e.getMessage());
+            return false;
+        }
     }
 
 }

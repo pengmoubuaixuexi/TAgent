@@ -4,14 +4,14 @@ import cn.bugstack.ai.domain.agent.adapter.repository.IAgentRepository;
 import cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity;
 import cn.bugstack.ai.domain.agent.model.entity.ExecuteCommandEntity;
 import cn.bugstack.ai.domain.agent.model.valobj.enums.AiAgentEnumVO;
-import cn.bugstack.ai.domain.agent.model.valobj.enums.ModelTierEnumVO;
 import cn.bugstack.ai.domain.agent.service.execute.auto.step.factory.DefaultAutoAgentExecuteStrategyFactory;
 import cn.bugstack.ai.domain.agent.service.execute.common.LlmCallContext;
 import cn.bugstack.ai.domain.agent.service.execute.common.LlmCallGateway;
 import cn.bugstack.ai.domain.agent.service.execute.common.LlmObservationRecorder;
 import cn.bugstack.ai.domain.agent.service.memory.working.IWorkingMemoryService;
+import cn.bugstack.ai.domain.agent.service.router.AgentToolRegistry;
+import cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService;
 import cn.bugstack.ai.domain.agent.service.security.OutputFilter;
-import cn.bugstack.ai.domain.agent.service.router.ModelTierRegistry;
 import cn.bugstack.ai.domain.agent.service.security.OutputModerationFilter;
 
 import cn.bugstack.wrench.design.framework.tree.AbstractMultiThreadStrategyRouter;
@@ -25,19 +25,22 @@ import org.springframework.ai.chat.metadata.Usage;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.client.ChatClientResponse;
 import org.springframework.ai.chat.prompt.ChatOptions;
+import org.springframework.ai.tool.ToolCallback;
 import org.springframework.context.ApplicationContext;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyEmitter;
 import reactor.core.publisher.Flux;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 
 /**
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/7/27 16:48
  */
 public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategyRouter<ExecuteCommandEntity, DefaultAutoAgentExecuteStrategyFactory.DynamicContext, String> {
@@ -64,13 +67,15 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
     @Resource
     protected LlmObservationRecorder llmObservationRecorder;
 
-    /** P0.1.3：按 tier 反查 clientId 用 */
-    @Resource
-    protected ModelTierRegistry modelTierRegistry;
-
     /** P1.2.2：Working Memory 旁路镜像；默认 NoopWorkingMemoryService，开关打开后切 Redis 实现 */
     @Resource
     protected IWorkingMemoryService workingMemory;
+
+    @Resource
+    protected AgentToolRegistry dynamicAgentToolRegistry;
+
+    @Resource
+    protected McpToolCatalogService dynamicMcpToolCatalogService;
 
     /** P2.4 13.2 Token Budget：每步最大输出 token 数（0=不限） */
     @org.springframework.beans.factory.annotation.Value("${agent.token-budget.step1-max-tokens:0}")
@@ -95,13 +100,54 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         return getBean(AiAgentEnumVO.AI_CLIENT.getBeanName(clientId));
     }
 
+    protected List<ToolCallback> resolveAgentDynamicToolCallbacks(ExecuteCommandEntity requestParameter, String clientId) {
+        if (requestParameter == null || clientId == null || dynamicMcpToolCatalogService == null) {
+            return List.of();
+        }
+        return dynamicMcpToolCatalogService.resolveDynamicToolCallbacks(clientId,
+                requestParameter.getDynamicMissingToolDesc(), requestParameter.getMessage(),
+                dynamicAgentToolRegistry != null ? dynamicAgentToolRegistry.getTools(clientId) : List.of());
+    }
+
+    /**
+     * 构造 per-request 工具回调数组 = 该 client 常驻工具 + 路由动态补充工具的并集。
+     * <p>Spring AI 的 per-request toolCallbacks 非空时会整体替换常驻工具，必须把常驻工具一并带上，
+     * 否则补了动态工具反而把 agent 自己的工具挤掉（见 {@link AgentToolRegistry#combineWithResident}）。
+     */
+    protected ToolCallback[] toRequestToolCallbacks(String clientId, List<ToolCallback> dynamicToolCallbacks) {
+        List<ToolCallback> combined = dynamicAgentToolRegistry != null
+                ? dynamicAgentToolRegistry.combineWithResident(clientId, dynamicToolCallbacks)
+                : dynamicToolCallbacks;
+        return combined.toArray(new ToolCallback[0]);
+    }
+
     protected String buildLtmRetrievalQuery(ExecuteCommandEntity req, String stage) {
         if (req == null) return "";
         String message = req.getMessage();
         if (message == null) message = "";
-        return stage == null || stage.isBlank()
-                ? message
-                : message + "\n当前阶段: " + stage;
+        return message;
+    }
+
+    /**
+     * 引导感知的 RAG/LTM 检索 query：优先用 currentTask（可能已被 {@link #foldSteerIntoCurrentTask} 折入引导），
+     * 回退到原始 message。必须在 specBuilder lambda 里<b>每轮实时调用</b>，引导重跑时 RAG 才用新任务检索。
+     */
+    protected String steerAwareRetrievalQuery(DefaultAutoAgentExecuteStrategyFactory.DynamicContext ctx, ExecuteCommandEntity req) {
+        // 用"有效用户问题"(原始 message + 引导补充)做检索，而非 currentTask——currentTask 会被 Step3 覆写成"重新执行"指令，是糟糕的检索词
+        String q = effectiveUserQuestion(req, ctx);
+        return (q == null || q.isBlank()) ? buildLtmRetrievalQuery(req, null) : q;
+    }
+
+    protected String appendCurrentTimeContext(String promptText) {
+        String base = promptText == null ? "" : promptText;
+        if (base.contains("【当前时间】")) return base;
+        return base + "\n\n【当前时间】\n" + currentTimeForPrompt()
+                + "\n涉及 today/今天/明天/最近/截止时间/时区等判断时，必须以这个时间为准。";
+    }
+
+    protected String currentTimeForPrompt() {
+        java.time.ZonedDateTime now = java.time.ZonedDateTime.now(java.time.ZoneId.systemDefault());
+        return now.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss XXX '['VV']'"));
     }
 
     /**
@@ -141,29 +187,6 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         return entity;
     }
 
-    /**
-     * P0.1.3 Model Router：按 tier 选 ChatClient，命中失败则回退到 fallbackClientId。
-     * <p>
-     * 适用场景：
-     * <ul>
-     *   <li>step1 分类/解析这种轻量任务 → SMALL（haiku/mini）</li>
-     *   <li>step3 评审这种中等推理 → MEDIUM（sonnet）</li>
-     *   <li>step2 精确执行这种深度推理 → LARGE（opus/4-turbo）</li>
-     * </ul>
-     * 注册表为空（TAgent扳手未跑或没贴 tier）时直接走 fallback，安全无破坏性。
-     */
-    protected ChatClient getChatClientByTier(ModelTierEnumVO preferredTier, String fallbackClientId) {
-        String picked = modelTierRegistry.pickClientIdByTier(preferredTier);
-        if (picked != null) {
-            try {
-                return getChatClientByClientId(picked);
-            } catch (Exception e) {
-                log.warn("model-router tier={} picked clientId={} but bean missing, fallback to {}",
-                        preferredTier, picked, fallbackClientId);
-            }
-        }
-        return getChatClientByClientId(fallbackClientId);
-    }
 
     /**
      * 执行 LLM 调用并打印结构化指标（stepName / tokens / latencyMs）。
@@ -217,6 +240,32 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
             log.info("[Cancel] 客户端已断开或执行被取消，跳过后续 step 执行");
             throw new CancellationException("SSE client disconnected or execution cancelled");
         }
+    }
+
+    /**
+     * 立即回答路由钩子：finalizeRequested 置位时直接跳汇总节点 Step4，返回其结果短路剩余步骤。
+     * <p>各非汇总节点在 doApply 入口调用：{@code String r = checkFinalizeRoute(req, ctx); if (r != null) return r;}
+     * 未置位返 null → 原流程逐字节不变（零影响保证，见设计文档 §7）。
+     */
+    protected String checkFinalizeRoute(ExecuteCommandEntity req,
+                                        DefaultAutoAgentExecuteStrategyFactory.DynamicContext ctx) throws Exception {
+        if (!ctx.isFinalizeRequested()) return null;
+        log.info("[AnswerNow] finalize requested → 直接跳 Step4 汇总（基于半成品尽力作答）");
+        cn.bugstack.wrench.design.framework.tree.StrategyHandler<ExecuteCommandEntity,
+                DefaultAutoAgentExecuteStrategyFactory.DynamicContext, String> step4 = getBean("step4LogExecutionSummaryNode");
+        return step4.apply(req, ctx);
+    }
+
+    /**
+     * 2026-05-20：把当前 step 末尾的 DynamicContext 演化写一行到独立 logger {@code step.transition}，→ ES。
+     * <p>
+     * 调用方约定：每个 Step 节点在 {@code return router(req, ctx)} 之前调一次，
+     * 让 Kibana 按 traceId 排序就能看到 step1→2→3→4 之间 dataObjects 怎么接力。
+     */
+    protected void recordTransition(String fromStep, DefaultAutoAgentExecuteStrategyFactory.DynamicContext ctx) {
+        if (ctx == null) return;
+        cn.bugstack.ai.domain.agent.service.execute.common.StepTransitionRecorder.record(
+                fromStep, ctx.getDataObjects(), ctx.getExecutionHistory(), ctx.getStep(), ctx.isCompleted());
     }
 
     /**
@@ -405,12 +454,22 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
             DefaultAutoAgentExecuteStrategyFactory.DynamicContext dynamicContext,
             String stepId, String displayName, String promptText, String sessionId) {
         sendStepStart(dynamicContext, stepId, displayName, sessionId);
+        // G1-C 修复：把 sessionId 塞进 ToolContext，让它跟着调用流到工具执行线程。
+        // 流式（.stream()）的工具调用跑在 Reactor 线程上、MDC（ThreadLocal）为空，MeteredToolCallback 优先从
+        // ToolContext 读 sessionId 才能查到 SSE 通道弹出人工审批 / 进度事件（详见 MeteredToolCallback.resolveSessionId）。
+        // 用 final 局部变量而非重赋值参数：下方 spec::call 方法引用要求被捕获变量 effectively final。
+        // stepLabel(displayName) 让 DAG 并行审批时前端能标注是哪个步骤要的许可。
+        // 注：动态补挂的工具由各 step 节点通过 spec.options(OpenAiChatOptions.toolCallbacks(...)) 注入，这里不重复注入。
+        log.info("[ToolCtxDiag][auto] step={} sessionId={} inject={}", stepId, sessionId, (sessionId != null && !sessionId.isBlank()));
+        final ChatClient.ChatClientRequestSpec callSpec = (sessionId != null && !sessionId.isBlank())
+                ? spec.toolContext(buildToolContext(sessionId, displayName))
+                : spec;
         String result;
         try {
             if (tokenStreamingEnabled) {
-                result = callChatClientWithTokenStreaming(spec, dynamicContext, stepId, promptText);
+                result = callChatClientWithTokenStreaming(callSpec, dynamicContext, stepId, promptText);
             } else {
-                result = callChatClientWithLogging(spec::call, stepId, promptText);
+                result = callChatClientWithLogging(callSpec::call, stepId, promptText);
             }
         } finally {
             sendStepEnd(dynamicContext, stepId, displayName + " 已完成", sessionId);
@@ -418,9 +477,135 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         return result;
     }
 
+    /**
+     * 构建注入到 Spring AI ToolContext 的 map：sessionId（工具线程查 SSE 通道）+ stepLabel（DAG 并行审批区分步骤）。
+     * 用 HashMap 而非 Map.of —— stepLabel 可能为 null，Map.of 不允许 null value。
+     */
+    protected static java.util.Map<String, Object> buildToolContext(String sessionId, String stepLabel) {
+        java.util.Map<String, Object> tc = new java.util.HashMap<>();
+        tc.put("sessionId", sessionId);
+        if (stepLabel != null && !stepLabel.isBlank()) tc.put("stepLabel", stepLabel);
+        return tc;
+    }
+
+    /**
+     * 引导回复（steer）包装器：在 {@link #callStepWithStreaming} 外套一层"被引导打断就重做本步"的循环。
+     * <p>语义：用户在本步流式中途点【引导】→ steerExecute 置 steerIdea + fire 断流 → 本方法把"上轮思考+上轮半截输出+
+     * 新想法"折进 prompt，**用同一 client/advisor/工具、思考不关**重跑本步；执行模式/后续流程不变。
+     * <p>不触发引导时与直接 {@link #callStepWithStreaming} 行为一致（drain 为 null，循环只跑一轮）→ 零影响。
+     * 立即回答优先：若循环中检测到 finalizeRequested，立即跳出交由上层路由到 finalize。
+     *
+     * @param specBuilder 以"最终 prompt 文本"为入参构造 spec（每轮重建，因为 prompt 会被引导改写）
+     * @param basePromptSupplier 本步 prompt 的构造器，<b>每轮重新求值</b>：引导触发时先 {@link #foldSteerIntoCurrentTask}
+     *        把引导折进 currentTask，再调 supplier 用<b>更新后的 currentTask</b> 重建本步 prompt（否则重跑仍用引导前固化的旧 prompt）。
+     */
+    protected String callStepWithSteer(
+            java.util.function.Function<String, ChatClient.ChatClientRequestSpec> specBuilder,
+            DefaultAutoAgentExecuteStrategyFactory.DynamicContext dynamicContext,
+            String stepId, String displayName,
+            java.util.function.Supplier<String> basePromptSupplier, String sessionId) {
+        String prompt = basePromptSupplier.get();
+        String prevPartial = null, prevReasoning = null;
+        String result;
+        int rounds = 0;
+        while (true) {
+            String idea = steerEnabled ? dynamicContext.drainSteerIdea() : null;
+            if (idea != null && !idea.isBlank()) {
+                foldSteerIntoCurrentTask(dynamicContext, idea);
+                String rebuilt = basePromptSupplier.get();
+                prompt = buildSteerPrompt(rebuilt, idea, prevPartial, prevReasoning);
+                writeSteerMarker(sessionId, stepId, idea, prompt);
+                log.info("[Steer] 重做本步 step={} round={} ideaLen={}", stepId, rounds + 1, idea.length());
+            }
+            final String fp = prompt;
+            result = callStepWithStreaming(specBuilder.apply(fp), dynamicContext, stepId, displayName, fp, sessionId);
+            if (!steerEnabled || !dynamicContext.hasSteerIdea() || dynamicContext.isFinalizeRequested()
+                    || ++rounds >= steerMaxRounds) {
+                break;
+            }
+            // 本轮被引导打断：记下半截，循环重跑
+            prevPartial = result;
+            prevReasoning = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.getLatestReasoning(sessionId);
+        }
+        return result;
+    }
+
+    /** 引导：把"用户新想法 + 上轮思考 + 上轮半截输出"折进本步 prompt（思考不关，故保留思考引导）。 */
+    protected String buildSteerPrompt(String basePrompt, String idea, String prevPartial, String prevReasoning) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("【用户在本步执行途中补充了新想法，请重做本步并把它纳入考虑，不要丢弃已有进展】\n");
+        sb.append("用户补充：").append(idea).append("\n\n");
+        if (prevReasoning != null && !prevReasoning.isBlank()) {
+            String pr = prevReasoning.length() > 3000 ? prevReasoning.substring(0, 3000) + "...(截断)" : prevReasoning;
+            sb.append("你刚才在本步的思考（被打断，可能半截）：\n").append(pr).append("\n\n");
+        }
+        if (prevPartial != null && !prevPartial.isBlank()) {
+            String pp = prevPartial.length() > 2000 ? prevPartial.substring(0, 2000) + "...(截断)" : prevPartial;
+            sb.append("你刚才在本步已写出的内容（被打断，可能半截）：\n").append(pp).append("\n\n");
+        }
+        sb.append("----- 本步原始任务 -----\n").append(basePrompt);
+        return sb.toString();
+    }
+
+    /**
+     * 引导串行传递：把用户引导折进 {@code currentTask}（原任务保留 + 追加引导），让所有读 {@code getCurrentTask()}
+     * 的下游 step 拿到引导（auto：下一轮 Step1 分析 / Step4 主题；flow 那份则直达规划+执行）。
+     * <p>当轮 Step2 在 auto 模式不读 currentTask（用 message+analysisResult），故引导对当轮 Step2 经"Step1 重跑结果"间接生效。
+     * <p>只做"原始保留 + 追加"，不改写、不分类、不跨域重路由（属后续 C 阶段）。idea/currentTask 为空时安全降级，不触发引导时本方法永不被调用 → 零影响。
+     */
+    protected void foldSteerIntoCurrentTask(DefaultAutoAgentExecuteStrategyFactory.DynamicContext dynamicContext, String idea) {
+        if (idea == null || idea.isBlank()) return;
+        // auto 真正的载体：steerSupplement（持久、Step3 不覆写），由 Step1/Step2 追加进"用户问题"
+        dynamicContext.appendSteerSupplement(idea);
+        // currentTask 也折一份：auto 里它被 Step3 覆写、step1 模板又不引用，仅影响 Step4 记忆主题；保留无害
+        String prev = dynamicContext.getCurrentTask();
+        String base = prev == null ? "" : prev.trim();
+        String merged = base.isEmpty() ? idea.trim() : base + "\n\n【用户追加引导】" + idea.trim();
+        dynamicContext.setCurrentTask(merged);
+        log.info("[Steer] 引导已折入 steerSupplement + currentTask（len {} -> {}）", base.length(), merged.length());
+    }
+
+    /**
+     * auto 的"有效用户问题" = 不可变原始 message + 持久引导补充（steerSupplement）。
+     * Step1/Step2 用它替代裸 getMessage() 作为"用户问题"，让引导持久贯穿且不破坏 reflexion（原问题保留）。
+     * 无引导时 == 原始 message，零影响。
+     */
+    protected static String effectiveUserQuestion(ExecuteCommandEntity req, DefaultAutoAgentExecuteStrategyFactory.DynamicContext ctx) {
+        String base = (req == null || req.getMessage() == null) ? "" : req.getMessage().trim();
+        String supp = ctx == null ? null : ctx.getSteerSupplement();
+        if (supp == null || supp.isBlank()) return base;
+        return base + "\n\n【用户后续补充/纠正（以此为准，与上面原始问题冲突时优先）】\n" + supp.trim();
+    }
+
+    /** 引导可观测：写一条 ai_event_log 标记行（stepName=steer_triggered，记录想法 + 重做本步的输入）。 */
+    protected void writeSteerMarker(String sessionId, String stepId, String idea, String augmentedPrompt) {
+        if (eventLogServiceForSteer == null) return;
+        try {
+            eventLogServiceForSteer.log(cn.bugstack.ai.domain.agent.service.execute.EventLogEntry.builder()
+                    .sessionId(sessionId)
+                    .userId(MDC.get("userId")).tenantId(MDC.get("tenantId")).agentId(MDC.get("agentId"))
+                    .billingScope(cn.bugstack.ai.domain.agent.service.execute.common.LlmObservationRecorder.BILLING_SCOPE_USER_CHARGEABLE)
+                    .stepName("steer_triggered")
+                    .inputPrompt("【引导触发】step=" + stepId + " | 用户补充=" + idea + "\n----- 重做本步的输入 -----\n" + augmentedPrompt)
+                    .model("intervention").latencyMs(0L).build());
+        } catch (Exception e) {
+            log.debug("[Steer] marker log failed: {}", e.getMessage());
+        }
+    }
+
     /** US-018：流式调用重试最大次数，默认与 Resilience4j llmCall retry.max-attempts 对齐 */
     @org.springframework.beans.factory.annotation.Value("${agent.streaming.retry-max-attempts:3}")
     protected int streamingRetryMaxAttempts;
+
+    /** 引导回复：开关 + 单步最大重做轮次（防止反复引导死循环）。 */
+    @org.springframework.beans.factory.annotation.Value("${agent.steer.enabled:true}")
+    protected boolean steerEnabled;
+    @org.springframework.beans.factory.annotation.Value("${agent.steer.max-rounds:3}")
+    protected int steerMaxRounds;
+
+    /** 引导可观测：写 steer_triggered 标记行。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    protected cn.bugstack.ai.domain.agent.service.execute.IEventLogService eventLogServiceForSteer;
 
     /** 流式调用无 token 空闲超时（秒），连续 N 秒无新 token 判定为卡死 */
     @org.springframework.beans.factory.annotation.Value("${agent.streaming.idle-timeout-seconds:120}")
@@ -455,7 +640,21 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         // 优先从 dynamicContext 拿 sessionId（execute 入口塞入），dag-step 线程读 MDC 拿不到。
         String __sidFromCtx = dynamicContext.getValue("sessionId");
         String __sid = (__sidFromCtx != null && !__sidFromCtx.isBlank()) ? __sidFromCtx : MDC.get("sessionId");
-        try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(__sid)) {
+        // G1-C：把 sessionId 写回 MDC，让 Reactor 自动上下文传播（ReactorContextPropagationConfig）在 blockLast 订阅时
+        // 捕获它，再恢复到 boundedElastic 工具执行线程上 —— MeteredToolCallback 才能 MDC.get("sessionId") 拿到、触发审批。
+        // 线程池 wrap 的 finally 会在任务结束统一还原 MDC，不会泄漏到下个任务。
+        if (__sid != null && !__sid.isBlank()) MDC.put("sessionId", __sid);
+        // 立即回答/引导 mid-stream 截断触发器：answer_now/steer emit 它 → takeUntilOther 优雅完成 Flux → 拿到半截。
+        // 不触发时对原流完全透明（companion 永不 emit）；Sinks.one 的 replay 语义可处理"刚 emit 就被订阅"的竞态。
+        reactor.core.publisher.Sinks.One<Object> __cancelTrigger = reactor.core.publisher.Sinks.one();
+        dynamicContext.setCancelTrigger(__cancelTrigger);
+        // 立即回答 finalize（stepName 含 answer_now）那一发关思考：与 scopeSession 同机制（订阅在调用线程，filter 读 ThreadLocal）。
+        // 其余步骤 __noThink=false，scopeNoThinking 退化为 no-op → 零影响。
+        boolean __noThink = stepName != null && stepName.contains("answer_now");
+        try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(__sid);
+             AutoCloseable __noThinkScope = __noThink
+                     ? cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeNoThinking(__sid)
+                     : (AutoCloseable) () -> {}) {
         for (int attempt = 1; attempt <= streamingRetryMaxAttempts; attempt++) {
             fullResponse.setLength(0);
             lastResponse[0] = null;
@@ -492,7 +691,15 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
                         }
                         t = t.getCause();
                     }
-                }).blockLast();
+                })
+                // 立即回答/引导：trigger 一 emit → 优雅完成 Flux（取消上游 WebClient，LLM 真停）→ blockLast 返回半截
+                .takeUntilOther(__cancelTrigger.asMono())
+                .blockLast();
+
+                // mid-stream 截断时上游被取消、doOnComplete 不触发，补发 [DONE] 收尾该 step 的 token 流
+                if (dynamicContext.isFinalizeRequested() || dynamicContext.hasSteerIdea()) {
+                    sendTokenEvent(dynamicContext, "[DONE]", stepName, MDC.get("requestId"));
+                }
 
                 // 流式调用返回后检查取消：如果在 blockLast() 期间被取消，丢弃过期结果
                 if (dynamicContext.isCancelled() || Thread.currentThread().isInterrupted()) {
@@ -519,6 +726,9 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
 
                 log.info("[Streaming] step={} model={} promptTokens={} completionTokens={} latency={}ms",
                         stepName, model, promptTokens, completionTokens, latency);
+
+                // 立即回答可观测：把本步（含被截断步）的 token 累加进本轮上下文，供 finalize marker 报告叠加值
+                dynamicContext.addTokens(promptTokens, completionTokens);
 
                 llmObservationRecorder.record(buildCallContext(stepName, promptText, result, model), lastResponse[0], latency,
                         result.isEmpty() ? new IllegalStateException("empty streaming response") : null);
@@ -563,11 +773,13 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
                     if (attempt >= streamingRetryMaxAttempts) {
                         break;
                     }
+                    sleepBeforeStreamingRetry(stepName, attempt);
                     continue;
                 }
                 if (attempt < streamingRetryMaxAttempts) {
                     log.warn("[Streaming] step={} attempt {}/{} failed: {}, retrying...",
                             stepName, attempt, streamingRetryMaxAttempts, e.getMessage());
+                    sleepBeforeStreamingRetry(stepName, attempt);
                 } else {
                     log.warn("[Streaming] step={} all {} attempts failed: {}",
                             stepName, streamingRetryMaxAttempts, e.getMessage());
@@ -594,6 +806,19 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
     /**
      * 判断异常是否由 Flux idle timeout 触发（cause chain 中含 TimeoutException）
      */
+    private void sleepBeforeStreamingRetry(String stepName, int failedAttempt) {
+        long baseDelayMs = 2_000L << Math.max(0, failedAttempt - 1);
+        long jitterMs = ThreadLocalRandom.current().nextLong(-500L, 501L);
+        long delayMs = Math.max(0L, baseDelayMs + jitterMs);
+        log.info("[Streaming] step={} retry backoff after attempt {}: {}ms", stepName, failedAttempt, delayMs);
+        try {
+            Thread.sleep(delayMs);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new CancellationException("streaming retry backoff interrupted");
+        }
+    }
+
     private boolean isStreamingTimeout(Exception e) {
         Throwable t = e;
         while (t != null) {

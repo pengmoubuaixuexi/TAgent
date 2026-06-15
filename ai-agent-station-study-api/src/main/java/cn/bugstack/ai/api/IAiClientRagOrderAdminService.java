@@ -11,7 +11,7 @@ import java.util.List;
 /**
  * 知识库配置管理服务接口
  *
- * @author TAgent
+ * @author bugstack虫洞栈
  * @description 知识库配置管理服务接口
  */
 public interface IAiClientRagOrderAdminService {

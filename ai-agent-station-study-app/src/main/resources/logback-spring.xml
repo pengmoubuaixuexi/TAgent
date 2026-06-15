@@ -107,6 +107,20 @@
             <includeMdcKeyName>latencyMs</includeMdcKeyName>
             <includeMdcKeyName>toolName</includeMdcKeyName>
             <includeMdcKeyName>toolLatencyMs</includeMdcKeyName>
+            <!-- 2026-05-20：完整链路观测扩字段 -->
+            <!-- qid：E2E 测试给每题打的稳定 ID（Qxx），生产环境为空；用于 Kibana 按题筛 -->
+            <includeMdcKeyName>qid</includeMdcKeyName>
+            <!-- llmHop：WireTraceRecorder 给一次 Spring AI .call() 内每次 HTTP round-trip 分配的序号，
+                 多轮 tool_use 循环时 hop=1 是首发请求，hop=2/3/... 是 tool_result 回写后的后续请求 -->
+            <includeMdcKeyName>llmHop</includeMdcKeyName>
+            <!-- transitionFrom：StepTransitionRecorder 写入，标记是哪个 step 在汇报状态 -->
+            <includeMdcKeyName>transitionFrom</includeMdcKeyName>
+            <!-- toolInputFull / toolResultFull：MeteredToolCallback 写入的工具完整入参/出参（截断到 4KB/8KB） -->
+            <includeMdcKeyName>toolInputFull</includeMdcKeyName>
+            <includeMdcKeyName>toolResultFull</includeMdcKeyName>
+            <includeMdcKeyName>toolInputChars</includeMdcKeyName>
+            <includeMdcKeyName>toolRawResultChars</includeMdcKeyName>
+            <includeMdcKeyName>toolResultChars</includeMdcKeyName>
             <!-- 服务名作为根字段，Kibana 多服务场景下过滤用；值从 springProperty 渲染 -->
             <customFields>{"app":"${appName}"}</customFields>
         </encoder>

@@ -39,6 +39,13 @@ public class EpisodicMemoryAdvisor implements BaseAdvisor {
     private final int topN;
     private final int order;
 
+    /** H2-A：记忆证据 emitter（可选）。null → 不 emit，advisor 行为不变。setter 注入避免改构造链。 */
+    private volatile cn.bugstack.ai.domain.agent.service.execute.common.MemoryEvidenceEmitter memoryEvidenceEmitter;
+
+    public void setMemoryEvidenceEmitter(cn.bugstack.ai.domain.agent.service.execute.common.MemoryEvidenceEmitter emitter) {
+        this.memoryEvidenceEmitter = emitter;
+    }
+
     public EpisodicMemoryAdvisor(IEpisodicMemoryService episodic, int topN) {
         this(episodic, topN, -80); // order 比 LTM(-100) 晚但早于 RAG(0)，让 RAG 之前已有上下文
     }
@@ -56,8 +63,10 @@ public class EpisodicMemoryAdvisor implements BaseAdvisor {
         Map<String, Object> ctx = request.context();
         String userId = MDC.get("userId");
         if (userId == null || userId.isBlank()) {
+            // H2-A：userId fallback 对齐 LongTermMemoryAdvisor —— conversationId 可能是
+            // tenant:user:session 复合键，要提取 user 段，不能整串当 userId
             Object sidObj = ctx == null ? null : ctx.get(SESSION_CONTEXT_KEY);
-            userId = sidObj == null ? null : sidObj.toString();
+            userId = extractUserIdFromConversationId(sidObj == null ? null : sidObj.toString());
         }
         if (userId == null || userId.isBlank()) {
             return request;
@@ -68,16 +77,16 @@ public class EpisodicMemoryAdvisor implements BaseAdvisor {
         String userText = userMsg.getText();
         if (userText == null || userText.isBlank()) return request;
 
-        // 当前 sessionId：优先从 MDC 取
-        String sessionId = MDC.get("sessionId");
+        // 当前 sessionId：优先从 MDC 取；MDC 缺失时从 conversationId 最后一段还原，和 RAG evidence 对齐
+        String sessionId = resolveSessionIdForEvidence(ctx);
 
-        // ① 当前会话的摘要
+        // ① 当前会话的摘要（按 user 维度查，防 sessionId 跨用户复用串台）
         String currentSessionSummary = null;
         if (sessionId != null && !sessionId.isBlank()) {
             try {
-                currentSessionSummary = episodic.findBySessionId(sessionId);
+                currentSessionSummary = episodic.findBySessionIdForUser(userId, sessionId);
             } catch (Exception e) {
-                log.warn("episodic.findBySessionId failed: {}", e.getMessage());
+                log.warn("episodic.findBySessionIdForUser failed: {}", e.getMessage());
             }
         }
 
@@ -101,6 +110,16 @@ public class EpisodicMemoryAdvisor implements BaseAdvisor {
         boolean hasCurrent = currentSessionSummary != null && !currentSessionSummary.isBlank();
         boolean hasOthers = otherEpisodes != null && !otherEpisodes.isEmpty();
         if (!hasCurrent && !hasOthers) return request;
+
+        // H2-A：emit memory_evidence SSE 给前端展示"本轮用了哪些会话记忆"。
+        // emitter 内部已 explain 开关 + try/catch 兜底；此处再外层 try 保险，advisor 失败 ≠ 主回答失败
+        try {
+            if (memoryEvidenceEmitter != null) {
+                memoryEvidenceEmitter.emitEpisodicEvidence(sessionId, currentSessionSummary, otherEpisodes);
+            }
+        } catch (Exception emitEx) {
+            log.debug("[Episodic] memory evidence emit skipped: {}", emitEx.toString());
+        }
 
         StringBuilder sb = new StringBuilder();
         if (hasCurrent) {
@@ -126,7 +145,8 @@ public class EpisodicMemoryAdvisor implements BaseAdvisor {
         messages.add(new UserMessage(sb.toString()));
 
         return ChatClientRequest.builder()
-                .prompt(Prompt.builder().messages(messages).build())
+                // 透传 options，否则 per-request 动态工具回调会丢（见 LongTermMemoryAdvisor 同样修复）。
+                .prompt(Prompt.builder().messages(messages).chatOptions(originalPrompt.getOptions()).build())
                 .context(ctx)
                 .build();
     }
@@ -154,5 +174,35 @@ public class EpisodicMemoryAdvisor implements BaseAdvisor {
     @Override
     public String getName() {
         return getClass().getSimpleName();
+    }
+
+    /**
+     * H2-A：跟 LongTermMemoryAdvisor 同款 userId 提取 —— conversationId 形如
+     * {@code tenant:user:session} 取 user 段，{@code user:session} 取第一段，单段原样返回。
+     */
+    private String extractUserIdFromConversationId(String conversationId) {
+        if (conversationId == null || conversationId.isBlank()) return null;
+        String[] parts = conversationId.split(":");
+        if (parts.length >= 3) return parts[1];
+        if (parts.length == 2) return parts[0];
+        return conversationId;
+    }
+
+    private String resolveSessionIdForEvidence(Map<String, Object> context) {
+        String mdcSid = MDC.get("sessionId");
+        if (mdcSid != null && !mdcSid.isBlank()) return mdcSid;
+        if (context != null) {
+            Object sid = context.get(SESSION_CONTEXT_KEY);
+            String sessionId = extractSessionIdFromConversationId(sid == null ? null : String.valueOf(sid));
+            if (sessionId != null && !sessionId.isBlank()) return sessionId;
+        }
+        return null;
+    }
+
+    private String extractSessionIdFromConversationId(String conversationId) {
+        if (conversationId == null || conversationId.isBlank()) return null;
+        String trimmed = conversationId.trim();
+        int idx = trimmed.lastIndexOf(':');
+        return idx >= 0 && idx + 1 < trimmed.length() ? trimmed.substring(idx + 1) : trimmed;
     }
 }

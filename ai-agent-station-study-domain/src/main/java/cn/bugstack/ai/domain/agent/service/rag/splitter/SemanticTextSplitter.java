@@ -60,6 +60,14 @@ public class SemanticTextSplitter extends TextSplitter {
 
     @Override
     protected List<String> splitText(String text) {
+        return splitTextToChunks(text);
+    }
+
+    /**
+     * 暴露给 Parent/Child 两层 RAG 切分复用：保持同一套语义边界规则，
+     * 只是不同调用方可用不同 target/overlap 参数。
+     */
+    public List<String> splitTextToChunks(String text) {
         if (text == null || text.isBlank()) return List.of();
 
         // 预处理：剥离 markdown 图片引用
@@ -254,10 +262,25 @@ public class SemanticTextSplitter extends TextSplitter {
 
         for (int i = 1; i < chunks.size(); i++) {
             String prev = chunks.get(i - 1);
+            String current = chunks.get(i);
+            // 代码块作为原子单元。相邻 chunk 若包含代码围栏，不追加 overlap，
+            // 避免把代码块尾巴复制成另一个 chunk 里的半截代码。
+            if (containsCodeFence(prev) || containsCodeFence(current)) {
+                result.add(current);
+                continue;
+            }
             String tail = smartTail(prev, overlapChars);
-            result.add(tail + "\n\n" + chunks.get(i));
+            result.add(tail + "\n\n" + current);
         }
         return result;
+    }
+
+    private boolean containsCodeFence(String text) {
+        if (text == null || text.isEmpty()) return false;
+        for (String line : text.split("\n")) {
+            if (CODE_FENCE.matcher(line).find()) return true;
+        }
+        return false;
     }
 
     /**

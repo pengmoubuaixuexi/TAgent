@@ -16,6 +16,11 @@
         header select, header button { background: #21262d; color: #e6edf3; border: 1px solid #30363d;
             padding: 6px 12px; border-radius: 6px; font-size: 13px; cursor: pointer; }
         header button:hover { background: #30363d; }
+        .tabs { display: flex; gap: 6px; align-items: center; }
+        .tabs a { color: #8b949e; text-decoration: none; border: 1px solid #30363d; background: #161b22;
+            padding: 6px 12px; border-radius: 6px; font-size: 13px; line-height: 1; }
+        .tabs a:hover { color: #e6edf3; background: #21262d; }
+        .tabs a.active { color: #e6edf3; border-color: #58a6ff; background: rgba(88, 166, 255, 0.14); }
         .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; padding: 20px 24px; }
         .stat { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 14px 16px; }
         .stat .label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -40,6 +45,10 @@
 <header>
     <h1>AI Agent Station · 观测面板</h1>
     <span class="muted" id="status"><span class="dot ok"></span>就绪</span>
+    <nav class="tabs" aria-label="观测视图">
+        <a class="active" href="/observe.html">LLM 观测</a>
+        <a href="/observe-mcp.html">MCP 工具治理</a>
+    </nav>
     <div class="right">
         <span class="muted">时间窗口</span>
         <select id="range">
@@ -66,7 +75,7 @@
         <canvas id="chart-model" height="220"></canvas>
     </div>
     <div class="card">
-        <h2>会话 LLM 调用 Top 15<span class="muted">当前时间窗口 · sessionId 维度</span></h2>
+        <h2>会话 / 系统 LLM 调用 Top 15<span class="muted">当前时间窗口 · sessionId 或 system:* 维度</span></h2>
         <canvas id="chart-session" height="220"></canvas>
     </div>
 </div>

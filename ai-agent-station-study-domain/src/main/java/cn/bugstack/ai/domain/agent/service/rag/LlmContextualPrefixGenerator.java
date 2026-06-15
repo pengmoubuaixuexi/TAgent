@@ -1,5 +1,6 @@
 package cn.bugstack.ai.domain.agent.service.rag;
 
+import cn.bugstack.ai.domain.agent.model.valobj.enums.AiAgentEnumVO;
 import lombok.extern.slf4j.Slf4j;
 import org.slf4j.MDC;
 import org.springframework.ai.chat.client.ChatClient;
@@ -59,7 +60,7 @@ public class LlmContextualPrefixGenerator implements IContextualPrefixGenerator 
 
         ChatClient chatClient;
         try {
-            chatClient = applicationContext.getBean("aiClient_" + clientId, ChatClient.class);
+            chatClient = applicationContext.getBean(AiAgentEnumVO.AI_CLIENT.getBeanName(clientId), ChatClient.class);
         } catch (Exception e) {
             log.warn("contextual-retrieval ChatClient bean not found for clientId={}, skip all", clientId);
             return Collections.nCopies(chunks.size(), null);

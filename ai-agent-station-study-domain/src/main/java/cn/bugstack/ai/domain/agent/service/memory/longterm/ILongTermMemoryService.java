@@ -61,12 +61,15 @@ public interface ILongTermMemoryService {
     List<String> retrieveForInjection(String userId, String query, int coreN, int relevantK);
 
     /**
-     * P2.1 10.2 遗忘衰减：按双因子（last_accessed 距离 + access_count 频率）打分，
-     * 把久未访问的冷记忆批量归档。
-     * @param staleDays 超过多少天未访问算"冷"（默认 30）
-     * @param minAccess 最低访问次数（默认 3，低于此值且超时即归档）
-     * @param limit     单次最多归档条数
+     * P2.1 10.2 遗忘衰减（2026-06-07 重设计）：把闲置超过 "基线天数 + 热度宽限" 的冷记忆批量归档
+     * （破坏性：删向量 + archived=1）。
+     * <p>
+     * 归档阈值 = baseDays + k(topic) × min(access_count, cap)：access_count 经 touchAccess 的 1 天
+     * 节流后≈"被召回的不同天数"，越热宽限越久；k 按 topic 分档（技能/偏好耐久 &gt; 计划/情况会过期）；
+     * cap 给宽限一个有限上界，取代旧的 access_count&lt;3 硬阈值（破阈即"永久免疫"）。画像槽位永不归档。
+     * 基线天数、各档 k、cap 均走配置（{@code agent.memory.long-term.decay-*}）。
+     * @param limit 单次最多归档条数
      * @return 实际归档条数
      */
-    int runDecay(int staleDays, int minAccess, int limit);
+    int runDecay(int limit);
 }

@@ -152,6 +152,11 @@
             <artifactId>opentelemetry-exporter-otlp</artifactId>
         </dependency>
 
+<!--        <dependency>-->
+<!--            <groupId>cn.bugstack.wrench</groupId>-->
+<!--            <artifactId>xfg-wrench-starter-task-job</artifactId>-->
+<!--        </dependency>-->
+
         <!-- 工程模块；启动依赖 trigger->domain, infrastructure-->
         <dependency>
             <groupId>cn.bugstack.ai</groupId>

@@ -66,7 +66,8 @@ public class ReadOnlyChatMemoryAdvisor implements BaseAdvisor {
             }
         }
         return ChatClientRequest.builder()
-                .prompt(Prompt.builder().messages(messages).build())
+                // 透传 options，否则 per-request 动态工具回调会丢（见 LongTermMemoryAdvisor 同样修复）。
+                .prompt(Prompt.builder().messages(messages).chatOptions(request.prompt().getOptions()).build())
                 .context(ctx)
                 .build();
     }

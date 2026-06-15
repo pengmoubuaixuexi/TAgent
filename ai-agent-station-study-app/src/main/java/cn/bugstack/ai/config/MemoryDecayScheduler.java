@@ -9,8 +9,10 @@ import org.springframework.stereotype.Component;
 /**
  * P2.1 10.2 记忆遗忘衰减：定期归档冷记忆。
  * <p>
- * 双因子打分：last_accessed（距今多少天）+ access_count（被召回次数）。
- * 每天凌晨 3 点扫描，把 staleDays 天未访问且访问次数低于 minAccess 的记录归档。
+ * 归档阈值 = baseDays + k(topic) × min(access_count, cap)：access_count 经 touchAccess 的 1 天
+ * 节流后≈"被召回的不同天数"，越热宽限越久；技能/偏好（耐久）比 计划/情况（会过期）活得久；
+ * cap 给宽限一个有限上界（取代旧 access_count&lt;3 硬阈值的"永久免疫"）。画像永不归档。
+ * 各参数走配置 {@code agent.memory.long-term.decay-*}。
  * <p>
  * 支持通过配置开关：{@code agent.memory.decay.enabled=true}
  */
@@ -32,7 +34,7 @@ public class MemoryDecayScheduler {
     @Scheduled(cron = "0 7 3 * * ?")
     public void runDecay() {
         try {
-            int count = ltmService.runDecay(30, 3, 200);
+            int count = ltmService.runDecay(200);
             if (count > 0) {
                 log.info("[MemoryDecay] archived {} stale memories", count);
             }

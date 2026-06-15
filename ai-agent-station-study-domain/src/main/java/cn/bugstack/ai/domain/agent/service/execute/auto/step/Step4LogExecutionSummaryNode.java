@@ -13,14 +13,16 @@ import cn.bugstack.wrench.design.framework.tree.StrategyHandler;
 import lombok.extern.slf4j.Slf4j;
 import org.slf4j.MDC;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.prompt.ChatOptions;
+import org.springframework.ai.tool.ToolCallback;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+
+import java.util.List;
 
 /**
  * 执行总结节点
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/7/27 16:45
  */
 @Slf4j
@@ -38,10 +40,26 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
     @Autowired(required = false)
     private cn.bugstack.ai.domain.agent.service.memory.longterm.ILongTermMemoryService longTermMemoryService;
 
+    /** 立即回答可观测：打断时写一条 ai_event_log 标记行（即使 finalize LLM 失败也留痕）。 */
+    @Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.execute.IEventLogService eventLogService;
+
     /** 摘要触发阈值：10 轮 = 20 条消息 */
     private static final int EPISODIC_SUMMARY_THRESHOLD = 20;
     /** 节流间隔：每新增 4 条消息（= 2 轮）触发一次 */
     private static final int EPISODIC_THROTTLE_INTERVAL = 4;
+
+    /** 立即回答：finalize 是否允许调工具（默认关，求"立即"）。 */
+    @org.springframework.beans.factory.annotation.Value("${agent.answer-now.finalize-tools:false}")
+    private boolean answerNowFinalizeTools;
+
+    /** 立即回答：关思考指令（model-agnostic 提示词；可填 /no_think 等 provider token）。单行，代码侧补换行。 */
+    @org.springframework.beans.factory.annotation.Value("${agent.answer-now.no-think-directive:[立即作答模式] 用户已要求立即回答，请直接基于以上已有信息给出最终答案，不要再展开额外的思考或分析过程，简明扼要。}")
+    private String answerNowNoThinkDirective;
+
+    /** 立即回答 finalize 关思考：OpenAI reasoning_effort（minimal/low/medium/high）；空=不设。设到 OpenAiChatOptions，由 Spring AI 确定性序列化进 body。 */
+    @org.springframework.beans.factory.annotation.Value("${agent.no-think.reasoning-effort:}")
+    private String answerNowReasoningEffort;
 
     @Override
     protected String doApply(ExecuteCommandEntity requestParameter, DefaultAutoAgentExecuteStrategyFactory.DynamicContext dynamicContext) throws Exception {
@@ -57,7 +75,8 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
         generateFinalReport(requestParameter, dynamicContext);
         
         log.info("\n🏁 === 动态多轮执行结束 ====");
-        
+
+        recordTransition("step4_log_execution_summary", dynamicContext);
         return "ai agent execution summary completed!";
     }
 
@@ -93,7 +112,8 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
     private void generateFinalReport(ExecuteCommandEntity requestParameter, DefaultAutoAgentExecuteStrategyFactory.DynamicContext dynamicContext) {
         try {
             boolean isCompleted = dynamicContext.isCompleted();
-            log.info("\n--- 生成{}任务的最终答案 ---", isCompleted ? "已完成" : "未完成");
+            boolean answerNow = dynamicContext.isFinalizeRequested();
+            log.info("\n--- 生成{}任务的最终答案{} ---", isCompleted ? "已完成" : "未完成", answerNow ? "（立即回答）" : "");
 
             AiAgentClientFlowConfigVO aiAgentClientFlowConfigVO = dynamicContext.getAiAgentClientFlowConfigVOMap().get(AiClientTypeEnumVO.RESPONSE_ASSISTANT.getCode());
             if (aiAgentClientFlowConfigVO == null) {
@@ -101,11 +121,31 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
                         + " for agentId=" + requestParameter.getAiAgentId());
             }
 
-            String summaryPrompt = getSummaryPrompt(aiAgentClientFlowConfigVO, requestParameter, dynamicContext, isCompleted);
+            // 工具：常驻 + 路由补充（既用于挂回调，也用于注入 prompt 工具清单）
+            String clientId = aiAgentClientFlowConfigVO.getClientId();
+            List<ToolCallback> dynamicToolCallbacks = resolveAgentDynamicToolCallbacks(requestParameter, clientId);
+            boolean attachTools = !dynamicToolCallbacks.isEmpty() && (!answerNow || answerNowFinalizeTools);
+
+            // 立即回答：用半成品上下文（含半截思考）拼专用 prompt + 关思考指令；否则走原 completed/incomplete 提示词。
+            String summaryPrompt = answerNow
+                    ? buildAnswerNowPrompt(requestParameter, dynamicContext) + "\n\n" + answerNowNoThinkDirective
+                    : getSummaryPrompt(aiAgentClientFlowConfigVO, requestParameter, dynamicContext, isCompleted);
+            // 立即回答且挂工具：把常驻+补充工具清单注入 prompt（与正常执行步一致，帮模型选对工具、防幻觉）
+            if (answerNow && attachTools && dynamicAgentToolRegistry != null) {
+                summaryPrompt += "\n\n**【可用工具清单】**\n"
+                        + dynamicAgentToolRegistry.describeToolsForPrompt(clientId, dynamicToolCallbacks)
+                        + "\n如需补足信息可调用上述工具后再作答；不需要则直接作答。";
+            }
+            summaryPrompt = appendCurrentTimeContext(summaryPrompt);
+
+            // 立即回答可观测：在 LLM 调用前写一条标记行，记录"中断点 + 改写后的完整 finalize 输入"，LLM 失败也留痕。
+            if (answerNow) {
+                logAnswerNowMarker(requestParameter, dynamicContext, summaryPrompt);
+            }
 
             // 获取对话客户端 - 使用任务分析客户端进行总结
-            ChatClient chatClient = getChatClientByClientId(aiAgentClientFlowConfigVO.getClientId());
-            
+            ChatClient chatClient = getChatClientByClientId(clientId);
+
             ChatClient.ChatClientRequestSpec spec0 = chatClient
                     .prompt(summaryPrompt)
                     .advisors(a -> a
@@ -113,12 +153,23 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
                             .param(LTM_RETRIEVAL_QUERY_KEY, buildLtmRetrievalQuery(requestParameter, "auto-step4-final-summary"))
                             .param("memory_persist_final_turn", true)
                             .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 50));
-            final ChatClient.ChatClientRequestSpec streamSpec = (step4MaxTokens > 0)
-                    ? spec0.options(ChatOptions.builder().maxTokens(step4MaxTokens).build())
-                    : spec0;
+            org.springframework.ai.openai.OpenAiChatOptions.Builder step4OptionsBuilder =
+                    org.springframework.ai.openai.OpenAiChatOptions.builder();
+            if (step4MaxTokens > 0) {
+                step4OptionsBuilder.maxTokens(step4MaxTokens);
+            }
+            // 挂工具回调（常驻+补充）：finalize-tools 开 + 该 agent 原有工具时
+            if (attachTools) {
+                step4OptionsBuilder.toolCallbacks(toRequestToolCallbacks(clientId, dynamicToolCallbacks));
+            }
+            // 立即回答关思考：reasoning_effort 设到 options，由 Spring AI 序列化进 body（确定性，绕开 filter 跨线程）。
+            if (answerNow && answerNowReasoningEffort != null && !answerNowReasoningEffort.isBlank()) {
+                step4OptionsBuilder.reasoningEffort(answerNowReasoningEffort);
+            }
+            ChatClient.ChatClientRequestSpec streamSpec = spec0.options(step4OptionsBuilder.build());
             // 2026-05-07 流式 UX：step_start → 流式 token → step_end（折叠为"最终总结 已完成"）
             String summaryResult = callStepWithStreaming(
-                    streamSpec, dynamicContext, "step4_summary", "最终总结",
+                    streamSpec, dynamicContext, answerNow ? "step4_answer_now" : "step4_summary", "最终总结",
                     summaryPrompt, requestParameter.getSessionId());
 
             if (summaryResult == null) throw new BizException("step4: summaryResult is null", "LLM returned null for Step4LogExecutionSummaryNode");
@@ -174,11 +225,81 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
                         userId, tenantId, req.getSessionId(), req.getAiAgentId());
     }
 
+    /**
+     * 立即回答可观测：写一条 ai_event_log 标记行（stepName=answer_now_triggered），记录中断点 + 改写后的完整 finalize 输入。
+     * 独立于 finalize LLM 调用：即使后续 LLM 失败也能在 event_log 看到"打断发生了 + 输入改成了啥"。
+     */
+    private void logAnswerNowMarker(ExecuteCommandEntity req, DefaultAutoAgentExecuteStrategyFactory.DynamicContext ctx, String finalizePrompt) {
+        if (eventLogService == null) return;
+        try {
+            String partialReasoning = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.getLatestReasoning(req.getSessionId());
+            int histLen = ctx.getExecutionHistory() != null ? ctx.getExecutionHistory().length() : 0;
+            String header = "【立即回答触发】中断于 step=" + ctx.getStep()
+                    + " | executionHistoryChars=" + histLen
+                    + " | partialReasoningChars=" + (partialReasoning != null ? partialReasoning.length() : 0)
+                    + " | 打断前累计token(prompt+completion)=" + ctx.cumulativePromptTokens()
+                        + "+" + ctx.cumulativeCompletionTokens()
+                    + " | finalizeTools=" + answerNowFinalizeTools
+                    + "\n----- 改写后的 finalize 输入 -----\n";
+            eventLogService.log(cn.bugstack.ai.domain.agent.service.execute.EventLogEntry.builder()
+                    .sessionId(req.getSessionId())
+                    .userId(req.getUserId())
+                    .tenantId(req.getTenantId())
+                    .agentId(req.getAiAgentId())
+                    .billingScope(cn.bugstack.ai.domain.agent.service.execute.common.LlmObservationRecorder.BILLING_SCOPE_USER_CHARGEABLE)
+                    .stepName("answer_now_triggered")
+                    .stepIndex(ctx.getStep())
+                    .inputPrompt(header + finalizePrompt)
+                    .outputText(null)
+                    .model("intervention")
+                    .latencyMs(0L)
+                    .build());
+            log.info("[AnswerNow] event_log marker written: interruptedStep={} histChars={}", ctx.getStep(), histLen);
+        } catch (Exception e) {
+            log.debug("[AnswerNow] marker log failed: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 立即回答专用 prompt：把当前能拿到的半成品全捞上——已完成步骤记录 + 当前分析 + 当前执行产出 + 被中断的半截思考。
+     * 任一为空就略过该段；clicked 很早时退化为"基于 RAG/记忆直接答原问题"。
+     */
+    private String buildAnswerNowPrompt(ExecuteCommandEntity req, DefaultAutoAgentExecuteStrategyFactory.DynamicContext ctx) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("用户在执行过程中点击了【立即回答】，要求基于目前已有的（可能不完整的）信息立刻作答。\n\n");
+        sb.append("**用户原始问题:**\n").append(effectiveUserQuestion(req, ctx)).append("\n\n");
+
+        String history = ctx.getExecutionHistory() != null ? ctx.getExecutionHistory().toString() : "";
+        if (history != null && !history.isBlank()) {
+            sb.append("**已完成步骤记录:**\n").append(history).append("\n\n");
+        }
+        String analysis = ctx.getValue("analysisResult");
+        if (analysis != null && !analysis.isBlank()) {
+            sb.append("**当前分析（可能为半截）:**\n").append(analysis).append("\n\n");
+        }
+        String execResult = ctx.getValue("executionResult");
+        if (execResult != null && !execResult.isBlank()) {
+            sb.append("**当前执行产出（可能为半截）:**\n").append(execResult).append("\n\n");
+        }
+        String partialReasoning = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter
+                .getLatestReasoning(req.getSessionId());
+        if (partialReasoning != null && !partialReasoning.isBlank()) {
+            String pr = partialReasoning.length() > 4000 ? partialReasoning.substring(0, 4000) + "...(截断)" : partialReasoning;
+            sb.append("**你刚才正在进行的思考（被用户中断，可能为半截）:**\n").append(pr).append("\n\n");
+        }
+
+        sb.append("**要求:**\n");
+        sb.append("1. 立即基于以上信息直接回答用户原始问题，给出尽可能完整、有用的答案。\n");
+        sb.append("2. 信息不足的部分简要说明，不要编造。\n");
+        sb.append("3. 用清晰的 Markdown 输出。\n");
+        return sb.toString();
+    }
+
     private static String getSummaryPrompt(AiAgentClientFlowConfigVO aiAgentClientFlowConfigVO, ExecuteCommandEntity requestParameter, DefaultAutoAgentExecuteStrategyFactory.DynamicContext dynamicContext, boolean isCompleted) {
         String summaryPrompt;
         if (isCompleted) {
             summaryPrompt = String.format(aiAgentClientFlowConfigVO.getStepPrompt(),
-                    requestParameter.getMessage(),
+                    effectiveUserQuestion(requestParameter, dynamicContext),
                     dynamicContext.getExecutionHistory().toString());
         } else {
             summaryPrompt = String.format("""
@@ -198,7 +319,7 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
                     
                     请基于现有信息给出用户问题的答案：
                     """,
-                    requestParameter.getMessage(),
+                    effectiveUserQuestion(requestParameter, dynamicContext),
                     dynamicContext.getExecutionHistory().toString());
         }
         return summaryPrompt;

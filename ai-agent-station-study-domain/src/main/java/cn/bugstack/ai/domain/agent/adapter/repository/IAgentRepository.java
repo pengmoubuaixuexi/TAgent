@@ -8,7 +8,7 @@ import java.util.Map;
 /**
  * AiAgent 仓储接口
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/6/27 16:48
  */
 public interface IAgentRepository {
@@ -18,6 +18,18 @@ public interface IAgentRepository {
     List<AiClientModelVO> AiClientModelVOByClientIds(List<String> clientIdList);
 
     List<AiClientToolMcpVO> AiClientToolMcpVOByClientIds(List<String> clientIdList);
+
+    AiClientToolMcpVO queryAiClientToolMcpVOByMcpId(String mcpId);
+
+    List<AiClientToolMcpVO> queryEnabledAiClientToolMcpVOList();
+
+    List<AiMcpToolCatalogVO> queryEnabledMcpToolCatalog();
+
+    List<AiMcpToolCatalogVO> queryMcpToolCatalogByMcpId(String mcpId);
+
+    void upsertMcpToolCatalog(List<AiMcpToolCatalogVO> catalogList);
+
+    void deleteMcpToolCatalog(String mcpId, List<String> toolNames);
 
     List<AiClientSystemPromptVO> AiClientSystemPromptVOByClientIds(List<String> clientIdList);
 
@@ -30,6 +42,9 @@ public interface IAgentRepository {
     List<AiClientApiVO> queryAiClientApiVOListByModelIds(List<String> modelIdList);
 
     List<AiClientModelVO> AiClientModelVOByModelIds(List<String> modelIdList);
+
+    /** 查询所有启用(status=1)的模型配置 VO；RouterPoolConfig 按 tier 选 model 用 */
+    List<AiClientModelVO> queryEnabledAiClientModelVOList();
 
     Map<String, AiAgentClientFlowConfigVO> queryAiAgentClientFlowConfig(String aiAgentId);
 

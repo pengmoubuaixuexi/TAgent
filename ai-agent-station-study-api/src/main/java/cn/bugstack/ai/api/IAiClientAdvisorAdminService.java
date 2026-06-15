@@ -10,7 +10,7 @@ import java.util.List;
 /**
  * 顾问配置管理服务接口
  *
- * @author TAgent
+ * @author bugstack虫洞栈
  * @description 顾问配置管理服务接口
  */
 public interface IAiClientAdvisorAdminService {

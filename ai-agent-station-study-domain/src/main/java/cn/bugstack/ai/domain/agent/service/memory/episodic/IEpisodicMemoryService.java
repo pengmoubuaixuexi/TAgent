@@ -51,6 +51,12 @@ public interface IEpisodicMemoryService {
     String findBySessionId(String sessionId);
 
     /**
+     * 按 user 维度查指定 session 的摘要（注入专用）。命中的 session 记录若不属于该 userId，
+     * 视为未命中返回 null —— 防止 sessionId 跨用户/跨租户复用时把别人的会话摘要注入进来。
+     */
+    String findBySessionIdForUser(String userId, String sessionId);
+
+    /**
      * 查指定 session 上次摘要时的消息总数，用于"每 N 条消息"节流。
      * @return 上次摘要时的消息数；session 无记录时返回 -1
      */

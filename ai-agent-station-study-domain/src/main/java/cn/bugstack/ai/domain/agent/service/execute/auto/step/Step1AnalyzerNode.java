@@ -9,13 +9,15 @@ import cn.bugstack.ai.types.exception.BizException;
 import cn.bugstack.wrench.design.framework.tree.StrategyHandler;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.prompt.ChatOptions;
+import org.springframework.ai.tool.ToolCallback;
 import org.springframework.stereotype.Service;
+
+import java.util.List;
 
 /**
  * 任务分析节点
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/7/27 16:36
  */
 @Slf4j
@@ -25,6 +27,9 @@ public class Step1AnalyzerNode extends AbstractExecuteSupport {
     @Override
     protected String doApply(ExecuteCommandEntity requestParameter, DefaultAutoAgentExecuteStrategyFactory.DynamicContext dynamicContext) throws Exception {
         checkCancelled(dynamicContext);
+        // 立即回答：跳过分析，直接汇总
+        String __finalize = checkFinalizeRoute(requestParameter, dynamicContext);
+        if (__finalize != null) return __finalize;
         log.info("\n🎯 === 执行第 {} 步 ===", dynamicContext.getStep());
 
         // 获取配置信息
@@ -36,27 +41,39 @@ public class Step1AnalyzerNode extends AbstractExecuteSupport {
 
         // 第一阶段：任务分析
         log.info("\n📊 阶段1: 任务状态分析");
-        String analysisPrompt = String.format(aiAgentClientFlowConfigVO.getStepPrompt(),
-                requestParameter.getMessage(),
+        // 引导感知：本步 prompt 包成 Supplier，每轮按最新 currentTask(%5) 重建（引导后 currentTask 已折入引导）
+        final AiAgentClientFlowConfigVO step1Config = aiAgentClientFlowConfigVO;
+        java.util.function.Supplier<String> analysisPromptSupplier = () -> appendCurrentTimeContext(String.format(step1Config.getStepPrompt(),
+                effectiveUserQuestion(requestParameter, dynamicContext),
                 dynamicContext.getStep(),
                 dynamicContext.getMaxStep(),
                 !dynamicContext.getExecutionHistory().isEmpty() ? dynamicContext.getExecutionHistory().toString() : "[首次执行]",
                 dynamicContext.getCurrentTask()
-        );
-        analysisPrompt = analysisPrompt + githubRepositorySearchGuidance();
+        ));
 
         ChatClient chatClient = getChatClientByClientId(aiAgentClientFlowConfigVO.getClientId());
+        List<ToolCallback> dynamicToolCallbacks = resolveAgentDynamicToolCallbacks(requestParameter, aiAgentClientFlowConfigVO.getClientId());
 
         // 2026-05-07 流式 UX：step_start → 流式 token → step_end（折叠为"需求分析 已完成"）
-        ChatClient.ChatClientRequestSpec spec1 = chatClient
-                .prompt(analysisPrompt)
-                .advisors(a -> a
-                        .param(CHAT_MEMORY_CONVERSATION_ID_KEY, buildConversationId(requestParameter))
-                        .param(LTM_RETRIEVAL_QUERY_KEY, buildLtmRetrievalQuery(requestParameter, "auto-step1-analysis"))
-                        .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 1024));
-        if (step1MaxTokens > 0) spec1 = spec1.options(ChatOptions.builder().maxTokens(step1MaxTokens).build());
-        String analysisResult = callStepWithStreaming(
-                spec1, dynamicContext, "step1_analyzer", "需求分析", analysisPrompt, requestParameter.getSessionId());
+        org.springframework.ai.openai.OpenAiChatOptions.Builder step1OptionsBuilder =
+                org.springframework.ai.openai.OpenAiChatOptions.builder();
+        if (step1MaxTokens > 0) {
+            step1OptionsBuilder.maxTokens(step1MaxTokens);
+        }
+        if (!dynamicToolCallbacks.isEmpty()) {
+            step1OptionsBuilder.toolCallbacks(toRequestToolCallbacks(aiAgentClientFlowConfigVO.getClientId(), dynamicToolCallbacks));
+        }
+        final ChatClient step1Client = chatClient;
+        final org.springframework.ai.openai.OpenAiChatOptions step1Opts = step1OptionsBuilder.build();
+        // 引导回复：被打断则折入新想法重做本步（思考不关、工具不变）；不触发时等价于单发流式
+        String analysisResult = callStepWithSteer(
+                p -> step1Client.prompt(p)
+                        .advisors(a -> a
+                                .param(CHAT_MEMORY_CONVERSATION_ID_KEY, buildConversationId(requestParameter))
+                                .param(LTM_RETRIEVAL_QUERY_KEY, steerAwareRetrievalQuery(dynamicContext, requestParameter))
+                                .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 1024))
+                        .options(step1Opts),
+                dynamicContext, "step1_analyzer", "需求分析", analysisPromptSupplier, requestParameter.getSessionId());
 
         if (analysisResult == null) throw new BizException("step1: analysisResult is null", "LLM returned null for Step1AnalyzerNode");
         // P2.7 16.2：发送 thinking 事件展示中间推理
@@ -74,9 +91,11 @@ public class Step1AnalyzerNode extends AbstractExecuteSupport {
                 analysisResult.contains("完成度评估: 100%")) {
             dynamicContext.setCompleted(true);
             log.info("✅ 任务分析显示已完成！");
+            recordTransition("step1_analyzer", dynamicContext);
             return router(requestParameter, dynamicContext);
         }
 
+        recordTransition("step1_analyzer", dynamicContext);
         return router(requestParameter, dynamicContext);
     }
 
@@ -89,17 +108,6 @@ public class Step1AnalyzerNode extends AbstractExecuteSupport {
         
         // 否则继续执行下一步
         return getBean("step2PrecisionExecutorNode");
-    }
-
-    private String githubRepositorySearchGuidance() {
-        return """
-
-                [GitHub repository search guidance]
-                If you need to search GitHub repositories, prefer English technical queries and GitHub qualifiers.
-                Do not pass broad Chinese tutorial/resource phrases directly as the GitHub query unless the user explicitly asks to search only Chinese repositories.
-                Examples: `spring-boot learning language:Java stars:>500`, `spring-boot examples language:Java stars:>500`, `spring-boot tutorial language:Java stars:>500`.
-                Use page=1 and perPage<=10 for repository recommendations.
-                """;
     }
 
     private void parseAnalysisResult(DefaultAutoAgentExecuteStrategyFactory.DynamicContext dynamicContext, String analysisResult, String sessionId) {

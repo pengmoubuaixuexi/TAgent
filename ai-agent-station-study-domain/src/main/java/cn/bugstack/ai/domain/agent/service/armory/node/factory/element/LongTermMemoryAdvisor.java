@@ -1,5 +1,6 @@
 package cn.bugstack.ai.domain.agent.service.armory.node.factory.element;
 
+import cn.bugstack.ai.domain.agent.service.execute.common.LongTermMemoryTurnSnapshot;
 import cn.bugstack.ai.domain.agent.service.memory.longterm.ILongTermMemoryService;
 import lombok.extern.slf4j.Slf4j;
 import org.slf4j.MDC;
@@ -41,46 +42,60 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
     public static final String RETRIEVAL_QUERY_CONTEXT_KEY = "ltm_retrieval_query";
 
     private static final String EXTRACTION_PROMPT = """
-            Extract any new facts, preferences, skills, or decisions about the user from this conversation.
-            Ignore generic chitchat, greetings, or things the AI said about itself.
-            Focus ONLY on what you learn about the USER.
+            你是用户长期记忆的抽取器。从下面这轮对话中，抽取关于【用户本人】的、长期有价值的信息。
+            只关注你了解到的关于用户的信息；忽略寒暄、闲聊、以及 AI 自己说的话。
 
-            Categories for TOPIC:
-            - preference:<subject> — what the user likes/dislikes/prefers
-              e.g. "preference:answer_style", "preference:language_choice"
-            - fact:<subject> — objective information about the user
-              e.g. "fact:role", "fact:company", "fact:location"
-            - skill:<subject> — what the user knows or uses (be specific: skill:Java, skill:PostgreSQL)
-              e.g. "skill:Java", "skill:PostgreSQL", "skill:Spring_Boot"
-            - decision:<subject> — a choice the user made
-              e.g. "decision:caching", "decision:database_migration"
+            【事实来源】只抽取用户主动陈述、在提问中透露、或明确同意采纳的信息。
+            助手的建议、推测、方案、评价，若用户没有明确采纳，绝不要当成用户的事实或决定。
+            下面的"助手"文本仅用于帮你理解用户在指什么，它本身不是事实来源。
 
-            IMPORTANT: Use granular, compound topics (e.g., "skill:Java" not just "skill") so different
-            skills/facts don't collide. For each skill, tool, or technology, use a separate line with its
-            own topic.
+            【必须丢弃】一次性或当下状态，不要抽：今天的心情、今天吃什么、本回合的临时请求、
+            临时请假、此刻正在做的单次操作——这些不是长期记忆。
 
-            If the user acquires a new skill or role (e.g. became a Java engineer after being Python),
-            output it as a NEW fact — don't replace the old one. Only output contradictory statements
-            when the user explicitly says they NO LONGER have the old attribute.
+            每条信息输出一行，格式严格为：
+            TOPIC: <主题> | CONTENT: <一句话事实>
 
-            For each extracted fact, output exactly one line:
-            TOPIC: <category>:<subject> | CONTENT: <one sentence fact>
+            主题(TOPIC)必须用中文，只能从下面的受控词表里选，逐字照抄；
+            不许自创主题、不许把数值/状态/姓名写进主题（必须"画像:姓名"而不是"画像:姓名:张伟"，值一律放 CONTENT）、不许中英混用。
+            每条事实独立成一行，绝不把多条挤在一行；TOPIC 只放"类别:主体"，CONTENT 只放一句话事实。
 
-            CRITICAL — Language: Output the CONTENT in the SAME language as the user's
-            last message. If the user wrote in Chinese, output the fact in Chinese.
-            If English, English. Topic codes (preference/fact/skill/decision) stay English.
+            【一、画像槽位】用户的长期背景，会跨领域影响回答。单值：只陈述用户当前的真实值，
+            系统会自动用新值覆盖旧值。只有信息确实落在以下某槽位时才用"画像:"，不要新增槽位：
+              画像:姓名 / 画像:年龄 / 画像:常驻城市 / 画像:职业 / 画像:工作年限 /
+              画像:税前月收入 / 画像:身高 / 画像:当前体重 / 画像:健身目标 /
+              画像:伴侣状况 / 画像:家庭赡养 / 画像:职业目标 / 画像:风险偏好
+            画像:职业 必须写完整头衔（如"Java后端开发工程师"），不要泛化成"程序员"/"开发"；
+            同一句话重复出现不代表职业变了，只有用户明确换了工作才更新。
 
-            If nothing new or meaningful to remember, output exactly: NONE
+            【二、情景信息】只在相关话题才有用。主题为"类别:主体"，类别只能是这四种之一，主体用简短名词：
+              技能:<技术名>   只放用户【已掌握】的具体技术能力点（语言/框架/工具/方法，技术专名保留英文如 技能:Java、技能:SQL优化）；"想学/想了解/打算学"某技术是【意图】不是技能→归 计划:；职业头衔/岗位归 画像:职业，绝不写进技能；同一技能只用一个主体，不同技能可多条并存
+              偏好:<主体>     用户长期稳定的喜好/习惯(偏好:回答风格、偏好:出行方式)；一次性请求("帮我推荐X")不是偏好，丢弃
+              计划:<主体>     用户的具体计划或决定，会过期(计划:五一成都游、计划:Python学习)；同一件计划固定用同一个主体名，不要 计划:学python / 计划 / 计划:python学习 混着写
+              情况:<主体>     其它长期但话题局限的事实(情况:徒弟、情况:在读书目)
 
-            Conversation:
-            User: %s
-            Assistant: %s""";
+            内容(CONTENT)的语言跟随用户本轮的语言：用户说中文就写中文，说英文就写英文
+            (内容要进向量检索，必须语言保真，绝不翻译)。每条只写一句话，
+            同一主题只输出一条最新事实。
+
+            如果这轮没有任何值得长期记住的新信息，只输出: NONE
+
+            对话:
+            用户: %s
+            助手: %s""";
 
     private final ILongTermMemoryService ltm;
     private final int topK;
     private final int order;
     private ChatClient extractionClient;
     private ApplicationContext applicationContext;
+    private volatile LongTermMemoryTurnSnapshot turnSnapshot;
+
+    /** H2-A：记忆证据 emitter（可选）。null → 不 emit，advisor 行为不变。setter 注入避免改构造链。 */
+    private volatile cn.bugstack.ai.domain.agent.service.execute.common.MemoryEvidenceEmitter memoryEvidenceEmitter;
+
+    public void setMemoryEvidenceEmitter(cn.bugstack.ai.domain.agent.service.execute.common.MemoryEvidenceEmitter emitter) {
+        this.memoryEvidenceEmitter = emitter;
+    }
 
     /** before() → after() 同线程传用户原文（Context propagation 不可靠，ThreadLocal 最稳） */
     private final ThreadLocal<String> currentUserText = new ThreadLocal<>();
@@ -115,6 +130,10 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
 
     public void setApplicationContext(ApplicationContext applicationContext) {
         this.applicationContext = applicationContext;
+    }
+
+    public void setTurnSnapshot(LongTermMemoryTurnSnapshot turnSnapshot) {
+        this.turnSnapshot = turnSnapshot;
     }
 
     @Override
@@ -153,19 +172,19 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
         }
 
         // 混合检索：核心记忆（高频+近期）+ 语义相关记忆（向量相似度）
-        List<String> profileLines;
-        try {
-            profileLines = ltm.retrieveForInjection(userId, retrievalQuery, 5, 5);
-        } catch (Exception e) {
-            log.warn("ltm.retrieveForInjection failed, fallback to retrieveProfile: {}", e.getMessage());
-            try {
-                profileLines = ltm.retrieveProfile(userId);
-            } catch (Exception e2) {
-                log.warn("ltm.retrieveProfile also failed: {}", e2.getMessage());
-                return request;
-            }
-        }
+        String evidenceSessionId = resolveSessionIdForEvidence(ctx);
+        List<String> profileLines = loadTurnMemorySnapshot(evidenceSessionId, userId, retrievalQuery);
         if (profileLines == null || profileLines.isEmpty()) return request;
+
+        // H2-A：emit memory_evidence SSE 给前端展示"本轮用了哪些长期记忆"。
+        // emitter 内部已 explain 开关 + try/catch 兜底；此处再外层 try 保险，advisor 失败 ≠ 主回答失败
+        try {
+            if (memoryEvidenceEmitter != null) {
+                memoryEvidenceEmitter.emitLongTermEvidence(evidenceSessionId, profileLines);
+            }
+        } catch (Exception emitEx) {
+            log.debug("[LTM] memory evidence emit skipped: {}", emitEx.toString());
+        }
 
         // 按 topic 分组展示，格式：[topic] content → 归类到对应区块
         StringBuilder memBlock = new StringBuilder();
@@ -206,9 +225,34 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
         messages.add(new UserMessage(advisedUserText));
 
         return ChatClientRequest.builder()
-                .prompt(Prompt.builder().messages(messages).build())
+                // 保留入参 Prompt 的 options：动态补充的 per-request toolCallbacks 只存在于此，
+                // 不透传会被丢掉（常驻工具在 model.defaultOptions 里不受影响），导致路由补的工具不进 tools。
+                .prompt(Prompt.builder().messages(messages).chatOptions(request.prompt().getOptions()).build())
                 .context(ctx)
                 .build();
+    }
+
+    private List<String> loadTurnMemorySnapshot(String sessionId, String userId, String retrievalQuery) {
+        LongTermMemoryTurnSnapshot snapshot = this.turnSnapshot;
+        if (snapshot == null || sessionId == null || sessionId.isBlank()) {
+            return retrieveProfileLines(userId, retrievalQuery);
+        }
+        return snapshot.getOrLoad(sessionId, userId, () -> retrieveProfileLines(userId, retrievalQuery));
+    }
+
+    private List<String> retrieveProfileLines(String userId, String retrievalQuery) {
+        try {
+            // 核心记忆=全部画像槽位(封闭约13个)，给足上限确保全取；语义相关记忆 5 条
+            return ltm.retrieveForInjection(userId, retrievalQuery, 30, 5);
+        } catch (Exception e) {
+            log.warn("ltm.retrieveForInjection failed, fallback to retrieveProfile: {}", e.getMessage());
+            try {
+                return ltm.retrieveProfile(userId);
+            } catch (Exception e2) {
+                log.warn("ltm.retrieveProfile also failed: {}", e2.getMessage());
+                return List.of();
+            }
+        }
     }
 
     @Override
@@ -376,6 +420,14 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
                     if (topic.isBlank()) topic = "general";
                     if (content.isBlank()) continue;
 
+                    // 脏抽取防护（2026-05-31）：LLM 偶尔把值粘进 topic（画像:姓名:张伟）或把多条记忆挤进一行
+                    // （CONTENT 又长得像一条"类别:主体"记录）。这类行整条丢弃，避免污染库（下一轮会重新干净抽取）。
+                    if (isDirtyExtraction(topic, content)) {
+                        log.warn("[LTM] 丢弃脏抽取行 topic='{}' content='{}'", topic,
+                                content.length() > 60 ? content.substring(0, 60) + "…" : content);
+                        continue;
+                    }
+
                     String memoryId = ltm.save(finalUserId, content, topic, "auto", finalSessionId);
                     if (memoryId != null) saved++;
                 }
@@ -444,6 +496,24 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
         return conversationId;
     }
 
+    private String resolveSessionIdForEvidence(Map<String, Object> context) {
+        String mdcSid = MDC.get("sessionId");
+        if (mdcSid != null && !mdcSid.isBlank()) return mdcSid;
+        if (context != null) {
+            Object sid = context.get(SESSION_CONTEXT_KEY);
+            String sessionId = extractSessionIdFromConversationId(sid == null ? null : String.valueOf(sid));
+            if (sessionId != null && !sessionId.isBlank()) return sessionId;
+        }
+        return null;
+    }
+
+    private String extractSessionIdFromConversationId(String conversationId) {
+        if (conversationId == null || conversationId.isBlank()) return null;
+        String trimmed = conversationId.trim();
+        int idx = trimmed.lastIndexOf(':');
+        return idx >= 0 && idx + 1 < trimmed.length() ? trimmed.substring(idx + 1) : trimmed;
+    }
+
     private static String stripLabelPrefix(String s, String[] knownLabels) {
         if (s == null) return "";
         String trimmed = s.trim();
@@ -462,5 +532,35 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
             }
         }
         return trimmed;
+    }
+
+    /** content 自身又长得像一条"类别:主体…"记录 → 说明多条粘连/字段错位。 */
+    private static final java.util.regex.Pattern DIRTY_CONTENT_AS_TOPIC =
+            java.util.regex.Pattern.compile("^\\s*(画像|计划|情况|技能|偏好|职业目标)\\s*[:：]");
+
+    /**
+     * 脏抽取判定（2026-05-31）：命中任一即整行丢弃。
+     * 1) content 又像一条"类别:主体"记录 → 一行挤了多条 / 字段错位（如 content="计划:技术博客写作: …"）。
+     * 2) topic 的"主体"（首个冒号之后）里还含冒号 → 值被粘进了 topic（如 "画像:姓名: 张伟"）。
+     */
+    private static boolean isDirtyExtraction(String topic, String content) {
+        if (topic == null || content == null) return true;
+        if (DIRTY_CONTENT_AS_TOPIC.matcher(content).find()) return true;
+        String t = topic.trim();
+        int c = firstColonIndex(t);
+        if (c >= 0) {
+            String subject = t.substring(c + 1);
+            if (subject.indexOf(':') >= 0 || subject.indexOf('：') >= 0) return true;
+        }
+        return false;
+    }
+
+    /** 返回首个半角或全角冒号的下标（取靠前者），无冒号返回 -1。 */
+    private static int firstColonIndex(String s) {
+        int half = s.indexOf(':');
+        int full = s.indexOf('：');
+        if (half < 0) return full;
+        if (full < 0) return half;
+        return Math.min(half, full);
     }
 }

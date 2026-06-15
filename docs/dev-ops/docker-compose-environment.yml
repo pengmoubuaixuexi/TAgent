@@ -9,7 +9,7 @@ services:
     restart: always
     environment:
       TZ: Asia/Shanghai
-      MYSQL_ROOT_PASSWORD: 123456
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
     ports:
       - "13306:3306"
     volumes:
@@ -34,7 +34,7 @@ services:
     environment:
       - PMA_HOST=mysql
       - PMA_PORT=3306
-      - MYSQL_ROOT_PASSWORD=123456
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
     depends_on:
       mysql:
         condition: service_healthy
@@ -71,8 +71,8 @@ services:
       - 8081:8081
     environment:
       - REDIS_HOSTS=local:redis:6379
-      - HTTP_USER=admin
-      - HTTP_PASSWORD=admin
+      - HTTP_USER=${REDIS_ADMIN_USER}
+      - HTTP_PASSWORD=${REDIS_ADMIN_PASSWORD}
       - LANG=C.UTF-8
       - LANGUAGE=C.UTF-8
       - LC_ALL=C.UTF-8
@@ -88,9 +88,9 @@ services:
     restart: always
     environment:
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_PASSWORD=${PGVECTOR_PASSWORD}
       - POSTGRES_DB=springai
-      - PGPASSWORD=postgres
+      - PGPASSWORD=${PGVECTOR_PASSWORD}
     volumes:
       - ./pgvector/sql/init.sql:/docker-entrypoint-initdb.d/init.sql
     logging:

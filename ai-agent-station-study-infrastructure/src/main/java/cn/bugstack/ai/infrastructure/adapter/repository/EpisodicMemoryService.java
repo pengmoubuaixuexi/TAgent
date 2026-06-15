@@ -1,6 +1,7 @@
 package cn.bugstack.ai.infrastructure.adapter.repository;
 
 import cn.bugstack.ai.domain.agent.service.memory.episodic.IEpisodicMemoryService;
+import cn.bugstack.ai.infrastructure.adapter.repository.cache.MemoryCacheService;
 import cn.bugstack.ai.infrastructure.dao.IAiEpisodicMemoryDao;
 import cn.bugstack.ai.infrastructure.dao.po.AiEpisodicMemory;
 import jakarta.annotation.Resource;
@@ -26,6 +27,9 @@ public class EpisodicMemoryService implements IEpisodicMemoryService {
     @Resource
     private IAiEpisodicMemoryDao dao;
 
+    @Resource
+    private MemoryCacheService memoryCache;
+
     @Override
     public void save(String userId, String tenantId, String sessionId, String topic, String summary) {
         if (userId == null || userId.isBlank() || summary == null || summary.isBlank()) {
@@ -43,6 +47,9 @@ public class EpisodicMemoryService implements IEpisodicMemoryService {
                 .summary(summary)
                 .build();
         dao.insert(po);
+        if (sessionId != null && !sessionId.isBlank()) {
+            memoryCache.putEpisodicBySession(sessionId, po);
+        }
         log.info("episodic.save OK userId={} sessionId={} topic={} summaryLen={}",
                 userId, sessionId, topic, summary.length());
     }
@@ -80,10 +87,16 @@ public class EpisodicMemoryService implements IEpisodicMemoryService {
     public void upsert(String userId, String tenantId, String sessionId, String topic, String summary, Integer lastSummarizedMsgCount) {
         if (userId == null || userId.isBlank() || summary == null || summary.isBlank()) return;
         if (summary.length() > 512) summary = summary.substring(0, 512);
-        AiEpisodicMemory existing = dao.findBySessionId(sessionId);
+        AiEpisodicMemory existing = loadBySessionWithCache(sessionId);
+        AiEpisodicMemory toCache;
         if (existing != null) {
             // 覆盖式：新 summary 直接替换旧的（LLM 已经做了"旧摘要 + 新消息 → 重新摘要"）
             dao.updateBySessionId(sessionId, summary, topic, lastSummarizedMsgCount);
+            existing.setSummary(summary);
+            existing.setTopic(topic);
+            existing.setLastSummarizedMsgCount(lastSummarizedMsgCount);
+            existing.setUpdatedAt(java.time.LocalDateTime.now());
+            toCache = existing;
             log.info("episodic.upsert UPDATED (overwrite) sessionId={} newLen={} lastSummarizedMsgCount={}",
                     sessionId, summary.length(), lastSummarizedMsgCount);
         } else {
@@ -93,24 +106,50 @@ public class EpisodicMemoryService implements IEpisodicMemoryService {
                     .lastSummarizedMsgCount(lastSummarizedMsgCount)
                     .build();
             dao.insert(po);
+            toCache = po;
             log.info("episodic.upsert INSERTED userId={} sessionId={} summaryLen={} lastSummarizedMsgCount={}",
                     userId, sessionId, summary.length(), lastSummarizedMsgCount);
+        }
+        if (sessionId != null && !sessionId.isBlank() && toCache != null) {
+            memoryCache.putEpisodicBySession(sessionId, toCache);
         }
     }
 
     @Override
     public String findBySessionId(String sessionId) {
-        if (sessionId == null || sessionId.isBlank()) return null;
-        AiEpisodicMemory po = dao.findBySessionId(sessionId);
+        AiEpisodicMemory po = loadBySessionWithCache(sessionId);
         return po != null ? po.getSummary() : null;
     }
 
     @Override
+    public String findBySessionIdForUser(String userId, String sessionId) {
+        if (userId == null || userId.isBlank()) return null;
+        AiEpisodicMemory po = loadBySessionWithCache(sessionId);
+        if (po == null) return null;
+        // 防跨用户/跨租户串台：命中的 session 记录必须属于当前 user，否则视为未命中
+        if (po.getUserId() == null || !userId.equals(po.getUserId())) {
+            log.warn("episodic.findBySessionIdForUser 跨用户命中已拦截 sessionId={} owner={} requester={}",
+                    sessionId, po.getUserId(), userId);
+            return null;
+        }
+        return po.getSummary();
+    }
+
+    @Override
     public int getLastSummarizedMsgCount(String sessionId) {
-        if (sessionId == null || sessionId.isBlank()) return -1;
-        AiEpisodicMemory po = dao.findBySessionId(sessionId);
+        AiEpisodicMemory po = loadBySessionWithCache(sessionId);
         if (po == null || po.getLastSummarizedMsgCount() == null) return -1;
         return po.getLastSummarizedMsgCount();
+    }
+
+    /** 公共缓存入口：Redis 优先；miss 回源 DB 后回填 */
+    private AiEpisodicMemory loadBySessionWithCache(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) return null;
+        AiEpisodicMemory cached = memoryCache.getEpisodicBySession(sessionId);
+        if (cached != null) return cached;
+        AiEpisodicMemory po = dao.findBySessionId(sessionId);
+        if (po != null) memoryCache.putEpisodicBySession(sessionId, po);
+        return po;
     }
 
     @Override

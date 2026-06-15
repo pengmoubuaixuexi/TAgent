@@ -23,9 +23,9 @@ spring:
       max-request-size: 100MB
   datasource:
     mysql:
-      username: root
-      password: 123456
-      url: jdbc:mysql://127.0.0.1:13306/ai-agent-station-study?useUnicode=true&characterEncoding=utf8&autoReconnect=true&zeroDateTimeBehavior=convertToNull&serverTimezone=Asia/Shanghai&useSSL=true
+      username: ${MYSQL_USERNAME:root}
+      password: ${MYSQL_PASSWORD:}
+      url: ${MYSQL_URL:jdbc:mysql://127.0.0.1:13306/ai-agent-station-study?useUnicode=true&characterEncoding=utf8&autoReconnect=true&zeroDateTimeBehavior=convertToNull&serverTimezone=Asia/Shanghai&useSSL=true}
       driver-class-name: com.mysql.cj.jdbc.Driver
       type: com.zaxxer.hikari.HikariDataSource
       hikari:
@@ -39,9 +39,9 @@ spring:
         connection-test-query: SELECT 1
     pgvector:
       driver-class-name: org.postgresql.Driver
-      username: postgres
-      password: postgres
-      url: jdbc:postgresql://127.0.0.1:15432/ai-rag-knowledge
+      username: ${PGVECTOR_USERNAME:postgres}
+      password: ${PGVECTOR_PASSWORD:}
+      url: ${PGVECTOR_URL:jdbc:postgresql://127.0.0.1:15432/ai-rag-knowledge}
       type: com.zaxxer.hikari.HikariDataSource
       hikari:
         maximum-pool-size: 5
@@ -95,11 +95,14 @@ agent:
     embeddings-path: ${LLM_EMBEDDINGS_PATH:/embeddings}
   mcp:
     return-error-on-failure: true
+    disable-tools-on-nonexec-steps: ${MCP_DISABLE_TOOLS_ON_NONEXEC_STEPS:true}
     github:
       write-enabled: ${GITHUB_MCP_WRITE_ENABLED:false}
     tool-call:
       max-attempts: ${MCP_TOOL_CALL_MAX_ATTEMPTS:2}
       retry-delay-ms: ${MCP_TOOL_CALL_RETRY_DELAY_MS:1000}
+      parallel-enabled: ${MCP_TOOL_CALL_PARALLEL_ENABLED:true}
+      max-serial-rounds-per-client: ${MCP_MAX_SERIAL_ROUNDS_PER_CLIENT:3}
   # P0.1.1 / P0.1.2：意图分类 + 策略路由
   # client-id 指向一个轻量 ChatClient（推荐 router-small）；live-mode=true 后 dispatch 按 intent → strategy 改写
   intent-router:
@@ -108,6 +111,26 @@ agent:
     live-mode: false
   # 统一路由 fallback：当 LLM 路由未命中时使用的 agent_id（需确保该 agent 已启用且已装配）
   fallback-agent-id: "8011"
+  intervention:
+    enabled: ${AGENT_INTERVENTION_ENABLED:true}
+  steer:
+    enabled: ${AGENT_STEER_ENABLED:true}
+    max-rounds: ${AGENT_STEER_MAX_ROUNDS:3}
+  answer-now:
+    finalize-tools: ${AGENT_ANSWER_NOW_FINALIZE_TOOLS:true}
+  no-think:
+    reasoning-effort: ${AGENT_NO_THINK_REASONING_EFFORT:}
+    body-params: ${AGENT_NO_THINK_BODY_PARAMS:}
+  dynamic-tools:
+    infer-on-selected-agent: ${AGENT_DYNAMIC_TOOLS_INFER:true}
+    per-need-top-k: ${AGENT_DYNAMIC_TOOLS_TOP_K:2}
+    max-extra-tools-per-request: ${AGENT_DYNAMIC_TOOLS_MAX_EXTRA:6}
+    match-cache-ttl-ms: ${AGENT_DYNAMIC_TOOLS_CACHE_TTL_MS:600000}
+    catalog:
+      auto-refresh-enabled: ${AGENT_TOOL_CATALOG_AUTO_REFRESH:false}
+      warmup-on-startup: ${AGENT_TOOL_CATALOG_WARMUP:false}
+      translate-enabled: ${AGENT_TOOL_CATALOG_TRANSLATE:true}
+      translate-batch-size: ${AGENT_TOOL_CATALOG_TRANSLATE_BATCH_SIZE:20}
   # P0.1.4：RAG Router——闲聊跳过双库 + rerank
   # llm-enabled=true → LlmRagRouter（一次调用同时输出路径+子查询/变体）
   # llm-enabled=false（默认）→ HeuristicRagRouter（纯规则，零成本）
@@ -251,17 +274,18 @@ agent:
     timeout-seconds: 10
 
 # TAgent扳手通用组件配置
-tagent:
-  task:
-    # 任务调度配置
-    job:
-      enabled: true
-      pool-size: 5
-      thread-name-prefix: "test-tagent-task-scheduler-"
-      wait-for-tasks-to-complete-on-shutdown: true
-      await-termination-seconds: 30
-      refresh-interval: 30000
-      clean-invalid-tasks-cron: "0 0/5 * * * ?"
+xfg:
+  wrench:
+    task:
+      # 任务调度配置
+      job:
+        enabled: true
+        pool-size: 5
+        thread-name-prefix: "test-tagent-task-scheduler-"
+        wait-for-tasks-to-complete-on-shutdown: true
+        await-termination-seconds: 30
+        refresh-interval: 30000
+        clean-invalid-tasks-cron: "0 0/5 * * * ?"
 
 
 # 日志

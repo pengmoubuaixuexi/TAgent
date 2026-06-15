@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="cn.bugstack.ai.infrastructure.dao.IAiMcpToolCatalogDao">
+
+    <resultMap id="AiMcpToolCatalogMap" type="cn.bugstack.ai.infrastructure.dao.po.AiMcpToolCatalog">
+        <id column="id" property="id"/>
+        <result column="mcp_id" property="mcpId"/>
+        <result column="mcp_name" property="mcpName"/>
+        <result column="tool_name" property="toolName"/>
+        <result column="tool_description" property="toolDescription"/>
+        <result column="tool_description_zh" property="toolDescriptionZh"/>
+        <result column="tool_intent_zh" property="toolIntentZh"/>
+        <result column="input_schema_json" property="inputSchemaJson"/>
+        <result column="enabled" property="enabled"/>
+        <result column="last_seen_at" property="lastSeenAt"/>
+        <result column="create_time" property="createTime"/>
+        <result column="update_time" property="updateTime"/>
+    </resultMap>
+
+    <select id="queryEnabled" resultMap="AiMcpToolCatalogMap">
+        SELECT id, mcp_id, mcp_name, tool_name, tool_description, tool_description_zh, tool_intent_zh, input_schema_json,
+               enabled, last_seen_at, create_time, update_time
+        FROM ai_mcp_tool_catalog
+        WHERE enabled = 1
+        ORDER BY update_time DESC, id DESC
+    </select>
+
+    <select id="queryByMcpId" resultMap="AiMcpToolCatalogMap">
+        SELECT id, mcp_id, mcp_name, tool_name, tool_description, tool_description_zh, tool_intent_zh, input_schema_json,
+               enabled, last_seen_at, create_time, update_time
+        FROM ai_mcp_tool_catalog
+        WHERE mcp_id = #{mcpId}
+    </select>
+
+    <insert id="upsertBatch">
+        INSERT INTO ai_mcp_tool_catalog (
+            mcp_id, mcp_name, tool_name, tool_description, tool_description_zh, tool_intent_zh, input_schema_json,
+            enabled, last_seen_at, create_time, update_time
+        )
+        VALUES
+        <foreach collection="list" item="item" separator=",">
+            (
+                #{item.mcpId}, #{item.mcpName}, #{item.toolName}, #{item.toolDescription},
+                #{item.toolDescriptionZh}, #{item.toolIntentZh}, #{item.inputSchemaJson}, #{item.enabled}, #{item.lastSeenAt}, NOW(), NOW()
+            )
+        </foreach>
+        ON DUPLICATE KEY UPDATE
+            mcp_name = VALUES(mcp_name),
+            tool_description = VALUES(tool_description),
+            tool_description_zh = VALUES(tool_description_zh),
+            tool_intent_zh = VALUES(tool_intent_zh),
+            input_schema_json = VALUES(input_schema_json),
+            enabled = VALUES(enabled),
+            last_seen_at = VALUES(last_seen_at),
+            update_time = NOW()
+    </insert>
+
+    <delete id="deleteByMcpIdAndToolNames">
+        DELETE FROM ai_mcp_tool_catalog
+        WHERE mcp_id = #{mcpId}
+        AND tool_name IN
+        <foreach collection="toolNames" item="name" open="(" separator="," close=")">
+            #{name}
+        </foreach>
+    </delete>
+
+</mapper>

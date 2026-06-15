@@ -10,7 +10,7 @@ import java.util.List;
 /**
  * AI客户端管理服务接口
  *
- * @author TAgent
+ * @author bugstack虫洞栈
  * @description AI客户端配置管理服务接口
  */
 public interface IAiClientAdminService {

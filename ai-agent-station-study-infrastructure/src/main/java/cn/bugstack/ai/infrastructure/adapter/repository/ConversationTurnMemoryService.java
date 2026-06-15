@@ -5,6 +5,7 @@ import cn.bugstack.ai.domain.agent.model.entity.ExecuteCommandEntity;
 import cn.bugstack.ai.domain.agent.service.memory.IConversationSummarizer;
 import cn.bugstack.ai.domain.agent.service.memory.IConversationTurnMemoryService;
 import cn.bugstack.ai.domain.agent.service.security.OutputFilter;
+import cn.bugstack.ai.infrastructure.adapter.repository.cache.MemoryCacheService;
 import cn.bugstack.ai.infrastructure.dao.IAiChatMemoryDao;
 import cn.bugstack.ai.infrastructure.dao.IAiChatMemorySummaryDao;
 import cn.bugstack.ai.infrastructure.dao.po.AiChatMemory;
@@ -39,6 +40,9 @@ public class ConversationTurnMemoryService implements IConversationTurnMemorySer
     @Resource
     private IAgentRepository agentRepository;
 
+    @Resource
+    private MemoryCacheService memoryCache;
+
     @Autowired(required = false)
     private java.util.concurrent.ThreadPoolExecutor threadPoolExecutor;
 
@@ -66,7 +70,7 @@ public class ConversationTurnMemoryService implements IConversationTurnMemorySer
 
         LocalDateTime now = LocalDateTime.now();
         String agentId = request.getAiAgentId();
-        List<AiChatMemory> rows = List.of(
+        List<AiChatMemory> newRows = List.of(
                 AiChatMemory.builder()
                         .conversationId(conversationId)
                         .userId(userId)
@@ -84,14 +88,47 @@ public class ConversationTurnMemoryService implements IConversationTurnMemorySer
                         .createdAt(now.plusNanos(1))
                         .build()
         );
-        aiChatMemoryDao.insertBatch(rows);
 
-        int count = countConversationRows(conversationId);
+        // 1) 先把 cache 列表拼齐 — Redis 已有则在内存中追加；Redis 未命中再回源 DB
+        //    这样下一轮 advisor.before 读 chat_memory 永远命中 Redis，不查 DB
+        List<AiChatMemory> existing = memoryCache.getChatList(conversationId);
+        if (existing == null) {
+            existing = aiChatMemoryDao.findByConversationIdFull(conversationId);
+            if (existing == null) existing = new ArrayList<>();
+        }
+        List<AiChatMemory> merged = new ArrayList<>(existing.size() + newRows.size());
+        merged.addAll(existing);
+        merged.addAll(newRows);
+        memoryCache.putChatList(conversationId, merged);
+
+        int count = merged.size();
         agentRepository.updateChatMemoryCount(conversationId, count);
-        log.info("[FinalTurnMemory] saved conversationId={} userId={} count={}", conversationId, userId, count);
+        log.info("[FinalTurnMemory] saved conversationId={} userId={} count={} (cache-first)", conversationId, userId, count);
 
+        // 2) DB 落库异步 — 用户感知零延迟；失败不影响 Redis 命中（1h TTL 内仍可读）
+        scheduleDbInsert(conversationId, newRows);
+
+        // 3) 摘要任务异步触发（保持原行为）
         if (count > triggerThreshold) {
             triggerSummarizeAsync(conversationId, userId);
+        }
+    }
+
+    private void scheduleDbInsert(String conversationId, List<AiChatMemory> rows) {
+        Runnable task = () -> {
+            try {
+                aiChatMemoryDao.insertBatch(rows);
+                log.debug("[FinalTurnMemory] async DB insert OK conv={} rows={}", conversationId, rows.size());
+            } catch (Exception e) {
+                // DB 写失败 → Redis 仍有最新数据，1h 内业务无感；记 ERROR 让运维感知
+                log.error("[FinalTurnMemory] async DB insert FAILED conv={} rows={}: {}",
+                        conversationId, rows.size(), e.getMessage(), e);
+            }
+        };
+        if (threadPoolExecutor != null) {
+            threadPoolExecutor.execute(task);
+        } else {
+            CompletableFuture.runAsync(task);
         }
     }
 
@@ -111,10 +148,18 @@ public class ConversationTurnMemoryService implements IConversationTurnMemorySer
     }
 
     private void doSummarize(String conversationId, String userId) {
-        List<AiChatMemory> rows = aiChatMemoryDao.findByConversationIdFull(conversationId);
+        // 优先用 cache 中的最新视图（包含本轮新追加的 2 条）；miss 才回源 DB
+        List<AiChatMemory> rows = memoryCache.getChatList(conversationId);
+        if (rows == null) {
+            rows = aiChatMemoryDao.findByConversationIdFull(conversationId);
+        }
         if (rows == null || rows.size() <= triggerThreshold) return;
 
-        AiChatMemorySummary existing = summaryDao.findByConversationId(conversationId);
+        AiChatMemorySummary existing = memoryCache.getSummary(conversationId);
+        if (existing == null) {
+            existing = summaryDao.findByConversationId(conversationId);
+            if (existing != null) memoryCache.putSummary(conversationId, existing);
+        }
         int watermark = existing != null && existing.getSummaryMsgCount() != null ? existing.getSummaryMsgCount() : 0;
         if (watermark > 0 && rows.size() < watermark + keepRecent) {
             return;
@@ -146,13 +191,17 @@ public class ConversationTurnMemoryService implements IConversationTurnMemorySer
                 .summaryMsgCount(digestEnd)
                 .detailMsgCount(rows.size())
                 .build();
-        summaryDao.upsert(summary);
-        log.info("[FinalTurnMemory] summarized conversationId={} digestEnd={} total={}", conversationId, digestEnd, rows.size());
-    }
 
-    private int countConversationRows(String conversationId) {
-        List<AiChatMemory> rows = aiChatMemoryDao.findByConversationIdFull(conversationId);
-        return rows == null ? 0 : rows.size();
+        // 先 put cache（下次 advisor.before 立刻读到新摘要），再落 DB
+        memoryCache.putSummary(conversationId, summary);
+        try {
+            summaryDao.upsert(summary);
+        } catch (Exception e) {
+            // DB 失败：cache 已有新摘要，下次读不影响；但 detail 推进了，要让 cache 1h 内自然过期或显式 evict
+            log.error("[FinalTurnMemory] summary DB upsert FAILED conv={}: {}", conversationId, e.getMessage(), e);
+        }
+        log.info("[FinalTurnMemory] summarized conversationId={} digestEnd={} total={} version={}",
+                conversationId, digestEnd, rows.size(), summary.getVersion());
     }
 
     private String buildConversationId(ExecuteCommandEntity req) {

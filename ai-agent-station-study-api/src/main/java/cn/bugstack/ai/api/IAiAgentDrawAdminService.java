@@ -9,7 +9,7 @@ import java.util.List;
 /**
  * AI智能体拖拉拽配置管理服务接口
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/9/28 07:35
  */
 public interface IAiAgentDrawAdminService {

@@ -11,7 +11,7 @@ import java.util.List;
 /**
  * 管理员用户管理服务接口
  *
- * @author TAgent
+ * @author bugstack虫洞栈
  * @description 管理员用户管理服务接口
  */
 public interface IAdminUserAdminService {

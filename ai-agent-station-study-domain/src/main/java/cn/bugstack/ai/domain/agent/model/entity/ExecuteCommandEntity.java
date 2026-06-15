@@ -8,7 +8,7 @@ import lombok.NoArgsConstructor;
 /**
  * 执行命令实体
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/7/27 16:46
  */
 @Data
@@ -30,5 +30,13 @@ public class ExecuteCommandEntity {
     private String tenantId;
 
     private Integer maxStep;
+
+    /**
+     * 路由产出的"可能缺失的工具能力"的一句中文描述，用于本次请求做字符模糊匹配补挂工具。
+     * 不是工具名，也不保证一定能匹配到工具；为空表示不需要补充工具。
+     */
+    private String dynamicMissingToolDesc;
+
+    private Double routeConfidence;
 
 }

@@ -7,7 +7,7 @@ import java.util.List;
 
 /**
  * MCP客户端配置表 DAO
- * @author TAgent
+ * @author bugstack虫洞栈
  * @description MCP客户端配置表数据访问对象
  */
 @Mapper

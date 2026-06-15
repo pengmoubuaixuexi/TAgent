@@ -11,7 +11,7 @@ import java.io.Serializable;
 /**
  * AutoAgent 请求 DTO
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/1/15 10:00
  */
 @Data

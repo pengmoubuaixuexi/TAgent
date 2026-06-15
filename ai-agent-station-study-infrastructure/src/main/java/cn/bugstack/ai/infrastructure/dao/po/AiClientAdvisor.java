@@ -9,7 +9,7 @@ import java.time.LocalDateTime;
 
 /**
  * 顾问配置表
- * @author TAgent
+ * @author bugstack虫洞栈
  * @description 顾问配置表 PO 对象
  */
 @Data

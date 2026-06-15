@@ -15,7 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 流程执行策略
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/8/5 09:56
  */
 @Slf4j
@@ -25,8 +25,15 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy {
     @Resource
     private DefaultFlowAgentExecuteStrategyFactory defaultFlowAgentExecuteStrategyFactory;
 
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.execute.common.LongTermMemoryTurnSnapshot longTermMemoryTurnSnapshot;
+
     /** per-session 活跃执行上下文，用于支持 cancelExecute() */
     private final ConcurrentHashMap<String, DefaultFlowAgentExecuteStrategyFactory.DynamicContext> activeContexts = new ConcurrentHashMap<>();
+
+    /** 第 61 轮 RAG 引用计数器；每轮入口清一次，保证引用从 [1] 起（修跨题累加成 [9][10]）。 */
+    @javax.annotation.Resource
+    private cn.bugstack.ai.domain.agent.service.execute.common.SessionRefCounter sessionRefCounter;
 
     @Override
     public void execute(ExecuteCommandEntity executeCommandEntity, ResponseBodyEmitter emitter) throws Exception {
@@ -48,6 +55,11 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy {
         // 注册到 activeContexts 以支持 cancelExecute()
         String sessionId = executeCommandEntity.getSessionId();
         if (sessionId != null) activeContexts.put(sessionId, dynamicContext);
+        // 引用计数器跨轮泄漏修复（2026-05-31）：每轮入口清一次，让引用从 [1] 起；
+        // 轮内多步检索仍连续累加。
+        if (sessionRefCounter != null && sessionId != null && !sessionId.isBlank()) {
+            sessionRefCounter.clear(sessionId);
+        }
 
         // P2.2.4 Step 取消：SSE 客户端断开 / 超时 → 设 cancelled 标记
         emitter.onCompletion(dynamicContext::cancel);
@@ -68,6 +80,7 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy {
                 log.error("发送完成标识失败：{}", e.getMessage(), e);
             }
         } finally {
+            longTermMemoryTurnSnapshot.clearSession(sessionId);
             if (sessionId != null) activeContexts.remove(sessionId);
         }
     }
@@ -78,6 +91,33 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy {
         if (ctx != null) {
             ctx.cancel();
             log.info("[FlowAgent] cancelExecute called for sessionId={}", sessionId);
+        }
+    }
+
+    /** 立即回答：置 finalize 标记 + 截断当前在飞流式 call；step4 据标记停止调度剩余子步、直接整合。 */
+    @Override
+    public void finalizeExecute(String sessionId) {
+        DefaultFlowAgentExecuteStrategyFactory.DynamicContext ctx = activeContexts.get(sessionId);
+        if (ctx != null) {
+            ctx.requestFinalize();
+            ctx.fireCancelTrigger();
+            log.info("[FlowAgent] finalizeExecute (answer-now) for sessionId={}", sessionId);
+        }
+    }
+
+    /** 引导回复：写入新想法 + 截断当前步（flow 进 step4 后前端已禁引导，此处仍兜底）。 */
+    @Override
+    public void steerExecute(String sessionId, String idea) {
+        DefaultFlowAgentExecuteStrategyFactory.DynamicContext ctx = activeContexts.get(sessionId);
+        if (ctx != null && idea != null && !idea.isBlank()) {
+            // flow 进入 step4 执行阶段后禁止引导（不消费 steerIdea），忽略以免无意义断流
+            if (Boolean.TRUE.equals(ctx.getValue("flowInExecution"))) {
+                log.info("[FlowAgent] steer ignored: in step4 execution phase, sessionId={}", sessionId);
+                return;
+            }
+            ctx.setSteerIdea(idea);
+            ctx.fireCancelTrigger();
+            log.info("[FlowAgent] steerExecute for sessionId={} ideaLen={}", sessionId, idea.length());
         }
     }
 

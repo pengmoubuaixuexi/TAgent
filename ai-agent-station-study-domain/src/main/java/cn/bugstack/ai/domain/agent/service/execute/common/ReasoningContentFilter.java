@@ -85,6 +85,44 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
     private final ConcurrentMap<String, List<String>> sessionReasonings = new ConcurrentHashMap<>();
 
     /**
+     * 立即回答专用旁路缓存：按 sessionId 记录"最近一次（含被 cancel 截断的半截）reasoning_content"，供 finalize 读取。
+     * <p>
+     * 与上面 per-instance 的 {@link #sessionReasonings}（roundtrip 注入用）<b>相互独立</b>：static 跨所有 filter 实例共享，
+     * 让 finalize 代码不必持有具体 filter 实例就能读到半截思考。只写不影响原注入逻辑。
+     */
+    private static final ConcurrentMap<String, String> LATEST_REASONING = new ConcurrentHashMap<>();
+    private static final int MAX_LATEST_SESSIONS = 1024;
+
+    /**
+     * 关思考（disable thinking）要 deep-merge 进出站请求体的 JSON 片段；null = 不注入（零影响）。
+     * 仅当调用方用 {@link #scopeNoThinking()} 标记本次调用、且本字段非空时才注入。
+     * 由 {@link cn.bugstack.ai.domain.agent.service.armory.node.AiClientApiNode} 从 yml
+     * {@code agent.no-think.body-params} 读出 JSON 传入（MiMo 官方 API 的关思考参数因 serving 而异，故做成可配置）。
+     */
+    private final Map<String, Object> disableThinkingFragment;
+
+    /** 默认构造：不注入关思考参数（保持历史行为，零影响）。 */
+    public ReasoningContentFilter() {
+        this(null);
+    }
+
+    /** @param disableThinkingBodyJson 关思考要注入出站 body 的 JSON 片段；null/空白 = 禁用注入。 */
+    public ReasoningContentFilter(String disableThinkingBodyJson) {
+        Map<String, Object> frag = null;
+        if (disableThinkingBodyJson != null && !disableThinkingBodyJson.isBlank()) {
+            try {
+                frag = OBJECT_MAPPER.readValue(disableThinkingBodyJson, MAP_TYPE);
+            } catch (Exception e) {
+                log.warn("[ReasoningFilter] agent.no-think.body-params 解析失败，关思考注入禁用: {}", e.getMessage());
+            }
+        }
+        this.disableThinkingFragment = frag;
+        if (frag != null) {
+            log.info("[ReasoningFilter] 关思考注入已启用，片段={}", frag);
+        }
+    }
+
+    /**
      * 调用方在 spec.stream() 前后 set/clear 的 sessionId。
      * static 是因为 filter 是 per-API 实例化的（{@link cn.bugstack.ai.domain.agent.service.armory.node.AiClientApiNode}），
      * 调用方拿不到具体实例，用 static API 调用方一行即可：
@@ -104,6 +142,38 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
         return CURRENT_SESSION_ID::remove;
     }
 
+    /**
+     * 关思考标记：按 <b>sessionId</b> 记到一个 static 集合，<b>不靠</b> ThreadLocal/MDC 跨线程传播——本 filter 的 {@link #filter}
+     * 实际跑在 WebClient 的 reactor 线程（boundedElastic / HttpClient-Worker），per-thread 通道不可靠；但 filter 一定能拿到
+     * sessionId（{@link #resolveSessionId()} 已验证可靠），故用 sessionId 作 key 最稳，tool-call 多跳整发 finalize 都命中。
+     * 调用方在 finalize 那一发外包：
+     * <pre>try (var __nt = ReasoningContentFilter.scopeNoThinking(sessionId)) { spec.stream()...blockLast(); }</pre>
+     * 集合不含该 session → 永不注入 → 零影响。
+     */
+    private static final java.util.Set<String> NO_THINK_SESSIONS = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** 标记某 session 本次关思考，返回 AutoCloseable 供 try-with-resources 清理。sessionId 空则 no-op。 */
+    public static AutoCloseable scopeNoThinking(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) return () -> {};
+        NO_THINK_SESSIONS.add(sessionId);
+        return () -> NO_THINK_SESSIONS.remove(sessionId);
+    }
+
+    private static boolean isNoThinkSession(String sessionId) {
+        return sessionId != null && NO_THINK_SESSIONS.contains(sessionId);
+    }
+
+    /** 立即回答：读取某 session 最近一次（含 mid-stream 截断的半截）reasoning_content，无则 null。 */
+    public static String getLatestReasoning(String sessionId) {
+        if (sessionId == null) return null;
+        return LATEST_REASONING.get(sessionId);
+    }
+
+    /** 轮末清理旁路缓存，避免 session 堆积（与 LongTermMemoryTurnSnapshot.clearSession 同处调用）。 */
+    public static void clearLatestReasoning(String sessionId) {
+        if (sessionId != null) LATEST_REASONING.remove(sessionId);
+    }
+
     @Override
     public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
         // filter 入口在调用者同步线程上跑（subscribe 时触发），此时 ThreadLocal/MDC 仍可用
@@ -117,13 +187,13 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
                     sessionReasonings.size(), MAX_SESSIONS);
         }
 
-        // ============ Request 侧：按顺序 inject ============
+        // ============ Request 侧：reasoning_content 注入 + 关思考参数注入（一次解析/重建）============
         ClientRequest finalRequest;
         try {
-            ClientRequest modified = injectReasoningContents(request, reasonings, sessionId);
+            ClientRequest modified = rewriteRequestBody(request, reasonings, sessionId, isNoThinkSession(sessionId));
             finalRequest = modified != null ? modified : request;
         } catch (Exception e) {
-            log.warn("[ReasoningFilter] inject failed session={}: {}", sessionId, e.getMessage());
+            log.warn("[ReasoningFilter] request rewrite failed session={}: {}", sessionId, e.getMessage());
             finalRequest = request;
         }
 
@@ -183,6 +253,11 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
                                 reasonings.remove(0);
                             }
                         }
+                        // 立即回答旁路：记录半截/完整思考供 finalize 读取。signal=cancel（mid-stream 截断）时也会走到这里。
+                        if (sessionId != null && !"unknown-session".equals(sessionId)) {
+                            if (LATEST_REASONING.size() > MAX_LATEST_SESSIONS) LATEST_REASONING.clear();
+                            LATEST_REASONING.put(sessionId, captured);
+                        }
                         log.info("[ReasoningFilter] reasoning_content captured ({} chars) session={} cacheSize={} signal={}",
                                 captured.length(), sessionId, reasonings.size(), signal);
                     }
@@ -219,69 +294,100 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
     // Request 侧：按 messages 中 tool_calls assistant 顺序，按对齐索引注入
     // ====================================================================
 
-    @SuppressWarnings("unchecked")
-    private ClientRequest injectReasoningContents(ClientRequest original, List<String> reasonings, String sessionId) {
+    /**
+     * 统一改写出站请求体：① reasoning_content 注入（mimo tool-call roundtrip）；② 关思考参数注入（finalize）。
+     * 一次解析、一次重建；两者都不命中 → 返回 null（调用方用原 request，零影响）。
+     */
+    private ClientRequest rewriteRequestBody(ClientRequest original, List<String> reasonings, String sessionId, boolean noThink) {
         byte[] bodyBytes = extractBodyBytes(original);
         if (bodyBytes == null || bodyBytes.length == 0) return null;
-
         try {
             Map<String, Object> requestMap = OBJECT_MAPPER.readValue(bodyBytes, MAP_TYPE);
-            Object messagesObj = requestMap.get("messages");
-            if (!(messagesObj instanceof List<?> messages)) return null;
-
-            // 收集 messages 中所有 tool_calls assistant 的索引
-            List<Integer> toolCallAssistantIdx = new ArrayList<>();
-            for (int i = 0; i < messages.size(); i++) {
-                Object msgObj = messages.get(i);
-                if (!(msgObj instanceof Map<?, ?> msg)) continue;
-                if (!"assistant".equals(msg.get("role"))) continue;
-                if (msg.get("tool_calls") == null) continue;
-                toolCallAssistantIdx.add(i);
+            // 关思考时跳过 reasoning_content 注入：思考关了 mimo 不产 reasoning，再回填反而可能 400。
+            boolean changed = !noThink && injectReasoningInto(requestMap, reasonings, sessionId);
+            if (noThink && disableThinkingFragment != null) {
+                deepMerge(requestMap, disableThinkingFragment);
+                changed = true;
+                log.info("[ReasoningFilter] 关思考参数已注入出站 body session={}", sessionId);
             }
-            if (toolCallAssistantIdx.isEmpty()) return null;
-
-            int K = toolCallAssistantIdx.size();
-            int J;
-            // 拷贝快照，避免遍历时 response 侧再 append 改了 list
-            List<String> snapshot;
-            synchronized (reasonings) {
-                snapshot = new ArrayList<>(reasonings);
-                J = snapshot.size();
-            }
-
-            // 对齐策略：取 snapshot 的"最后 K 个" 一一对应到 messages 中 K 个 tool_calls assistant 的顺序。
-            // reasoningIdx = J - K + k：
-            //   - J >= K（cache 够）：范围 [J-K, J-1]，全部命中
-            //   - J <  K（cache 不够，例如服务重启）：前 (K-J) 个为负数 → 用 "[reasoning unavailable]" 占位
-            //     至少让 mimo 不报"缺字段"，避免历史断点导致永久 400
-            int injectedFromCache = 0;
-            int placeholderCount = 0;
-            for (int k = 0; k < K; k++) {
-                int msgIdx = toolCallAssistantIdx.get(k);
-                Map<String, Object> msg = (Map<String, Object>) messages.get(msgIdx);
-                int reasoningIdx = J - K + k;
-                String reasoning;
-                if (reasoningIdx >= 0 && reasoningIdx < J) {
-                    reasoning = snapshot.get(reasoningIdx);
-                    injectedFromCache++;
-                } else {
-                    reasoning = "[reasoning unavailable]";
-                    placeholderCount++;
-                }
-                msg.put("reasoning_content", reasoning);
-            }
-
+            if (!changed) return null;
             byte[] newBody = OBJECT_MAPPER.writeValueAsBytes(requestMap);
-
-            log.info("[ReasoningFilter] injected reasoning_content into {} tool_calls assistant(s) (fromCache={}, placeholder={}) session={} cacheSize={}",
-                    K, injectedFromCache, placeholderCount, sessionId, J);
-
             return ClientRequest.from(original)
                     .body(BodyInserters.fromValue(BUFFER_FACTORY.wrap(newBody)))
                     .build();
         } catch (Exception e) {
-            log.warn("[ReasoningFilter] inject parse failed session={}: {}", sessionId, e.getMessage());
+            log.warn("[ReasoningFilter] body rewrite parse failed session={}: {}", sessionId, e.getMessage());
             return null;
+        }
+    }
+
+    /**
+     * 把 reasoning_content 按顺序注入 requestMap 里的 tool_calls assistant 消息（原 injectReasoningContents 逻辑，改为就地操作 map）。
+     * @return 是否改动了 requestMap
+     */
+    @SuppressWarnings("unchecked")
+    private boolean injectReasoningInto(Map<String, Object> requestMap, List<String> reasonings, String sessionId) {
+        Object messagesObj = requestMap.get("messages");
+        if (!(messagesObj instanceof List<?> messages)) return false;
+
+        // 收集 messages 中所有 tool_calls assistant 的索引
+        List<Integer> toolCallAssistantIdx = new ArrayList<>();
+        for (int i = 0; i < messages.size(); i++) {
+            Object msgObj = messages.get(i);
+            if (!(msgObj instanceof Map<?, ?> msg)) continue;
+            if (!"assistant".equals(msg.get("role"))) continue;
+            if (msg.get("tool_calls") == null) continue;
+            toolCallAssistantIdx.add(i);
+        }
+        if (toolCallAssistantIdx.isEmpty()) return false;
+
+        int K = toolCallAssistantIdx.size();
+        int J;
+        // 拷贝快照，避免遍历时 response 侧再 append 改了 list
+        List<String> snapshot;
+        synchronized (reasonings) {
+            snapshot = new ArrayList<>(reasonings);
+            J = snapshot.size();
+        }
+
+        // 对齐策略：取 snapshot 的"最后 K 个" 一一对应到 messages 中 K 个 tool_calls assistant 的顺序。
+        // reasoningIdx = J - K + k：
+        //   - J >= K（cache 够）：范围 [J-K, J-1]，全部命中
+        //   - J <  K（cache 不够，例如服务重启）：前 (K-J) 个为负数 → 用 "[reasoning unavailable]" 占位
+        //     至少让 mimo 不报"缺字段"，避免历史断点导致永久 400
+        int injectedFromCache = 0;
+        int placeholderCount = 0;
+        for (int k = 0; k < K; k++) {
+            int msgIdx = toolCallAssistantIdx.get(k);
+            Map<String, Object> msg = (Map<String, Object>) messages.get(msgIdx);
+            int reasoningIdx = J - K + k;
+            String reasoning;
+            if (reasoningIdx >= 0 && reasoningIdx < J) {
+                reasoning = snapshot.get(reasoningIdx);
+                injectedFromCache++;
+            } else {
+                reasoning = "[reasoning unavailable]";
+                placeholderCount++;
+            }
+            msg.put("reasoning_content", reasoning);
+        }
+
+        log.info("[ReasoningFilter] injected reasoning_content into {} tool_calls assistant(s) (fromCache={}, placeholder={}) session={} cacheSize={}",
+                K, injectedFromCache, placeholderCount, sessionId, J);
+        return true;
+    }
+
+    /** 递归合并 overlay 进 base：两边都是 Map 时深合并，否则 overlay 覆盖。 */
+    @SuppressWarnings("unchecked")
+    private static void deepMerge(Map<String, Object> base, Map<String, Object> overlay) {
+        for (Map.Entry<String, Object> e : overlay.entrySet()) {
+            Object bv = base.get(e.getKey());
+            Object ov = e.getValue();
+            if (bv instanceof Map && ov instanceof Map) {
+                deepMerge((Map<String, Object>) bv, (Map<String, Object>) ov);
+            } else {
+                base.put(e.getKey(), ov);
+            }
         }
     }
 

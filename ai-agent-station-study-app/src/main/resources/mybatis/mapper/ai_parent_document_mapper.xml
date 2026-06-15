@@ -8,13 +8,14 @@
         <result column="content" property="content"/>
         <result column="knowledge_tag" property="knowledgeTag"/>
         <result column="source" property="source"/>
+        <result column="title" property="title"/>
         <result column="user_id" property="userId"/>
         <result column="created_at" property="createdAt"/>
     </resultMap>
 
     <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiParentDocument">
-        INSERT INTO ai_parent_document (parent_id, content, knowledge_tag, source, user_id)
-        VALUES (#{parentId}, #{content}, #{knowledgeTag}, #{source}, #{userId})
+        INSERT INTO ai_parent_document (parent_id, content, knowledge_tag, source, title, user_id)
+        VALUES (#{parentId}, #{content}, #{knowledgeTag}, #{source}, #{title}, #{userId})
     </insert>
 
     <select id="findByParentId" parameterType="string" resultMap="AiParentDocumentMap">

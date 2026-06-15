@@ -40,6 +40,7 @@ public class LlmRagRouter implements IRagRouter {
 
     private static final String ROUTER_PROMPT = """
             Analyze the user query and decide the optimal RAG (Retrieval-Augmented Generation) strategy.
+            You produce the query-building strategy in ONE call, so the downstream advisor needs no extra LLM call.
 
             ## Skip retrieval (shouldRetrieve=false) if the query is:
             - Casual chitchat, greetings, thanks, farewells
@@ -47,21 +48,22 @@ public class LlmRagRouter implements IRagRouter {
             - Simple opinions or subjective questions without factual need
             - Follow-ups that don't need new facts ("repeat that", "say it again")
 
-            ## If retrieval IS needed (shouldRetrieve=true), pick ONE strategy:
-            - SIMPLE: single straightforward fact lookup ("what is X", "who is Y")
-            - HYBRID: general knowledge question, benefits from keyword + semantic search
-            - DECOMPOSE: complex multi-hop question that needs sub-questions (e.g. "compare A and B", "how does X relate to Y and what impact did Z have")
-            - FUSION: abstract/ambiguous question that benefits from multiple search angles
+            ## If retrieval IS needed (shouldRetrieve=true), pick exactly ONE strategy and fill its payload:
+            - SIMPLE: a clear factual/general question. Fill "rewrittenQuery" with a concise, retrieval-friendly
+              restatement of the query (keep original language; strip filler/politeness).
+            - HYDE: a vague/abstract question where a hypothetical answer retrieves better than the raw query.
+              Fill "hypotheticalDocument" with a short 1-3 sentence hypothetical answer/passage (original language).
+            - DECOMPOSE: a complex multi-hop question. Fill "subQueries" with 2-4 specific sub-queries (original language).
+            - FUSION: an ambiguous question that benefits from multiple angles. Fill "variants" with 2-3 rephrasings.
 
             ## Rules:
-            - For DECOMPOSE: provide 2-4 specific sub-queries in the original language
-            - For FUSION: provide 2-3 search variants rephrased from different angles
-            - For SIMPLE/HYBRID: subQueries and variants can be empty arrays
-            - Default to HYBRID when unsure
+            - Fill ONLY the payload field for the chosen strategy; leave the others empty ("" or []).
+            - Default to SIMPLE (with a rewrittenQuery) when unsure.
+            - The retrieval engine (keyword+vector hybrid vs pure vector) is decided automatically downstream — do NOT choose it.
 
             Output ONLY a JSON object (no markdown fences, no explanation):
 
-            {"shouldRetrieve":true,"path":"HYBRID","subQueries":[],"variants":[],"reason":"general knowledge question"}
+            {"shouldRetrieve":true,"path":"SIMPLE","rewrittenQuery":"","hypotheticalDocument":"","subQueries":[],"variants":[],"reason":"clear factual question"}
 
             User query: %s
             """;
@@ -185,6 +187,8 @@ public class LlmRagRouter implements IRagRouter {
         boolean shouldRetrieve = obj.getBooleanValue("shouldRetrieve");
         String path = obj.getString("path");
         String reason = obj.getString("reason");
+        String rewrittenQuery = obj.getString("rewrittenQuery");
+        String hypotheticalDocument = obj.getString("hypotheticalDocument");
 
         @SuppressWarnings("unchecked")
         List<String> subQueries = obj.getJSONArray("subQueries") != null
@@ -196,12 +200,15 @@ public class LlmRagRouter implements IRagRouter {
                 ? obj.getJSONArray("variants").toJavaList(String.class)
                 : Collections.emptyList();
 
-        // 规范化 path
+        // 规范化 path：A 重构后策略层为 SIMPLE/HYDE/FUSION/DECOMPOSE；
+        // HYBRID 仍接受（兼容旧值，下游 advisor 当单 query 检索处理）；未知一律退 SIMPLE
         if (path != null) path = path.toUpperCase().trim();
         if (!RagRouterDecision.PATH_DECOMPOSE.equals(path)
                 && !RagRouterDecision.PATH_FUSION.equals(path)
-                && !RagRouterDecision.PATH_SIMPLE.equals(path)) {
-            path = RagRouterDecision.PATH_HYBRID;
+                && !RagRouterDecision.PATH_SIMPLE.equals(path)
+                && !RagRouterDecision.PATH_HYDE.equals(path)
+                && !RagRouterDecision.PATH_HYBRID.equals(path)) {
+            path = RagRouterDecision.PATH_SIMPLE;
         }
 
         return RagRouterDecision.builder()
@@ -209,6 +216,8 @@ public class LlmRagRouter implements IRagRouter {
                 .path(path)
                 .subQueries(subQueries != null ? subQueries : Collections.emptyList())
                 .variants(variants != null ? variants : Collections.emptyList())
+                .rewrittenQuery(rewrittenQuery)
+                .hypotheticalDocument(hypotheticalDocument)
                 .reason(reason)
                 .build();
     }

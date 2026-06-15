@@ -37,6 +37,47 @@
   .step-card.running .step-head .step-status::before { content:'⏳ '; }
   .step-card.done .step-head .step-status::before { content:'✓ '; color:#10b981; }
   .step-body { padding:8px 12px; background:#0f172a; font-size:13px; color:#cbd5e1; max-height:300px; overflow-y:auto; word-break:break-word; }
+  .tool-card { border:1px solid #374151; border-radius:8px; margin:6px 0; overflow:hidden; background:#0b1120; }
+  .tool-card .tool-head { display:flex; align-items:center; gap:8px; padding:6px 10px; background:#111827; font-size:12px; color:#9ca3af; cursor:pointer; user-select:none; }
+  .tool-card .tool-action { font-weight:600; color:#bfdbfe; white-space:nowrap; }
+  .tool-card .tool-name { font-weight:500; color:#e5e7eb; word-break:break-all; max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .tool-card .tool-summary { color:#94a3b8; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .tool-card .tool-status { margin-left:auto; font-size:11px; color:#9ca3af; white-space:nowrap; }
+  .tool-card .tool-body { padding:8px 12px; background:#0f172a; font-size:12px; color:#cbd5e1; max-height:160px; overflow-y:auto; white-space:pre-wrap; word-break:break-word; }
+  .tool-card.collapsed .tool-body { display:none; }
+  .tool-card .tool-chev { transition: transform 0.15s; display:inline-block; width:12px; color:#64748b; }
+  .tool-card.collapsed .tool-chev { transform: rotate(-90deg); }
+  .tool-card .tool-purpose { color:#e2e8f0; line-height:1.45; }
+  .tool-card .tool-purpose strong { color:#93c5fd; font-weight:600; }
+  .tool-card .tool-meta { display:flex; flex-wrap:wrap; gap:6px; margin-top:7px; }
+  .tool-card .tool-pill { display:inline-flex; align-items:center; gap:4px; border:1px solid #334155; background:#111827; color:#cbd5e1; border-radius:999px; padding:2px 7px; font-size:11px; line-height:1.4; }
+  .tool-card .tool-input { margin-top:7px; color:#94a3b8; }
+  .tool-card .tool-input code { color:#f8fafc; background:#020617; border:1px solid #1f2937; border-radius:6px; padding:1px 5px; white-space:normal; word-break:break-word; }
+  .tool-card .tool-detail { margin-top:7px; color:#cbd5e1; }
+  .tool-card.running { border-color:#2563eb; }
+  .tool-card.success { border-color:#059669; }
+  .tool-card.blocked,
+  .tool-card.approval_denied,
+  .tool-card.approval_timeout,
+  .tool-card.approval_unavailable { border-color:#d97706; }
+  .tool-card.error { border-color:#dc2626; }
+  .evidence-card { border:1px solid #334155; border-radius:8px; margin:8px 0 2px; overflow:hidden; background:#0b1120; }
+  .evidence-card.collapsed .evidence-body { display:none; }
+  .evidence-card.collapsed .evidence-chev { transform: rotate(-90deg); }
+  .evidence-head { display:flex; align-items:center; gap:8px; padding:7px 10px; background:#111827; cursor:pointer; user-select:none; font-size:12px; color:#9ca3af; }
+  .evidence-chev { transition: transform 0.15s; display:inline-block; width:12px; color:#94a3b8; }
+  .evidence-title { color:#e5e7eb; font-weight:500; }
+  .evidence-count { margin-left:auto; color:#94a3b8; font-size:11px; white-space:nowrap; }
+  .evidence-body { padding:8px 10px; background:#0f172a; display:flex; flex-direction:column; gap:8px; }
+  .evidence-item { border:1px solid #1f2937; border-radius:6px; padding:8px; background:#111827; }
+  .evidence-meta { display:flex; align-items:center; gap:8px; margin-bottom:5px; font-size:11px; color:#9ca3af; }
+  .evidence-ref { color:#93c5fd; font-weight:600; }
+  .evidence-source { color:#cbd5e1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .evidence-snippet { color:#d1d5db; font-size:12px; line-height:1.55; word-break:break-word; }
+  .memory-section { display:flex; flex-direction:column; gap:8px; }
+  .memory-section-title { color:#93c5fd; font-size:11px; font-weight:600; letter-spacing:0; }
+  .memory-tag { color:#bfdbfe; font-weight:600; }
+  .memory-kind { color:#a7f3d0; font-weight:600; }
   /* 2026-05-07：markdown 元素样式（深色主题，兼容 marked.js 输出的标准标签） */
   .msg-content h1, .msg-content h2, .msg-content h3,
   .msg-content h4, .msg-content h5, .msg-content h6,
@@ -160,18 +201,50 @@
       <div class="space-y-4">
         <div>
           <label class="block text-sm text-gray-400 mb-1">名称</label>
-          <input id="ragName" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500" placeholder="文档名称">
+          <input id="ragName" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500" placeholder="单文件可填">
         </div>
         <div>
           <label class="block text-sm text-gray-400 mb-1">知识标签 (tag)</label>
-          <input id="ragTag" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500" placeholder="e.g. article, doc, manual">
+          <input id="ragTag" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500" placeholder="单文件可填">
         </div>
         <div>
           <label class="block text-sm text-gray-400 mb-1">文件（可多选：PDF, PPT, TXT, MD 等）</label>
-          <input id="ragFiles" type="file" multiple class="w-full text-sm text-gray-300 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-blue-600 file:text-white file:hover:bg-blue-700">
+          <input id="ragFiles" type="file" multiple onchange="syncRagUploadDefaults()" class="w-full text-sm text-gray-300 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-blue-600 file:text-white file:hover:bg-blue-700">
         </div>
         <div id="ragStatus" class="hidden text-sm"></div>
         <button onclick="uploadRag()" id="ragUploadBtn" class="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white py-2.5 rounded-lg transition text-sm font-medium">开始上传</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="approvalModal" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+    <div class="bg-gray-900 rounded-2xl p-6 border border-amber-700/70 w-full max-w-xl shadow-2xl">
+      <div class="flex items-start justify-between gap-4 mb-4">
+        <div>
+          <h3 class="text-lg font-bold text-white">需要确认工具调用</h3>
+          <p id="approvalCountdown" class="text-xs text-amber-300 mt-1"></p>
+        </div>
+        <button onclick="dismissApproval()" class="text-gray-500 hover:text-white text-xl">&times;</button>
+      </div>
+      <div class="space-y-3">
+        <div id="approvalStepWrap" class="hidden">
+          <div class="text-xs text-gray-500 mb-1">所属步骤</div>
+          <div id="approvalStep" class="text-sm text-amber-200 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 break-all"></div>
+        </div>
+        <p id="approvalQueueCount" class="hidden text-xs text-gray-400"></p>
+        <div>
+          <div class="text-xs text-gray-500 mb-1">工具</div>
+          <div id="approvalToolName" class="text-sm text-gray-100 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 break-all"></div>
+        </div>
+        <div>
+          <div class="text-xs text-gray-500 mb-1">参数</div>
+          <pre id="approvalToolInput" class="text-xs text-gray-300 bg-gray-950 border border-gray-800 rounded-lg p-3 max-h-56 overflow-auto whitespace-pre-wrap break-words"></pre>
+        </div>
+        <div id="approvalStatus" class="hidden text-sm"></div>
+        <div class="flex justify-end gap-3 pt-2">
+          <button id="approvalRejectBtn" onclick="submitApproval(false)" class="bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-gray-200 px-4 py-2 rounded-lg transition text-sm">拒绝</button>
+          <button id="approvalApproveBtn" onclick="submitApproval(true)" class="bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg transition text-sm font-medium">批准</button>
+        </div>
       </div>
     </div>
   </div>
@@ -187,6 +260,14 @@
         class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition resize-none"
         onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}"
         oninput="this.style.height='';this.style.height=Math.min(this.scrollHeight,200)+'px'"></textarea>
+      <button onclick="steer()" id="steerBtn" title="补充一个新想法，让 Agent 在当前步重做并纳入考虑（不丢弃已有进展）"
+        class="hidden bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 disabled:opacity-50 text-white px-4 py-3 rounded-lg transition font-medium shrink-0">
+        💬 引导
+      </button>
+      <button onclick="answerNow()" id="answerNowBtn" title="基于已有信息立即作答，中止剩余步骤"
+        class="hidden bg-amber-600 hover:bg-amber-700 active:bg-amber-800 disabled:opacity-50 text-white px-4 py-3 rounded-lg transition font-medium shrink-0">
+        ⚡ 立即回答
+      </button>
       <button onclick="sendMessage()" id="sendBtn"
         class="bg-blue-600 hover:bg-blue-700 active:bg-blue-800 disabled:opacity-50 disabled:cursor-not-allowed text-white px-6 py-3 rounded-lg transition font-medium">
         发送
@@ -213,7 +294,11 @@ let state = {
   currentAgentId: null,
   maxStep: 5,
   sending: false,
-  agents: []
+  agents: [],
+  pendingApproval: null,
+  approvalQueue: [],   // DAG 并行下多个步骤同时要审批：排队逐个弹，避免后者覆盖前者
+  approvalTimer: null,
+  interventionEnabled: false  // 立即回答总开关，由 ack 事件 intervention 字段决定
 };
 
 // ==================== INIT ====================
@@ -284,6 +369,7 @@ function showLoginError(msg) {
 
 function doLogout() {
   localStorage.removeItem('agent_login');
+  resetHistoryPagination(); // 第 70 轮：退出登录也要清历史分页状态，避免下次登录残留旧监听
   state.userId = null; state.username = null; state.sessionId = null;
   document.getElementById('messageArea').innerHTML = '<div class="text-center text-gray-600 text-sm py-8"><p class="text-4xl mb-3">👋</p><p>已退出登录</p></div>';
   showLogin();
@@ -309,14 +395,9 @@ async function loadAgents() {
       sel.innerHTML = '<option value="">自动（AI 路由选择）</option>' + state.agents.map(a =>
         `<option value="${a.agentId}">${a.agentName} (${a.agentId})</option>`
       ).join('');
-      if (state.agents.length > 0) {
-        // 优先选 85374287（测试Agent），否则选 4（Auto）
-        const pref = state.agents.find(a => a.agentId === '85374287')
-                  || state.agents.find(a => a.agentId === '4')
-                  || state.agents[0];
-        sel.value = pref.agentId;
-        state.currentAgentId = pref.agentId;
-      }
+      // 默认停在「自动（AI 路由选择）」空值选项 → 走后端统一路由，不强制选具体 agent
+      sel.value = '';
+      state.currentAgentId = '';
     }
   } catch(e) {
     console.error('load agents failed:', e);
@@ -328,6 +409,12 @@ function onAgentChange() {
 }
 
 function newSession() {
+  // 第 70 轮：先退出历史分页模式，否则旧会话挂的 scroll 监听 + 哨兵会立刻把旧历史加载回空页面
+  resetHistoryPagination();
+  // 清掉上个会话可能残留的待审批队列 + 收起弹窗，避免跨会话串
+  state.approvalQueue = [];
+  state.pendingApproval = null;
+  hideApprovalModal();
   state.sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
   document.getElementById('sessionInfo').textContent = 'Session: ' + state.sessionId.substring(0, 28) + '...';
   document.getElementById('messageArea').innerHTML =
@@ -351,6 +438,16 @@ async function sendMessage() {
   addMessage('user', message);
   // 添加 AI 占位
   const aiMsg = addMessage('assistant', '', true);
+  // 顶部作者标题：手动选了 agent 直接显示「名称(id)」；自动模式先显示「路由中…」，收到 agent_routed 再替换
+  const aiAuthorEl = aiMsg.querySelector('.msg-author');
+  if (aiAuthorEl) {
+    if (state.currentAgentId) {
+      const selA = (state.agents || []).find(x => String(x.agentId) === String(state.currentAgentId));
+      aiAuthorEl.textContent = selA ? `${selA.agentName}(${selA.agentId})` : `Agent ${state.currentAgentId}`;
+    } else {
+      aiAuthorEl.textContent = '路由中…';
+    }
+  }
 
   try {
     const res = await fetch(API + '/auto_agent', {
@@ -373,11 +470,14 @@ async function sendMessage() {
     // 2026-05-07 流式 UX：step 卡片管理
     // 把消息气泡改造成"步骤卡片容器 + 最终答案区"
     const msgContent = aiMsg.querySelector('.msg-content');
-    msgContent.innerHTML = '<div class="steps-container"></div><div class="final-answer mt-2"></div>';
+    msgContent.innerHTML = '<div class="steps-container"></div><div class="final-answer mt-2"></div><div class="memory-evidence-container mt-2"></div><div class="rag-evidence-container mt-2"></div>';
     aiMsg.classList.remove('typing');
     const stepsContainer = msgContent.querySelector('.steps-container');
     const finalAnswerEl = msgContent.querySelector('.final-answer');
+    const memoryEvidenceContainer = msgContent.querySelector('.memory-evidence-container');
+    const evidenceContainer = msgContent.querySelector('.rag-evidence-container');
     const stepBuffers = {}; // stepId → { card, body, buf, displayName }
+    const toolProgressByName = {}; // toolName → running entries queue
 
     function depBadgeHtml(dependsOn) {
       if (!Array.isArray(dependsOn) || dependsOn.length === 0) return '';
@@ -475,7 +575,319 @@ async function sendMessage() {
       return stepBuffers[stepId] || activateStepCard(stepId, displayName, dependsOn);
     }
 
+    function toolStatusText(status) {
+      const map = {
+        running: '调用中',
+        success: '已完成',
+        blocked: '已拦截',
+        approval_denied: '已拒绝',
+        approval_timeout: '审批超时',
+        approval_unavailable: '无审批通道',
+        error: '调用失败'
+      };
+      return map[status] || status || '未知';
+    }
+
+    function toolStatusClass(status) {
+      return ['success', 'blocked', 'approval_denied', 'approval_timeout', 'approval_unavailable', 'error'].includes(status)
+        ? status
+        : 'running';
+    }
+
+    function shortToolName(toolName) {
+      return String(toolName || 'unknown_tool')
+        .replace(/^JavaSDKMCPClient_/, '')
+        .replace(/^spring_ai_mcp_client_/i, '');
+    }
+
+    function tryParseToolInput(inputPreview) {
+      if (!inputPreview || typeof inputPreview !== 'string') return null;
+      const clean = inputPreview.replace(/\.\.\.\(truncated, full=\d+\)$/, '').trim();
+      if (!clean.startsWith('{') && !clean.startsWith('[')) return null;
+      try {
+        return JSON.parse(clean);
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function pickToolInputValue(inputPreview) {
+      const parsed = tryParseToolInput(inputPreview);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const keys = ['query', 'q', 'keyword', 'keywords', 'search', 'repository', 'repo', 'owner', 'path', 'url', 'address', 'origin', 'destination'];
+        for (const key of keys) {
+          const value = parsed[key];
+          if (value !== undefined && value !== null && String(value).trim()) {
+            return `${key}: ${String(value).trim()}`;
+          }
+        }
+        const first = Object.entries(parsed).find(([, value]) => value !== undefined && value !== null && String(value).trim());
+        if (first) return `${first[0]}: ${String(first[1]).trim()}`;
+      }
+      const oneLine = String(inputPreview || '').replace(/\s+/g, ' ').trim();
+      return oneLine.length > 120 ? oneLine.slice(0, 120) + '...' : oneLine;
+    }
+
+    function toolPurposeText(toolName) {
+      const shortName = shortToolName(toolName).toLowerCase();
+      if (shortName.includes('search_repositories')) return '搜索 GitHub 仓库，给回答提供真实项目候选、仓库信息或示例参考。';
+      if (shortName.includes('search_code')) return '搜索代码片段，用来验证 API、配置或实现细节。';
+      if (shortName.includes('search_papers')) return '搜索论文资料，用来补充技术背景、方法依据或参考文献。';
+      if (shortName.includes('aisearch') || shortName.includes('search')) return '检索外部资料或知识库，补充回答所需的事实依据。';
+      if (shortName.includes('amap') || shortName.includes('route') || shortName.includes('geo')) return '查询地图、路线或地点信息，用来生成可执行的出行建议。';
+      if (shortName.includes('weather')) return '查询天气信息，用来校准时间、地点和出行/运动建议。';
+      if (shortName.includes('calculate')) return '执行计算，避免手算误差并给出可复核结果。';
+      if (shortName.includes('create') || shortName.includes('publish') || shortName.includes('csdn')) return '创建、发布或写入外部平台，属于会改变外部状态的高风险操作。';
+      return '调用外部工具补充模型自身没有的实时数据、系统能力或可验证结果。';
+    }
+
+    function toolActionText(toolName) {
+      const shortName = shortToolName(toolName).toLowerCase();
+      if (shortName.includes('search_repositories')) return '搜仓库';
+      if (shortName.includes('get_file_contents')) return '读文件';
+      if (shortName.includes('search_code')) return '搜代码';
+      if (shortName.includes('search_papers')) return '搜论文';
+      if (shortName.includes('aisearch') || shortName.includes('search')) return '检索资料';
+      if (shortName.includes('amap') || shortName.includes('route') || shortName.includes('geo')) return '查地图';
+      if (shortName.includes('weather')) return '查天气';
+      if (shortName.includes('calculate')) return '计算';
+      if (shortName.includes('create') || shortName.includes('publish') || shortName.includes('update') || shortName.includes('delete')) return '写入操作';
+      return '调用工具';
+    }
+
+    function resultHintText(payload, status, detail) {
+      if (detail) return detail;
+      if (status === 'error') return payload.error || '工具调用失败，Agent 应尝试换路或解释失败原因。';
+      if (status === 'blocked') return '已被安全策略拦截：这类工具会创建、发布或修改外部资源，需要显式授权或不允许自动执行。';
+      if (status === 'approval_denied') return '用户已拒绝执行，Agent 应改用不改变外部状态的方案。';
+      if (status === 'approval_timeout') return '审批超时，本次工具调用已拒绝。';
+      if (status === 'approval_unavailable') return '没有可用审批通道，本次高风险工具未执行。';
+      if (typeof payload.resultChars === 'number') {
+        if (payload.resultChars <= 120) return `返回 ${payload.resultChars} 字符，结果很短，可能为空结果、拒绝信息或精简摘要。`;
+        if (payload.resultChars >= 8000) return `返回 ${payload.resultChars} 字符，结果很长，后续回答应只提炼关键命中。`;
+        return `返回 ${payload.resultChars} 字符，可作为本轮回答的工具依据。`;
+      }
+      return '';
+    }
+
+    function renderToolBody(payload, status, detail) {
+      const toolName = payload.toolName || 'unknown_tool';
+      const shortName = shortToolName(toolName);
+      const step = payload.step || '';
+      const inputFocus = pickToolInputValue(payload.inputPreview || '');
+      const pills = [];
+      if (step) pills.push(`<span class="tool-pill">步骤：${escapeHtml(step)}</span>`);
+      pills.push(`<span class="tool-pill">工具：${escapeHtml(shortName)}</span>`);
+      if (typeof payload.latencyMs === 'number') pills.push(`<span class="tool-pill">耗时 ${payload.latencyMs}ms</span>`);
+      if (typeof payload.resultChars === 'number') pills.push(`<span class="tool-pill">返回 ${payload.resultChars} 字符</span>`);
+      const inputHtml = inputFocus
+        ? `<div class="tool-input">本次参数：<code>${escapeHtml(inputFocus)}</code></div>`
+        : '';
+      const resultHint = resultHintText(payload, status, detail);
+      return `
+        <div class="tool-purpose"><strong>为什么用：</strong>${escapeHtml(toolPurposeText(toolName))}</div>
+        <div class="tool-meta">${pills.join('')}</div>
+        ${inputHtml}
+        ${resultHint ? `<div class="tool-detail">${escapeHtml(resultHint)}</div>` : ''}
+      `;
+    }
+
+    function toolSummaryText(payload) {
+      const parts = [];
+      if (payload.step) parts.push(`阶段：${payload.step}`);
+      const inputFocus = pickToolInputValue(payload.inputPreview || '');
+      if (inputFocus) parts.push(`参数：${inputFocus}`);
+      if (typeof payload.latencyMs === 'number') parts.push(`${payload.latencyMs}ms`);
+      if (typeof payload.resultChars === 'number') parts.push(`${payload.resultChars}字`);
+      return parts.join(' · ');
+    }
+
+    function createToolProgressCard(payload) {
+      const toolName = payload.toolName || 'unknown_tool';
+      const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card):not(.tool-card)');
+      if (placeholder) placeholder.remove();
+      const card = document.createElement('div');
+      card.className = 'tool-card running fade-in';
+      card.innerHTML = `
+        <div class="tool-head">
+          <span class="tool-chev">▾</span>
+          <span class="tool-action">${escapeHtml(toolActionText(toolName))}</span>
+          <span class="tool-name" title="${escapeHtml(toolName)}">${escapeHtml(shortToolName(toolName))}</span>
+          <span class="tool-summary">${escapeHtml(toolSummaryText(payload))}</span>
+          <span class="tool-status">${toolStatusText('running')}</span>
+        </div>
+        <div class="tool-body">${renderToolBody(payload, 'running', '')}</div>
+      `;
+      card.querySelector('.tool-head').addEventListener('click', () => {
+        card.classList.toggle('collapsed');
+      });
+      stepsContainer.appendChild(card);
+      const entry = { card, toolName, status: 'running', payload: {...payload} };
+      if (!toolProgressByName[toolName]) toolProgressByName[toolName] = [];
+      toolProgressByName[toolName].push(entry);
+      scrollBottom();
+      return entry;
+    }
+
+    function findRunningToolProgress(toolName) {
+      const queue = toolProgressByName[toolName] || [];
+      return queue.find(x => x.status === 'running') || null;
+    }
+
+    function finishToolProgress(payload, status, detail) {
+      const toolName = payload.toolName || 'unknown_tool';
+      const normalized = toolStatusClass(status);
+      let entry = findRunningToolProgress(toolName);
+      if (!entry) {
+        entry = createToolProgressCard({ toolName, inputPreview: '' });
+      }
+      entry.status = normalized;
+      entry.payload = {...(entry.payload || {}), ...payload};
+      entry.card.className = `tool-card ${normalized} collapsed fade-in`;
+      const statusEl = entry.card.querySelector('.tool-status');
+      const summaryEl = entry.card.querySelector('.tool-summary');
+      const bodyEl = entry.card.querySelector('.tool-body');
+      if (statusEl) statusEl.textContent = toolStatusText(normalized);
+      if (summaryEl) summaryEl.textContent = toolSummaryText(entry.payload);
+      if (bodyEl) {
+        bodyEl.innerHTML = renderToolBody(entry.payload, normalized, detail);
+      }
+      scrollBottom();
+    }
+
     // SSE 事件状态机：跨行收集 event:/data: 字段，遇到空行触发 dispatch
+    // 第 61 轮：多 step 场景下同 session 多次 RAG → 累加到同一张卡片，ref 按全局 startRef 编号
+    function renderRagEvidence(payload) {
+      const items = Array.isArray(payload && payload.items) ? payload.items : [];
+      if (!items.length || !evidenceContainer) return;
+      // 找到当前已有卡片，没有就建一张；后续批次 append 到同一张卡的 evidence-body
+      let card = evidenceContainer.querySelector('.evidence-card');
+      let bodyEl, countEl;
+      if (!card) {
+        card = document.createElement('div');
+        card.className = 'evidence-card collapsed fade-in';
+        card.innerHTML = `
+          <div class="evidence-head">
+            <span class="evidence-chev">v</span>
+            <span class="evidence-title">引用依据</span>
+            <span class="evidence-count">0 条</span>
+          </div>
+          <div class="evidence-body"></div>
+        `;
+        card.querySelector('.evidence-head').addEventListener('click', () => {
+          card.classList.toggle('collapsed');
+        });
+        evidenceContainer.appendChild(card);
+      }
+      bodyEl = card.querySelector('.evidence-body');
+      countEl = card.querySelector('.evidence-count');
+      const itemHtml = items.map(item => {
+        const ref = item.ref == null ? '?' : item.ref;
+        const source = item.source || 'unknown source';
+        const snippet = item.snippet || '';
+        return `
+          <div class="evidence-item" id="rag-evidence-${escapeHtml(String(ref))}">
+            <div class="evidence-meta">
+              <span class="evidence-ref">[${escapeHtml(String(ref))}]</span>
+              <span class="evidence-source" title="${escapeHtml(String(source))}">${escapeHtml(String(source))}</span>
+            </div>
+            <div class="evidence-snippet">${escapeHtml(String(snippet))}</div>
+          </div>
+        `;
+      }).join('');
+      bodyEl.insertAdjacentHTML('beforeend', itemHtml);
+      // 总数 = 卡内现有 item 数量
+      const total = bodyEl.querySelectorAll('.evidence-item').length;
+      if (countEl) countEl.textContent = total + ' 条';
+      scrollBottom();
+    }
+
+    function memoryTypeLabel(memoryType) {
+      if (memoryType === 'long_term') return '长期记忆';
+      if (memoryType === 'episodic') return '会话记忆';
+      return '记忆';
+    }
+
+    function memoryKindLabel(kind) {
+      if (kind === 'current') return '当前会话';
+      if (kind === 'other') return '最近话题';
+      return kind || '记忆';
+    }
+
+    function renderMemoryEvidence(payload) {
+      const items = Array.isArray(payload && payload.items) ? payload.items : [];
+      if (!items.length || !memoryEvidenceContainer) return;
+      const memoryType = payload.memoryType || 'memory';
+      const memoryTypeKey = String(memoryType).replace(/[^a-zA-Z0-9_-]/g, '_');
+      let card = memoryEvidenceContainer.querySelector('.memory-card');
+      let bodyEl, countEl;
+      if (!card) {
+        card = document.createElement('div');
+        card.className = 'evidence-card memory-card collapsed fade-in';
+        card.innerHTML = `
+          <div class="evidence-head">
+            <span class="evidence-chev">v</span>
+            <span class="evidence-title">记忆依据</span>
+            <span class="evidence-count">0 条</span>
+          </div>
+          <div class="evidence-body"></div>
+        `;
+        card.querySelector('.evidence-head').addEventListener('click', () => {
+          card.classList.toggle('collapsed');
+        });
+        memoryEvidenceContainer.appendChild(card);
+      }
+      bodyEl = card.querySelector('.evidence-body');
+      countEl = card.querySelector('.evidence-count');
+
+      let section = bodyEl.querySelector(`[data-memory-type="${memoryTypeKey}"]`);
+      if (!section) {
+        section = document.createElement('div');
+        section.className = 'memory-section';
+        section.setAttribute('data-memory-type', memoryTypeKey);
+        section.innerHTML = `<div class="memory-section-title">${escapeHtml(memoryTypeLabel(memoryType))}</div>`;
+        bodyEl.appendChild(section);
+      }
+
+      // 多 step 多 client 会按同一 userId 召回相同记忆并各发一帧，这里按内容指纹去重，
+      // 避免"记忆依据"卡片里同一条记忆重复堆叠。去重范围 = 当前 section 已有 data-fp + 本批新增
+      const seenFp = new Set();
+      section.querySelectorAll('.memory-item[data-fp]').forEach(el => seenFp.add(el.getAttribute('data-fp')));
+      const itemHtml = items.map(item => {
+        const content = item.content || '';
+        if (memoryType === 'long_term') {
+          const topic = item.topic || 'other';
+          const fp = 'lt|' + topic + '|' + content;
+          if (seenFp.has(fp)) return '';
+          seenFp.add(fp);
+          return `
+            <div class="evidence-item memory-item" data-fp="${escapeHtml(fp)}">
+              <div class="evidence-meta">
+                <span class="memory-tag">${escapeHtml(String(topic))}</span>
+              </div>
+              <div class="evidence-snippet">${escapeHtml(String(content))}</div>
+            </div>
+          `;
+        }
+        const kind = memoryKindLabel(item.kind);
+        const fp = 'ep|' + (item.kind || '') + '|' + content;
+        if (seenFp.has(fp)) return '';
+        seenFp.add(fp);
+        return `
+          <div class="evidence-item memory-item" data-fp="${escapeHtml(fp)}">
+            <div class="evidence-meta">
+              <span class="memory-kind">${escapeHtml(String(kind))}</span>
+            </div>
+            <div class="evidence-snippet">${escapeHtml(String(content))}</div>
+          </div>
+        `;
+      }).join('');
+      section.insertAdjacentHTML('beforeend', itemHtml);
+      const total = bodyEl.querySelectorAll('.memory-item').length;
+      if (countEl) countEl.textContent = total + ' 条';
+      scrollBottom();
+    }
+
     let curEvent = 'message';
     let curData = '';
 
@@ -520,6 +932,28 @@ async function sendMessage() {
         if (!stepsContainer.querySelector('.step-card')) {
           stepsContainer.innerHTML = '<div class="text-xs text-gray-500 px-2 py-1 fade-in">⚡ 已连接，正在分析...</div>';
         }
+        // 干预总开关：服务端启用时亮出「立即回答」按钮
+        if (payload && payload.intervention) {
+          state.interventionEnabled = true;
+          showAnswerNow(true);
+        }
+      } else if (curEvent === 'agent_routed') {
+        // 路由命中：把作者标题从「路由中…」替换成「名称(id)」
+        if (aiAuthorEl) {
+          aiAuthorEl.textContent = payload.agentName ? `${payload.agentName}(${payload.agentId})` : `Agent ${payload.agentId}`;
+        }
+      } else if (curEvent === 'human_approval_required') {
+        enqueueApproval(payload);
+      } else if (curEvent === 'tool_call_start') {
+        createToolProgressCard(payload);
+      } else if (curEvent === 'tool_call_end') {
+        finishToolProgress(payload, payload.status || 'success', '');
+      } else if (curEvent === 'tool_call_error') {
+        finishToolProgress(payload, 'error', payload.error || '');
+      } else if (curEvent === 'rag_evidence') {
+        renderRagEvidence(payload);
+      } else if (curEvent === 'memory_evidence') {
+        renderMemoryEvidence(payload);
       } else if (curEvent === 'thinking') {
         // 老的 thinking 事件，弱化显示
         // （保留兼容，不渲染避免噪音）
@@ -567,15 +1001,222 @@ async function sendMessage() {
   } finally {
     state.sending = false;
     document.getElementById('sendBtn').disabled = false;
+    showAnswerNow(false);
+    clearApprovalTimer();
     scrollBottom(true);
   }
 }
 
+// 立即回答 + 引导：根据 (sending && interventionEnabled) 显隐两个按钮
+function showAnswerNow(show) {
+  const visible = show && state.sending && state.interventionEnabled;
+  const an = document.getElementById('answerNowBtn');
+  if (an) { if (visible) { an.classList.remove('hidden'); an.disabled = false; an.textContent = '⚡ 立即回答'; } else an.classList.add('hidden'); }
+  const st = document.getElementById('steerBtn');
+  if (st) { if (visible) { st.classList.remove('hidden'); st.disabled = false; st.textContent = '💬 引导'; } else st.classList.add('hidden'); }
+}
+
+// 引导：补充新想法，POST /steer，后端在当前步重做并纳入想法（不丢弃进度、不关思考）
+async function steer() {
+  if (!state.sessionId || !state.sending) return;
+  const idea = (window.prompt('补充你的新想法（Agent 会在当前步重做并纳入考虑）：') || '').trim();
+  if (!idea) return;
+  const btn = document.getElementById('steerBtn');
+  try {
+    if (btn) { btn.disabled = true; btn.textContent = '💬 已提交'; }
+    await fetch(API + '/steer', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ sessionId: state.sessionId, idea })
+    });
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = '💬 引导'; }
+  } finally {
+    // 引导后流会继续，1.5s 后恢复按钮（仍在流式中时）
+    setTimeout(() => { if (btn && state.sending) { btn.disabled = false; btn.textContent = '💬 引导'; } }, 1500);
+  }
+}
+
+// 立即回答：POST /answer_now，后端中止剩余步骤、跳 finalize 基于半成品作答
+async function answerNow() {
+  if (!state.sessionId || !state.sending) return;
+  const btn = document.getElementById('answerNowBtn');
+  try {
+    if (btn) { btn.disabled = true; btn.textContent = '⚡ 收尾中…'; }
+    await fetch(API + '/answer_now', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ sessionId: state.sessionId })
+    });
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = '⚡ 立即回答'; }
+  }
+}
+
+// DAG 并行下多个步骤同时发起审批：入队，去重，没有正在处理的就立即弹队首
+function enqueueApproval(payload) {
+  if (!payload || !payload.approvalId) return;
+  const dup = (state.pendingApproval && state.pendingApproval.approvalId === payload.approvalId)
+    || state.approvalQueue.some(p => p.approvalId === payload.approvalId);
+  if (dup) return;
+  state.approvalQueue.push(payload);
+  if (!state.pendingApproval) {
+    showNextApproval();
+  } else {
+    renderApprovalQueueCount();
+  }
+}
+
+// 取队首弹出；队列空则收起弹窗并清空当前态
+function showNextApproval() {
+  const next = state.approvalQueue.shift();
+  if (!next) {
+    state.pendingApproval = null;
+    hideApprovalModal();
+    return;
+  }
+  showApprovalModal(next);
+}
+
+// 用户点 × 主动关闭：放弃当前这条（后端会超时自动拒绝），推进到下一条
+function dismissApproval() {
+  showNextApproval();
+}
+
+function showApprovalModal(payload) {
+  if (!payload || !payload.approvalId) return;
+  state.pendingApproval = payload;
+
+  // 步骤标签：DAG 并行时标注"是哪个步骤要的许可"，后端 payload.step 为空则不显示
+  const stepWrap = document.getElementById('approvalStepWrap');
+  const stepEl = document.getElementById('approvalStep');
+  if (payload.step) {
+    stepEl.textContent = payload.step;
+    stepWrap.classList.remove('hidden');
+  } else {
+    stepEl.textContent = '';
+    stepWrap.classList.add('hidden');
+  }
+
+  document.getElementById('approvalToolName').textContent = payload.toolName || 'unknown';
+  document.getElementById('approvalToolInput').textContent = payload.toolInput || '';
+  renderApprovalQueueCount();
+  setApprovalStatus('', '');
+  setApprovalButtons(false);
+  document.getElementById('approvalModal').classList.remove('hidden');
+
+  clearApprovalTimer();
+  const timeoutSeconds = Number(payload.timeoutSeconds || 0);
+  if (timeoutSeconds > 0) {
+    const deadline = Date.now() + timeoutSeconds * 1000;
+    updateApprovalCountdown(deadline);
+    state.approvalTimer = setInterval(() => updateApprovalCountdown(deadline), 1000);
+  } else {
+    document.getElementById('approvalCountdown').textContent = '';
+  }
+}
+
+function renderApprovalQueueCount() {
+  const el = document.getElementById('approvalQueueCount');
+  const n = state.approvalQueue.length;
+  if (n > 0) {
+    el.textContent = `还有 ${n} 个待审批（并行步骤），处理完会逐个弹出`;
+    el.classList.remove('hidden');
+  } else {
+    el.textContent = '';
+    el.classList.add('hidden');
+  }
+}
+
+function updateApprovalCountdown(deadline) {
+  const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+  document.getElementById('approvalCountdown').textContent = left > 0
+    ? `请在 ${left} 秒内确认，超时会自动拒绝`
+    : '已超时，后端会自动拒绝';
+  if (left <= 0) {
+    clearApprovalTimer();
+    setApprovalButtons(true);
+    setApprovalStatus('确认已超时，本次工具调用会被拒绝', 'error');
+    // 后端已对这条自动拒绝；前端推进到下一条待审批（确认还是同一条才推进，避免竞态误关）
+    const timedOut = state.pendingApproval;
+    setTimeout(() => {
+      if (state.pendingApproval && timedOut && state.pendingApproval.approvalId === timedOut.approvalId) {
+        showNextApproval();
+      }
+    }, 1200);
+  }
+}
+
+function hideApprovalModal() {
+  document.getElementById('approvalModal').classList.add('hidden');
+  clearApprovalTimer();
+}
+
+function clearApprovalTimer() {
+  if (state.approvalTimer) {
+    clearInterval(state.approvalTimer);
+    state.approvalTimer = null;
+  }
+}
+
+function setApprovalButtons(disabled) {
+  document.getElementById('approvalApproveBtn').disabled = disabled;
+  document.getElementById('approvalRejectBtn').disabled = disabled;
+}
+
+function setApprovalStatus(text, kind) {
+  const el = document.getElementById('approvalStatus');
+  if (!text) {
+    el.className = 'hidden text-sm';
+    el.textContent = '';
+    return;
+  }
+  const color = kind === 'error' ? 'text-red-300' : 'text-emerald-300';
+  el.className = `${color} text-sm`;
+  el.textContent = text;
+}
+
+async function submitApproval(approved) {
+  const approval = state.pendingApproval;
+  if (!approval || !approval.approvalId) return;
+  setApprovalButtons(true);
+  setApprovalStatus(approved ? '正在批准...' : '正在拒绝...', '');
+  try {
+    const res = await fetch(API + '/approval', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({approvalId: approval.approvalId, approved})
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || json.code !== '0000') {
+      throw new Error(json.info || `HTTP ${res.status}`);
+    }
+    setApprovalStatus(approved ? '已批准，工具将继续执行' : '已拒绝，Agent 会尝试换一种方式', '');
+    clearApprovalTimer();
+    setTimeout(() => {
+      if (state.pendingApproval && state.pendingApproval.approvalId === approval.approvalId) {
+        // 处理完当前这条 → 弹下一个待审批；队列空时 showNextApproval 内部会收起弹窗
+        showNextApproval();
+      }
+    }, 900);
+  } catch (e) {
+    setApprovalButtons(false);
+    setApprovalStatus('提交失败：' + (e.message || '未知错误'), 'error');
+  }
+}
+
 // ==================== HELPERS ====================
-function addMessage(role, content, isPlaceholder) {
+// 把存的 agentId 映射成「名称(id)」；查不到名就显示「Agent id」；没有 agentId（实时占位）回退「AI Assistant」
+function agentLabel(agentId) {
+  if (!agentId) return 'AI Assistant';
+  const a = (state.agents || []).find(x => String(x.agentId) === String(agentId));
+  return a ? `${a.agentName}(${a.agentId})` : `Agent ${agentId}`;
+}
+
+function addMessage(role, content, isPlaceholder, agentId) {
   const area = document.getElementById('messageArea');
-  // 移除空状态
-  const empty = area.querySelector('.text-center');
+  // 移除空状态。第 70 轮：排除历史顶部哨兵（它也带 .text-center），否则在历史会话里继续发消息会误删哨兵
+  const empty = area.querySelector('.text-center:not(#historyTopSentinel)');
   if (empty && !empty.classList.contains('hidden')) empty.remove();
 
   const div = document.createElement('div');
@@ -592,7 +1233,7 @@ function addMessage(role, content, isPlaceholder) {
   div.innerHTML = `
     ${avatar}
     <div class="${bubbleClass} px-4 py-3 max-w-[80%]">
-      <div class="text-xs text-gray-500 mb-1">${role === 'user' ? state.username : 'AI Assistant'}</div>
+      <div class="text-xs text-gray-500 mb-1 msg-author">${role === 'user' ? state.username : escapeHtml(agentLabel(agentId))}</div>
       <div class="msg-content text-sm leading-relaxed ${isPlaceholder ? 'typing' : ''}">
         ${isPlaceholder ? '<span class="text-gray-500">思考中...</span>' : renderMarkdown(content)}
       </div>
@@ -671,39 +1312,65 @@ function hideRagModal() {
   document.getElementById('ragModal').classList.add('hidden');
 }
 
-async function uploadRag() {
-  const name = document.getElementById('ragName').value.trim() || 'doc_' + Date.now();
-  const tag = document.getElementById('ragTag').value.trim();
+function ragTagFromFileName(fileName) {
+  return fileName.replace(/\.[^.]+$/, '') || fileName;
+}
+
+function syncRagUploadDefaults() {
   const files = document.getElementById('ragFiles').files;
-  const statusEl = document.getElementById('ragStatus');
+  const nameEl = document.getElementById('ragName');
+  const tagEl = document.getElementById('ragTag');
+  if (files.length === 1) {
+    if (!nameEl.value.trim()) nameEl.value = files[0].name;
+    if (!tagEl.value.trim()) tagEl.value = ragTagFromFileName(files[0].name);
+  }
+}
+
+async function postRagFile(name, tag, file) {
+  const form = new FormData();
+  form.append('name', name);
+  form.append('tag', tag);
+  form.append('files', file);
+
+  const res = await fetch('/api/v1/admin/ai-client-rag-order/file/upload', {
+    method: 'POST',
+    headers: state.userId ? { 'X-User-Id': state.userId } : {},
+    body: form
+  });
+  const data = await res.json();
+  if (data.code !== '0000') {
+    throw new Error(data.info || '未知错误');
+  }
+  return data;
+}
+
+async function uploadRag() {
+  const nameInput = document.getElementById('ragName').value.trim();
+  const tagInput = document.getElementById('ragTag').value.trim();
+  const files = document.getElementById('ragFiles').files;
   const btn = document.getElementById('ragUploadBtn');
 
-  if (!tag) { showRagStatus('请输入知识标签', 'red'); return; }
   if (!files.length) { showRagStatus('请选择文件', 'red'); return; }
 
   btn.disabled = true; btn.textContent = '上传中...';
   showRagStatus('正在上传...', 'blue');
 
-  const form = new FormData();
-  form.append('name', name);
-  form.append('tag', tag);
-  for (const f of files) form.append('files', f);
-
   try {
-    const res = await fetch('/api/v1/admin/ai-client-rag-order/file/upload', {
-      method: 'POST',
-      headers: state.userId ? { 'X-User-Id': state.userId } : {},
-      body: form
-    });
-    const data = await res.json();
-    if (data.code === '0000') {
-      showRagStatus(`上传成功！${files.length} 个文件，userId=${state.userId || '(未登录)'}`, 'green');
-      document.getElementById('ragFiles').value = '';
-    } else {
-      showRagStatus('上传失败: ' + (data.info || '未知错误'), 'red');
+    let ok = 0;
+    for (const file of files) {
+      const batchMode = files.length > 1;
+      const name = batchMode ? file.name : (nameInput || file.name);
+      const tag = batchMode ? ragTagFromFileName(file.name) : (tagInput || ragTagFromFileName(file.name));
+      showRagStatus(`正在上传 ${ok + 1}/${files.length}：${file.name}`, 'blue');
+      await postRagFile(name, tag, file);
+      ok++;
     }
+    showRagStatus(`上传成功！${ok} 个文件，userId=${state.userId || '(未登录)'}`, 'green');
+    document.getElementById('ragFiles').value = '';
+    document.getElementById('ragName').value = '';
+    document.getElementById('ragTag').value = '';
   } catch(e) {
-    showRagStatus('网络错误: ' + e.message, 'red');
+    showRagStatus('上传失败: ' + e.message, 'red');
   } finally {
     btn.disabled = false; btn.textContent = '开始上传';
   }
@@ -738,15 +1405,38 @@ async function loadHistory() {
       const time = c.lastTime ? new Date(c.lastTime).toLocaleString('zh-CN', {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
       const sid = (c.conversationId || '').split(':').pop() || c.conversationId;
       const active = state.sessionId && c.conversationId && c.conversationId.endsWith(state.sessionId) ? 'border-blue-500 bg-blue-900/20' : 'border-gray-700 hover:border-gray-500';
-      return `<div onclick="loadConversation('${escapeHtml(c.conversationId)}')" class="${active} border rounded-lg p-2 cursor-pointer transition text-xs">
-        <div class="text-gray-300 truncate">${escapeHtml(preview || '(空)')}</div>
-        <div class="text-gray-500 mt-1 flex justify-between">
-          <span>${c.messageCount} 条消息</span><span>${time}</span>
+      return `<div class="${active} border rounded-lg p-2 transition text-xs relative group">
+        <div onclick="loadConversation('${escapeHtml(c.conversationId)}')" class="cursor-pointer">
+          <div class="text-gray-300 truncate pr-5">${escapeHtml(preview || '(空)')}</div>
+          <div class="text-gray-500 mt-1 flex justify-between">
+            <span>${c.messageCount} 条消息</span><span>${time}</span>
+          </div>
         </div>
+        <button onclick="event.stopPropagation();deleteConversation('${escapeHtml(c.conversationId)}')" title="删除此会话"
+          class="absolute top-1 right-1.5 text-gray-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition text-base leading-none px-1">&times;</button>
       </div>`;
     }).join('');
   } catch(e) {
     list.innerHTML = '<div class="text-xs text-red-400 text-center py-4">加载失败</div>';
+  }
+}
+
+// 删除单个会话历史（带确认；后端 DELETE /conversation 带归属校验）
+async function deleteConversation(conversationId) {
+  if (!conversationId || !state.userId) return;
+  if (!confirm('确定删除这个会话的全部历史？此操作不可恢复。')) return;
+  try {
+    const res = await fetch(`/api/v1/agent/conversation?conversationId=${encodeURIComponent(conversationId)}&userId=${encodeURIComponent(state.userId)}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (data.code === '0000' && data.data) {
+      // 删的是当前会话 → 自动开新会话
+      if (state.sessionId && conversationId.endsWith(state.sessionId)) newSession();
+      loadHistory();
+    } else {
+      alert('删除失败：' + (data.info || '未知错误'));
+    }
+  } catch(e) {
+    alert('删除失败：' + e.message);
   }
 }
 
@@ -757,7 +1447,28 @@ const historyPage = {
   oldestId: null,
   hasMore: false,
   loading: false,
+  // 第 70 轮：版本号。newSession / loadConversation / doLogout 都会 bump，
+  // in-flight 的 loadHistoryEarlier 请求返回后若发现 generation 变了就丢弃结果，
+  // 避免"点新会话后旧会话的更早消息异步返回又被插回当前空页面"
+  generation: 0,
 };
+
+// 第 70 轮：彻底退出历史分页模式 —— 作废 in-flight 请求 + 移除 scroll 监听 + 删哨兵 + 清状态。
+// newSession / doLogout 必须调用，否则旧会话的"上滑加载更早"监听会污染新空会话。
+function resetHistoryPagination() {
+  historyPage.generation++;          // 作废所有 in-flight loadHistoryEarlier
+  historyPage.conversationId = null;
+  historyPage.oldestId = null;
+  historyPage.hasMore = false;
+  historyPage.loading = false;
+  const area = document.getElementById('messageArea');
+  if (area && historyScrollHandler) {
+    area.removeEventListener('scroll', historyScrollHandler);
+    historyScrollHandler = null;
+  }
+  const sentinel = document.getElementById('historyTopSentinel');
+  if (sentinel) sentinel.remove();
+}
 
 async function loadConversation(conversationId) {
   // 从 conversationId 提取 sessionId
@@ -766,7 +1477,10 @@ async function loadConversation(conversationId) {
   document.getElementById('sessionInfo').textContent = 'Session: ' + state.sessionId.substring(0, 28) + '...';
   document.getElementById('historyPanel').classList.add('hidden');
 
-  // 重置分页状态
+  // 重置分页状态。第 70 轮：bump generation 作废之前会话 in-flight 的 loadHistoryEarlier，
+  // 同时记录本次加载的 myGen，首屏返回后校验，防止用户快速切换两个历史会话时旧结果覆盖新会话
+  historyPage.generation++;
+  const myGen = historyPage.generation;
   historyPage.conversationId = conversationId;
   historyPage.oldestId = null;
   historyPage.hasMore = false;
@@ -778,6 +1492,8 @@ async function loadConversation(conversationId) {
   try {
     const res = await fetch(`/api/v1/agent/conversation_messages?conversationId=${encodeURIComponent(conversationId)}&limit=${HISTORY_PAGE_SIZE}`);
     const data = await res.json();
+    // 返回时用户已切到别的会话 / 点了新会话 → 丢弃，不要污染当前页面
+    if (myGen !== historyPage.generation) return;
     if (data.code !== '0000' || !data.data) {
       area.innerHTML = '<div class="text-center text-gray-500 py-4">加载失败</div>';
       return;
@@ -791,7 +1507,7 @@ async function loadConversation(conversationId) {
     area.innerHTML = '';
     // 先全部 append 消息（addMessage 会 scrollBottom，正常）
     messages.forEach(m => {
-      addMessage(m.messageType === 'USER' ? 'user' : 'assistant', m.content, false);
+      addMessage(m.messageType === 'USER' ? 'user' : 'assistant', m.content, false, m.agentId);
     });
     // 再插入哨兵到顶部（避免 addMessage 内部 querySelector('.text-center') 误删它）
     insertHistoryTopSentinel(area);
@@ -850,6 +1566,10 @@ function setupHistoryScrollWatcher() {
 
 async function loadHistoryEarlier() {
   if (!historyPage.conversationId || !historyPage.oldestId || !historyPage.hasMore) return;
+  // 第 70 轮：抓拍本次请求所属的 generation + conversationId。请求是异步的，返回时若用户已经
+  // 点了"新会话"或切到别的会话，generation 会变，直接丢弃结果不 prepend
+  const myGen = historyPage.generation;
+  const myConv = historyPage.conversationId;
   historyPage.loading = true;
   updateHistoryTopSentinel();
 
@@ -858,8 +1578,10 @@ async function loadHistoryEarlier() {
   const prevScrollHeight = area.scrollHeight;
 
   try {
-    const res = await fetch(`/api/v1/agent/conversation_messages?conversationId=${encodeURIComponent(historyPage.conversationId)}&limit=${HISTORY_PAGE_SIZE}&beforeId=${historyPage.oldestId}`);
+    const res = await fetch(`/api/v1/agent/conversation_messages?conversationId=${encodeURIComponent(myConv)}&limit=${HISTORY_PAGE_SIZE}&beforeId=${historyPage.oldestId}`);
     const data = await res.json();
+    // 关键：返回后校验 generation —— 变了说明已经离开这个历史会话，丢弃，绝不插回当前页面
+    if (myGen !== historyPage.generation) return;
     if (data.code !== '0000' || !data.data) {
       historyPage.loading = false;
       updateHistoryTopSentinel();
@@ -874,7 +1596,7 @@ async function loadHistoryEarlier() {
     const sentinel = document.getElementById('historyTopSentinel');
     const fragment = document.createDocumentFragment();
     messages.forEach(m => {
-      const node = buildMessageNode(m.messageType === 'USER' ? 'user' : 'assistant', m.content);
+      const node = buildMessageNode(m.messageType === 'USER' ? 'user' : 'assistant', m.content, m.agentId);
       if (node) fragment.appendChild(node);
     });
     if (sentinel && sentinel.nextSibling) {
@@ -889,14 +1611,17 @@ async function loadHistoryEarlier() {
   } catch(e) {
     console.error('loadHistoryEarlier failed:', e);
   } finally {
-    historyPage.loading = false;
-    updateHistoryTopSentinel();
+    // 只有还停在同一个 generation 才更新 loading 态，否则别动新会话的 UI
+    if (myGen === historyPage.generation) {
+      historyPage.loading = false;
+      updateHistoryTopSentinel();
+    }
   }
 }
 
 // 与 addMessage 同源的 DOM 构造，但只构造不挂载、不 scroll，供 prepend 使用。
 // 改 addMessage 时记得同步这里。
-function buildMessageNode(role, content) {
+function buildMessageNode(role, content, agentId) {
   const div = document.createElement('div');
   div.className = 'fade-in flex gap-3 ' + (role === 'user' ? 'flex-row-reverse' : '');
 
@@ -911,7 +1636,7 @@ function buildMessageNode(role, content) {
   div.innerHTML = `
     ${avatar}
     <div class="${bubbleClass} px-4 py-3 max-w-[80%]">
-      <div class="text-xs text-gray-500 mb-1">${role === 'user' ? state.username : 'AI Assistant'}</div>
+      <div class="text-xs text-gray-500 mb-1 msg-author">${role === 'user' ? state.username : escapeHtml(agentLabel(agentId))}</div>
       <div class="msg-content text-sm leading-relaxed">${renderMarkdown(content)}</div>
     </div>
   `;

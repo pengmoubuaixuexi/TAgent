@@ -7,7 +7,7 @@ import java.util.List;
 /**
  * 任务数据提供者接口，用户需要实现此接口来提供任务调度数据
  *
- * @author @TAgent
+ * @author @小傅哥
  */
 public interface ITaskDataProvider {
 

@@ -12,7 +12,7 @@ import java.time.LocalDateTime;
 /**
  * 系统提示词配置响应 DTO
  *
- * @author TAgent
+ * @author bugstack虫洞栈
  * @description 系统提示词配置响应数据传输对象
  */
 @Data

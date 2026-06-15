@@ -20,7 +20,7 @@ import java.util.regex.Pattern;
 /**
  * 步骤3：规划步骤解析节点
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/8/25 11:00
  */
 @Slf4j
@@ -76,7 +76,8 @@ public class Step3ParseStepsNode extends AbstractExecuteSupport {
         
         // 更新步骤
         dynamicContext.setStep(dynamicContext.getStep() + 1);
-        
+
+        recordTransition("flow_step3_parse_steps", dynamicContext);
         return router(requestParameter, dynamicContext);
     }
 

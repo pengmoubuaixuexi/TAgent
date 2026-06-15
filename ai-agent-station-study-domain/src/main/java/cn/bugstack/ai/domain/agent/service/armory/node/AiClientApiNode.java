@@ -11,7 +11,6 @@ import com.alibaba.fastjson.JSON;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.openai.api.OpenAiApi;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.stereotype.Service;
 
@@ -20,7 +19,7 @@ import java.util.List;
 /**
  * OpenAI API配置节点
  *
- * @author TAgent
+ * @author xiaofuge bugstack.cn @小傅哥
  * 2025/7/1 07:09
  */
 @Slf4j
@@ -30,17 +29,9 @@ public class AiClientApiNode extends AbstractArmorySupport {
     @Resource
     private AiClientToolMcpNode aiClientToolMcpNode;
 
-    @Value("${agent.llm.base-url:}")
-    private String llmBaseUrl;
-
-    @Value("${agent.llm.api-key:}")
-    private String llmApiKey;
-
-    @Value("${agent.llm.completions-path:}")
-    private String llmCompletionsPath;
-
-    @Value("${agent.llm.embeddings-path:}")
-    private String llmEmbeddingsPath;
+    /** 立即回答 finalize"真·关思考"时注入出站请求体的参数 JSON；空=不注入（零影响）。MiMo 官方 API 关思考参数因 serving 而异，做成可配置。 */
+    @org.springframework.beans.factory.annotation.Value("${agent.no-think.body-params:}")
+    private String noThinkBodyParams;
 
     @Override
     protected String doApply(ArmoryCommandEntity requestParameter, DefaultArmoryStrategyFactory.DynamicContext dynamicContext) throws Exception {
@@ -54,20 +45,22 @@ public class AiClientApiNode extends AbstractArmorySupport {
         }
 
         for (AiClientApiVO aiClientApiVO : aiClientApiList) {
-            boolean llmOverride = OpenAiCompatibleApiSupport.hasText(llmBaseUrl)
-                    || OpenAiCompatibleApiSupport.hasText(llmApiKey);
-            String effectiveBaseUrl = OpenAiCompatibleApiSupport.valueOrDefault(llmBaseUrl, aiClientApiVO.getBaseUrl());
-            String effectiveApiKey = OpenAiCompatibleApiSupport.valueOrDefault(llmApiKey, aiClientApiVO.getApiKey());
-            String completionsPath = llmOverride
-                    ? OpenAiCompatibleApiSupport.chatCompletionsPath(effectiveBaseUrl, llmCompletionsPath)
-                    : OpenAiCompatibleApiSupport.chatCompletionsPath(effectiveBaseUrl, aiClientApiVO.getCompletionsPath());
-            String embeddingsPath = llmOverride
-                    ? OpenAiCompatibleApiSupport.embeddingsPath(effectiveBaseUrl, llmEmbeddingsPath)
-                    : OpenAiCompatibleApiSupport.embeddingsPath(effectiveBaseUrl, aiClientApiVO.getEmbeddingsPath());
-            // 构建 OpenAiApi（WebClient 注入 ReasoningContentFilter 以回传 mimo thinking mode 的 reasoning_content）
-            ReasoningContentFilter reasoningFilter = new ReasoningContentFilter();
-            WebClient.Builder webClientBuilder = WebClient.builder().filter(reasoningFilter);
-            log.info("[AiClientApiNode] building OpenAiApi apiId={} baseUrl={} filterCount=1 (ReasoningContentFilter)",
+            // 2026-05-29：连接全部来自 DB ai_client_api（已去掉 agent.llm.* 全局覆盖）
+            String effectiveBaseUrl = aiClientApiVO.getBaseUrl();
+            String effectiveApiKey = aiClientApiVO.getApiKey();
+            String completionsPath = OpenAiCompatibleApiSupport.chatCompletionsPath(effectiveBaseUrl, aiClientApiVO.getCompletionsPath());
+            String embeddingsPath = OpenAiCompatibleApiSupport.embeddingsPath(effectiveBaseUrl, aiClientApiVO.getEmbeddingsPath());
+            // 构建 OpenAiApi（WebClient 注入两个 filter）：
+            //   1. ReasoningContentFilter：回传 mimo thinking mode 的 reasoning_content
+            //   2. WireTraceRecorder：抓取 advisor 注入后的最终请求体 + 原始响应体到 ES（logger=llm.wire）
+            // 顺序很重要：reasoning 先注入 → wire 再 log，看到的就是真正发出去的 body
+            ReasoningContentFilter reasoningFilter = new ReasoningContentFilter(noThinkBodyParams);
+            cn.bugstack.ai.domain.agent.service.execute.common.WireTraceRecorder wireTraceRecorder =
+                    new cn.bugstack.ai.domain.agent.service.execute.common.WireTraceRecorder();
+            WebClient.Builder webClientBuilder = WebClient.builder()
+                    .filter(reasoningFilter)
+                    .filter(wireTraceRecorder);
+            log.info("[AiClientApiNode] building OpenAiApi apiId={} baseUrl={} filterCount=2 (ReasoningContentFilter, WireTraceRecorder)",
                     aiClientApiVO.getApiId(), effectiveBaseUrl);
             OpenAiApi openAiApi = OpenAiApi.builder()
                     .baseUrl(effectiveBaseUrl)

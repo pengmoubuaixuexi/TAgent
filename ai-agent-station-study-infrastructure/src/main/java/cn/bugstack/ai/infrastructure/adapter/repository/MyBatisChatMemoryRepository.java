@@ -1,5 +1,6 @@
 package cn.bugstack.ai.infrastructure.adapter.repository;
 
+import cn.bugstack.ai.infrastructure.adapter.repository.cache.MemoryCacheService;
 import cn.bugstack.ai.infrastructure.dao.IAiChatMemoryDao;
 import cn.bugstack.ai.infrastructure.dao.po.AiChatMemory;
 import jakarta.annotation.Resource;
@@ -43,6 +44,9 @@ public class MyBatisChatMemoryRepository implements ChatMemoryRepository {
     @Resource
     private IAiChatMemoryDao aiChatMemoryDao;
 
+    @Resource
+    private MemoryCacheService memoryCache;
+
     /** 由调用方（FixedAgentExecuteStrategy 等）通过 {@link cn.bugstack.ai.domain.agent.service.memory.ChatMemoryContext} 设置 */
 
     @Override
@@ -54,7 +58,7 @@ public class MyBatisChatMemoryRepository implements ChatMemoryRepository {
     @Override
     public List<Message> findByConversationId(String conversationId) {
         if (conversationId == null || conversationId.isBlank()) return Collections.emptyList();
-        List<AiChatMemory> rows = aiChatMemoryDao.findByConversationId(conversationId);
+        List<AiChatMemory> rows = loadRowsWithCache(conversationId);
         if (rows == null || rows.isEmpty()) return Collections.emptyList();
         List<Message> messages = new ArrayList<>(rows.size());
         for (AiChatMemory r : rows) {
@@ -62,6 +66,26 @@ public class MyBatisChatMemoryRepository implements ChatMemoryRepository {
             if (m != null) messages.add(m);
         }
         return messages;
+    }
+
+    /**
+     * 给 ConversationTurnMemoryService / AgentRepository 等共享 PO 视图的调用方使用，
+     * 走 Redis → DB 兜底，DB 命中后回填缓存。
+     */
+    public List<AiChatMemory> loadRowsWithCache(String conversationId) {
+        if (conversationId == null || conversationId.isBlank()) return Collections.emptyList();
+        List<AiChatMemory> cached = memoryCache.getChatList(conversationId);
+        if (cached != null) {
+            log.debug("[ChatMem.read] HIT conv={} size={}", conversationId, cached.size());
+            return cached;
+        }
+        List<AiChatMemory> rows = aiChatMemoryDao.findByConversationId(conversationId);
+        if (rows == null) rows = Collections.emptyList();
+        if (!rows.isEmpty()) {
+            memoryCache.putChatList(conversationId, rows);
+        }
+        log.debug("[ChatMem.read] MISS→DB conv={} size={}", conversationId, rows.size());
+        return rows;
     }
 
     @Override
@@ -93,12 +117,15 @@ public class MyBatisChatMemoryRepository implements ChatMemoryRepository {
         if (!rows.isEmpty()) {
             aiChatMemoryDao.insertBatch(rows);
         }
+        // saveAll 当前是死路径（ReadOnlyChatMemoryAdvisor 不调 add），但留个 evict 保证一致性
+        memoryCache.evictChatList(conversationId);
     }
 
     @Override
     public void deleteByConversationId(String conversationId) {
         if (conversationId == null || conversationId.isBlank()) return;
         aiChatMemoryDao.deleteByConversationId(conversationId);
+        memoryCache.evictChatList(conversationId);
     }
 
     private Message toSpringMessage(AiChatMemory r) {
