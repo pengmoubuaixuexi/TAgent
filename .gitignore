@@ -49,6 +49,7 @@ build/
 ### Runtime / Debug ###
 hs_err_pid*.log
 replay_pid*.log
+*.stackdump
 *.pid
 browser-state-*.json
 browser-state-*-fingerprint.json

@@ -90,6 +90,7 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy {
         DefaultFlowAgentExecuteStrategyFactory.DynamicContext ctx = activeContexts.get(sessionId);
         if (ctx != null) {
             ctx.cancel();
+            ctx.fireCancelTrigger();  // 立即截断在飞流式调用，不等当前 LLM 调用跑完才在下个 checkpoint 生效
             log.info("[FlowAgent] cancelExecute called for sessionId={}", sessionId);
         }
     }

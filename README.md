@@ -8,7 +8,7 @@ TAgent 是一个基于 Java 17、Spring Boot、Spring AI 和 DDD 分层构建的
 
 ## 系统总览
 
-![TAgent 端到端架构](docs/images/tagent-end-to-end-architecture-2026-06.png)
+![TAgent 端到端架构](docs/images/tagent-end-to-end-architecture-2026-06-v2.png)
 
 主链路：
 
@@ -22,10 +22,11 @@ TAgent 是一个基于 Java 17、Spring Boot、Spring AI 和 DDD 分层构建的
   -> SSE 流式响应
 ```
 
-主链之外还有两条关键控制链：
+主链之外还有几条关键控制链：
 
 - 动态工具补充：路由判断缺失能力，PgVector 从工具目录中匹配真实 MCP 工具，再与 Agent 常驻工具合并。
-- 执行中干预：用户可以发送 `steer` 重做当前步骤，或发送 `answer_now` 跳过剩余步骤并进入 finalize。
+- 执行中干预：用户可以发送 `steer` 重做当前步骤，发送 `answer_now` 跳过剩余步骤并进入 finalize，也可以通过 `cancel` 显式中断当前执行。
+- 主动追问：模型缺少关键信息时可调用 `ask_user`，经 `user_input_required` SSE 事件向用户收集补充，再回填到模型上下文继续执行。
 
 ## 项目亮点
 
@@ -39,8 +40,9 @@ TAgent 是一个基于 Java 17、Spring Boot、Spring AI 和 DDD 分层构建的
 | 工具治理 | 非执行步禁工具、未知工具纠正、参数提示、轮次预算、跨 MCP 并行 |
 | Agentic RAG | SIMPLE、HyDE、FUSION、DECOMPOSE 四种查询策略 |
 | 四层记忆 | Working、Chat、Long-Term、Episodic Memory |
-| 流式干预 | Auto、Flow、Fixed 均支持立即回答与引导 |
-| 人机协同 | 高风险工具调用通过 SSE 请求人工批准或拒绝 |
+| 流式干预 | Auto、Flow、Fixed 均支持立即回答、引导与取消执行 |
+| 主动追问 | `ask_user` 通过 SSE 向用户请求补充信息，默认关闭、按 session 限次和超时 |
+| 人机协同 | 高风险工具调用通过 SSE 请求人工批准或拒绝，主动追问与审批通道隔离 |
 | 可解释输出 | 工具进度、RAG evidence、Memory evidence、步骤状态 |
 | 全链路观测 | Prometheus、ELK、Jaeger、event_log、LLM 成本与 MCP 健康页 |
 
@@ -56,7 +58,7 @@ TAgent 是一个基于 Java 17、Spring Boot、Spring AI 和 DDD 分层构建的
 4. `AiAgentController`：创建 `ResponseBodyEmitter`、注册审批通道并立即发送 `ack`。
 5. Controller 组装 `ExecuteCommandEntity`，交给 Dispatch 异步执行。
 
-`ack` 会携带干预能力是否开启，前端据此决定是否显示“引导”和“立即回答”按钮。
+`ack` 会携带干预能力是否开启，前端据此决定是否显示执行中的操作栏。
 
 ### 2. 统一路由与懒装配
 
@@ -289,7 +291,7 @@ Query Planning
 
 ## 执行中干预
 
-Auto、Flow、Fixed 三种模式均完成了 `steer` 和 `answer_now` 支持。
+Auto、Flow、Fixed 三种模式均完成了 `steer`、`answer_now` 和 `cancel` 支持。前端发送按钮在执行中会切换为取消态；引导复用主输入框，不再单独弹出输入框。
 
 ### 引导 steer
 
@@ -339,6 +341,46 @@ Content-Type: application/json
 - Flow：`flow_step4_answer_now`
 - Fixed：`fixed_answer_now`
 
+### 取消执行 cancel
+
+```http
+POST /api/v1/agent/cancel
+Content-Type: application/json
+
+{
+  "sessionId": "session_demo_001"
+}
+```
+
+行为：
+
+- 后端向 Fixed、Auto、Flow 策略广播取消信号。
+- 正在进行的 LLM 流式调用通过取消触发器尽快截断。
+- 已取消的执行不会继续走剩余步骤或 finalize。
+- 前端会在调用 `/cancel` 后中止本地 fetch，避免浏览器和后端状态脱节。
+
+## 主动追问 ask_user
+
+当模型缺少完成任务所必需的信息，或用户意图存在多种合理理解需要拍板时，可以调用 `ask_user` 主动向用户追问。
+
+流程：
+
+```text
+Advisor + LLM
+  -> ask_user tool_call
+  -> user_input_required SSE
+  -> 用户补充回填
+  -> ask_user tool result
+  -> 继续下一轮推理
+```
+
+设计边界：
+
+- `agent.user-input.enabled=false` 时完全不广播 `ask_user`，默认不影响原链路。
+- `UserInputGate` 按 `sessionId` 限制追问次数，并支持超时自动放行。
+- `ask_user` 与人工审批互不复用 ID：审批管工具授权，`ask_user` 管需求澄清。
+- V048 迁移仅放开分析步的 `ask_user` 例外，避免非执行步误调用真实工具。
+
 ## 人工审批
 
 高风险工具可配置为执行前审批：
@@ -367,6 +409,7 @@ Content-Type: application/json
 | `token` | 逐 token 渲染回答 |
 | `tool_call_start` / `tool_call_end` / `tool_call_error` | 展示工具进度 |
 | `human_approval_required` | 请求人工审批 |
+| `user_input_required` | 模型通过 `ask_user` 请求用户补充信息 |
 | `rag_evidence` | 展示知识库引用依据 |
 | `memory_evidence` | 展示记忆召回依据 |
 | `data` | 返回步骤结果或最终结果 |
@@ -514,6 +557,10 @@ agent:
     max-rounds: 3
   answer-now:
     finalize-tools: true
+  user-input:
+    enabled: false
+    max-asks: 2
+    timeout-seconds: 120
 
   mcp:
     disable-tools-on-nonexec-steps: true

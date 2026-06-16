@@ -52,6 +52,10 @@ public class AiClientModelNode extends AbstractArmorySupport {
     @Resource
     private cn.bugstack.ai.domain.agent.service.security.HumanApprovalGate humanApprovalGate;
 
+    /** D 段：ask_user 人工补充 gate，装配时 setter 注入到 RobustToolCallingManager */
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.security.UserInputGate userInputGate;
+
     /** H3-A：工具调用进度 SSE emitter，装配时 setter 注入到 MeteredToolCallback */
     @Resource
     private cn.bugstack.ai.domain.agent.service.execute.common.ToolCallProgressEmitter toolCallProgressEmitter;
@@ -181,6 +185,8 @@ public class AiClientModelNode extends AbstractArmorySupport {
             // (a) 非执行步禁工具：开关开时，resolveToolDefinitions 对分析/规划/质检/汇总步返回空工具集
             // → 模型请求无 tools 字段 → 模型不会 tool_call（从源头掐，非事后拦截）。关时所有步保留工具（旧行为）。
             robustMgr.setDisableToolsOnNonExecStep(disableToolsOnNonExecStep);
+            // D 段：注入 ask_user gate（gate 内部 enabled=false 时 manager 不广播/不进 gate，零影响）
+            robustMgr.setUserInputGate(userInputGate);
 
             OpenAiChatModel chatModel = OpenAiChatModel.builder()
                     .openAiApi(openAiApi)

@@ -73,6 +73,35 @@ public class RobustToolCallingManager implements ToolCallingManager {
         this.disableToolsOnNonExecStep = v;
     }
 
+    /**
+     * D 段：{@code ask_user} 工具的人工补充 gate（可选，null → 功能关闭）。由 {@code AiClientModelNode}
+     * 装配时 set（和 {@link #disableToolsOnNonExecStep} 同处），manager 经它读 enabled/maxAsks/timeout，
+     * 自身无需任何 @Value。
+     */
+    private volatile cn.bugstack.ai.domain.agent.service.security.UserInputGate userInputGate;
+
+    public void setUserInputGate(cn.bugstack.ai.domain.agent.service.security.UserInputGate g) {
+        this.userInputGate = g;
+    }
+
+    /** ask_user 工具保留名（大小写不敏感匹配）。 */
+    public static final String ASK_USER_TOOL_NAME = "ask_user";
+
+    /**
+     * ask_user 工具定义。模型缺关键信息 / 存在多种合理理解需用户拍板时调用；要求一次把所有问题问全。
+     * 不进 delegate 的 toolCallbacks —— 执行由本 manager 在 {@link #handleAskUser} 内拦截消化。
+     */
+    private static final ToolDefinition ASK_USER_DEFINITION = ToolDefinition.builder()
+            .name(ASK_USER_TOOL_NAME)
+            .description("当你缺少完成任务所必需的关键信息，或对用户意图存在多种合理理解、需要用户拍板时，调用本工具向用户提问。"
+                    + "请把所有需要澄清的问题一次性放进 questions 数组问全，不要逐条反复追问；questions 里每条必须是一个具体、可直接回答的问题，不要写笼统含糊的话。"
+                    + "用户会以自由文本回答（可能直接回答、也可能补充信息或调整需求），其回答会作为本工具的结果返回给你，请据此继续完成任务。")
+            .inputSchema("{\"type\":\"object\",\"properties\":{"
+                    + "\"context\":{\"type\":\"string\",\"description\":\"可选。向用户说明你为什么需要这些信息，或你目前的理解，便于用户作答\"},"
+                    + "\"questions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"要问用户的问题列表，每条是一个具体、可直接回答的问题，尽量一次问全\"}"
+                    + "},\"required\":[\"questions\"]}")
+            .build();
+
     public RobustToolCallingManager(ToolCallingManager delegate) {
         this(delegate, null, null, false, null, 0);
     }
@@ -105,11 +134,25 @@ public class RobustToolCallingManager implements ToolCallingManager {
 
     @Override
     public List<ToolDefinition> resolveToolDefinitions(ToolCallingChatOptions options) {
+        List<ToolDefinition> base;
         if (disableToolsOnNonExecStep && isNonExecStep(options)) {
-            // 非执行步：不暴露工具定义 → 请求无 tools 字段 → 模型根本不会 tool_call（从源头掐掉，非事后拦截）
-            return List.of();
+            // 非执行步：不暴露真实工具定义 → 请求无真实 tools → 模型不会调真实工具（从源头掐掉，非事后拦截）
+            base = new ArrayList<>();
+        } else {
+            base = new ArrayList<>(delegate.resolveToolDefinitions(options));
         }
-        return delegate.resolveToolDefinitions(options);
+        // D 段：在「非执行步禁真实工具」之后再追加 ask_user —— 非执行步=[ask_user]，执行步=[真实工具…, ask_user]。
+        // 追加不替换 → 不覆盖原工具；预算用尽 / 开关关 → 不追加，行为同现状。
+        if (askUserAvailable()) {
+            base.add(ASK_USER_DEFINITION);
+        }
+        return base;
+    }
+
+    /** ask_user 当前是否可广播：gate 存在且开启，且本次执行预算未用尽。sessionId 取自 MDC。 */
+    private boolean askUserAvailable() {
+        if (userInputGate == null || !userInputGate.isEnabled()) return false;
+        return userInputGate.remainingFor(org.slf4j.MDC.get("sessionId")) > 0;
     }
 
     /**
@@ -142,6 +185,12 @@ public class RobustToolCallingManager implements ToolCallingManager {
     public ToolExecutionResult executeToolCalls(Prompt prompt, ChatResponse chatResponse) {
         if (prompt == null || chatResponse == null) {
             return delegate.executeToolCalls(prompt, chatResponse);
+        }
+
+        // D 段：ask_user 不是注册 callback（不在 toolCallbacks 里）→ 必须在 caseMap / unknown-tool 检查之前
+        // 由本 manager 自己消化，否则会被 findUnknownToolNames 当成幻觉工具误杀。
+        if (userInputGate != null && userInputGate.isEnabled() && hasAskUserCall(chatResponse)) {
+            return handleAskUser(prompt, chatResponse);
         }
 
         // 拿 prompt 自带的真实工具名（注入到 ChatClient.defaultToolCallbacks 的那一组）
@@ -187,16 +236,126 @@ public class RobustToolCallingManager implements ToolCallingManager {
         return delegate.executeToolCalls(prompt, normalized);
     }
 
-    /** 统计当前 client 执行链路已经走过多少个串行工具轮次；一条 ToolResponseMessage 代表一轮，可含多条并行响应。 */
+    /**
+     * 统计当前 client 执行链路已经走过多少个串行工具轮次；一条 ToolResponseMessage 代表一轮，可含多条并行响应。
+     * <p>
+     * D 段：纯 ask_user 的 ToolResponseMessage 不计工具轮（用户拍板：单独问用户不消耗工具预算；
+     * 与真实工具并行的混合批含真实响应 → 仍计 1 轮）。
+     */
     private int countPriorToolRounds(Prompt prompt) {
         int count = 0;
         if (prompt == null || prompt.getInstructions() == null) return 0;
         for (Message message : prompt.getInstructions()) {
             if (message instanceof ToolResponseMessage trm && trm.getResponses() != null && !trm.getResponses().isEmpty()) {
+                if (isAskUserOnlyResponses(trm.getResponses())) continue;
                 count++;
             }
         }
         return count;
+    }
+
+    /** 该批响应是否「全是 ask_user」——纯 ask_user 轮不计工具预算。 */
+    private boolean isAskUserOnlyResponses(List<ToolResponseMessage.ToolResponse> responses) {
+        for (ToolResponseMessage.ToolResponse r : responses) {
+            if (!isAskUserName(r.name())) return false;
+        }
+        return true;
+    }
+
+    private boolean isAskUserName(String name) {
+        return name != null && ASK_USER_TOOL_NAME.equalsIgnoreCase(name);
+    }
+
+    private boolean hasAskUserCall(ChatResponse chatResponse) {
+        for (Generation gen : chatResponse.getResults()) {
+            if (gen.getOutput() == null || !gen.getOutput().hasToolCalls()) continue;
+            for (AssistantMessage.ToolCall tc : gen.getOutput().getToolCalls()) {
+                if (isAskUserName(tc.name())) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * D 段：消化含 ask_user 的这一批 tool_calls。逐个 call 构建响应：
+     * <ul>
+     *   <li>ask_user → 调 {@link cn.bugstack.ai.domain.agent.service.security.UserInputGate} 阻塞拿用户回答（超时/预算/通道缺失返结构化提示）；</li>
+     *   <li>真实工具（混合批场景）→ 复用 {@link #executeSingleToolCall} 委托 delegate 单工具执行（保留 callback 查找 / metric）；</li>
+     *   <li>未知工具 → 同 {@link #buildUnknownToolErrorResult} 语义返「工具不存在」。</li>
+     * </ul>
+     * 组装成<b>单条</b> ToolResponseMessage（覆盖原 assistant message 里全部 tool_call_id），保证回填对齐。
+     * 纯 ask_user 批不经轮次预算检查（早返回），与真实工具混合时其响应在下一轮按 {@link #countPriorToolRounds} 计 1 轮。
+     */
+    private ToolExecutionResult handleAskUser(Prompt prompt, ChatResponse chatResponse) {
+        Map<String, String> caseMap = buildLowerToOriginalNameMap(prompt);
+        ChatResponse normalized = caseMap.isEmpty() ? chatResponse : normalizeToolCallNames(chatResponse, caseMap);
+        Generation toolGen = firstGenerationWithToolCalls(normalized);
+        if (toolGen == null || toolGen.getOutput() == null) {
+            return delegate.executeToolCalls(prompt, normalized);
+        }
+        AssistantMessage fullAm = toolGen.getOutput();
+        List<AssistantMessage.ToolCall> calls = fullAm.getToolCalls();
+        Set<String> realNames = new HashSet<>(caseMap.values());
+
+        String sessionId = org.slf4j.MDC.get("sessionId");
+        String stepLabel = currentStepLabel(prompt);
+
+        List<ToolResponseMessage.ToolResponse> responses = new ArrayList<>(calls.size());
+        for (AssistantMessage.ToolCall tc : calls) {
+            if (isAskUserName(tc.name())) {
+                responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(), runAskUser(sessionId, tc, stepLabel)));
+            } else if (!realNames.contains(tc.name())) {
+                log.warn("[RobustToolMgr] unknown tool '{}' in ask_user batch", tc.name());
+                if (metrics != null) metrics.recordUnknownToolName(tc.name());
+                responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(),
+                        "工具不存在（tool not found）：" + tc.name() + "。禁止编造工具名，只能使用已注册的真实工具。"));
+            } else {
+                try {
+                    responses.add(executeSingleToolCall(prompt, normalized, toolGen, tc));
+                } catch (Exception e) {
+                    log.warn("[RobustToolMgr] tool '{}' failed in ask_user batch: {}", tc.name(), e.getMessage());
+                    responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(),
+                            "工具执行失败（tool execution failed）：" + e.getMessage()
+                                    + "。请不要重复同样的无效调用，可基于已有信息回答。"));
+                }
+            }
+        }
+
+        List<Message> conversationHistory = new ArrayList<>(prompt.getInstructions());
+        conversationHistory.add(fullAm);
+        conversationHistory.add(ToolResponseMessage.builder().responses(responses).metadata(Map.of()).build());
+        return ToolExecutionResult.builder()
+                .conversationHistory(conversationHistory)
+                .returnDirect(false)
+                .build();
+    }
+
+    /** 调 gate 阻塞提问，把状态翻译成给 LLM 的工具结果文本。 */
+    private String runAskUser(String sessionId, AssistantMessage.ToolCall tc, String stepLabel) {
+        cn.bugstack.ai.domain.agent.service.security.UserInputGate.Result r =
+                userInputGate.requestUserInput(sessionId, tc.arguments(), stepLabel);
+        switch (r.status) {
+            case ANSWERED:
+                return (r.answer == null || r.answer.isBlank())
+                        ? "用户未填写具体内容。请基于现有信息继续完成任务。"
+                        : "用户回复：" + r.answer;
+            case TIMEOUT:
+                return "用户未在规定时间内回应。请基于现有信息继续完成任务，必要时在答案中说明哪些信息缺失及你做出的假设。";
+            case BUDGET_EXCEEDED:
+                return "向用户提问的次数已用完，请不要再调用 ask_user。请基于已经掌握的信息给出最佳答案。";
+            case UNAVAILABLE:
+            default:
+                return "当前无法向用户提问（交互通道不可用）。请基于现有信息继续完成任务。";
+        }
+    }
+
+    /** 取当前步骤标签：优先 ToolContext 的 stepLabel，退 MDC step；都没有返 null（前端不显示步骤行）。 */
+    private String currentStepLabel(Prompt prompt) {
+        if (prompt.getOptions() instanceof ToolCallingChatOptions tco && tco.getToolContext() != null) {
+            Object v = tco.getToolContext().get("stepLabel");
+            if (v != null) return String.valueOf(v);
+        }
+        return org.slf4j.MDC.get("step");
     }
 
     /** 取第一个含 tool call 的 Generation（与 buildUnknownToolErrorResult 取法一致，通常只有一个）。 */

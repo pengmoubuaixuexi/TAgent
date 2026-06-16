@@ -128,11 +128,17 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
                     if (sessionRefCounter != null) sessionRefCounter.clear(sessionId);
                     finalStrategy1.execute(requestParameter, emitter);
                 } catch (Exception e) {
-                    log.error("Agent执行异常：agentId={} strategy={} error={}", finalAgentId, finalStrategy, e.getMessage(), e);
-                    try {
-                        emitter.send("执行异常：" + e.getMessage());
-                    } catch (Exception ex) {
-                        log.error("发送异常信息失败：{}", ex.getMessage(), ex);
+                    // 取消（用户点取消 / 客户端断开）会抛 CancellationException，属正常中止，静默结束不报错给前端
+                    if (e instanceof java.util.concurrent.CancellationException
+                            || e.getCause() instanceof java.util.concurrent.CancellationException) {
+                        log.info("[Dispatch] 执行已取消 agentId={} strategy={} sessionId={}", finalAgentId, finalStrategy, sessionId);
+                    } else {
+                        log.error("Agent执行异常：agentId={} strategy={} error={}", finalAgentId, finalStrategy, e.getMessage(), e);
+                        try {
+                            emitter.send("执行异常：" + e.getMessage());
+                        } catch (Exception ex) {
+                            log.error("发送异常信息失败：{}", ex.getMessage(), ex);
+                        }
                     }
                 } finally {
                     if (sessionRefCounter != null) sessionRefCounter.clear(sessionId);
@@ -172,6 +178,19 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
                 s.steerExecute(sessionId, idea);
             } catch (Exception e) {
                 log.debug("[Dispatch] steerExecute on {} failed: {}", s.getClass().getSimpleName(), e.getMessage());
+            }
+        }
+    }
+
+    /** 取消：广播给所有策略；持有该 session 的策略中止剩余执行并截断在飞流式调用，其余 no-op。 */
+    @Override
+    public void cancelExecute(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) return;
+        for (IExecuteStrategy s : executeStrategyMap.values()) {
+            try {
+                s.cancelExecute(sessionId);
+            } catch (Exception e) {
+                log.debug("[Dispatch] cancelExecute on {} failed: {}", s.getClass().getSimpleName(), e.getMessage());
             }
         }
     }

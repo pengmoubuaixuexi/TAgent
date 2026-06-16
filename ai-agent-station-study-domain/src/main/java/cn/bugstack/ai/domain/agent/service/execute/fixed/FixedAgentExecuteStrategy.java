@@ -361,6 +361,9 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         AtomicBoolean flag = cancelFlags.get(sessionId);
         if (flag != null) {
             flag.set(true);
+            // 立即截断在飞流式调用；line 297 流式返回后检查 cancelled→break，不走 finalize
+            reactor.core.publisher.Sinks.One<Object> t = cancelTriggers.get(sessionId);
+            if (t != null) t.tryEmitValue(Boolean.TRUE);
             log.info("[FixedAgent] cancelExecute called for sessionId={}", sessionId);
         }
     }

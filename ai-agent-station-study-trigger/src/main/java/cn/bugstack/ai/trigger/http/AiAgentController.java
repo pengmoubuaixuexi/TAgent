@@ -84,6 +84,8 @@ public class AiAgentController implements IAiAgentService {
                 emitter.onCompletion(() -> approvalChannelRegistry.unregister(sessionId, emitter));
                 emitter.onTimeout(() -> approvalChannelRegistry.unregister(sessionId, emitter));
                 emitter.onError(e -> approvalChannelRegistry.unregister(sessionId, emitter));
+                // D 段：每次执行入口清零 ask_user 提问计数，避免 session 复用时上一轮额度残留
+                userInputGate.reset(sessionId);
             }
 
             // 2026-05-07 #2 TTFT 优化：emitter 创建后立即吐一个 ack 事件，
@@ -305,6 +307,31 @@ public class AiAgentController implements IAiAgentService {
     }
 
     /**
+     * D 段：ask_user 工具的用户回答回填入口。前端在收到 {@code user_input_required} SSE 事件、用户填完后 POST 过来。
+     */
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.security.UserInputGate userInputGate;
+
+    @RequestMapping(value = "user-input", method = RequestMethod.POST)
+    public Response<Boolean> submitUserInput(@RequestBody Map<String, Object> request) {
+        String inputId = (String) request.get("inputId");
+        String answer = request.get("answer") != null ? String.valueOf(request.get("answer")) : null;
+        if (inputId == null || inputId.isBlank()) {
+            return Response.<Boolean>builder()
+                    .code(ResponseCode.UN_ERROR.getCode())
+                    .info("缺少 inputId")
+                    .data(false)
+                    .build();
+        }
+        userInputGate.resolveUserInput(inputId, answer);
+        return Response.<Boolean>builder()
+                .code(ResponseCode.SUCCESS.getCode())
+                .info("已提交")
+                .data(true)
+                .build();
+    }
+
+    /**
      * 立即回答：中止当前 session 剩余执行，跳各模式 finalize 例程基于半成品作答。
      * 设计见 docs/INTERVENTION_立即回答与引导回复_设计.md。
      */
@@ -338,6 +365,21 @@ public class AiAgentController implements IAiAgentService {
         agentDispatchService.steerExecute(sessionId, idea);
         log.info("[Steer] sessionId={} ideaLen={}", sessionId, idea.length());
         return Response.<Boolean>builder().code(ResponseCode.SUCCESS.getCode()).info("已提交引导").data(true).build();
+    }
+
+    /**
+     * 取消执行：中止当前 session 正在跑的任务，截断在飞流式调用、跳过剩余步骤（不产出答案）。
+     * 不受 interventionEnabled 约束——「停止」是基础控制，任何时候都应可用。
+     */
+    @RequestMapping(value = "cancel", method = RequestMethod.POST)
+    public Response<Boolean> cancel(@RequestBody Map<String, Object> request) {
+        String sessionId = request != null ? (String) request.get("sessionId") : null;
+        if (sessionId == null || sessionId.isBlank()) {
+            return Response.<Boolean>builder().code(ResponseCode.UN_ERROR.getCode()).info("缺少 sessionId").data(false).build();
+        }
+        agentDispatchService.cancelExecute(sessionId);
+        log.info("[Cancel] sessionId={}", sessionId);
+        return Response.<Boolean>builder().code(ResponseCode.SUCCESS.getCode()).info("已取消").data(true).build();
     }
 
     /** 取第一个非空非空白的字符串值 */

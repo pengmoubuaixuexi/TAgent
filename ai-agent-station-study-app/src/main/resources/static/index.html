@@ -249,8 +249,54 @@
     </div>
   </div>
 
+  <!-- D 段：ask_user —— AI 主动请求用户补充信息（与审批独立通道，按 inputId 各解各的，不串话） -->
+  <div id="userInputModal" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+    <div class="bg-gray-900 rounded-2xl p-6 border border-indigo-700/70 w-full max-w-xl shadow-2xl">
+      <div class="flex items-start justify-between gap-4 mb-4">
+        <div>
+          <h3 class="text-lg font-bold text-white">AI 需要你补充信息</h3>
+          <p id="userInputCountdown" class="text-xs text-indigo-300 mt-1"></p>
+        </div>
+        <button onclick="dismissUserInput()" class="text-gray-500 hover:text-white text-xl">&times;</button>
+      </div>
+      <div class="space-y-3">
+        <div id="userInputStepWrap" class="hidden">
+          <div class="text-xs text-gray-500 mb-1">所属步骤</div>
+          <div id="userInputStep" class="text-sm text-indigo-200 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 break-all"></div>
+        </div>
+        <div id="userInputContextWrap" class="hidden">
+          <div id="userInputContext" class="text-sm text-gray-200 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 whitespace-pre-wrap break-words"></div>
+        </div>
+        <div id="userInputQuestionsWrap" class="hidden">
+          <div class="text-xs text-gray-500 mb-1">AI 想了解</div>
+          <ul id="userInputQuestions" class="text-sm text-gray-100 bg-gray-950 border border-gray-800 rounded-lg p-3 space-y-1.5 max-h-56 overflow-auto list-disc list-inside"></ul>
+        </div>
+        <div>
+          <div class="text-xs text-gray-500 mb-1">你的回答（可回答问题，也可补充信息或调整需求）</div>
+          <textarea id="userInputAnswer" rows="4" class="w-full text-sm text-gray-100 bg-gray-950 border border-gray-800 rounded-lg p-3 focus:outline-none focus:border-indigo-600 resize-none" placeholder="自由输入..."></textarea>
+        </div>
+        <div id="userInputStatus" class="hidden text-sm"></div>
+        <div class="flex justify-end gap-3 pt-2">
+          <button id="userInputSubmitBtn" onclick="submitUserInput()" class="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg transition text-sm font-medium">提交</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Input -->
   <div class="bg-gray-900 border-t border-gray-800 p-4 shrink-0">
+    <!-- 干预浮条：流式中且开启干预时浮现在输入框上方（半透明）；引导直接复用下方输入框 -->
+    <div id="interveneBar" class="hidden max-w-4xl mx-auto mb-2 flex items-center gap-2 flex-wrap">
+      <button onclick="answerNow()" id="answerNowBtn" title="基于已有信息立即作答，中止剩余步骤"
+        class="bg-amber-600/70 hover:bg-amber-600 disabled:opacity-50 text-white px-3 py-1.5 rounded-full transition text-sm font-medium shadow">
+        ⚡ 立即回答
+      </button>
+      <button onclick="steer()" id="steerBtn" title="在下方输入框写下新想法后点此（或直接回车），Agent 在当前步重做并纳入考虑，不丢弃已有进展"
+        class="bg-indigo-600/70 hover:bg-indigo-600 disabled:opacity-50 text-white px-3 py-1.5 rounded-full transition text-sm font-medium shadow">
+        💬 引导
+      </button>
+      <span class="text-xs text-gray-400">运行中 · 在下方输入框补充引导后回车 / 点「引导」，或点「立即回答」收尾</span>
+    </div>
     <div class="max-w-4xl mx-auto flex gap-3">
       <button onclick="newSession()" title="新会话"
         class="bg-gray-800 hover:bg-gray-700 text-gray-400 px-3 py-3 rounded-lg transition text-sm shrink-0">
@@ -258,17 +304,9 @@
       </button>
       <textarea id="msgInput" rows="1" placeholder="输入消息..."
         class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition resize-none"
-        onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}"
+        onkeydown="onComposerKey(event)"
         oninput="this.style.height='';this.style.height=Math.min(this.scrollHeight,200)+'px'"></textarea>
-      <button onclick="steer()" id="steerBtn" title="补充一个新想法，让 Agent 在当前步重做并纳入考虑（不丢弃已有进展）"
-        class="hidden bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 disabled:opacity-50 text-white px-4 py-3 rounded-lg transition font-medium shrink-0">
-        💬 引导
-      </button>
-      <button onclick="answerNow()" id="answerNowBtn" title="基于已有信息立即作答，中止剩余步骤"
-        class="hidden bg-amber-600 hover:bg-amber-700 active:bg-amber-800 disabled:opacity-50 text-white px-4 py-3 rounded-lg transition font-medium shrink-0">
-        ⚡ 立即回答
-      </button>
-      <button onclick="sendMessage()" id="sendBtn"
+      <button onclick="onSendBtn()" id="sendBtn"
         class="bg-blue-600 hover:bg-blue-700 active:bg-blue-800 disabled:opacity-50 disabled:cursor-not-allowed text-white px-6 py-3 rounded-lg transition font-medium">
         发送
       </button>
@@ -432,7 +470,9 @@ async function sendMessage() {
 
   state.sending = true;
   input.value = ''; input.style.height = '';
-  document.getElementById('sendBtn').disabled = true;
+  const ac = new AbortController();
+  state.abortController = ac;
+  setSendBtn(true);  // 发送中：把「发送」变「取消」（红色、可点）
 
   // 添加用户消息
   addMessage('user', message);
@@ -452,6 +492,7 @@ async function sendMessage() {
   try {
     const res = await fetch(API + '/auto_agent', {
       method: 'POST',
+      signal: ac.signal,
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         aiAgentId: state.currentAgentId || null,
@@ -944,6 +985,8 @@ async function sendMessage() {
         }
       } else if (curEvent === 'human_approval_required') {
         enqueueApproval(payload);
+      } else if (curEvent === 'user_input_required') {
+        showUserInput(payload);
       } else if (curEvent === 'tool_call_start') {
         createToolProgressCard(payload);
       } else if (curEvent === 'tool_call_end') {
@@ -996,31 +1039,92 @@ async function sendMessage() {
     }
     scrollBottom();
   } catch(e) {
-    aiMsg.querySelector('.msg-content').innerHTML = `<span class="text-red-400">❌ 请求失败: ${escapeHtml(e.message)}</span>`;
-    aiMsg.classList.remove('typing');
+    if (e && e.name === 'AbortError') {
+      // 用户点了「取消」：保留已生成的内容，仅追加一条停止标记，不当作错误
+      aiMsg.classList.remove('typing');
+      const c = aiMsg.querySelector('.msg-content');
+      if (c) c.insertAdjacentHTML('beforeend', '<div class="text-xs text-gray-500 mt-2">⏹ 已取消</div>');
+    } else {
+      aiMsg.querySelector('.msg-content').innerHTML = `<span class="text-red-400">❌ 请求失败: ${escapeHtml(e.message)}</span>`;
+      aiMsg.classList.remove('typing');
+    }
   } finally {
     state.sending = false;
-    document.getElementById('sendBtn').disabled = false;
+    state.abortController = null;
+    setSendBtn(false);  // 恢复「发送」
     showAnswerNow(false);
     clearApprovalTimer();
     scrollBottom(true);
   }
 }
 
-// 立即回答 + 引导：根据 (sending && interventionEnabled) 显隐两个按钮
+// 立即回答 + 引导：流式中且开启干预时，浮现输入框上方的半透明浮条；引导复用下方输入框
 function showAnswerNow(show) {
   const visible = show && state.sending && state.interventionEnabled;
+  const bar = document.getElementById('interveneBar');
+  if (bar) bar.classList.toggle('hidden', !visible);
   const an = document.getElementById('answerNowBtn');
-  if (an) { if (visible) { an.classList.remove('hidden'); an.disabled = false; an.textContent = '⚡ 立即回答'; } else an.classList.add('hidden'); }
+  if (an && visible) { an.disabled = false; an.textContent = '⚡ 立即回答'; }
   const st = document.getElementById('steerBtn');
-  if (st) { if (visible) { st.classList.remove('hidden'); st.disabled = false; st.textContent = '💬 引导'; } else st.classList.add('hidden'); }
+  if (st && visible) { st.disabled = false; st.textContent = '💬 引导'; }
+  const box = document.getElementById('msgInput');
+  if (box) box.placeholder = visible ? '运行中：在此输入引导内容，回车即发送引导…' : '输入消息...';
 }
 
-// 引导：补充新想法，POST /steer，后端在当前步重做并纳入想法（不丢弃进度、不关思考）
+// 发送/取消 双态按钮：发送中显示红色「取消」（不禁用），否则蓝色「发送」
+function setSendBtn(sending) {
+  const b = document.getElementById('sendBtn');
+  if (!b) return;
+  b.disabled = false;
+  if (sending) {
+    b.textContent = '取消';
+    b.classList.remove('bg-blue-600','hover:bg-blue-700','active:bg-blue-800');
+    b.classList.add('bg-red-600','hover:bg-red-700','active:bg-red-800');
+  } else {
+    b.textContent = '发送';
+    b.classList.remove('bg-red-600','hover:bg-red-700','active:bg-red-800');
+    b.classList.add('bg-blue-600','hover:bg-blue-700','active:bg-blue-800');
+  }
+}
+
+// 按钮点击分发：发送中→取消，否则→发送
+function onSendBtn() {
+  if (state.sending) cancelSend();
+  else sendMessage();
+}
+
+// 取消：① 通知后端截断（关键——光 abort 本地停不掉后端，后端会继续跑烧配额）② 中止本地 SSE 读取
+async function cancelSend() {
+  const b = document.getElementById('sendBtn');
+  if (b) { b.disabled = true; b.textContent = '取消中…'; }
+  if (state.sessionId) {
+    try {
+      await fetch(API + '/cancel', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ sessionId: state.sessionId })
+      });
+    } catch (e) { /* 后端取消请求失败也继续 abort 本地 */ }
+  }
+  if (state.abortController) { try { state.abortController.abort(); } catch (e) {} }
+  // abort 会让 sendMessage 的 fetch/reader 抛 AbortError → 其 finally 复位按钮与状态
+}
+
+// 输入框回车分发：流式 + 开启干预时走「引导」（复用输入框），否则发新消息
+function onComposerKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    if (state.sending && state.interventionEnabled) steer();
+    else sendMessage();
+  }
+}
+
+// 引导：复用主输入框的内容，POST /steer，后端在当前步重做并纳入想法（不丢弃进度、不关思考）
 async function steer() {
   if (!state.sessionId || !state.sending) return;
-  const idea = (window.prompt('补充你的新想法（Agent 会在当前步重做并纳入考虑）：') || '').trim();
-  if (!idea) return;
+  const box = document.getElementById('msgInput');
+  const idea = ((box && box.value) || '').trim();
+  if (!idea) { if (box) box.focus(); return; }  // 空则聚焦输入框，提示用户先输入
   const btn = document.getElementById('steerBtn');
   try {
     if (btn) { btn.disabled = true; btn.textContent = '💬 已提交'; }
@@ -1029,6 +1133,7 @@ async function steer() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ sessionId: state.sessionId, idea })
     });
+    if (box) { box.value = ''; box.style.height = ''; }  // 发出后清空并复位高度
   } catch (e) {
     if (btn) { btn.disabled = false; btn.textContent = '💬 引导'; }
   } finally {
@@ -1202,6 +1307,125 @@ async function submitApproval(approved) {
   } catch (e) {
     setApprovalButtons(false);
     setApprovalStatus('提交失败：' + (e.message || '未知错误'), 'error');
+  }
+}
+
+// ==================== ASK_USER（AI 主动请求补充信息）====================
+// 与审批独立：按 inputId 各发各的 POST /user-input，互不串话；阻塞在后端 gate，超时后端自动放行
+function showUserInput(payload) {
+  if (!payload || !payload.inputId) return;
+  state.pendingUserInput = payload;
+
+  const stepWrap = document.getElementById('userInputStepWrap');
+  const stepEl = document.getElementById('userInputStep');
+  if (payload.step) { stepEl.textContent = payload.step; stepWrap.classList.remove('hidden'); }
+  else { stepEl.textContent = ''; stepWrap.classList.add('hidden'); }
+
+  const ctxWrap = document.getElementById('userInputContextWrap');
+  const ctxEl = document.getElementById('userInputContext');
+  if (payload.context) { ctxEl.textContent = payload.context; ctxWrap.classList.remove('hidden'); }
+  else { ctxEl.textContent = ''; ctxWrap.classList.add('hidden'); }
+
+  const qWrap = document.getElementById('userInputQuestionsWrap');
+  const qEl = document.getElementById('userInputQuestions');
+  qEl.innerHTML = '';
+  const questions = Array.isArray(payload.questions) ? payload.questions : [];
+  if (questions.length > 0) {
+    questions.forEach(q => { const li = document.createElement('li'); li.textContent = q; qEl.appendChild(li); });
+    qWrap.classList.remove('hidden');
+  } else if (payload.raw) {
+    const li = document.createElement('li'); li.textContent = payload.raw; qEl.appendChild(li);
+    qWrap.classList.remove('hidden');
+  } else {
+    qWrap.classList.add('hidden');
+  }
+
+  const ta = document.getElementById('userInputAnswer');
+  ta.value = '';
+  setUserInputStatus('', '');
+  document.getElementById('userInputSubmitBtn').disabled = false;
+  document.getElementById('userInputModal').classList.remove('hidden');
+  ta.focus();
+
+  clearUserInputTimer();
+  const timeoutSeconds = Number(payload.timeoutSeconds || 0);
+  if (timeoutSeconds > 0) {
+    const deadline = Date.now() + timeoutSeconds * 1000;
+    updateUserInputCountdown(deadline);
+    state.userInputTimer = setInterval(() => updateUserInputCountdown(deadline), 1000);
+  } else {
+    document.getElementById('userInputCountdown').textContent = '';
+  }
+}
+
+function updateUserInputCountdown(deadline) {
+  const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+  document.getElementById('userInputCountdown').textContent = left > 0
+    ? `请在 ${left} 秒内回答，超时 AI 会基于现有信息继续`
+    : '已超时，AI 会基于现有信息继续';
+  if (left <= 0) {
+    clearUserInputTimer();
+    document.getElementById('userInputSubmitBtn').disabled = true;
+    setUserInputStatus('已超时，AI 已基于现有信息继续', 'error');
+    const timedOut = state.pendingUserInput;
+    setTimeout(() => {
+      if (state.pendingUserInput && timedOut && state.pendingUserInput.inputId === timedOut.inputId) {
+        hideUserInputModal();
+        state.pendingUserInput = null;
+      }
+    }, 1200);
+  }
+}
+
+// 用户主动关闭：放弃本次（后端会超时自动放行）
+function dismissUserInput() {
+  hideUserInputModal();
+  state.pendingUserInput = null;
+}
+
+function hideUserInputModal() {
+  document.getElementById('userInputModal').classList.add('hidden');
+  clearUserInputTimer();
+}
+
+function clearUserInputTimer() {
+  if (state.userInputTimer) { clearInterval(state.userInputTimer); state.userInputTimer = null; }
+}
+
+function setUserInputStatus(text, kind) {
+  const el = document.getElementById('userInputStatus');
+  if (!text) { el.className = 'hidden text-sm'; el.textContent = ''; return; }
+  const color = kind === 'error' ? 'text-red-300' : 'text-emerald-300';
+  el.className = `${color} text-sm`;
+  el.textContent = text;
+}
+
+async function submitUserInput() {
+  const cur = state.pendingUserInput;
+  if (!cur || !cur.inputId) return;
+  const answer = document.getElementById('userInputAnswer').value || '';
+  const btn = document.getElementById('userInputSubmitBtn');
+  btn.disabled = true;
+  setUserInputStatus('正在提交...', '');
+  try {
+    const res = await fetch(API + '/user-input', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({inputId: cur.inputId, answer})
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || json.code !== '0000') throw new Error(json.info || `HTTP ${res.status}`);
+    setUserInputStatus('已提交，AI 会据此继续', '');
+    clearUserInputTimer();
+    setTimeout(() => {
+      if (state.pendingUserInput && state.pendingUserInput.inputId === cur.inputId) {
+        hideUserInputModal();
+        state.pendingUserInput = null;
+      }
+    }, 700);
+  } catch (e) {
+    btn.disabled = false;
+    setUserInputStatus('提交失败：' + (e.message || '未知错误'), 'error');
   }
 }
 
