@@ -7,6 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Java 17+](https://img.shields.io/badge/Java-17+-orange)](https://www.oracle.com/java/)
 [![Spring Boot 3.4.3](https://img.shields.io/badge/Spring%20Boot-3.4.3-green)](https://spring.io/projects/spring-boot)
+[![CI](https://github.com/pengmoubuaixuexi/TAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/pengmoubuaixuexi/TAgent/actions/workflows/ci.yml)
 [![GitHub Stars](https://img.shields.io/github/stars/pengmoubuaixuexi/TAgent?style=social)](https://github.com/pengmoubuaixuexi/TAgent)
 
 [🇬🇧 English](./README_EN.md) | 🇨🇳 中文
@@ -56,7 +57,7 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 | 能力 | 实现 |
 |---|---|
 | **三种 Agent 模式** | Fixed 单步直答、Auto 分析执行闭环、Flow DAG 编排 |
-| **数据库驱动装配** | Agent、Client、Model、Prompt、Advisor���RAG、MCP 关系由数据库配置 |
+| **数据库驱动装配** | Agent、Client、Model、Prompt、Advisor、RAG、MCP 关系由数据库配置 |
 | **统一 Agent 路由** | 一次模型调用选择 Agent，并输出可能缺失的工具能力 |
 | **动态 MCP 工具** | 工具目录中文化、意图扩写、PgVector 语义匹配、按请求临时补挂 |
 | **MCP 自愈** | 懒探活、失败重试、超时重连、dead-client 重建、冷却与熔断 |
@@ -268,7 +269,7 @@ Content-Type: application/json
 - 中断当前正在生成的流，而不是等待步骤自然结束
 - 保留当前 reasoning、半截输出和已有步骤结果
 - 将新想法合并到有效用户问题
-- 重做当前步骤，并将引导继续传递到后续���骤
+- 重做当前步骤，并将引导继续传递到后续步骤
 
 ---
 
@@ -322,7 +323,7 @@ Content-Type: application/json
 | `ack` | 确认连接建立并返回干预开关 |
 | `step_start` / `step_end` | 展示 Agent 当前步骤 |
 | `token` | 逐 token 渲染回答 |
-| `tool_call_start` / `tool_call_end` / `tool_call_error` | ���示工具进度 |
+| `tool_call_start` / `tool_call_end` / `tool_call_error` | 展示工具进度 |
 | `human_approval_required` | 请求人工审批 |
 | `user_input_required` | 模型通过 `ask_user` 请求用户补充信息 |
 | `rag_evidence` | 展示知识库引用依据 |
