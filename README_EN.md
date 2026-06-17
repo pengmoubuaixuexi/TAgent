@@ -16,6 +16,12 @@ Unlike simple model wrapper, TAgent covers the **complete end-to-end lifecycle**
 
 *This repository is a sanitized public version without real API keys, runtime logs, chat histories, temporary reports, database backups, or personal data.*
 
+### Who Is This For?
+
+- Developers learning **Java / Spring AI Agent engineering** beyond a simple model wrapper.
+- Builders exploring **MCP tool governance, dynamic tool attachment, Agentic RAG, and multi-layer memory**.
+- Teams looking for a reference implementation of **SSE streaming, human approval, in-execution intervention, proactive `ask_user` clarification, and observability**.
+
 ---
 
 ## 🎯 System Overview
