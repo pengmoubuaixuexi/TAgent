@@ -493,7 +493,7 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
             java.util.function.Supplier<String> basePromptSupplier, String sessionId) {
         String prompt = basePromptSupplier.get();
         String prevPartial = null, prevReasoning = null;
-        String result;
+        String result = null;
         int rounds = 0;
         while (true) {
             String idea = steerEnabled ? dynamicContext.drainSteerIdea() : null;
@@ -503,6 +503,14 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
                 prompt = buildSteerPrompt(rebuilt, idea, prevPartial, prevReasoning);
                 writeSteerMarker(sessionId, stepId, idea, prompt);
                 log.info("[Steer][flow] 重做本步 step={} round={} ideaLen={}", stepId, rounds + 1, idea.length());
+            }
+            // 立即回答/取消若在「引导断旧流 → 起新重做流」的空窗里被点（那一发 fireCancelTrigger 打在已消费的旧触发器上成了
+            // no-op），这里在起新流前拦下：不再跑这条重做流（否则它会整条跑完，让立即回答/取消看起来没反应）。引导内容此时
+            // 已折进持久 steerSupplement、半截思考在 ReasoningContentFilter，上层据 finalizeRequested 跳 finalize 时会捞回；
+            // 返回上一轮已写出的半截（result 非空=已跑过至少一条流），避免覆盖成空丢内容。
+            if (dynamicContext.isFinalizeRequested() || dynamicContext.isCancelled()) {
+                log.info("[Steer][flow] finalize/cancel 已请求，跳过重做流 step={}", stepId);
+                return result != null ? result : (prevPartial != null ? prevPartial : "");
             }
             final String fp = prompt;
             result = callStepWithStreaming(specBuilder.apply(fp), dynamicContext, stepId, displayName, fp, sessionId);

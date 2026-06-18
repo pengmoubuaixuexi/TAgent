@@ -469,6 +469,7 @@ async function sendMessage() {
   if (!state.sessionId) newSession();
 
   state.sending = true;
+  state.finalizing = false;  // 新一轮：清掉上一轮「已点立即回答」的终态，引导/立即回答恢复可用
   input.value = ''; input.style.height = '';
   const ac = new AbortController();
   state.abortController = ac;
@@ -1063,10 +1064,12 @@ function showAnswerNow(show) {
   const visible = show && state.sending && state.interventionEnabled;
   const bar = document.getElementById('interveneBar');
   if (bar) bar.classList.toggle('hidden', !visible);
+  // 终态（已点立即回答）下不再点亮按钮：立即回答收尾中、引导已失效（后端会无视后续 steerIdea）
+  const enable = visible && !state.finalizing;
   const an = document.getElementById('answerNowBtn');
-  if (an && visible) { an.disabled = false; an.textContent = '⚡ 立即回答'; }
+  if (an && enable) { an.disabled = false; an.textContent = '⚡ 立即回答'; }
   const st = document.getElementById('steerBtn');
-  if (st && visible) { st.disabled = false; st.textContent = '💬 引导'; }
+  if (st && enable) { st.disabled = false; st.textContent = '💬 引导'; }
   const box = document.getElementById('msgInput');
   if (box) box.placeholder = visible ? '运行中：在此输入引导内容，回车即发送引导…' : '输入消息...';
 }
@@ -1146,6 +1149,10 @@ async function steer() {
 async function answerNow() {
   if (!state.sessionId || !state.sending) return;
   const btn = document.getElementById('answerNowBtn');
+  const st = document.getElementById('steerBtn');
+  // 进入终态：立即回答优先且不可逆，引导自此失效（后端 callStepWithSteer 会无视后续 steerIdea）→ 把引导按钮一并置灰
+  state.finalizing = true;
+  if (st) { st.disabled = true; st.textContent = '💬 引导'; }
   try {
     if (btn) { btn.disabled = true; btn.textContent = '⚡ 收尾中…'; }
     await fetch(API + '/answer_now', {
@@ -1154,7 +1161,10 @@ async function answerNow() {
       body: JSON.stringify({ sessionId: state.sessionId })
     });
   } catch (e) {
+    // 仅网络层失败才回滚终态；请求成功后保持引导/立即回答置灰
+    state.finalizing = false;
     if (btn) { btn.disabled = false; btn.textContent = '⚡ 立即回答'; }
+    if (st) { st.disabled = false; }
   }
 }
 
