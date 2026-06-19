@@ -129,6 +129,50 @@ public class McpToolCatalogService {
 
     private final Map<String, ToolCallback> dynamicWrapperCache = new ConcurrentHashMap<>();
 
+    /**
+     * 本次执行（按 sessionId）已知的"缺失工具能力描述"(need，多条换行连接)。统一来源：
+     * <ul>
+     *   <li>路由/选定 agent 推断的 need 由 dispatch 层 {@link #setNeeds} 写入（替换式）；</li>
+     *   <li>执行中途 request_tool 由 manager {@link #appendNeed} 追加（去重累加）；</li>
+     *   <li>每个 step 经 {@link #needsFor} 读取后 resolve 补挂工具。</li>
+     * </ul>
+     * 退休了原 {@code ExecuteCommandEntity.dynamicMissingToolDesc} 字段（请求级自动 GC）→
+     * 改用本 map 后<b>必须</b>在执行结束 {@link #clearNeeds} 显式清理，否则泄漏 + 串请求。
+     */
+    private final Map<String, String> sessionNeeds = new ConcurrentHashMap<>();
+
+    /** 路由层写入本次执行的 need（多条已换行连接）。空串视为清除。 */
+    public void setNeeds(String sessionId, String joinedNeeds) {
+        if (sessionId == null || sessionId.isBlank()) return;
+        if (joinedNeeds == null || joinedNeeds.isBlank()) {
+            sessionNeeds.remove(sessionId);
+            return;
+        }
+        sessionNeeds.put(sessionId, joinedNeeds.trim());
+    }
+
+    /** request_tool：执行中途追加一条 need（按行去重、换行累加），供后续 step resolve。 */
+    public void appendNeed(String sessionId, String need) {
+        if (sessionId == null || sessionId.isBlank() || need == null || need.isBlank()) return;
+        String add = need.trim();
+        sessionNeeds.merge(sessionId, add, (old, n) -> {
+            for (String line : old.split("\\r?\\n")) {
+                if (line.trim().equals(n)) return old; // 已含该 need，不重复
+            }
+            return old + "\n" + n;
+        });
+    }
+
+    /** 取本次执行已知的 need（路由 + 中途 request_tool 合并后的换行串）；无则 null。 */
+    public String needsFor(String sessionId) {
+        return sessionId == null ? null : sessionNeeds.get(sessionId);
+    }
+
+    /** 执行结束清理（必须调，否则 sessionId 维度泄漏 + 串请求）。 */
+    public void clearNeeds(String sessionId) {
+        if (sessionId != null) sessionNeeds.remove(sessionId);
+    }
+
     @Value("${agent.dynamic-tools.catalog.warmup-on-startup:false}")
     private boolean warmupOnStartup;
 

@@ -49,7 +49,7 @@ public class Step1AnalyzerNode extends AbstractExecuteSupport {
                 dynamicContext.getMaxStep(),
                 !dynamicContext.getExecutionHistory().isEmpty() ? dynamicContext.getExecutionHistory().toString() : "[首次执行]",
                 dynamicContext.getCurrentTask()
-        ));
+        ) + metaToolPromptHint(requestParameter.getSessionId()));
 
         ChatClient chatClient = getChatClientByClientId(aiAgentClientFlowConfigVO.getClientId());
         List<ToolCallback> dynamicToolCallbacks = resolveAgentDynamicToolCallbacks(requestParameter, aiAgentClientFlowConfigVO.getClientId());

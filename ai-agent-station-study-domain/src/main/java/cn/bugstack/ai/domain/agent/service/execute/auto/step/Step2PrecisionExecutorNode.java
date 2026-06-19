@@ -63,7 +63,7 @@ public class Step2PrecisionExecutorNode extends AbstractExecuteSupport{
         String executorClientId = aiAgentClientFlowConfigVO.getClientId();
         List<ToolCallback> dynamicToolCallbacks = mcpToolCatalogService != null
                 ? mcpToolCatalogService.resolveDynamicToolCallbacks(executorClientId,
-                        requestParameter.getDynamicMissingToolDesc(), requestParameter.getMessage(),
+                        mcpToolCatalogService.needsFor(requestParameter.getSessionId()), requestParameter.getMessage(),
                         agentToolRegistry != null ? agentToolRegistry.getTools(executorClientId) : List.of())
                 : List.of();
         if (agentToolRegistry != null && executorClientId != null) {

@@ -122,6 +122,9 @@ agent:
     enabled: ${AGENT_USER_INPUT_ENABLED:false}
     max-asks: ${AGENT_USER_INPUT_MAX_ASKS:2}
     timeout-seconds: ${AGENT_USER_INPUT_TIMEOUT_SECONDS:120}
+  request-tool:
+    enabled: ${AGENT_REQUEST_TOOL_ENABLED:false}
+    max-calls: ${AGENT_REQUEST_TOOL_MAX_CALLS:3}
   no-think:
     reasoning-effort: ${AGENT_NO_THINK_REASONING_EFFORT:}
     body-params: ${AGENT_NO_THINK_BODY_PARAMS:}

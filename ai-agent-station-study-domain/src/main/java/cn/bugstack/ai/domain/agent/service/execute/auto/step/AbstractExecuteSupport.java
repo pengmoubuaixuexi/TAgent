@@ -77,6 +77,14 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
     @Resource
     protected McpToolCatalogService dynamicMcpToolCatalogService;
 
+    /** ask_user 人工补充 gate；用于判断「非执行步元工具豁免」提示是否提及 ask_user（功能关则不提，免幻觉）。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    protected cn.bugstack.ai.domain.agent.service.security.UserInputGate userInputGate;
+
+    /** request_tool 开关；与 {@link #dynamicMcpToolCatalogService} 同时具备才在豁免提示里提及 request_tool。 */
+    @org.springframework.beans.factory.annotation.Value("${agent.request-tool.enabled:false}")
+    protected boolean requestToolEnabled;
+
     /** P2.4 13.2 Token Budget：每步最大输出 token 数（0=不限） */
     @org.springframework.beans.factory.annotation.Value("${agent.token-budget.step1-max-tokens:0}")
     protected int step1MaxTokens;
@@ -105,8 +113,29 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
             return List.of();
         }
         return dynamicMcpToolCatalogService.resolveDynamicToolCallbacks(clientId,
-                requestParameter.getDynamicMissingToolDesc(), requestParameter.getMessage(),
+                dynamicMcpToolCatalogService.needsFor(requestParameter.getSessionId()), requestParameter.getMessage(),
                 dynamicAgentToolRegistry != null ? dynamicAgentToolRegistry.getTools(clientId) : List.of());
+    }
+
+    /**
+     * 非执行步「除元工具外不执行」豁免提示：仅在对应功能<b>实际开启</b>时才提及该元工具，
+     * 避免功能在配置里被关闭时仍提示模型可用 → 诱发对未广播工具的幻觉调用。两者都关返回空串（零注入）。
+     * <p>用法：拼到分析等非执行步 prompt 末尾即可，与 {@code RobustToolCallingManager.resolveToolDefinitions}
+     * 实际广播 ask_user/request_tool 的条件保持同源（gate.enabled / requestToolEnabled）。
+     */
+    protected String metaToolPromptHint(String sessionId) {
+        // ask_user 的提示条件必须与实际广播条件一致：广播除 isEnabled() 外还看本会话剩余额度 remainingFor>0
+        //（见 RobustToolCallingManager.askUserAvailable），否则额度用尽后 prompt 仍说"可用"但请求里不广播该工具 → 幻觉调用。
+        boolean askOn = userInputGate != null && userInputGate.isEnabled()
+                && userInputGate.remainingFor(sessionId) > 0;
+        boolean reqOn = requestToolEnabled && dynamicMcpToolCatalogService != null;
+        if (!askOn && !reqOn) return "";
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n\n## 本阶段可用的元工具（例外）\n");
+        sb.append("本阶段不执行用户的实际任务，但下列元工具属于例外、可按需调用（调用它们不算执行用户任务）：\n");
+        if (askOn) sb.append("- ask_user：关键信息缺失、或对用户意图有多种合理理解需用户拍板时，向用户提问澄清（一次把问题问全）。\n");
+        if (reqOn) sb.append("- request_tool：发现完成任务需要当前工具列表里没有的能力时，在 needs 里逐条用一句话描述所缺能力，预先装载真实工具供后续步骤使用。\n");
+        return sb.toString();
     }
 
     /**

@@ -30,7 +30,7 @@ public record RouteDecision(
         return missingToolDescs != null && !missingToolDescs.isEmpty();
     }
 
-    /** 多条 need 用换行连成单串，喂给沿用单字段透传的 {@code ExecuteCommandEntity.dynamicMissingToolDesc}。 */
+    /** 多条 need 用换行连成单串，由 dispatch 层经 {@code McpToolCatalogService.setNeeds(sessionId, ...)} 写入会话级 store。 */
     public String missingToolDescJoined() {
         return missingToolDescs == null || missingToolDescs.isEmpty()
                 ? null : String.join("\n", missingToolDescs);

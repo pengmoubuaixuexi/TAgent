@@ -544,7 +544,7 @@ async function sendMessage() {
     // 2026-05-07 DAG UX：在执行前先广播所有 step 占位卡片
     // status: 'pending' = 等待依赖完成，'running' = 正在跑，'done' = 完成
     function createPendingStepCard(stepId, displayName, dependsOn) {
-      const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card)');
+      const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card):not(.tool-card)');
       if (placeholder) placeholder.remove();
       const card = document.createElement('div');
       card.className = 'step-card pending collapsed fade-in';
@@ -571,7 +571,7 @@ async function sendMessage() {
       let entry = stepBuffers[stepId];
       if (!entry) {
         // 没收到 pending（比如 fixed / auto 的单 step 路径），临时创建一张
-        const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card)');
+        const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card):not(.tool-card)');
         if (placeholder) placeholder.remove();
         const card = document.createElement('div');
         card.className = 'step-card running fade-in';
@@ -642,6 +642,24 @@ async function sendMessage() {
         .replace(/^spring_ai_mcp_client_/i, '');
     }
 
+    // 元工具(ask_user / request_tool)：不是真实 MCP 工具，由后端 RobustToolCallingManager 自消化，
+    // 后端用 emitMetaStart/emitMetaEnd 复用 tool_call_start/end 走同一套卡片，但内容专用渲染。
+    function isMetaTool(toolName) {
+      const n = String(toolName || '').toLowerCase();
+      return n === 'ask_user' || n === 'request_tool';
+    }
+    function metaActionText(toolName) {
+      return String(toolName).toLowerCase() === 'ask_user' ? '询问用户' : '装配工具';
+    }
+    // 把多行预览(need 列表 / context+问题 / 工具名列表)拆成去空的行数组
+    function splitMetaLines(s) {
+      return String(s || '').split('\n').map(x => x.trim()).filter(Boolean);
+    }
+    // ask_user 预览是「context\n1. q1\n2. q2...」，数编号问题行得到问题数
+    function metaQuestionCount(inputPreview) {
+      return String(inputPreview || '').split('\n').filter(l => /^\s*\d+\.\s*\S/.test(l)).length;
+    }
+
     function tryParseToolInput(inputPreview) {
       if (!inputPreview || typeof inputPreview !== 'string') return null;
       const clean = inputPreview.replace(/\.\.\.\(truncated, full=\d+\)$/, '').trim();
@@ -684,6 +702,7 @@ async function sendMessage() {
     }
 
     function toolActionText(toolName) {
+      if (isMetaTool(toolName)) return metaActionText(toolName);
       const shortName = shortToolName(toolName).toLowerCase();
       if (shortName.includes('search_repositories')) return '搜仓库';
       if (shortName.includes('get_file_contents')) return '读文件';
@@ -712,7 +731,54 @@ async function sendMessage() {
       return '';
     }
 
+    // 元工具卡片体（专用模板，不复用真实工具的"为什么用/本次参数"）：
+    //   ask_user     → 具体问题(context+问题列表) → 用户回答 → [步骤/工具]
+    //   request_tool → 缺失能力(need 逐条)        → 装配的工具(逐条) → [步骤/工具]
+    function renderMetaBody(payload, status, detail) {
+      const name = String(payload.toolName || '').toLowerCase();
+      const isAsk = name === 'ask_user';
+      const running = status === 'running';
+      const finalDetail = detail || payload.detail || '';
+      const primaryLines = splitMetaLines(payload.inputPreview);
+      const linesHtml = (lines, bullet) => lines.length
+        ? `<div class="tool-detail">${lines.map(l => (bullet ? '• ' : '') + escapeHtml(l)).join('<br>')}</div>`
+        : '';
+      const label = (t) => `<span class="tool-purpose"><strong>${t}</strong></span>`;
+      const pills = [];
+      if (payload.step) pills.push(`<span class="tool-pill">步骤：${escapeHtml(payload.step)}</span>`);
+      pills.push(`<span class="tool-pill">工具：${escapeHtml(name)}</span>`);
+      const pillsHtml = `<div class="tool-meta">${pills.join('')}</div>`;
+
+      if (isAsk) {
+        const answerHtml = finalDetail
+          ? `<div class="tool-detail">${label('用户回答：')} ${escapeHtml(finalDetail)}</div>`
+          : (running ? `<div class="tool-detail text-gray-500">等待你回答…</div>` : '');
+        return `
+          <div class="tool-purpose"><strong>具体问题：</strong></div>
+          ${linesHtml(primaryLines, false)}
+          ${answerHtml}
+          ${pillsHtml}
+        `;
+      }
+      // request_tool
+      let loadedHtml;
+      if (running) {
+        loadedHtml = `<div class="tool-detail text-gray-500">正在匹配并装配工具…</div>`;
+      } else if (status === 'success') {
+        loadedHtml = `<div class="tool-detail">${label('装配的工具：')}</div>${linesHtml(splitMetaLines(finalDetail), true)}`;
+      } else {
+        loadedHtml = `<div class="tool-detail">${label('装配结果：')} ${escapeHtml(finalDetail || '未装配工具')}</div>`;
+      }
+      return `
+        <div class="tool-purpose"><strong>缺失能力：</strong></div>
+        ${linesHtml(primaryLines, true)}
+        ${loadedHtml}
+        ${pillsHtml}
+      `;
+    }
+
     function renderToolBody(payload, status, detail) {
+      if (isMetaTool(payload.toolName)) return renderMetaBody(payload, status, detail);
       const toolName = payload.toolName || 'unknown_tool';
       const shortName = shortToolName(toolName);
       const step = payload.step || '';
@@ -734,7 +800,25 @@ async function sendMessage() {
       `;
     }
 
+    // 折叠态摘要：ask_user=「问了 X 个问题」；request_tool=「装配工具中…」→「装配了 X 个工具」
+    function metaSummaryText(payload) {
+      const isAsk = String(payload.toolName).toLowerCase() === 'ask_user';
+      const finished = !!payload.status;
+      if (isAsk) {
+        const n = metaQuestionCount(payload.inputPreview);
+        return n > 0 ? `问了 ${n} 个问题` : '询问用户';
+      }
+      // request_tool
+      if (!finished) return '装配工具中…';
+      if (payload.status === 'success') {
+        const n = splitMetaLines(payload.detail).length;
+        return n > 0 ? `装配了 ${n} 个工具` : '未装配工具';
+      }
+      return payload.status === 'blocked' ? '已达装配上限' : '未匹配到工具';
+    }
+
     function toolSummaryText(payload) {
+      if (isMetaTool(payload.toolName)) return metaSummaryText(payload);
       const parts = [];
       if (payload.step) parts.push(`阶段：${payload.step}`);
       const inputFocus = pickToolInputValue(payload.inputPreview || '');

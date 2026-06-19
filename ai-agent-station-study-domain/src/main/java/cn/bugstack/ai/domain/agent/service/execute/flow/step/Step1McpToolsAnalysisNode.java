@@ -62,7 +62,7 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
                 .get(AiClientTypeEnumVO.EXECUTOR_CLIENT.getCode());
         String executorClientId = executorConfig != null ? executorConfig.getClientId() : aiAgentClientFlowConfigVO.getClientId();
         List<ToolCallback> dynamicToolCallbacks = mcpToolCatalogService.resolveDynamicToolCallbacks(executorClientId,
-                requestParameter.getDynamicMissingToolDesc(), requestParameter.getMessage(),
+                mcpToolCatalogService.needsFor(requestParameter.getSessionId()), requestParameter.getMessage(),
                 agentToolRegistry != null ? agentToolRegistry.getTools(executorClientId) : List.of());
         String toolListBlock = agentToolRegistry.describeToolsForPrompt(executorClientId, dynamicToolCallbacks);
         log.info("[Step1] inject tools for executor clientId={} hasTools={}",
@@ -105,7 +105,7 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
                         请基于上面给出的真实工具列表进行分析，禁止编造工具。""",
                 toolListBlockForPrompt,
                 dynamicContext.getCurrentTask()
-        ));
+        ) + metaToolPromptHint(requestParameter.getSessionId()));
 
         // 2026-05-07 流式 UX：step_start → 流式 token → step_end（折叠为"MCP 工具分析 已完成"）
         org.springframework.ai.openai.OpenAiChatOptions.Builder step1OptionsBuilder =

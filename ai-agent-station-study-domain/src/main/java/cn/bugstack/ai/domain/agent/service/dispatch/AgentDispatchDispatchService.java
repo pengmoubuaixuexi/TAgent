@@ -49,6 +49,10 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
     @Autowired(required = false)
     private SessionRefCounter sessionRefCounter;
 
+    /** 动态补工具能力描述(need)的统一存储入口；按 sessionId 写入，执行层读取。 */
+    @Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService mcpToolCatalogService;
+
     /** 路由失败时的兜底 agent_id（需确保该 agent 已启用） */
     @Value("${agent.fallback-agent-id:8011}")
     private String fallbackAgentId;
@@ -61,6 +65,15 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
     public void dispatch(ExecuteCommandEntity requestParameter, ResponseBodyEmitter emitter) throws Exception {
         String agentId = requestParameter.getAiAgentId();
 
+        // 防串请求/泄漏：进入即清掉本 session 可能残留的旧 need（上一次请求若在"交给异步策略执行"前同步失败，
+        // 策略 finally 不会跑、clearNeeds 漏掉）。本轮 need 写在这之后；若本轮也没成功交出去，由方法末尾 finally 兜底清。
+        final String __needSid = requestParameter.getSessionId();
+        if (mcpToolCatalogService != null && __needSid != null && !__needSid.isBlank()) {
+            mcpToolCatalogService.clearNeeds(__needSid);
+        }
+        boolean __handedOff = false;
+        try {
+
         // 1. 如果前端没选 agent（aiAgentId 为空），走统一路由
         if (agentId == null || agentId.isBlank()) {
             if (unifiedAgentRouter != null) {
@@ -71,13 +84,15 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
                     log.info("统一路由未命中，fallback 到 {}", fallbackAgentId);
                 }
                 if (routeDecision != null && routeDecision.hasMissingToolDesc()) {
-                    // 多条 need 用换行连成单串透传（下游 resolveDynamicToolCallbacks 拆开、各取 top-k 再并集）
-                    requestParameter.setDynamicMissingToolDesc(routeDecision.missingToolDescJoined());
+                    // 多条 need 用换行连成单串，按 sessionId 写入统一 store（下游 resolveDynamicToolCallbacks 拆开、各取 top-k 再并集）
+                    if (mcpToolCatalogService != null) {
+                        mcpToolCatalogService.setNeeds(requestParameter.getSessionId(), routeDecision.missingToolDescJoined());
+                    }
                     requestParameter.setRouteConfidence(routeDecision.confidence());
                 }
                 requestParameter.setAiAgentId(agentId);
                 log.info("[Dispatch] 统一路由选中 agent: {} missingTool='{}'",
-                        agentId, requestParameter.getDynamicMissingToolDesc());
+                        agentId, mcpToolCatalogService != null ? mcpToolCatalogService.needsFor(requestParameter.getSessionId()) : null);
             } else {
                 throw new BizException("未配置路由器且未指定 agentId");
             }
@@ -85,7 +100,9 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
             // M1：前端已选定 agent，不走路由，但仍推断该 agent 可能缺失的工具能力（可多条），给动态补挂用
             java.util.List<String> missing = unifiedAgentRouter.inferMissingTool(agentId, requestParameter.getMessage());
             if (missing != null && !missing.isEmpty()) {
-                requestParameter.setDynamicMissingToolDesc(String.join("\n", missing));
+                if (mcpToolCatalogService != null) {
+                    mcpToolCatalogService.setNeeds(requestParameter.getSessionId(), String.join("\n", missing));
+                }
                 log.info("[Dispatch] 已选定 agent={} 推断 missingTools={}", agentId, missing);
             }
         }
@@ -149,10 +166,18 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
                     }
                 }
             });
+            __handedOff = true; // 已成功交给异步策略执行 → 本轮 need 的清理归策略 finally 的 clearNeeds
         } catch (RejectedExecutionException e) {
             log.warn("线程池已满，拒绝执行 agent={} strategy={}", finalAgentId, finalStrategy);
             emitter.send("{\"error\":\"service_unavailable\",\"message\":\"Server too busy, please retry later\",\"status\":503}");
             emitter.complete();
+        }
+        } finally {
+            // 同步路径异常（armory/查 agent/策略查找抛 BizException）或线程池拒绝 → 没交给异步策略 → 策略 finally 不跑，
+            // 这里兜底清掉本轮已写入的 need，避免 session 维度泄漏 + 下次同 session 读到旧 need。
+            if (!__handedOff && mcpToolCatalogService != null && __needSid != null && !__needSid.isBlank()) {
+                mcpToolCatalogService.clearNeeds(__needSid);
+            }
         }
     }
 

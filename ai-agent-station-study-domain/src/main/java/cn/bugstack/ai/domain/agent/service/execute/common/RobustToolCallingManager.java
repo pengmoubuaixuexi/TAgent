@@ -102,6 +102,60 @@ public class RobustToolCallingManager implements ToolCallingManager {
                     + "},\"required\":[\"questions\"]}")
             .build();
 
+    /**
+     * reactive 动态补工具：{@code request_tool} 让模型在执行中途发现缺能力时自助装载工具（语义匹配走
+     * {@link cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService}）。null / 关 → 不广播、不拦截，行为同现状。
+     * 由 {@code AiClientModelNode} 装配时 set（@Lazy 注入避免启动循环依赖）。
+     */
+    private volatile cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService mcpToolCatalogService;
+    private volatile boolean requestToolEnabled = false;
+    /** 单次执行最多允许 request_tool 几次（数 prompt 历史里已有 request_tool 响应数判定，无状态、免 sessionId map）。<=0 不限。 */
+    private volatile int requestToolMaxCalls = 3;
+
+    public void setMcpToolCatalogService(cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService s) {
+        this.mcpToolCatalogService = s;
+    }
+
+    public void setRequestToolEnabled(boolean v) {
+        this.requestToolEnabled = v;
+    }
+
+    public void setRequestToolMaxCalls(int v) {
+        this.requestToolMaxCalls = v;
+    }
+
+    /**
+     * 元工具(ask_user / request_tool)观察卡片 emitter（可选，null → 不发卡片，行为不变）。
+     * 这俩不走 {@link MeteredToolCallback}，进度事件得由本 manager 直接发，否则前端静默。
+     * 由 {@code AiClientModelNode} 装配时 set。
+     */
+    private volatile ToolCallProgressEmitter toolCallProgressEmitter;
+
+    public void setToolCallProgressEmitter(ToolCallProgressEmitter e) {
+        this.toolCallProgressEmitter = e;
+    }
+
+    /** request_tool 工具保留名（大小写不敏感匹配）。 */
+    public static final String REQUEST_TOOL_TOOL_NAME = "request_tool";
+
+    /**
+     * request_tool 工具定义。模型执行中途发现缺工具能力时调用，在 need 里描述所缺能力；
+     * manager 在 {@link #handleMetaToolCalls} 内语义匹配 → 物化真实工具(带 inputSchema)注入到当前 options，
+     * 并 appendNeed 到会话级 store 让后续 step 也带上。不进 delegate 的 toolCallbacks。
+     */
+    private static final ToolDefinition REQUEST_TOOL_DEFINITION = ToolDefinition.builder()
+            .name(REQUEST_TOOL_TOOL_NAME)
+            .description("当你发现完成任务需要某些当前工具列表里没有的能力时，调用本工具：在 needs 数组里列出你需要的能力，"
+                    + "每条用一句话描述（如「读取本地文件内容」「查询股票实时价格」「发送邮件」）。"
+                    + "如果一次需要多个能力，请一次性在 needs 里把它们全部列出，不要逐个反复调用。"
+                    + "系统会按每条描述分别语义匹配、一并为你装载真实工具；装载成功后你可在后续直接调用被装载的工具完成任务。"
+                    + "禁止凭空编造工具名；同一能力不要重复 request。")
+            .inputSchema("{\"type\":\"object\",\"properties\":{"
+                    + "\"needs\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
+                    + "\"description\":\"你需要的工具能力列表，每条一句话、越具体越好；需要多个能力就一次全列出\"}"
+                    + "},\"required\":[\"needs\"]}")
+            .build();
+
     public RobustToolCallingManager(ToolCallingManager delegate) {
         this(delegate, null, null, false, null, 0);
     }
@@ -146,6 +200,11 @@ public class RobustToolCallingManager implements ToolCallingManager {
         if (askUserAvailable()) {
             base.add(ASK_USER_DEFINITION);
         }
+        // reactive 动态补工具：开关开 + 有匹配服务即广播 request_tool（非执行步也给——预装给后续执行步用；
+        // 预算不在广播处限，只在 executeToolCalls 按 prompt 历史里已有 request_tool 次数硬限，避免再加 sessionId map）。
+        if (requestToolAvailable()) {
+            base.add(REQUEST_TOOL_DEFINITION);
+        }
         return base;
     }
 
@@ -153,6 +212,11 @@ public class RobustToolCallingManager implements ToolCallingManager {
     private boolean askUserAvailable() {
         if (userInputGate == null || !userInputGate.isEnabled()) return false;
         return userInputGate.remainingFor(org.slf4j.MDC.get("sessionId")) > 0;
+    }
+
+    /** request_tool 当前是否可广播：开关开且匹配服务在。预算在执行处限，不在此 gate。 */
+    private boolean requestToolAvailable() {
+        return requestToolEnabled && mcpToolCatalogService != null;
     }
 
     /**
@@ -187,10 +251,12 @@ public class RobustToolCallingManager implements ToolCallingManager {
             return delegate.executeToolCalls(prompt, chatResponse);
         }
 
-        // D 段：ask_user 不是注册 callback（不在 toolCallbacks 里）→ 必须在 caseMap / unknown-tool 检查之前
+        // ask_user / request_tool 都不是注册 callback（不在 toolCallbacks 里）→ 必须在 caseMap / unknown-tool 检查之前
         // 由本 manager 自己消化，否则会被 findUnknownToolNames 当成幻觉工具误杀。
-        if (userInputGate != null && userInputGate.isEnabled() && hasAskUserCall(chatResponse)) {
-            return handleAskUser(prompt, chatResponse);
+        boolean askUserActive = userInputGate != null && userInputGate.isEnabled() && hasAskUserCall(chatResponse);
+        boolean requestToolActive = requestToolAvailable() && hasRequestToolCall(chatResponse);
+        if (askUserActive || requestToolActive) {
+            return handleMetaToolCalls(prompt, chatResponse);
         }
 
         // 拿 prompt 自带的真实工具名（注入到 ChatClient.defaultToolCallbacks 的那一组）
@@ -247,17 +313,17 @@ public class RobustToolCallingManager implements ToolCallingManager {
         if (prompt == null || prompt.getInstructions() == null) return 0;
         for (Message message : prompt.getInstructions()) {
             if (message instanceof ToolResponseMessage trm && trm.getResponses() != null && !trm.getResponses().isEmpty()) {
-                if (isAskUserOnlyResponses(trm.getResponses())) continue;
+                if (isMetaToolOnlyResponses(trm.getResponses())) continue;
                 count++;
             }
         }
         return count;
     }
 
-    /** 该批响应是否「全是 ask_user」——纯 ask_user 轮不计工具预算。 */
-    private boolean isAskUserOnlyResponses(List<ToolResponseMessage.ToolResponse> responses) {
+    /** 该批响应是否「全是元工具(ask_user / request_tool)」——纯元工具轮不计工具预算。 */
+    private boolean isMetaToolOnlyResponses(List<ToolResponseMessage.ToolResponse> responses) {
         for (ToolResponseMessage.ToolResponse r : responses) {
-            if (!isAskUserName(r.name())) return false;
+            if (!isAskUserName(r.name()) && !isRequestToolName(r.name())) return false;
         }
         return true;
     }
@@ -266,27 +332,54 @@ public class RobustToolCallingManager implements ToolCallingManager {
         return name != null && ASK_USER_TOOL_NAME.equalsIgnoreCase(name);
     }
 
+    private boolean isRequestToolName(String name) {
+        return name != null && REQUEST_TOOL_TOOL_NAME.equalsIgnoreCase(name);
+    }
+
     private boolean hasAskUserCall(ChatResponse chatResponse) {
+        return hasToolCall(chatResponse, this::isAskUserName);
+    }
+
+    private boolean hasRequestToolCall(ChatResponse chatResponse) {
+        return hasToolCall(chatResponse, this::isRequestToolName);
+    }
+
+    private boolean hasToolCall(ChatResponse chatResponse, java.util.function.Predicate<String> nameMatch) {
         for (Generation gen : chatResponse.getResults()) {
             if (gen.getOutput() == null || !gen.getOutput().hasToolCalls()) continue;
             for (AssistantMessage.ToolCall tc : gen.getOutput().getToolCalls()) {
-                if (isAskUserName(tc.name())) return true;
+                if (nameMatch.test(tc.name())) return true;
             }
         }
         return false;
     }
 
+    /** 数 prompt 历史里已经有过多少次 request_tool 响应（一条响应里含 request_tool 即计 1），用于无状态预算硬限。 */
+    private int countPriorRequestToolCalls(Prompt prompt) {
+        int c = 0;
+        if (prompt == null || prompt.getInstructions() == null) return 0;
+        for (Message m : prompt.getInstructions()) {
+            if (m instanceof ToolResponseMessage trm && trm.getResponses() != null) {
+                for (ToolResponseMessage.ToolResponse r : trm.getResponses()) {
+                    if (isRequestToolName(r.name())) { c++; break; }
+                }
+            }
+        }
+        return c;
+    }
+
     /**
-     * D 段：消化含 ask_user 的这一批 tool_calls。逐个 call 构建响应：
+     * 消化含元工具(ask_user / request_tool)的这一批 tool_calls。逐个 call 构建响应：
      * <ul>
-     *   <li>ask_user → 调 {@link cn.bugstack.ai.domain.agent.service.security.UserInputGate} 阻塞拿用户回答（超时/预算/通道缺失返结构化提示）；</li>
-     *   <li>真实工具（混合批场景）→ 复用 {@link #executeSingleToolCall} 委托 delegate 单工具执行（保留 callback 查找 / metric）；</li>
-     *   <li>未知工具 → 同 {@link #buildUnknownToolErrorResult} 语义返「工具不存在」。</li>
+     *   <li>ask_user → 调 {@link cn.bugstack.ai.domain.agent.service.security.UserInputGate} 阻塞拿用户回答；</li>
+     *   <li>request_tool → 语义匹配装载工具（{@link #runRequestTool}：注入当前 options 让本步下一轮可调 + appendNeed 让后续 step 也带上）；</li>
+     *   <li>真实工具（混合批场景）→ 复用 {@link #executeSingleToolCall} 委托 delegate 单工具执行；</li>
+     *   <li>未知工具 / 未启用的元工具 → 返「工具不存在」。</li>
      * </ul>
      * 组装成<b>单条</b> ToolResponseMessage（覆盖原 assistant message 里全部 tool_call_id），保证回填对齐。
-     * 纯 ask_user 批不经轮次预算检查（早返回），与真实工具混合时其响应在下一轮按 {@link #countPriorToolRounds} 计 1 轮。
+     * 纯元工具批不计工具轮（见 {@link #countPriorToolRounds}），与真实工具混合时其响应在下一轮计 1 轮。
      */
-    private ToolExecutionResult handleAskUser(Prompt prompt, ChatResponse chatResponse) {
+    private ToolExecutionResult handleMetaToolCalls(Prompt prompt, ChatResponse chatResponse) {
         Map<String, String> caseMap = buildLowerToOriginalNameMap(prompt);
         ChatResponse normalized = caseMap.isEmpty() ? chatResponse : normalizeToolCallNames(chatResponse, caseMap);
         Generation toolGen = firstGenerationWithToolCalls(normalized);
@@ -297,15 +390,19 @@ public class RobustToolCallingManager implements ToolCallingManager {
         List<AssistantMessage.ToolCall> calls = fullAm.getToolCalls();
         Set<String> realNames = new HashSet<>(caseMap.values());
 
+        boolean askUserActive = userInputGate != null && userInputGate.isEnabled();
+        boolean requestToolActive = requestToolAvailable();
         String sessionId = org.slf4j.MDC.get("sessionId");
         String stepLabel = currentStepLabel(prompt);
 
         List<ToolResponseMessage.ToolResponse> responses = new ArrayList<>(calls.size());
         for (AssistantMessage.ToolCall tc : calls) {
-            if (isAskUserName(tc.name())) {
+            if (askUserActive && isAskUserName(tc.name())) {
                 responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(), runAskUser(sessionId, tc, stepLabel)));
+            } else if (requestToolActive && isRequestToolName(tc.name())) {
+                responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(), runRequestTool(prompt, tc, sessionId, stepLabel)));
             } else if (!realNames.contains(tc.name())) {
-                log.warn("[RobustToolMgr] unknown tool '{}' in ask_user batch", tc.name());
+                log.warn("[RobustToolMgr] unknown tool '{}' in meta-tool batch", tc.name());
                 if (metrics != null) metrics.recordUnknownToolName(tc.name());
                 responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(),
                         "工具不存在（tool not found）：" + tc.name() + "。禁止编造工具名，只能使用已注册的真实工具。"));
@@ -313,7 +410,7 @@ public class RobustToolCallingManager implements ToolCallingManager {
                 try {
                     responses.add(executeSingleToolCall(prompt, normalized, toolGen, tc));
                 } catch (Exception e) {
-                    log.warn("[RobustToolMgr] tool '{}' failed in ask_user batch: {}", tc.name(), e.getMessage());
+                    log.warn("[RobustToolMgr] tool '{}' failed in meta-tool batch: {}", tc.name(), e.getMessage());
                     responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(),
                             "工具执行失败（tool execution failed）：" + e.getMessage()
                                     + "。请不要重复同样的无效调用，可基于已有信息回答。"));
@@ -330,23 +427,199 @@ public class RobustToolCallingManager implements ToolCallingManager {
                 .build();
     }
 
-    /** 调 gate 阻塞提问，把状态翻译成给 LLM 的工具结果文本。 */
+    /**
+     * request_tool 命中：按 need 语义匹配装载工具。
+     * <ol>
+     *   <li>预算硬限：数 prompt 历史里已有 request_tool 次数，超 {@link #requestToolMaxCalls} 直接拒绝（无状态）；</li>
+     *   <li>{@link cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService#resolveDynamicToolCallbacks} 物化真实回调（带 inputSchema）；</li>
+     *   <li>{@link #injectIntoOptions} 并入当前 {@code prompt.getOptions().toolCallbacks} → 框架下一轮即广播+可执行；</li>
+     *   <li>{@code appendNeed(sessionId, need)} 写会话级 store → 后续 step 的 resolve 也带上。</li>
+     * </ol>
+     * 返回给模型的文本说明装载结果，引导其下一轮直接调用被装载工具。
+     */
+    private String runRequestTool(Prompt prompt, AssistantMessage.ToolCall tc, String sessionId, String stepLabel) {
+        String needs = parseRequestToolNeeds(tc.arguments());
+        // 观察卡片：开始（展示模型所列的能力描述 needs，让"装载工具"不再静默）
+        ToolCallProgressEmitter p = this.toolCallProgressEmitter;
+        if (p != null) {
+            p.emitMetaStart(sessionId, REQUEST_TOOL_TOOL_NAME,
+                    (needs == null || needs.isBlank()) ? "(未提供能力描述)" : needs, stepLabel);
+        }
+        int prior = countPriorRequestToolCalls(prompt);
+        if (requestToolMaxCalls > 0 && prior >= requestToolMaxCalls) {
+            return requestToolEnd(sessionId, stepLabel, "blocked", "装载次数已达上限(" + requestToolMaxCalls + ")",
+                    "本次执行装载工具的次数已达上限(" + requestToolMaxCalls + ")，请不要再调用 request_tool，"
+                            + "基于现有工具完成任务；若关键能力确实缺失，请在答案中说明。");
+        }
+        if (needs == null || needs.isBlank()) {
+            return requestToolEnd(sessionId, stepLabel, "error", "未提供能力描述",
+                    "未提供需要的能力描述。请在 needs 数组里用一句话描述你需要的工具能力（可一次多条）后重试。");
+        }
+        List<ToolCallback> resolved;
+        try {
+            // needs 多条换行连接；resolveDynamicToolCallbacks 内部 splitNeeds 拆开、各取 top-k 再并集。
+            // currentTools 传空：去重在 injectIntoOptions 按工具名统一做；clientId/query 仅供匹配器日志。
+            resolved = mcpToolCatalogService.resolveDynamicToolCallbacks(REQUEST_TOOL_TOOL_NAME, needs, needs, java.util.List.of());
+        } catch (Exception e) {
+            log.warn("[RequestTool] resolve failed needs='{}': {}", needs, e.getMessage());
+            return requestToolEnd(sessionId, stepLabel, "error", "匹配出错：" + e.getMessage(),
+                    "工具匹配出错：" + e.getMessage() + "。可换一种能力描述再试，或基于现有工具完成任务。");
+        }
+        if (resolved == null || resolved.isEmpty()) {
+            return requestToolEnd(sessionId, stepLabel, "error", "未匹配到「" + needs.replace("\n", " / ") + "」对应的工具",
+                    "没有匹配到「" + needs.replace("\n", " / ") + "」对应的可用工具。请基于现有工具完成任务，或换一种更具体的能力描述再试一次。");
+        }
+        int added = injectIntoOptions(prompt, resolved);
+        if (sessionId != null && !sessionId.isBlank()) {
+            // 逐条 append（appendNeed 按行去重），让后续 step 的 resolve 也带上每一条能力
+            for (String n : needs.split("\\r?\\n")) {
+                if (!n.isBlank()) mcpToolCatalogService.appendNeed(sessionId, n.trim());
+            }
+        }
+        List<String> names = new ArrayList<>();
+        for (ToolCallback cb : resolved) {
+            if (cb.getToolDefinition() != null) names.add(cb.getToolDefinition().name());
+        }
+        log.info("[RequestTool] needs='{}' matched={} injected={}", needs, names, added);
+        // detail 用"工具名按行排列"，前端按行拆成"装配的工具"列表 + 计数("装配了 N 个工具")；
+        // 给模型的文本仍用友好句（modelText 与卡片 detail 解耦）。
+        return requestToolEnd(sessionId, stepLabel, "success", String.join("\n", names),
+                "已为你装载工具：" + names + "。现在可以直接调用上述工具完成任务（同样的能力不要再次 request_tool）。");
+    }
+
+    /** request_tool 终态卡片 + 返回给模型的文本一处收口（多 return 点共用，避免每处都写一遍 emit）。 */
+    private String requestToolEnd(String sessionId, String step, String status, String detail, String modelText) {
+        ToolCallProgressEmitter p = this.toolCallProgressEmitter;
+        if (p != null) {
+            p.emitMetaEnd(sessionId, REQUEST_TOOL_TOOL_NAME, status, detail, step);
+        }
+        return modelText;
+    }
+
+    /**
+     * 把语义匹配到的回调并入 {@code prompt.getOptions().toolCallbacks}（按工具名去重），整列 setToolCallbacks 替换。
+     * <p>用 set 整列替换而非裸 add：{@code OpenAiChatModel.buildRequestPrompt} 在无 runtime options 的兜底分支里
+     * 会让 requestOptions.toolCallbacks 别名到全局 default options 的 list，裸 add 会污染该 model 后续所有请求；
+     * 整列替换天然请求级隔离。框架下一轮 {@code new Prompt(history, prompt.getOptions())} 复用同一 options → 即生效。
+     * @return 实际新增（去重后）的工具数
+     */
+    private int injectIntoOptions(Prompt prompt, List<ToolCallback> resolved) {
+        if (!(prompt.getOptions() instanceof ToolCallingChatOptions opts)) return 0;
+        List<ToolCallback> existing = opts.getToolCallbacks();
+        List<ToolCallback> union = new ArrayList<>();
+        Set<String> names = new HashSet<>();
+        if (existing != null) {
+            for (ToolCallback cb : existing) {
+                union.add(cb);
+                if (cb != null && cb.getToolDefinition() != null) names.add(cb.getToolDefinition().name());
+            }
+        }
+        int added = 0;
+        for (ToolCallback cb : resolved) {
+            if (cb == null || cb.getToolDefinition() == null) continue;
+            if (names.add(cb.getToolDefinition().name())) {
+                union.add(cb);
+                added++;
+            }
+        }
+        opts.setToolCallbacks(union);
+        return added;
+    }
+
+    /**
+     * 解析 request_tool 入参里的能力描述，返回多条换行连接的串（喂给 resolveDynamicToolCallbacks 再 splitNeeds）。
+     * 优先 JSON 的 {@code needs} 数组（多条）；退化 {@code need}/{@code capability} 单值；再退原始串。
+     */
+    private String parseRequestToolNeeds(String argsJson) {
+        if (argsJson == null || argsJson.isBlank()) return null;
+        try {
+            com.alibaba.fastjson.JSONObject obj = com.alibaba.fastjson.JSON.parseObject(argsJson);
+            if (obj != null) {
+                com.alibaba.fastjson.JSONArray arr = obj.getJSONArray("needs");
+                if (arr != null && !arr.isEmpty()) {
+                    List<String> lines = new ArrayList<>();
+                    for (int i = 0; i < arr.size(); i++) {
+                        String s = arr.getString(i);
+                        if (s != null && !s.isBlank()) lines.add(s.trim());
+                    }
+                    if (!lines.isEmpty()) return String.join("\n", lines);
+                }
+                String need = obj.getString("need");
+                if (need == null || need.isBlank()) need = obj.getString("capability");
+                if (need != null && !need.isBlank()) return need.trim();
+            }
+        } catch (Exception ignored) {
+        }
+        return argsJson.trim();
+    }
+
+    /** 调 gate 阻塞提问，把状态翻译成给 LLM 的工具结果文本；同时发观察卡片（开始=问题列表，结束=用户回复/超时）。 */
     private String runAskUser(String sessionId, AssistantMessage.ToolCall tc, String stepLabel) {
+        ToolCallProgressEmitter p = this.toolCallProgressEmitter;
+        // 卡片开始：在阻塞等待之前发，让时间线先出现"正在向你提问（问题列表）"，模态框关掉后仍可回看问了什么
+        if (p != null) {
+            p.emitMetaStart(sessionId, ASK_USER_TOOL_NAME, askUserPreview(tc.arguments()), stepLabel);
+        }
         cn.bugstack.ai.domain.agent.service.security.UserInputGate.Result r =
                 userInputGate.requestUserInput(sessionId, tc.arguments(), stepLabel);
+        String status;
+        String detail;
+        String modelText;
         switch (r.status) {
             case ANSWERED:
-                return (r.answer == null || r.answer.isBlank())
-                        ? "用户未填写具体内容。请基于现有信息继续完成任务。"
-                        : "用户回复：" + r.answer;
+                if (r.answer == null || r.answer.isBlank()) {
+                    status = "success";
+                    detail = "用户未填写具体内容";
+                    modelText = "用户未填写具体内容。请基于现有信息继续完成任务。";
+                } else {
+                    status = "success";
+                    detail = "用户回复：" + r.answer;
+                    modelText = "用户回复：" + r.answer;
+                }
+                break;
             case TIMEOUT:
-                return "用户未在规定时间内回应。请基于现有信息继续完成任务，必要时在答案中说明哪些信息缺失及你做出的假设。";
+                status = "approval_timeout";
+                detail = "用户未在规定时间内回应";
+                modelText = "用户未在规定时间内回应。请基于现有信息继续完成任务，必要时在答案中说明哪些信息缺失及你做出的假设。";
+                break;
             case BUDGET_EXCEEDED:
-                return "向用户提问的次数已用完，请不要再调用 ask_user。请基于已经掌握的信息给出最佳答案。";
+                status = "blocked";
+                detail = "提问次数已用完";
+                modelText = "向用户提问的次数已用完，请不要再调用 ask_user。请基于已经掌握的信息给出最佳答案。";
+                break;
             case UNAVAILABLE:
             default:
-                return "当前无法向用户提问（交互通道不可用）。请基于现有信息继续完成任务。";
+                status = "approval_unavailable";
+                detail = "交互通道不可用";
+                modelText = "当前无法向用户提问（交互通道不可用）。请基于现有信息继续完成任务。";
+                break;
         }
+        if (p != null) {
+            p.emitMetaEnd(sessionId, ASK_USER_TOOL_NAME, status, detail, stepLabel);
+        }
+        return modelText;
+    }
+
+    /** 解析 ask_user 入参里的 context + questions，拼成给卡片看的预览（编号列表）；解析失败退原始串。 */
+    private String askUserPreview(String argsJson) {
+        try {
+            com.alibaba.fastjson.JSONObject o = com.alibaba.fastjson.JSON.parseObject(argsJson);
+            if (o != null) {
+                StringBuilder sb = new StringBuilder();
+                String ctx = o.getString("context");
+                if (ctx != null && !ctx.isBlank()) sb.append(ctx.trim()).append("\n");
+                com.alibaba.fastjson.JSONArray qs = o.getJSONArray("questions");
+                if (qs != null) {
+                    for (int i = 0; i < qs.size(); i++) {
+                        String q = qs.getString(i);
+                        if (q != null && !q.isBlank()) sb.append(i + 1).append(". ").append(q.trim()).append("\n");
+                    }
+                }
+                if (sb.length() > 0) return sb.toString().trim();
+            }
+        } catch (Exception ignored) {
+        }
+        return argsJson == null ? "" : argsJson.trim();
     }
 
     /** 取当前步骤标签：优先 ToolContext 的 stepLabel，退 MDC step；都没有返 null（前端不显示步骤行）。 */

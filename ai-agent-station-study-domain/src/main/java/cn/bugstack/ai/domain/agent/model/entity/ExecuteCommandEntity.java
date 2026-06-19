@@ -31,11 +31,9 @@ public class ExecuteCommandEntity {
 
     private Integer maxStep;
 
-    /**
-     * 路由产出的"可能缺失的工具能力"的一句中文描述，用于本次请求做字符模糊匹配补挂工具。
-     * 不是工具名，也不保证一定能匹配到工具；为空表示不需要补充工具。
-     */
-    private String dynamicMissingToolDesc;
+    // 2026-06-19：原 dynamicMissingToolDesc(路由产出的"可能缺失工具能力"描述/need)字段已退休，
+    // 改为按 sessionId 存进 McpToolCatalogService.sessionNeeds（路由 setNeeds / 中途 request_tool appendNeed
+    // / step needsFor / 执行结束 clearNeeds）。统一来源，便于 manager 中途追加；代价是需显式清理（见该类）。
 
     private Double routeConfidence;
 

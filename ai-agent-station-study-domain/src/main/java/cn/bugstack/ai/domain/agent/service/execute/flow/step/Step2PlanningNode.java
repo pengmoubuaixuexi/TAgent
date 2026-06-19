@@ -58,7 +58,10 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
                     "2. 工具名称必须完全匹配（区分大小写）\n" +
                     "3. 每个步骤明确指定使用的MCP工具\n" +
                     "4. 避免使用不存在或无效的工具";
-            return appendCurrentTimeContext(refined);
+            // 规划阶段属非执行步，但若发现工具不够可经豁免提示主动 request_tool 预装给后续执行步（功能关则空串、零注入）。
+            // 注意：要真正生效，规划客户端的 DB 系统提示里"禁止调用任何工具"需改成"禁止调用业务/执行类工具"，
+            // 否则 system 的硬禁止会压过本 user 豁免，模型把调用写成文本（说而不做）。见 8013_p2。
+            return appendCurrentTimeContext(refined + metaToolPromptHint(requestParameter.getSessionId()));
         };
 
         // 2026-05-07 流式 UX：step_start → 流式 token → step_end（折叠为"步骤规划 已完成"）

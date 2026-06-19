@@ -106,7 +106,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         // 立即回答（在 step4 执行前点的）：跳过 DAG 执行，直接基于"计划 + 已有产出 + 半截思考"整合作答
         if (dynamicContext.isFinalizeRequested()) {
             dynamicContext.setValue("sessionId", request.getSessionId());
-            dynamicContext.setValue("dynamicMissingToolDesc", request.getDynamicMissingToolDesc());
+            dynamicContext.setValue("dynamicMissingToolDesc", mcpToolCatalogService.needsFor(request.getSessionId()));
             dynamicContext.setValue("dynamicToolQuery", request.getMessage());
             return finalizeNow(request, dynamicContext);
         }
@@ -117,7 +117,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         try {
             // 把 sessionId 暂存到 dynamicContext，executeStep / handleStepExecutionError 沿用历史约定取它发 SSE / mirror WM
             dynamicContext.setValue("sessionId", request.getSessionId());
-            dynamicContext.setValue("dynamicMissingToolDesc", request.getDynamicMissingToolDesc());
+            dynamicContext.setValue("dynamicMissingToolDesc", mcpToolCatalogService.needsFor(request.getSessionId()));
             dynamicContext.setValue("dynamicToolQuery", request.getMessage());
 
             // 获取配置信息

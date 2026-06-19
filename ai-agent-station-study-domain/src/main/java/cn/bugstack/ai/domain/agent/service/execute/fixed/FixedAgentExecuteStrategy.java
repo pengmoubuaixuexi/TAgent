@@ -181,7 +181,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             String clientId = config.getClientId();
             List<ToolCallback> dynamicToolCallbacks = mcpToolCatalogService != null
                     ? mcpToolCatalogService.resolveDynamicToolCallbacks(clientId,
-                            requestParameter.getDynamicMissingToolDesc(), requestParameter.getMessage(),
+                            mcpToolCatalogService.needsFor(requestParameter.getSessionId()), requestParameter.getMessage(),
                             agentToolRegistry != null ? agentToolRegistry.getTools(clientId) : List.of())
                     : List.of();
             if (agentToolRegistry != null && clientId != null) {
@@ -352,6 +352,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             if (sessionId != null) finalizeFlags.remove(sessionId);
             if (sessionId != null) cancelTriggers.remove(sessionId);
             if (sessionId != null) steerInbox.remove(sessionId);
+            if (sessionId != null && mcpToolCatalogService != null) mcpToolCatalogService.clearNeeds(sessionId);
             cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearLatestReasoning(sessionId);
         }
     }
@@ -676,7 +677,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         String partialReasoning = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.getLatestReasoning(sessionId);
         // 工具：常驻 + 补充（用于 prompt 工具清单 + 回调挂载）
         java.util.List<ToolCallback> dyn = (answerNowFinalizeTools && mcpToolCatalogService != null && clientId != null)
-                ? mcpToolCatalogService.resolveDynamicToolCallbacks(clientId, req.getDynamicMissingToolDesc(), req.getMessage(),
+                ? mcpToolCatalogService.resolveDynamicToolCallbacks(clientId, mcpToolCatalogService.needsFor(sessionId), req.getMessage(),
                         agentToolRegistry != null ? agentToolRegistry.getTools(clientId) : java.util.List.of())
                 : java.util.List.of();
         boolean attachTools = !dyn.isEmpty();
@@ -785,7 +786,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
     private String fixedSteerRerun(ChatClient client, String clientId, ExecuteCommandEntity req, String partialAnswer, String sessionId, String idea, ResponseBodyEmitter emitter) {
         String partialReasoning = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.getLatestReasoning(sessionId);
         java.util.List<ToolCallback> dyn = (mcpToolCatalogService != null && clientId != null)
-                ? mcpToolCatalogService.resolveDynamicToolCallbacks(clientId, req.getDynamicMissingToolDesc(), req.getMessage(),
+                ? mcpToolCatalogService.resolveDynamicToolCallbacks(clientId, mcpToolCatalogService.needsFor(sessionId), req.getMessage(),
                         agentToolRegistry != null ? agentToolRegistry.getTools(clientId) : java.util.List.of())
                 : java.util.List.of();
         boolean attachTools = !dyn.isEmpty();

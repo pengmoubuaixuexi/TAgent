@@ -96,6 +96,17 @@ public class AiClientModelNode extends AbstractArmorySupport {
     @Value("${agent.mcp.disable-tools-on-nonexec-steps:true}")
     private boolean disableToolsOnNonExecStep;
 
+    /** reactive 动态补工具：request_tool 总开关 + 单次执行最多装载次数。默认关，关时 manager 不广播/不拦截。 */
+    @Value("${agent.request-tool.enabled:false}")
+    private boolean requestToolEnabled;
+    @Value("${agent.request-tool.max-calls:3}")
+    private int requestToolMaxCalls;
+
+    /** request_tool 的语义匹配服务；@Lazy 注入避免 McpToolCatalogService→AiClientToolMcpNode→AiClientModelNode 启动循环依赖。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    @org.springframework.context.annotation.Lazy
+    private cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService mcpToolCatalogService;
+
     /** 并行工具执行线程池（execute() 自动 ContextSnapshot.wrap 接力 MDC），与 flow DAG step 共用 */
     @Resource(name = "dagExecutor")
     private ThreadPoolExecutor dagExecutor;
@@ -187,6 +198,12 @@ public class AiClientModelNode extends AbstractArmorySupport {
             robustMgr.setDisableToolsOnNonExecStep(disableToolsOnNonExecStep);
             // D 段：注入 ask_user gate（gate 内部 enabled=false 时 manager 不广播/不进 gate，零影响）
             robustMgr.setUserInputGate(userInputGate);
+            // reactive 动态补工具：注入 request_tool 依赖（开关关 / 服务缺失时 manager 不广播/不拦截，零影响）
+            robustMgr.setMcpToolCatalogService(mcpToolCatalogService);
+            robustMgr.setRequestToolEnabled(requestToolEnabled);
+            robustMgr.setRequestToolMaxCalls(requestToolMaxCalls);
+            // 元工具(ask_user / request_tool)观察卡片：它们不走 MeteredToolCallback，进度事件得由 manager 直接发
+            robustMgr.setToolCallProgressEmitter(toolCallProgressEmitter);
 
             OpenAiChatModel chatModel = OpenAiChatModel.builder()
                     .openAiApi(openAiApi)

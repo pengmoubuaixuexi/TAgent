@@ -28,6 +28,10 @@ public class AutoAgentExecuteStrategy implements IExecuteStrategy {
     @Resource
     private cn.bugstack.ai.domain.agent.service.execute.common.LongTermMemoryTurnSnapshot longTermMemoryTurnSnapshot;
 
+    /** 动态补工具 need 的会话级存储；执行结束按 sessionId 清理（退休 dynamicMissingToolDesc 后必须显式清，否则泄漏+串请求）。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService mcpToolCatalogService;
+
     /** per-session 活跃执行上下文，用于支持 cancelExecute() */
     private final ConcurrentHashMap<String, DefaultAutoAgentExecuteStrategyFactory.DynamicContext> activeContexts = new ConcurrentHashMap<>();
 
@@ -83,6 +87,7 @@ public class AutoAgentExecuteStrategy implements IExecuteStrategy {
         } finally {
             longTermMemoryTurnSnapshot.clearSession(sessionId);
             if (sessionId != null) activeContexts.remove(sessionId);
+            if (sessionId != null && mcpToolCatalogService != null) mcpToolCatalogService.clearNeeds(sessionId);
         }
     }
 

@@ -117,6 +117,44 @@ public class ToolCallProgressEmitter {
         sendEvent(emitter, "tool_call_error", data, sessionId, toolName);
     }
 
+    /**
+     * 元工具(ask_user / request_tool)观察卡片：复用 {@code tool_call_start}/{@code tool_call_end} 事件，
+     * 走前端同一套卡片生命周期(running→done、按 toolName 配对、完成折叠)，但带 {@code meta:true} 标记，
+     * 前端按 toolName 专用渲染(ask_user=问题列表、request_tool=needs+装载结果)。
+     * <p>这俩元工具不走 {@link MeteredToolCallback}(它们不是注册 callback，由 RobustToolCallingManager 自消化)，
+     * 故进度事件必须从 manager 侧单独发；否则前端"静默"看不到提问/装载。
+     */
+    public void emitMetaStart(String sessionId, String toolName, String preview, String step) {
+        ResponseBodyEmitter emitter = lookupEmitter(sessionId);
+        if (emitter == null) return;
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("sessionId", sessionId);
+        data.put("toolName", toolName);
+        putIfPresent(data, "step", step);
+        data.put("inputPreview", truncateMeta(preview));
+        data.put("meta", true);
+        data.put("timestamp", System.currentTimeMillis());
+        sendEvent(emitter, "tool_call_start", data, sessionId, toolName);
+    }
+
+    /**
+     * 元工具终态。{@code status} 复用前端已识别的枚举(success / approval_timeout / blocked / approval_unavailable / error)
+     * 以便沿用颜色；{@code detail} 承载给用户看的结果(用户回复 / 已装载工具列表 / 失败原因)。
+     */
+    public void emitMetaEnd(String sessionId, String toolName, String status, String detail, String step) {
+        ResponseBodyEmitter emitter = lookupEmitter(sessionId);
+        if (emitter == null) return;
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("sessionId", sessionId);
+        data.put("toolName", toolName);
+        putIfPresent(data, "step", step);
+        data.put("status", status);
+        putIfPresent(data, "detail", truncateMeta(detail));
+        data.put("meta", true);
+        data.put("timestamp", System.currentTimeMillis());
+        sendEvent(emitter, "tool_call_end", data, sessionId, toolName);
+    }
+
     private static void putIfPresent(Map<String, Object> data, String key, String value) {
         if (value != null && !value.isBlank()) {
             data.put(key, value);
@@ -151,5 +189,14 @@ public class ToolCallProgressEmitter {
         if (input == null) return "";
         if (input.length() <= INPUT_PREVIEW_MAX_CHARS) return input;
         return input.substring(0, INPUT_PREVIEW_MAX_CHARS) + "...(truncated, full=" + input.length() + ")";
+    }
+
+    /** 元工具卡片用更宽的上限：ask_user 一次可能问很多条问题，300 字会被截断。 */
+    static final int META_PREVIEW_MAX_CHARS = 2000;
+
+    static String truncateMeta(String input) {
+        if (input == null) return "";
+        if (input.length() <= META_PREVIEW_MAX_CHARS) return input;
+        return input.substring(0, META_PREVIEW_MAX_CHARS) + "...(truncated, full=" + input.length() + ")";
     }
 }
