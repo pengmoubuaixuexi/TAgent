@@ -47,6 +47,9 @@ import java.util.concurrent.ThreadPoolExecutor;
 @Slf4j
 public class RobustToolCallingManager implements ToolCallingManager {
 
+    /** P0-B2b-Step3：repair 专用 ToolContext key——置 {@code Boolean.TRUE} 时 resolveToolDefinitions 直接返回空定义。 */
+    public static final String FORCE_NO_TOOLS_KEY = "agent.force_no_tools";
+
     private final ToolCallingManager delegate;
     private final McpToolMetrics metrics;
     /** 并行执行用的 IO 线程池（dagExecutor，execute() 自动 ContextSnapshot.wrap 接力 MDC）；null → 退化串行 */
@@ -61,21 +64,12 @@ public class RobustToolCallingManager implements ToolCallingManager {
      * 所以同组（同连接）串行、不同组（不同连接）并行。null → 全部归一组，退化串行。
      */
     private final McpClientRegistry mcpClientRegistry;
-
-    /**
-     * true：非执行步（分析/规划/质检/汇总）不向模型暴露任何工具定义——{@link #resolveToolDefinitions} 直接返回空，
-     * 模型请求体里就<b>没有</b> {@code tools} 字段，<b>模型从源头不会发起 tool_call</b>（不是"调用后拦截"）。执行步不受影响。
-     * 由 {@code agent.mcp.disable-tools-on-nonexec-steps} 控制，{@code AiClientModelNode} 装配时 set。
-     */
-    private volatile boolean disableToolsOnNonExecStep = false;
-
-    public void setDisableToolsOnNonExecStep(boolean v) {
-        this.disableToolsOnNonExecStep = v;
-    }
+    /** P1-A1 迁移期每个共享 manager 只报一次 missing-policy warn；逐请求频次由低基数 metric 统计。 */
+    private final java.util.concurrent.atomic.AtomicBoolean missingPolicyWarned = new java.util.concurrent.atomic.AtomicBoolean(false);
 
     /**
      * D 段：{@code ask_user} 工具的人工补充 gate（可选，null → 功能关闭）。由 {@code AiClientModelNode}
-     * 装配时 set（和 {@link #disableToolsOnNonExecStep} 同处），manager 经它读 enabled/maxAsks/timeout，
+     * 装配时 set，manager 经它读 enabled/maxAsks/timeout，
      * 自身无需任何 @Value。
      */
     private volatile cn.bugstack.ai.domain.agent.service.security.UserInputGate userInputGate;
@@ -140,8 +134,8 @@ public class RobustToolCallingManager implements ToolCallingManager {
 
     /**
      * request_tool 工具定义。模型执行中途发现缺工具能力时调用，在 need 里描述所缺能力；
-     * manager 在 {@link #handleMetaToolCalls} 内语义匹配 → 物化真实工具(带 inputSchema)注入到当前 options，
-     * 并 appendNeed 到会话级 store 让后续 step 也带上。不进 delegate 的 toolCallbacks。
+     * manager 在 {@link #handleMetaToolCalls} 内语义匹配并 appendNeed 到会话级 store；仅当当前 profile 同时允许
+     * {@link ToolCapability#BUSINESS_TOOL} 时注入当前 options，否则只为后续执行阶段登记。不进 delegate 的 toolCallbacks。
      */
     private static final ToolDefinition REQUEST_TOOL_DEFINITION = ToolDefinition.builder()
             .name(REQUEST_TOOL_TOOL_NAME)
@@ -188,24 +182,60 @@ public class RobustToolCallingManager implements ToolCallingManager {
 
     @Override
     public List<ToolDefinition> resolveToolDefinitions(ToolCallingChatOptions options) {
-        List<ToolDefinition> base;
-        if (disableToolsOnNonExecStep && isNonExecStep(options)) {
-            // 非执行步：不暴露真实工具定义 → 请求无真实 tools → 模型不会调真实工具（从源头掐掉，非事后拦截）
-            base = new ArrayList<>();
-        } else {
-            base = new ArrayList<>(delegate.resolveToolDefinitions(options));
+        // P0-B2b-Step3：请求级强制无工具（repair 专用，类型化 flag，模型不可伪造）——
+        // 必须在 delegate / 非执行步 gate / ask_user / request_tool 之前返回空（连元工具也不广播）。
+        if (isForceNoTools(options)) {
+            return new ArrayList<>();
         }
-        // D 段：在「非执行步禁真实工具」之后再追加 ask_user —— 非执行步=[ask_user]，执行步=[真实工具…, ask_user]。
-        // 追加不替换 → 不覆盖原工具；预算用尽 / 开关关 → 不追加，行为同现状。
-        if (askUserAvailable()) {
+        ToolCapabilityProfile policy = effectivePolicy(options);
+        List<ToolDefinition> base = policy.allows(ToolCapability.BUSINESS_TOOL)
+                ? new ArrayList<>(delegate.resolveToolDefinitions(options))
+                : new ArrayList<>();
+        // policy ceiling 与运行期 availability 取交集；NONE/BUSINESS_ONLY 不得再泄出元工具。
+        if (policy.allows(ToolCapability.ASK_USER) && askUserAvailable()) {
             base.add(ASK_USER_DEFINITION);
         }
-        // reactive 动态补工具：开关开 + 有匹配服务即广播 request_tool（非执行步也给——预装给后续执行步用；
-        // 预算不在广播处限，只在 executeToolCalls 按 prompt 历史里已有 request_tool 次数硬限，避免再加 sessionId map）。
-        if (requestToolAvailable()) {
+        if (policy.allows(ToolCapability.REQUEST_TOOL) && requestToolAvailable()) {
             base.add(REQUEST_TOOL_DEFINITION);
         }
         return base;
+    }
+
+    /**
+     * P1-A1 policy 解析：显式值优先；非法显式值 fail-closed；缺失才精确复现旧开关+stepLabel 行为。
+     */
+    private ToolCapabilityProfile effectivePolicy(ToolCallingChatOptions options) {
+        Map<String, Object> context = options != null ? options.getToolContext() : null;
+        ToolCapabilities.Parsed parsed = ToolCapabilities.parse(context);
+        if (parsed.state() == ToolCapabilities.State.EXPLICIT) {
+            if (metrics != null) metrics.recordToolPolicyResolution("explicit");
+            return parsed.profile();
+        }
+        if (parsed.state() == ToolCapabilities.State.INVALID) {
+            if (metrics != null) metrics.recordToolPolicyResolution("invalid");
+            log.warn("[ToolPolicy] invalid explicit policy value '{}', fail-closed to NONE", parsed.rawValue());
+            return ToolCapabilityProfile.NONE;
+        }
+        if (metrics != null) metrics.recordToolPolicyResolution("missing");
+        if (missingPolicyWarned.compareAndSet(false, true)) {
+            log.warn("[ToolPolicy] missing explicit tool-capabilities policy; fail-closed to NONE (warn once per manager). "
+                    + "P1-B removed the legacy stepLabel/global-switch fallback — every call prototype must inject an explicit profile");
+        }
+        // P1-B：legacy stepLabel/global-switch fallback 已删除。缺失显式 policy 一律 fail-closed 到 NONE，
+        // 不再依据 stepLabel 猜执行步。主链所有调用原型已显式注入(P1-A1 + §63 smoke 证 missing=0)；
+        // 若此处仍触发，说明存在未迁移/漏注入路径——由 policy.resolution{state=missing} metric 暴露并补注入，绝不放行工具。
+        return ToolCapabilityProfile.NONE;
+    }
+
+    private ToolCapabilityProfile effectivePolicy(Prompt prompt) {
+        if (prompt != null && prompt.getOptions() instanceof ToolCallingChatOptions options) {
+            return effectivePolicy(options);
+        }
+        return effectivePolicy((ToolCallingChatOptions) null);
+    }
+
+    private boolean isForceNoTools(Prompt prompt) {
+        return prompt != null && prompt.getOptions() instanceof ToolCallingChatOptions options && isForceNoTools(options);
     }
 
     /** ask_user 当前是否可广播：gate 存在且开启，且本次执行预算未用尽。sessionId 取自 MDC。 */
@@ -219,36 +249,26 @@ public class RobustToolCallingManager implements ToolCallingManager {
         return requestToolEnabled && mcpToolCatalogService != null;
     }
 
-    /**
-     * 当前请求是否属于"非执行步"（分析/规划/质检/汇总）。判定依据：{@code callStepWithStreaming} 注入到
-     * ToolContext 的 {@code stepLabel}(=各步中文 displayName，如"需求分析/质量评审/步骤规划/最终总结/MCP 工具分析")；
-     * 取不到再退 MDC {@code "step"}(stepId)；都取不到 → 保守按执行步放行（识别不出时不误伤执行步/fixed）。
-     * 执行步含"执行/回答/最终合成"或对应 stepId 片段，其余即非执行步。与 E2E earlyStepToolCallCount 口径一致。
-     */
-    private boolean isNonExecStep(ToolCallingChatOptions options) {
-        String label = null;
+    /** P0-B2b-Step3：repair 请求级强制无工具开关（类型化、模型不可伪造，来自应用侧 ToolContext）。 */
+    private boolean isForceNoTools(ToolCallingChatOptions options) {
         if (options != null && options.getToolContext() != null) {
-            Object v = options.getToolContext().get("stepLabel");
-            if (v != null) label = String.valueOf(v);
+            return Boolean.TRUE.equals(options.getToolContext().get(FORCE_NO_TOOLS_KEY));
         }
-        if (label == null || label.isBlank()) {
-            label = org.slf4j.MDC.get("step");
-        }
-        if (label == null || label.isBlank()) {
-            return false;
-        }
-        String s = label.toLowerCase();
-        boolean executor = s.contains("执行") || s.contains("回答") || s.contains("最终合成")
-                || s.contains("precision_executor") || s.contains("execute_step")
-                || s.contains("execute_steps") || s.contains("final_synthesis")
-                || s.contains("fixed") || s.contains("response");
-        return !executor;
+        return false;
     }
 
     @Override
     public ToolExecutionResult executeToolCalls(Prompt prompt, ChatResponse chatResponse) {
         if (prompt == null || chatResponse == null) {
             return delegate.executeToolCalls(prompt, chatResponse);
+        }
+
+        // definitions 是第一道门；这里是第二道门，防模型幻觉/旧上下文直接发起未授权调用。
+        ToolCapabilityProfile policy = isForceNoTools(prompt) ? ToolCapabilityProfile.NONE : effectivePolicy(prompt);
+        Set<String> denied = findPolicyDeniedToolNames(chatResponse, policy);
+        if (!denied.isEmpty()) {
+            log.warn("[ToolPolicy] denied tool calls at execution stage: {}", denied);
+            return buildPolicyDeniedResult(prompt, chatResponse, denied);
         }
 
         // ask_user / request_tool 都不是注册 callback（不在 toolCallbacks 里）→ 必须在 caseMap / unknown-tool 检查之前
@@ -300,6 +320,41 @@ public class RobustToolCallingManager implements ToolCallingManager {
         }
 
         return delegate.executeToolCalls(prompt, normalized);
+    }
+
+    private Set<String> findPolicyDeniedToolNames(ChatResponse response, ToolCapabilityProfile policy) {
+        Set<String> denied = new java.util.LinkedHashSet<>();
+        if (response == null || response.getResults() == null) return denied;
+        for (Generation gen : response.getResults()) {
+            if (gen.getOutput() == null || !gen.getOutput().hasToolCalls()) continue;
+            for (AssistantMessage.ToolCall tc : gen.getOutput().getToolCalls()) {
+                ToolCapability needed = isAskUserName(tc.name()) ? ToolCapability.ASK_USER
+                        : isRequestToolName(tc.name()) ? ToolCapability.REQUEST_TOOL
+                        : ToolCapability.BUSINESS_TOOL;
+                if (!policy.allows(needed)) denied.add(tc.name());
+            }
+        }
+        return denied;
+    }
+
+    /** 越权批次整体不执行，逐 tool_call_id 返回可恢复错误，确保 delegate 收不到任何一项。 */
+    private ToolExecutionResult buildPolicyDeniedResult(Prompt prompt, ChatResponse response, Set<String> denied) {
+        Generation toolGen = firstGenerationWithToolCalls(response);
+        if (toolGen == null || toolGen.getOutput() == null) {
+            return ToolExecutionResult.builder().conversationHistory(prompt.getInstructions()).returnDirect(false).build();
+        }
+        AssistantMessage assistant = toolGen.getOutput();
+        List<ToolResponseMessage.ToolResponse> responses = new ArrayList<>();
+        for (AssistantMessage.ToolCall tc : assistant.getToolCalls()) {
+            String text = denied.contains(tc.name())
+                    ? "当前阶段未授权调用该工具，请不要重试；请在本阶段允许的能力范围内继续。"
+                    : "同批次包含未授权工具，本批次未执行；请重新规划后再调用。";
+            responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(), text));
+        }
+        List<Message> history = new ArrayList<>(prompt.getInstructions());
+        history.add(assistant);
+        history.add(ToolResponseMessage.builder().responses(responses).metadata(Map.of()).build());
+        return ToolExecutionResult.builder().conversationHistory(history).returnDirect(false).build();
     }
 
     /**
@@ -432,10 +487,10 @@ public class RobustToolCallingManager implements ToolCallingManager {
      * <ol>
      *   <li>预算硬限：数 prompt 历史里已有 request_tool 次数，超 {@link #requestToolMaxCalls} 直接拒绝（无状态）；</li>
      *   <li>{@link cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService#resolveDynamicToolCallbacks} 物化真实回调（带 inputSchema）；</li>
-     *   <li>{@link #injectIntoOptions} 并入当前 {@code prompt.getOptions().toolCallbacks} → 框架下一轮即广播+可执行；</li>
+     *   <li>当前 profile 允许 BUSINESS_TOOL 时才由 {@link #injectIntoOptions} 并入当前 options；DISCOVERY_ONLY 只登记后续；</li>
      *   <li>{@code appendNeed(sessionId, need)} 写会话级 store → 后续 step 的 resolve 也带上。</li>
      * </ol>
-     * 返回给模型的文本说明装载结果，引导其下一轮直接调用被装载工具。
+     * 返回给模型的文本按 profile 区分“当前可直接调用”与“仅供后续执行阶段”。
      */
     private String runRequestTool(Prompt prompt, AssistantMessage.ToolCall tc, String sessionId, String stepLabel) {
         String needs = parseRequestToolNeeds(tc.arguments());
@@ -459,7 +514,8 @@ public class RobustToolCallingManager implements ToolCallingManager {
         try {
             // needs 多条换行连接；resolveDynamicToolCallbacks 内部 splitNeeds 拆开、各取 top-k 再并集。
             // currentTools 传空：去重在 injectIntoOptions 按工具名统一做；clientId/query 仅供匹配器日志。
-            resolved = mcpToolCatalogService.resolveDynamicToolCallbacks(REQUEST_TOOL_TOOL_NAME, needs, needs, java.util.List.of());
+            resolved = mcpToolCatalogService.resolveDynamicToolCallbacks(currentRunId(prompt), sessionId,
+                    REQUEST_TOOL_TOOL_NAME, needs, needs, java.util.List.of());
         } catch (Exception e) {
             log.warn("[RequestTool] resolve failed needs='{}': {}", needs, e.getMessage());
             return requestToolEnd(sessionId, stepLabel, "error", "匹配出错：" + e.getMessage(),
@@ -469,7 +525,9 @@ public class RobustToolCallingManager implements ToolCallingManager {
             return requestToolEnd(sessionId, stepLabel, "error", "未匹配到「" + needs.replace("\n", " / ") + "」对应的工具",
                     "没有匹配到「" + needs.replace("\n", " / ") + "」对应的可用工具。请基于现有工具完成任务，或换一种更具体的能力描述再试一次。");
         }
-        int added = injectIntoOptions(prompt, resolved);
+        ToolCapabilityProfile policy = effectivePolicy(prompt);
+        boolean businessAllowedNow = policy.allows(ToolCapability.BUSINESS_TOOL);
+        int added = businessAllowedNow ? injectIntoOptions(prompt, resolved) : 0;
         if (sessionId != null && !sessionId.isBlank()) {
             // 逐条 append（appendNeed 按行去重），让后续 step 的 resolve 也带上每一条能力
             for (String n : needs.split("\\r?\\n")) {
@@ -483,8 +541,11 @@ public class RobustToolCallingManager implements ToolCallingManager {
         log.info("[RequestTool] needs='{}' matched={} injected={}", needs, names, added);
         // detail 用"工具名按行排列"，前端按行拆成"装配的工具"列表 + 计数("装配了 N 个工具")；
         // 给模型的文本仍用友好句（modelText 与卡片 detail 解耦）。
-        return requestToolEnd(sessionId, stepLabel, "success", String.join("\n", names),
-                "已为你装载工具：" + names + "。现在可以直接调用上述工具完成任务（同样的能力不要再次 request_tool）。");
+        String modelText = businessAllowedNow
+                ? "已为你装载工具：" + names + "。现在可以直接调用上述工具完成任务（同样的能力不要再次 request_tool）。"
+                : "已登记并为后续执行阶段准备工具：" + names
+                    + "。当前阶段没有业务工具执行权限，请继续完成本阶段职责，不要在本阶段调用上述工具。";
+        return requestToolEnd(sessionId, stepLabel, "success", String.join("\n", names), modelText);
     }
 
     /** request_tool 终态卡片 + 返回给模型的文本一处收口（多 return 点共用，避免每处都写一遍 emit）。 */
@@ -629,6 +690,16 @@ public class RobustToolCallingManager implements ToolCallingManager {
             if (v != null) return String.valueOf(v);
         }
         return org.slf4j.MDC.get("step");
+    }
+
+    /** 取本轮 runId：优先 ToolContext（跨 Reactor 线程稳定），退 MDC。 */
+    private String currentRunId(Prompt prompt) {
+        if (prompt != null && prompt.getOptions() instanceof ToolCallingChatOptions tco && tco.getToolContext() != null) {
+            Object v = tco.getToolContext().get("agent.run_id");
+            if (v != null && !String.valueOf(v).isBlank()) return String.valueOf(v);
+        }
+        String fromMdc = org.slf4j.MDC.get("agent.run_id");
+        return fromMdc != null && !fromMdc.isBlank() ? fromMdc : null;
     }
 
     /** 取第一个含 tool call 的 Generation（与 buildUnknownToolErrorResult 取法一致，通常只有一个）。 */

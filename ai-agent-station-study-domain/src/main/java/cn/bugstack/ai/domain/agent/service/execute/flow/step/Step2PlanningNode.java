@@ -46,12 +46,23 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         // 获取规划客户端
         ChatClient planningChatClient = getChatClientByClientId(aiAgentClientFlowConfigVO.getClientId());
         List<ToolCallback> dynamicToolCallbacks = resolveAgentDynamicToolCallbacks(requestParameter, aiAgentClientFlowConfigVO.getClientId());
+        AiAgentClientFlowConfigVO executorConfig = dynamicContext.getAiAgentClientFlowConfigVOMap()
+                .get(AiClientTypeEnumVO.EXECUTOR_CLIENT.getCode());
+        String executorClientId = executorConfig != null ? executorConfig.getClientId() : aiAgentClientFlowConfigVO.getClientId();
+        List<ToolCallback> executorDynamicToolCallbacks = resolveAgentDynamicToolCallbacks(requestParameter, executorClientId);
+        cn.bugstack.ai.domain.agent.service.execute.common.ExecutorToolCatalog v2Catalog =
+                storeExecutorToolCatalogSnapshot(dynamicContext, FLOW_TOOL_CATALOG_V2_KEY, executorClientId, executorDynamicToolCallbacks, 2);
+        List<String> v1ToV2Drift = compareExecutorToolCatalogLineage(dynamicContext, FLOW_TOOL_CATALOG_V1_KEY, v2Catalog);
+        if (!v1ToV2Drift.isEmpty()) {
+            log.warn("[ExecutorToolCatalog] V1->V2 lineage drift: {}", v1ToV2Drift);
+        }
 
         String mcpToolsAnalysis = dynamicContext.getValue("mcpToolsAnalysis");
         // 引导感知：本步 prompt 包成 Supplier，userRequest 每轮实时取 currentTask（引导后已折入引导，修复"重跑仍用原始询问"）
         final String mcpToolsAnalysisForPrompt = mcpToolsAnalysis;
+        final String toolRuntimeForPrompt = renderToolRuntimeForPrompt(v2Catalog, executorClientId);
         java.util.function.Supplier<String> planningPromptSupplier = () -> {
-            String planningPrompt = buildStructuredPlanningPrompt(dynamicContext.getCurrentTask(), mcpToolsAnalysisForPrompt);
+            String planningPrompt = buildStructuredPlanningPrompt(dynamicContext.getCurrentTask(), mcpToolsAnalysisForPrompt, toolRuntimeForPrompt);
             String refined = planningPrompt + "\n\n## ⚠️ 工具映射验证反馈\n" +
                     "\n\n**请根据上述验证反馈重新生成规划，确保：**\n" +
                     "1. 只使用验证报告中列出的有效工具\n" +
@@ -61,7 +72,9 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
             // 规划阶段属非执行步，但若发现工具不够可经豁免提示主动 request_tool 预装给后续执行步（功能关则空串、零注入）。
             // 注意：要真正生效，规划客户端的 DB 系统提示里"禁止调用任何工具"需改成"禁止调用业务/执行类工具"，
             // 否则 system 的硬禁止会压过本 user 豁免，模型把调用写成文本（说而不做）。见 8013_p2。
-            return appendCurrentTimeContext(refined + metaToolPromptHint(requestParameter.getSessionId()));
+            return appendCurrentTimeContext(refined + metaToolPromptHint(
+                    cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_STEP2_PLANNING,
+                    requestParameter.getSessionId()));
         };
 
         // 2026-05-07 流式 UX：step_start → 流式 token → step_end（折叠为"步骤规划 已完成"）
@@ -79,6 +92,7 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         String planningResult = callStepWithSteer(
                 p -> step2Client.prompt().user(p).options(step2Opts),
                 dynamicContext, "flow_step2_planning", "步骤规划",
+                cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_STEP2_PLANNING,
                 planningPromptSupplier, requestParameter.getSessionId());
         
         log.info("执行步骤规划结果: {}", planningResult);
@@ -109,7 +123,7 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
     /**
      * 构建结构化的规划提示词
      */
-    private String buildStructuredPlanningPrompt(String userRequest, String mcpToolsAnalysis) {
+    private String buildStructuredPlanningPrompt(String userRequest, String mcpToolsAnalysis, String toolRuntime) {
         StringBuilder prompt = new StringBuilder();
 
         // 1. 任务分析部分 - 通用化用户需求分析
@@ -129,6 +143,8 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         // 2. 工具能力分析
         prompt.append("## 🔧 MCP工具能力分析结果\n");
         prompt.append(mcpToolsAnalysis).append("\n\n");
+        prompt.append("## 🧰 实际可执行工具目录（含参数 schema）\n");
+        prompt.append(toolRuntime).append("\n\n");
 
         // 3. 工具映射验证 - 使用动态获取的工具信息
         prompt.append("## ✅ 工具映射验证要求\n");

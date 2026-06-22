@@ -92,10 +92,6 @@ public class AiClientModelNode extends AbstractArmorySupport {
     @Value("${agent.mcp.tool-call.max-serial-rounds-per-client:3}")
     private int toolCallMaxSerialRoundsPerClient;
 
-    /** (a) 非执行步（分析/规划/质检/汇总）禁工具：开 → 这些步不向模型暴露工具定义，模型不会 tool_call；关 → 所有步保留工具（旧行为）。 */
-    @Value("${agent.mcp.disable-tools-on-nonexec-steps:true}")
-    private boolean disableToolsOnNonExecStep;
-
     /** reactive 动态补工具：request_tool 总开关 + 单次执行最多装载次数。默认关，关时 manager 不广播/不拦截。 */
     @Value("${agent.request-tool.enabled:false}")
     private boolean requestToolEnabled;
@@ -193,9 +189,6 @@ public class AiClientModelNode extends AbstractArmorySupport {
                     new cn.bugstack.ai.domain.agent.service.execute.common.RobustToolCallingManager(
                             defaultMgr, mcpToolMetrics, dagExecutor, toolCallParallelEnabled, mcpClientRegistry,
                             toolCallMaxSerialRoundsPerClient);
-            // (a) 非执行步禁工具：开关开时，resolveToolDefinitions 对分析/规划/质检/汇总步返回空工具集
-            // → 模型请求无 tools 字段 → 模型不会 tool_call（从源头掐，非事后拦截）。关时所有步保留工具（旧行为）。
-            robustMgr.setDisableToolsOnNonExecStep(disableToolsOnNonExecStep);
             // D 段：注入 ask_user gate（gate 内部 enabled=false 时 manager 不广播/不进 gate，零影响）
             robustMgr.setUserInputGate(userInputGate);
             // reactive 动态补工具：注入 request_tool 依赖（开关关 / 服务缺失时 manager 不广播/不拦截，零影响）

@@ -4,6 +4,7 @@ import cn.bugstack.ai.domain.agent.adapter.repository.IAgentRepository;
 import cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity;
 import cn.bugstack.ai.domain.agent.model.entity.ExecuteCommandEntity;
 import cn.bugstack.ai.domain.agent.model.valobj.enums.AiAgentEnumVO;
+import cn.bugstack.ai.domain.agent.service.execute.common.ExecutorToolCatalog;
 import cn.bugstack.ai.domain.agent.service.execute.common.LlmCallContext;
 import cn.bugstack.ai.domain.agent.service.execute.common.LlmCallGateway;
 import cn.bugstack.ai.domain.agent.service.execute.common.LlmObservationRecorder;
@@ -101,12 +102,15 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
     public static final String CHAT_MEMORY_CONVERSATION_ID_KEY = "chat_memory_conversation_id";
     public static final String CHAT_MEMORY_RETRIEVE_SIZE_KEY = "chat_memory_response_size";
     public static final String LTM_RETRIEVAL_QUERY_KEY = "ltm_retrieval_query";
+    public static final String FLOW_TOOL_CATALOG_V1_KEY = "flow.toolCatalog.v1";
+    public static final String FLOW_TOOL_CATALOG_V2_KEY = "flow.toolCatalog.v2";
+    public static final String FLOW_TOOL_CATALOG_V3_KEY = "flow.toolCatalog.v3";
 
     protected List<ToolCallback> resolveAgentDynamicToolCallbacks(ExecuteCommandEntity requestParameter, String clientId) {
         if (requestParameter == null || clientId == null || dynamicMcpToolCatalogService == null) {
             return List.of();
         }
-        return dynamicMcpToolCatalogService.resolveDynamicToolCallbacks(clientId,
+        return dynamicMcpToolCatalogService.resolveDynamicToolCallbacks(requestParameter.getRunId(), requestParameter.getSessionId(), clientId,
                 dynamicMcpToolCatalogService.needsFor(requestParameter.getSessionId()), requestParameter.getMessage(),
                 dynamicAgentToolRegistry != null ? dynamicAgentToolRegistry.getTools(clientId) : List.of());
     }
@@ -123,6 +127,37 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         return combined.toArray(new ToolCallback[0]);
     }
 
+    protected ExecutorToolCatalog snapshotExecutorToolCatalog(String clientId,
+                                                              List<ToolCallback> dynamicToolCallbacks,
+                                                              int snapshotVersion) {
+        List<ToolCallback> resident = dynamicAgentToolRegistry != null
+                ? dynamicAgentToolRegistry.getToolCallbacks(clientId)
+                : List.of();
+        return ExecutorToolCatalog.from(resident, dynamicToolCallbacks, snapshotVersion);
+    }
+
+    protected ExecutorToolCatalog storeExecutorToolCatalogSnapshot(
+            DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
+            String key,
+            String clientId,
+            List<ToolCallback> dynamicToolCallbacks,
+            int snapshotVersion) {
+        ExecutorToolCatalog catalog = snapshotExecutorToolCatalog(clientId, dynamicToolCallbacks, snapshotVersion);
+        if (dynamicContext != null) dynamicContext.setValue(key, catalog);
+        log.info("[ExecutorToolCatalog] snapshot key={} version={} clientId={} tools={}",
+                key, catalog.snapshotVersion(), clientId, catalog.toolNames());
+        return catalog;
+    }
+
+    protected List<String> compareExecutorToolCatalogLineage(
+            DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
+            String previousKey,
+            ExecutorToolCatalog current) {
+        if (dynamicContext == null || current == null) return List.of();
+        ExecutorToolCatalog previous = dynamicContext.getValue(previousKey);
+        return current.missingOrChangedFrom(previous);
+    }
+
     /**
      * 非执行步「除元工具外不执行」豁免提示：仅在对应功能<b>实际开启</b>时才提及该元工具，
      * 避免功能在配置里被关闭时仍提示模型可用 → 诱发对未广播工具的幻觉调用。两者都关返回空串（零注入）。
@@ -130,18 +165,39 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
      * 实际广播 ask_user/request_tool 的条件保持同源（gate.enabled / requestToolEnabled）。
      */
     protected String metaToolPromptHint(String sessionId) {
+        return metaToolPromptHint(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityProfile.ALL, sessionId);
+    }
+
+    /** P1-A1：提示层与结构门读取同一 profile，禁止宣传本阶段未授权的元工具。 */
+    protected String metaToolPromptHint(
+            cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityProfile profile, String sessionId) {
         // ask_user 的提示条件必须与实际广播条件一致：广播除 isEnabled() 外还看本会话剩余额度 remainingFor>0
         //（见 RobustToolCallingManager.askUserAvailable），否则额度用尽后 prompt 仍说"可用"但请求里不广播该工具 → 幻觉调用。
-        boolean askOn = userInputGate != null && userInputGate.isEnabled()
+        boolean askOn = profile != null
+                && profile.allows(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapability.ASK_USER)
+                && userInputGate != null && userInputGate.isEnabled()
                 && userInputGate.remainingFor(sessionId) > 0;
-        boolean reqOn = requestToolEnabled && dynamicMcpToolCatalogService != null;
+        boolean reqOn = profile != null
+                && profile.allows(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapability.REQUEST_TOOL)
+                && requestToolEnabled && dynamicMcpToolCatalogService != null;
         if (!askOn && !reqOn) return "";
-        StringBuilder sb = new StringBuilder();
-        sb.append("\n\n## 本阶段可用的元工具（例外）\n");
-        sb.append("本阶段不执行用户的实际任务，但下列元工具属于例外、可按需调用（调用它们不算执行用户任务）：\n");
-        if (askOn) sb.append("- ask_user：关键信息缺失、或对用户意图有多种合理理解需用户拍板时，向用户提问澄清（一次把问题问全）。\n");
-        if (reqOn) sb.append("- request_tool：发现完成任务需要当前工具列表里没有的能力时，在 needs 里逐条用一句话描述所缺能力，预先装载真实工具供后续步骤使用。\n");
-        return sb.toString();
+        return cn.bugstack.ai.domain.agent.service.prompt.RuntimeToolPromptComposer
+                .renderMetaToolHint(askOn, reqOn);
+    }
+
+    protected String renderToolRuntimeForPrompt(ExecutorToolCatalog catalog, String clientId) {
+        String rendered = cn.bugstack.ai.domain.agent.service.prompt.RuntimeToolPromptComposer.renderToolRuntime(catalog);
+        if (rendered != null && !rendered.isBlank()) return rendered;
+        return "<tool_runtime>\n"
+                + "  <no_tools client_id=\"" + escapeXml(clientId) + "\">"
+                + "当前 Agent 没有配置任何可执行 MCP 工具；请仅基于已有上下文/模型知识作答，不要虚构工具调用过程。"
+                + "</no_tools>\n"
+                + "</tool_runtime>";
+    }
+
+    private static String escapeXml(String value) {
+        if (value == null) return "";
+        return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
     }
 
     protected String buildLtmRetrievalQuery(ExecuteCommandEntity req, String stage) {
@@ -440,7 +496,17 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
             DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
             String stepId, String displayName, String promptText, String sessionId) {
         return callStepWithStreaming(spec, dynamicContext, stepId, displayName,
-                java.util.Collections.emptySet(), promptText, sessionId);
+                java.util.Collections.emptySet(), null, promptText, sessionId);
+    }
+
+    protected String callStepWithStreaming(
+            ChatClient.ChatClientRequestSpec spec,
+            DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
+            String stepId, String displayName,
+            cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityProfile profile,
+            String promptText, String sessionId) {
+        return callStepWithStreaming(spec, dynamicContext, stepId, displayName,
+                java.util.Collections.emptySet(), profile, promptText, sessionId);
     }
 
     /**
@@ -473,6 +539,15 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
             DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
             String stepId, String displayName, java.util.Set<String> dependsOn,
             String promptText, String sessionId) {
+        return callStepWithStreaming(spec, dynamicContext, stepId, displayName, dependsOn, null, promptText, sessionId);
+    }
+
+    protected String callStepWithStreaming(
+            ChatClient.ChatClientRequestSpec spec,
+            DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
+            String stepId, String displayName, java.util.Set<String> dependsOn,
+            cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityProfile profile,
+            String promptText, String sessionId) {
         sendStepStart(dynamicContext, stepId, displayName, dependsOn, sessionId);
         // G1-C 修复：sessionId 注入 ToolContext，跟随调用流到 Reactor 工具执行线程（MDC 在那为空）。
         // MeteredToolCallback 优先从 ToolContext 取 sessionId 才能弹人工审批 / 发进度事件。
@@ -480,9 +555,9 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         // stepLabel(displayName) 让 DAG 并行审批时前端能标注是哪个步骤要的许可。
         // 注：动态补挂的工具由各 step 节点通过 spec.options(OpenAiChatOptions.toolCallbacks(...)) 注入，这里不重复注入。
         log.info("[ToolCtxDiag][flow] step={} sessionId={} inject={}", stepId, sessionId, (sessionId != null && !sessionId.isBlank()));
-        final ChatClient.ChatClientRequestSpec callSpec = (sessionId != null && !sessionId.isBlank())
-                ? spec.toolContext(buildToolContext(sessionId, displayName))
-                : spec;
+        String runId = dynamicContext != null ? dynamicContext.getValue("runId") : null;
+        java.util.Map<String, Object> toolContext = buildToolContext(sessionId, displayName, profile, runId);
+        final ChatClient.ChatClientRequestSpec callSpec = toolContext.isEmpty() ? spec : spec.toolContext(toolContext);
         String result;
         try {
             if (tokenStreamingEnabled) {
@@ -501,9 +576,24 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
      * 用 HashMap 而非 Map.of —— stepLabel 可能为 null，Map.of 不允许 null value。
      */
     protected static java.util.Map<String, Object> buildToolContext(String sessionId, String stepLabel) {
+        return buildToolContext(sessionId, stepLabel, null);
+    }
+
+    protected static java.util.Map<String, Object> buildToolContext(
+            String sessionId, String stepLabel,
+            cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityProfile profile) {
+        return buildToolContext(sessionId, stepLabel, profile, null);
+    }
+
+    protected static java.util.Map<String, Object> buildToolContext(
+            String sessionId, String stepLabel,
+            cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityProfile profile,
+            String runId) {
         java.util.Map<String, Object> tc = new java.util.HashMap<>();
-        tc.put("sessionId", sessionId);
+        if (sessionId != null && !sessionId.isBlank()) tc.put("sessionId", sessionId);
+        if (runId != null && !runId.isBlank()) tc.put("agent.run_id", runId);
         if (stepLabel != null && !stepLabel.isBlank()) tc.put("stepLabel", stepLabel);
+        cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilities.put(tc, profile);
         return tc;
     }
 
@@ -519,6 +609,15 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
             java.util.function.Function<String, ChatClient.ChatClientRequestSpec> specBuilder,
             DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
             String stepId, String displayName,
+            java.util.function.Supplier<String> basePromptSupplier, String sessionId) {
+        return callStepWithSteer(specBuilder, dynamicContext, stepId, displayName, null, basePromptSupplier, sessionId);
+    }
+
+    protected String callStepWithSteer(
+            java.util.function.Function<String, ChatClient.ChatClientRequestSpec> specBuilder,
+            DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
+            String stepId, String displayName,
+            cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityProfile profile,
             java.util.function.Supplier<String> basePromptSupplier, String sessionId) {
         String prompt = basePromptSupplier.get();
         String prevPartial = null, prevReasoning = null;
@@ -542,7 +641,7 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
                 return result != null ? result : (prevPartial != null ? prevPartial : "");
             }
             final String fp = prompt;
-            result = callStepWithStreaming(specBuilder.apply(fp), dynamicContext, stepId, displayName, fp, sessionId);
+            result = callStepWithStreaming(specBuilder.apply(fp), dynamicContext, stepId, displayName, profile, fp, sessionId);
             if (!steerEnabled || !dynamicContext.hasSteerIdea() || dynamicContext.isFinalizeRequested()
                     || ++rounds >= steerMaxRounds) {
                 break;

@@ -61,10 +61,12 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
         AiAgentClientFlowConfigVO executorConfig = dynamicContext.getAiAgentClientFlowConfigVOMap()
                 .get(AiClientTypeEnumVO.EXECUTOR_CLIENT.getCode());
         String executorClientId = executorConfig != null ? executorConfig.getClientId() : aiAgentClientFlowConfigVO.getClientId();
-        List<ToolCallback> dynamicToolCallbacks = mcpToolCatalogService.resolveDynamicToolCallbacks(executorClientId,
+        List<ToolCallback> dynamicToolCallbacks = mcpToolCatalogService.resolveDynamicToolCallbacks(requestParameter.getRunId(), requestParameter.getSessionId(), executorClientId,
                 mcpToolCatalogService.needsFor(requestParameter.getSessionId()), requestParameter.getMessage(),
                 agentToolRegistry != null ? agentToolRegistry.getTools(executorClientId) : List.of());
-        String toolListBlock = agentToolRegistry.describeToolsForPrompt(executorClientId, dynamicToolCallbacks);
+        cn.bugstack.ai.domain.agent.service.execute.common.ExecutorToolCatalog v1Catalog =
+                storeExecutorToolCatalogSnapshot(dynamicContext, FLOW_TOOL_CATALOG_V1_KEY, executorClientId, dynamicToolCallbacks, 1);
+        String toolListBlock = renderToolRuntimeForPrompt(v1Catalog, executorClientId);
         log.info("[Step1] inject tools for executor clientId={} hasTools={}",
                 executorClientId, agentToolRegistry.hasAnyTools(executorClientId));
 
@@ -105,7 +107,8 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
                         请基于上面给出的真实工具列表进行分析，禁止编造工具。""",
                 toolListBlockForPrompt,
                 dynamicContext.getCurrentTask()
-        ) + metaToolPromptHint(requestParameter.getSessionId()));
+        ) + metaToolPromptHint(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_STEP1_TOOL_ANALYSIS,
+                requestParameter.getSessionId()));
 
         // 2026-05-07 流式 UX：step_start → 流式 token → step_end（折叠为"MCP 工具分析 已完成"）
         org.springframework.ai.openai.OpenAiChatOptions.Builder step1OptionsBuilder =
@@ -126,6 +129,7 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
                         .options(step1Opts)
                         .advisors(a -> a.param(LTM_RETRIEVAL_QUERY_KEY, steerAwareRetrievalQuery(dynamicContext, requestParameter))),
                 dynamicContext, "flow_step1_mcp_tools_analysis", "MCP 工具分析",
+                cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_STEP1_TOOL_ANALYSIS,
                 mcpAnalysisPromptSupplier, requestParameter.getSessionId());
         
         log.info("MCP工具分析结果（仅分析，未执行实际操作）: {}", mcpToolsAnalysis);

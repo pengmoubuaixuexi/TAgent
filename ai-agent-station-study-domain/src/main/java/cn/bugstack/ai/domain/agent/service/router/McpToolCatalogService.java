@@ -8,6 +8,9 @@ import cn.bugstack.ai.domain.agent.service.execute.common.HintedToolCallback;
 import cn.bugstack.ai.domain.agent.service.execute.common.McpClientRegistry;
 import cn.bugstack.ai.domain.agent.service.execute.common.McpToolMetrics;
 import cn.bugstack.ai.domain.agent.service.execute.common.MeteredToolCallback;
+import cn.bugstack.ai.domain.agent.service.execute.common.DynamicToolUnavailableException;
+import cn.bugstack.ai.domain.agent.service.execute.common.ResolvedToolLease;
+import cn.bugstack.ai.domain.agent.service.execute.common.ResolvedToolLeaseStore;
 import cn.bugstack.ai.domain.agent.service.execute.common.ToolCallProgressEmitter;
 import cn.bugstack.ai.domain.agent.service.execute.common.ToolPromptHintRegistry;
 import cn.bugstack.ai.domain.agent.service.security.HumanApprovalGate;
@@ -15,6 +18,7 @@ import io.modelcontextprotocol.client.McpSyncClient;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.mcp.SyncMcpToolCallbackProvider;
 import org.springframework.ai.tool.ToolCallback;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
@@ -22,6 +26,9 @@ import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
 import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -73,6 +80,10 @@ public class McpToolCatalogService {
     @Resource
     private IToolVectorStore toolVectorStore;
 
+    /** P2-A1：run 级动态工具租约；可选，缺失时完全退回旧行为。 */
+    @Autowired(required = false)
+    private ResolvedToolLeaseStore resolvedToolLeaseStore;
+
     /**
      * 每条 need 各取 embedding top-k（默认 2）。一次 query 可能有多条 need（多类能力），
      * 每条各自取 top-k、最后并集去重——见 {@link #resolveDynamicToolCallbacks}。
@@ -97,6 +108,10 @@ public class McpToolCatalogService {
     private final Map<String, MatchCacheEntry> matchCache = new ConcurrentHashMap<>();
 
     private record MatchCacheEntry(List<AiMcpToolCatalogVO> tools, long expireAtMs) {}
+
+    private record MatchedTool(String need, AiMcpToolCatalogVO tool) {}
+
+    private record ToolIdentity(String mcpId, String toolName, String definitionHash) {}
 
     @Value("${agent.dynamic-tools.catalog.auto-refresh-enabled:false}")
     private boolean autoRefreshCatalogEnabled;
@@ -189,6 +204,20 @@ public class McpToolCatalogService {
                                                           String missingToolDesc,
                                                           String query,
                                                           List<AgentToolRegistry.ToolInfo> currentTools) {
+        return resolveDynamicToolCallbacks(null, null, clientId, missingToolDesc, query, currentTools);
+    }
+
+    /**
+     * P2-A1：带 runId 的动态工具解析。
+     * <p>有 runId + leaseStore 时，后续 step 优先重物化本 run 里已解析过的 tool identity；
+     * 未覆盖的 need 才走原 embedding/top-k。无 runId 时保持旧行为，便于迁移期回退。
+     */
+    public List<ToolCallback> resolveDynamicToolCallbacks(String runId,
+                                                          String sessionId,
+                                                          String clientId,
+                                                          String missingToolDesc,
+                                                          String query,
+                                                          List<AgentToolRegistry.ToolInfo> currentTools) {
         List<String> needs = splitNeeds(missingToolDesc);
         if (needs.isEmpty()) {
             return Collections.emptyList();
@@ -198,6 +227,57 @@ public class McpToolCatalogService {
                 .filter(t -> t != null && t.name() != null)
                 .map(AgentToolRegistry.ToolInfo::name)
                 .collect(Collectors.toSet());
+
+        boolean leaseEnabled = runId != null && !runId.isBlank() && resolvedToolLeaseStore != null;
+        if (leaseEnabled) {
+            List<ToolCallback> result = new ArrayList<>();
+            Set<String> resultToolNames = new LinkedHashSet<>();
+            Set<String> coveredNeeds = new LinkedHashSet<>();
+
+            for (ResolvedToolLease lease : resolvedToolLeaseStore.listLeases(runId)) {
+                if (lease == null || !needs.contains(lease.originalNeed()) || !lease.isAvailable()) {
+                    continue;
+                }
+                ToolCallback callback = materializeLease(lease);
+                String name = callback != null && callback.getToolDefinition() != null
+                        ? callback.getToolDefinition().name() : null;
+                coveredNeeds.add(lease.originalNeed());
+                if (name == null || currentToolNames.contains(name) || !resultToolNames.add(name)) {
+                    continue;
+                }
+                result.add(callback);
+            }
+
+            List<String> uncoveredNeeds = needs.stream()
+                    .filter(n -> !coveredNeeds.contains(n))
+                    .toList();
+            List<MatchedTool> matched = matchToolsByNeed(uncoveredNeeds, query, currentToolNames, resultToolNames);
+            if (matched.isEmpty() && !uncoveredNeeds.isEmpty() && autoRefreshCatalogEnabled) {
+                log.info("[DynamicTools] no lease/uncovered match for clientId={} runId={} needs={}, refreshing enabled MCP catalog",
+                        clientId, runId, uncoveredNeeds);
+                refreshEnabledMcpCatalog();
+                matched = matchToolsByNeed(uncoveredNeeds, query, currentToolNames, resultToolNames);
+            }
+            for (MatchedTool mt : matched) {
+                ToolCallback callback = ensureToolCallback(mt.tool());
+                if (callback != null) {
+                    String name = callback.getToolDefinition() != null ? callback.getToolDefinition().name() : null;
+                    if (name != null && resultToolNames.add(name)) {
+                        String identity = toolIdentity(mt.tool(), callback);
+                        resolvedToolLeaseStore.createOrMerge(runId, sessionId, mt.need(), identity);
+                        result.add(callback);
+                    }
+                }
+            }
+
+            if (!result.isEmpty()) {
+                log.info("[DynamicTools] clientId={} runId={} needs={} materializedOrMatchedTools={}", clientId, runId, needs,
+                        result.stream().map(cb -> cb.getToolDefinition().name()).toList());
+            } else {
+                log.info("[DynamicTools] clientId={} runId={} needs={} no usable catalog tool", clientId, runId, needs);
+            }
+            return result;
+        }
 
         // 每条 need 各取 embedding top-k，并集去重；语义匹配走 PgVector，命中按 need 请求级缓存复用。
         List<AiMcpToolCatalogVO> matched = matchUnion(needs, query, currentToolNames);
@@ -225,11 +305,27 @@ public class McpToolCatalogService {
         return result;
     }
 
+    /** 清理 run 级 lease；供 dispatch/strategy finally 调用。 */
+    public void cleanupRun(String runId) {
+        if (resolvedToolLeaseStore != null && runId != null && !runId.isBlank()) {
+            resolvedToolLeaseStore.cleanupRun(runId);
+        }
+    }
+
     /**
      * 多条 need 各取 embedding top-k，按 need 顺序<b>并集去重</b>、排除已挂工具、截到总量上限。
      * 向量库空/不可用（端点挂了、或没 refresh 过）时不补工具——不再回退词法。
      */
     private List<AiMcpToolCatalogVO> matchUnion(List<String> needs, String query, Set<String> currentToolNames) {
+        return matchToolsByNeed(needs, query, currentToolNames, Set.of()).stream()
+                .map(MatchedTool::tool)
+                .toList();
+    }
+
+    /**
+     * 多条 need 各取 embedding top-k，同时保留 tool ← need 的来源，供 P2-A1 建 lease(originalNeed, identity)。
+     */
+    private List<MatchedTool> matchToolsByNeed(List<String> needs, String query, Set<String> currentToolNames, Set<String> alreadySelectedNames) {
         if (needs == null || needs.isEmpty()) {
             return Collections.emptyList();
         }
@@ -240,19 +336,98 @@ public class McpToolCatalogService {
         int topK = perNeedTopK > 0 ? perNeedTopK : 2;
         int cap = maxExtraToolsPerRequest > 0 ? maxExtraToolsPerRequest : 6;
         Set<String> exclude = currentToolNames == null ? Set.of() : currentToolNames;
-        LinkedHashMap<String, AiMcpToolCatalogVO> union = new LinkedHashMap<>();
+        Set<String> already = alreadySelectedNames == null ? Set.of() : alreadySelectedNames;
+        LinkedHashMap<String, MatchedTool> union = new LinkedHashMap<>();
         for (String need : needs) {
             for (AiMcpToolCatalogVO tool : cachedMatch(need, topK)) {
                 String name = tool.getToolName();
-                if (name == null || exclude.contains(name) || union.containsKey(name)) {
+                if (name == null || exclude.contains(name) || already.contains(name) || union.containsKey(name)) {
                     continue;
                 }
-                union.put(name, tool);
-                if (union.size() >= cap) break;
+                union.put(name, new MatchedTool(need, tool));
+                if (already.size() + union.size() >= cap) break;
             }
-            if (union.size() >= cap) break;
+            if (already.size() + union.size() >= cap) break;
         }
         return new ArrayList<>(union.values());
+    }
+
+    private ToolCallback materializeLease(ResolvedToolLease lease) {
+        ToolIdentity identity = parseToolIdentity(lease.toolIdentity());
+        if (identity == null) {
+            markLeaseInvalidated(lease, ResolvedToolLease.Availability.INVALIDATED);
+            throw new DynamicToolUnavailableException(lease.toolIdentity(), ResolvedToolLease.Availability.INVALIDATED);
+        }
+        if (!mcpClientRegistry.hasClient(identity.mcpId())) {
+            markLeaseInvalidated(lease, ResolvedToolLease.Availability.MCP_DOWN);
+            log.warn("[DynamicTools][Lease] MCP down for lease runId={} identity={}", lease.runId(), lease.toolIdentity());
+            throw new DynamicToolUnavailableException(lease.toolIdentity(), ResolvedToolLease.Availability.MCP_DOWN);
+        }
+
+        ToolCallback current = mcpClientRegistry.getCurrentCallback(identity.toolName());
+        if (current == null) {
+            current = ensureToolCallback(AiMcpToolCatalogVO.builder()
+                    .mcpId(identity.mcpId())
+                    .toolName(identity.toolName())
+                    .build());
+        }
+        if (current == null) {
+            markLeaseInvalidated(lease, ResolvedToolLease.Availability.INVALIDATED);
+            throw new DynamicToolUnavailableException(lease.toolIdentity(), ResolvedToolLease.Availability.INVALIDATED);
+        }
+
+        String actualHash = definitionHash(readInputSchema(current));
+        if (!identity.definitionHash().equals(actualHash)) {
+            markLeaseInvalidated(lease, ResolvedToolLease.Availability.INVALIDATED);
+            log.warn("[DynamicTools][Lease] definition hash changed runId={} identity={} actual={}",
+                    lease.runId(), lease.toolIdentity(), actualHash);
+            throw new DynamicToolUnavailableException(lease.toolIdentity(), ResolvedToolLease.Availability.INVALIDATED);
+        }
+
+        ToolCallback wrapped = ensureToolCallback(AiMcpToolCatalogVO.builder()
+                .mcpId(identity.mcpId())
+                .toolName(identity.toolName())
+                .build());
+        return wrapped != null ? wrapped : current;
+    }
+
+    private void markLeaseInvalidated(ResolvedToolLease lease, ResolvedToolLease.Availability reason) {
+        if (resolvedToolLeaseStore != null && lease != null) {
+            resolvedToolLeaseStore.markInvalidated(lease.runId(), lease.toolIdentity(), reason);
+        }
+    }
+
+    private String toolIdentity(AiMcpToolCatalogVO tool, ToolCallback callback) {
+        String mcpId = safe(tool != null ? tool.getMcpId() : null);
+        String toolName = callback != null && callback.getToolDefinition() != null
+                ? safe(callback.getToolDefinition().name())
+                : safe(tool != null ? tool.getToolName() : null);
+        String schema = callback != null ? readInputSchema(callback)
+                : safe(tool != null ? tool.getInputSchemaJson() : null);
+        return mcpId + ":" + toolName + ":" + definitionHash(schema);
+    }
+
+    private ToolIdentity parseToolIdentity(String value) {
+        if (value == null || value.isBlank()) return null;
+        String[] parts = value.split(":", 3);
+        if (parts.length != 3 || parts[0].isBlank() || parts[1].isBlank() || parts[2].isBlank()) {
+            return null;
+        }
+        return new ToolIdentity(parts[0], parts[1], parts[2]);
+    }
+
+    private String definitionHash(String schema) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] bytes = digest.digest(safe(schema).getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(bytes.length * 2);
+            for (byte b : bytes) {
+                sb.append(String.format("%02x", b));
+            }
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 unavailable", e);
+        }
     }
 
     /**

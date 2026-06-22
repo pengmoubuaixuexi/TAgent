@@ -68,6 +68,9 @@ public class SummarizingChatMemory implements ChatMemory {
     @Value("${agent.chat-memory.max-messages:20}")
     private int maxMessages;
 
+    /** chat-memory floor：摘要路径下未摘要窗口塌缩时，至少按完整轮兜底这么多条最近明细（2 轮）。实际 floor 取 min(此值, maxMessages)。 */
+    private static final int RECENT_DETAIL_FLOOR = 4;
+
     /** 消息总数超过这个阈值开始摘要 */
     @Value("${agent.chat-memory.summarize-trigger:30}")
     private int triggerThreshold;
@@ -116,13 +119,23 @@ public class SummarizingChatMemory implements ChatMemory {
         }
         int watermark = (summary != null && summary.getSummaryMsgCount() != null) ? summary.getSummaryMsgCount() : 0;
 
-        // 取窗口：跳过已纳入摘要的消息，只取最近 maxMessages 条未摘要消息
-        List<Message> unsummarized = watermark > 0 && watermark < raw.size()
-                ? new ArrayList<>(raw.subList(watermark, raw.size()))
-                : raw;
+        // 取窗口：跳过已纳入摘要的消息，只取最近 maxMessages 条未摘要消息。
+        // equality bug 修复：用 start=max(0,min(watermark,size)) 统一边界——
+        // watermark==raw.size()(全摘要,如 40/40) → 空未摘要窗口（旧 `: raw` 会错误返回全量并与摘要重复）；
+        // watermark>raw.size()(异常) → 同样收敛到空，subList 不越界。
+        int start = Math.max(0, Math.min(watermark, raw.size()));
+        List<Message> unsummarized = new ArrayList<>(raw.subList(start, raw.size()));
         List<Message> windowed = unsummarized.size() <= maxMessages
                 ? unsummarized
                 : new ArrayList<>(unsummarized.subList(unsummarized.size() - maxMessages, unsummarized.size()));
+
+        // chat-memory floor：仅摘要路径(watermark>0)下，未摘要窗口塌缩到 < floor 时，按「完整轮」从 raw
+        // 末尾兜底，避免长对话摘要后最近上下文塌空。floor=RECENT_DETAIL_FLOOR(2轮)且不超过 maxMessages；
+        // 普通滑窗路径(watermark==0)不动。兜底窗口可与摘要区轻微重叠（可接受）。
+        int floor = Math.min(RECENT_DETAIL_FLOOR, maxMessages);
+        if (watermark > 0 && windowed.size() < floor && raw.size() > windowed.size()) {
+            windowed = recentRoundsFloor(raw, floor, maxMessages);
+        }
         log.info("[STM.get] conversation={} raw={} watermark={} unsummarized={} windowed={}",
                 conversationId, raw.size(), watermark, unsummarized.size(), windowed.size());
 
@@ -134,6 +147,26 @@ public class SummarizingChatMemory implements ChatMemory {
             return withSummary;
         }
         return windowed;
+    }
+
+    /**
+     * chat-memory floor 的「完整轮」回退：从 raw 末尾取至少 floor 条，并在不超过 maxMessages 预算的前提下，
+     * 把起点向前对齐到最近的 USER 消息（轮起点），避免窗口从 assistant/tool 消息中间切入而切断 user/assistant 配对。
+     * <p>不假设 raw 严格成对（极端历史可能不规整）；若 maxMessages 窗口内找不到 USER 边界，则退化为 floor 起点，
+     * 优先守住上下文预算上限，避免为了对齐把很久以前的大段历史重新带回模型。
+     */
+    private List<Message> recentRoundsFloor(List<Message> raw, int floor, int maxMessages) {
+        int n = raw.size();
+        int floorStart = Math.max(0, n - floor);
+        int lowerBound = Math.max(0, n - maxMessages);
+        int start = floorStart;
+        while (start > lowerBound && raw.get(start).getMessageType() != org.springframework.ai.chat.messages.MessageType.USER) {
+            start--;
+        }
+        if (raw.get(start).getMessageType() != org.springframework.ai.chat.messages.MessageType.USER) {
+            start = floorStart;
+        }
+        return new ArrayList<>(raw.subList(start, n));
     }
 
     @Override

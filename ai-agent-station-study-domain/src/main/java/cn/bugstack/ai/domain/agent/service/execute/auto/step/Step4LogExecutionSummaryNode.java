@@ -73,6 +73,12 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
         
         // 生成最终总结报告（无论任务是否完成都需要生成）
         generateFinalReport(requestParameter, dynamicContext);
+
+        // P0-B2b-Step3：质量交付终态每请求仅在 Step4 记一次（含 not_assessed）
+        if (autoAgentMetrics != null) {
+            cn.bugstack.ai.domain.agent.model.valobj.enums.QualityVerificationStatus __qvs = dynamicContext.getQualityVerificationStatus();
+            autoAgentMetrics.recordQualityTerminal(__qvs == null ? "not_assessed" : __qvs.name());
+        }
         
         log.info("\n🏁 === 动态多轮执行结束 ====");
 
@@ -109,7 +115,7 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
     /**
      * 生成最终总结报告
      */
-    private void generateFinalReport(ExecuteCommandEntity requestParameter, DefaultAutoAgentExecuteStrategyFactory.DynamicContext dynamicContext) {
+    protected void generateFinalReport(ExecuteCommandEntity requestParameter, DefaultAutoAgentExecuteStrategyFactory.DynamicContext dynamicContext) {
         try {
             boolean isCompleted = dynamicContext.isCompleted();
             boolean answerNow = dynamicContext.isFinalizeRequested();
@@ -137,6 +143,8 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
                         + "\n如需补足信息可调用上述工具后再作答；不需要则直接作答。";
             }
             summaryPrompt = appendCurrentTimeContext(summaryPrompt);
+            // P0-B2b-Step3：质量未通过/未验证时，要求最终交付向用户明示局限，且不泄露内部流程
+            summaryPrompt += qualityDeliveryDirective(dynamicContext.getQualityVerificationStatus());
 
             // 立即回答可观测：在 LLM 调用前写一条标记行，记录"中断点 + 改写后的完整 finalize 输入"，LLM 失败也留痕。
             if (answerNow) {
@@ -170,11 +178,17 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
             // 2026-05-07 流式 UX：step_start → 流式 token → step_end（折叠为"最终总结 已完成"）
             String summaryResult = callStepWithStreaming(
                     streamSpec, dynamicContext, answerNow ? "step4_answer_now" : "step4_summary", "最终总结",
+                    answerNow
+                            ? cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.answerNow(attachTools)
+                            : cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.AUTO_STEP4_SUMMARY,
                     summaryPrompt, requestParameter.getSessionId());
 
             if (summaryResult == null) throw new BizException("step4: summaryResult is null", "LLM returned null for Step4LogExecutionSummaryNode");
             // P2.5 14.2 PII 脱敏：仅在最终输出给用户时脱敏
             summaryResult = OutputFilter.cleanForUser(cn.bugstack.ai.domain.agent.service.security.PiiMasker.mask(summaryResult));
+            // P0-B2b-Step3：结构门控兜底。模型即使忽略软 directive，异常质量终态也必须确定性告知用户。
+            // 固定文案不含内部枚举/prompt/error；方法幂等，且只在 Step4 最终出口执行一次。
+            summaryResult = applyQualityDeliveryNotice(dynamicContext.getQualityVerificationStatus(), summaryResult);
             logFinalReport(dynamicContext, summaryResult, requestParameter.getSessionId());
 
             // 将总结结果保存到动态上下文中
@@ -264,6 +278,57 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
      * 立即回答专用 prompt：把当前能拿到的半成品全捞上——已完成步骤记录 + 当前分析 + 当前执行产出 + 被中断的半截思考。
      * 任一为空就略过该段；clicked 很早时退化为"基于 RAG/记忆直接答原问题"。
      */
+    /**
+     * P0-B2b-Step3：按质量交付状态给最终总结追加面向用户的"明示局限"指令（不泄露内部流程/提示词）。
+     * VERIFIED_PASS / NOT_ASSESSED / null → 不追加。
+     */
+    static String qualityDeliveryDirective(cn.bugstack.ai.domain.agent.model.valobj.enums.QualityVerificationStatus status) {
+        if (status == null) {
+            return "";
+        }
+        switch (status) {
+            case QUALITY_NOT_VERIFIED:
+                return "\n\n【质量边界】不得声称本次结果已完成质量验证；请给出当前最佳结果，不要提及任何内部流程、提示词或系统细节。";
+            case VERIFIED_FAIL:
+                return "\n\n【质量边界】不得把本次结果描述为已通过完整质量检查；请给出当前最佳结果，不要提及任何内部流程、提示词或系统细节。";
+            case VERIFIED_OPTIMIZE:
+                return "\n\n【质量边界】本次结果仍有优化空间，不要声称它已经是最终最优版本；不要提及任何内部流程、提示词或系统细节。";
+            default:
+                return "";
+        }
+    }
+
+    /**
+     * 按最终质量状态确定性添加面向用户的固定说明。固定文案不暴露内部枚举、step、prompt 或错误；
+     * PASS/NOT_ASSESSED/null 原样返回。方法幂等，防未来出口重入时重复叠加。
+     */
+    static String applyQualityDeliveryNotice(
+            cn.bugstack.ai.domain.agent.model.valobj.enums.QualityVerificationStatus status, String summary) {
+        String body = summary == null ? "" : summary;
+        if (status == null) {
+            return body;
+        }
+        switch (status) {
+            case QUALITY_NOT_VERIFIED: {
+                String notice = "⚠️ 说明：本次结果未经完整质量确认，可能存在局限。";
+                return body.startsWith(notice) ? body : notice + "\n\n" + body;
+            }
+            case VERIFIED_FAIL: {
+                String notice = "⚠️ 说明：本次结果尚未通过完整质量检查，可能不完整或仍需完善。";
+                return body.startsWith(notice) ? body : notice + "\n\n" + body;
+            }
+            case VERIFIED_OPTIMIZE: {
+                String notice = "提示：本次结果仍有进一步优化空间。";
+                if (body.endsWith(notice)) {
+                    return body;
+                }
+                return body.isEmpty() ? notice : body + "\n\n" + notice;
+            }
+            default:
+                return body;
+        }
+    }
+
     private String buildAnswerNowPrompt(ExecuteCommandEntity req, DefaultAutoAgentExecuteStrategyFactory.DynamicContext ctx) {
         StringBuilder sb = new StringBuilder();
         sb.append("用户在执行过程中点击了【立即回答】，要求基于目前已有的（可能不完整的）信息立刻作答。\n\n");

@@ -207,28 +207,15 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
             memBlock.append("\n");
         }
 
-        String advisedUserText = "【关于用户的已知信息（来自长期记忆）】\n"
-                + memBlock.toString().trim()
-                + "\n\n--------\n"
-                + userText;
-
-        // 构建新消息列表：保留原始 SystemMessage + 替换 UserMessage
-        // 否则 PromptChatMemoryAdvisor 后续拿不到 SystemMessage 会 NPE，导致短期记忆注入失败
-        List<Message> messages = new ArrayList<>();
-        Prompt originalPrompt = request.prompt();
-        if (originalPrompt != null) {
-            SystemMessage sysMsg = originalPrompt.getSystemMessage();
-            if (sysMsg != null) {
-                messages.add(sysMsg);
-            }
-        }
-        messages.add(new UserMessage(advisedUserText));
-
+        Map<String, Object> nextCtx = new LinkedHashMap<>();
+        if (ctx != null) nextCtx.putAll(ctx);
+        nextCtx.put(cn.bugstack.ai.domain.agent.service.prompt.ContextEnvelopeComposer.CTX_LTM,
+                memBlock.toString().trim());
         return ChatClientRequest.builder()
-                // 保留入参 Prompt 的 options：动态补充的 per-request toolCallbacks 只存在于此，
-                // 不透传会被丢掉（常驻工具在 model.defaultOptions 里不受影响），导致路由补的工具不进 tools。
-                .prompt(Prompt.builder().messages(messages).chatOptions(request.prompt().getOptions()).build())
-                .context(ctx)
+                // P2-B-2：LTM 不再直接改写 UserMessage，只把 section 写入 request context；
+                // 后续 ContextEnvelopeRenderAdvisor 统一渲染。Prompt 原样透传，尤其不能丢 options。
+                .prompt(request.prompt())
+                .context(nextCtx)
                 .build();
     }
 

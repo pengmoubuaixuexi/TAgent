@@ -129,6 +129,14 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
 
             // 获取规划客户端
             ChatClient executorChatClient = getChatClientByClientId(aiAgentClientFlowConfigVO.getClientId());
+            List<ToolCallback> step4DynamicToolCallbacks = resolveAgentDynamicToolCallbacks(request, aiAgentClientFlowConfigVO.getClientId());
+            cn.bugstack.ai.domain.agent.service.execute.common.ExecutorToolCatalog v3Catalog =
+                    storeExecutorToolCatalogSnapshot(dynamicContext, FLOW_TOOL_CATALOG_V3_KEY,
+                            aiAgentClientFlowConfigVO.getClientId(), step4DynamicToolCallbacks, 3);
+            List<String> v2ToV3Drift = compareExecutorToolCatalogLineage(dynamicContext, FLOW_TOOL_CATALOG_V2_KEY, v3Catalog);
+            if (!v2ToV3Drift.isEmpty()) {
+                log.warn("[ExecutorToolCatalog] V2->V3 lineage drift: {}", v2ToV3Drift);
+            }
 
             // 从动态上下文获取解析的步骤
             Map<String, String> stepsMap = dynamicContext.getValue("stepsMap");
@@ -405,16 +413,21 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             String executorClientId = execConfig != null ? execConfig.getClientId() : null;
             String dynamicMissingToolDesc = dynamicContext.getValue("dynamicMissingToolDesc");
             String dynamicToolQuery = dynamicContext.getValue("dynamicToolQuery");
+            String runId = dynamicContext.getValue("runId");
+            String leaseSessionId = dynamicContext.getValue("sessionId");
             List<ToolCallback> dynamicToolCallbacks = mcpToolCatalogService != null
-                    ? mcpToolCatalogService.resolveDynamicToolCallbacks(executorClientId, dynamicMissingToolDesc, dynamicToolQuery,
+                    ? mcpToolCatalogService.resolveDynamicToolCallbacks(runId, leaseSessionId, executorClientId, dynamicMissingToolDesc, dynamicToolQuery,
                             agentToolRegistry != null ? agentToolRegistry.getTools(executorClientId) : List.of())
                     : List.of();
+            storeExecutorToolCatalogSnapshot(dynamicContext, FLOW_TOOL_CATALOG_V3_KEY,
+                    executorClientId, dynamicToolCallbacks, 3);
             String stepExecPrompt = buildStepExecutionPrompt(stepContent, dynamicContext, dependsOnNumbers, executorClientId, dynamicToolCallbacks);
             stepExecPrompt = appendCurrentTimeContext(stepExecPrompt);
             // 子步用窄角色 system 覆盖 EXECUTOR_CLIENT 的领域人设，防每个子步都照"攻略编写者"吐整份完整攻略。
             // 整合步(buildFinalDeliverable)不走这里，仍用 DB 的 8010_p3 产出完整交付物。
             ChatClient.ChatClientRequestSpec spec0 = executorChatClient.prompt()
-                    .system(SUB_STEP_EXECUTOR_SYSTEM)
+                    // P2-B-1：A2 请求级 .system() 替换 defaultSystem，故公共信任边界须在此另行 prepend（否则 DAG 子步丢失）。
+                    .system(cn.bugstack.ai.domain.agent.service.prompt.SystemPolicyComposer.prepend(SUB_STEP_EXECUTOR_SYSTEM))
                     .user(stepExecPrompt);
             // 必须 OpenAiChatOptions：DefaultChatClientUtils 需 instanceof ToolCallingChatOptions 才注入 toolContext，
             // 且 OpenAiChatModel.buildRequestPrompt 的 toolContext merge 把 runtime 强转 OpenAiChatOptions，
@@ -439,7 +452,9 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             String executionResult = callStepWithStreaming(
                     streamSpec, dynamicContext,
                     "flow_step4_execute_step_" + stepNumber, "执行 " + stepKey,
-                    dependsOnStepIds, stepExecPrompt, stepSessionId);
+                    dependsOnStepIds,
+                    cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_DAG_EXECUTION,
+                    stepExecPrompt, stepSessionId);
 
             if (executionResult == null) throw new BizException("flow step4: executionResult is null", "LLM returned null for Step4ExecuteStepsNode");
             log.info("步骤 {} 执行结果: {}", stepNumber, executionResult.substring(0, Math.min(150, executionResult.length())) + "...");
@@ -529,7 +544,9 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
 
         // 0. 真实工具列表（让 LLM 知道实际有什么工具可用，避免引用不存在的工具）
         if (executorClientId != null && agentToolRegistry != null) {
-            sb.append("**【可用工具清单】**\n").append(agentToolRegistry.describeToolsForPrompt(executorClientId, dynamicToolCallbacks)).append("\n\n");
+            cn.bugstack.ai.domain.agent.service.execute.common.ExecutorToolCatalog catalog =
+                    snapshotExecutorToolCatalog(executorClientId, dynamicToolCallbacks, 3);
+            sb.append("**【可用工具清单】**\n").append(renderToolRuntimeForPrompt(catalog, executorClientId)).append("\n\n");
             sb.append("**工具选择说明（重要）:**\n");
             sb.append("- 【可用工具清单】是真实允许使用的工具范围；只要在清单里，就可以按本步骤目标调用。\n");
             sb.append("- 【步骤内容】里的“使用工具/首选工具”是规划阶段给出的首选建议，不是唯一允许工具。\n");
@@ -823,8 +840,10 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             String prompt = buildFlowAnswerNowPrompt(dynamicContext, request) + "\n\n" + answerNowNoThinkDirective;
             // 立即回答且挂工具：把常驻+补充工具清单注入 prompt（与正常执行步一致，帮模型选对工具、防幻觉）
             if (attachTools && dynamicAgentToolRegistry != null) {
+                cn.bugstack.ai.domain.agent.service.execute.common.ExecutorToolCatalog catalog =
+                        snapshotExecutorToolCatalog(clientId, dynamicToolCallbacks, 3);
                 prompt += "\n\n**【可用工具清单】**\n"
-                        + dynamicAgentToolRegistry.describeToolsForPrompt(clientId, dynamicToolCallbacks)
+                        + renderToolRuntimeForPrompt(catalog, clientId)
                         + "\n如需补足信息可调用上述工具后再作答；不需要则直接作答。";
             }
             prompt = appendCurrentTimeContext(prompt);
@@ -876,6 +895,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                 spec = spec.options(ob.build());
             }
             String answer = callStepWithStreaming(spec, dynamicContext, "flow_step4_answer_now", "立即回答",
+                    cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.answerNow(attachTools),
                     prompt, request.getSessionId());
             if (answer == null || answer.isBlank()) answer = "（当前可用信息不足，无法立即作答。）";
             answer = stripExecutionWrapper(answer);
@@ -963,6 +983,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         }
         String finalAnswer = callStepWithStreaming(
                 specFinal, dynamicContext, "flow_step4_final_synthesis", "最终合成",
+                cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_FINAL_SYNTHESIS,
                 prompt, request.getSessionId());
 
         if (finalAnswer == null || finalAnswer.isBlank()) {

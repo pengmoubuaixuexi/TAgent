@@ -52,12 +52,14 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy {
         // v1.3.2：sessionId 显式放进 dynamicContext，避免 dag-step 线程读 MDC 拿不到
         // ReasoningContentFilter.scopeSession 从这里取，按 session 隔离 reasoning_content 缓存
         dynamicContext.setValue("sessionId", executeCommandEntity.getSessionId());
+        dynamicContext.setValue("runId", executeCommandEntity.getRunId());
         dynamicContext.setValue("userId", executeCommandEntity.getUserId());
         dynamicContext.setValue("tenantId", executeCommandEntity.getTenantId());
         dynamicContext.setValue("agentId", executeCommandEntity.getAiAgentId());
 
         // 注册到 activeContexts 以支持 cancelExecute()
         String sessionId = executeCommandEntity.getSessionId();
+        String runId = executeCommandEntity.getRunId();
         if (sessionId != null) activeContexts.put(sessionId, dynamicContext);
         // 引用计数器跨轮泄漏修复（2026-05-31）：每轮入口清一次，让引用从 [1] 起；
         // 轮内多步检索仍连续累加。
@@ -87,6 +89,7 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy {
             longTermMemoryTurnSnapshot.clearSession(sessionId);
             if (sessionId != null) activeContexts.remove(sessionId);
             if (sessionId != null && mcpToolCatalogService != null) mcpToolCatalogService.clearNeeds(sessionId);
+            if (runId != null && mcpToolCatalogService != null) mcpToolCatalogService.cleanupRun(runId);
         }
     }
 

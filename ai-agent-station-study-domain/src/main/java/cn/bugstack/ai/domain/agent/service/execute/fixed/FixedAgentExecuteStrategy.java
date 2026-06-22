@@ -139,6 +139,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
 
         String content = "";
         String sessionId = requestParameter.getSessionId();
+        String runId = requestParameter.getRunId();
 
         // 注册取消标志以支持 cancelExecute()
         AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -180,7 +181,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             // 注入当前 agent 真实工具清单，防止 LLM 幻觉不存在的工具
             String clientId = config.getClientId();
             List<ToolCallback> dynamicToolCallbacks = mcpToolCatalogService != null
-                    ? mcpToolCatalogService.resolveDynamicToolCallbacks(clientId,
+                    ? mcpToolCatalogService.resolveDynamicToolCallbacks(runId, requestParameter.getSessionId(), clientId,
                             mcpToolCatalogService.needsFor(requestParameter.getSessionId()), requestParameter.getMessage(),
                             agentToolRegistry != null ? agentToolRegistry.getTools(clientId) : List.of())
                     : List.of();
@@ -207,16 +208,18 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             // MeteredToolCallback 优先从 ToolContext 取 sessionId 才能弹人工审批 / 发进度事件。
             // stepLabel(displayName) 让前端审批弹窗标注是哪个回答步骤要的许可。
             log.info("[ToolCtxDiag][fixed] stepId={} sessionId={} inject={}", stepId, sessionId, (sessionId != null && !sessionId.isBlank()));
-            if (sessionId != null && !sessionId.isBlank()) {
-                java.util.Map<String, Object> tc = new java.util.HashMap<>();
-                tc.put("sessionId", sessionId);
-                if (displayName != null && !displayName.isBlank()) tc.put("stepLabel", displayName);
-                spec = spec.toolContext(tc);
-            }
+            java.util.Map<String, Object> tc = new java.util.HashMap<>();
+            if (sessionId != null && !sessionId.isBlank()) tc.put("sessionId", sessionId);
+            if (runId != null && !runId.isBlank()) tc.put("agent.run_id", runId);
+            if (displayName != null && !displayName.isBlank()) tc.put("stepLabel", displayName);
+            cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilities.put(tc,
+                    cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FIXED_NORMAL);
+            spec = spec.toolContext(tc);
 
             // G1-C：写回 MDC，让 Reactor 自动上下文传播在订阅时捕获、恢复到 boundedElastic 工具线程，
             // MeteredToolCallback 才能拿到 sessionId 触发审批。线程池 wrap 的 finally 会统一还原 MDC。
             if (sessionId != null && !sessionId.isBlank()) MDC.put("sessionId", sessionId);
+            if (runId != null && !runId.isBlank()) MDC.put("agent.run_id", runId);
             String stepResult;
             ChatResponse lastResponse = null;
             try {
@@ -353,6 +356,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             if (sessionId != null) cancelTriggers.remove(sessionId);
             if (sessionId != null) steerInbox.remove(sessionId);
             if (sessionId != null && mcpToolCatalogService != null) mcpToolCatalogService.clearNeeds(sessionId);
+            if (runId != null && mcpToolCatalogService != null) mcpToolCatalogService.cleanupRun(runId);
             cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearLatestReasoning(sessionId);
         }
     }
@@ -677,7 +681,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         String partialReasoning = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.getLatestReasoning(sessionId);
         // 工具：常驻 + 补充（用于 prompt 工具清单 + 回调挂载）
         java.util.List<ToolCallback> dyn = (answerNowFinalizeTools && mcpToolCatalogService != null && clientId != null)
-                ? mcpToolCatalogService.resolveDynamicToolCallbacks(clientId, mcpToolCatalogService.needsFor(sessionId), req.getMessage(),
+                ? mcpToolCatalogService.resolveDynamicToolCallbacks(req.getRunId(), sessionId, clientId, mcpToolCatalogService.needsFor(sessionId), req.getMessage(),
                         agentToolRegistry != null ? agentToolRegistry.getTools(clientId) : java.util.List.of())
                 : java.util.List.of();
         boolean attachTools = !dyn.isEmpty();
@@ -746,6 +750,13 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             if (hasEffort) ob.reasoningEffort(answerNowReasoningEffort);
             spec = spec.options(ob.build());
         }
+        java.util.Map<String, Object> finalizeToolContext = new java.util.HashMap<>();
+        if (sessionId != null && !sessionId.isBlank()) finalizeToolContext.put("sessionId", sessionId);
+        if (req.getRunId() != null && !req.getRunId().isBlank()) finalizeToolContext.put("agent.run_id", req.getRunId());
+        finalizeToolContext.put("stepLabel", "立即回答");
+        cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilities.put(finalizeToolContext,
+                cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.answerNow(attachTools));
+        spec = spec.toolContext(finalizeToolContext);
         StringBuilder buf = new StringBuilder();
         final ChatResponse[] last = new ChatResponse[1];
         // 立即回答 finalize：流式逐 token 推（与正常路径同协议）+ 真·关思考（reasoning_effort 设到 options）。
@@ -786,7 +797,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
     private String fixedSteerRerun(ChatClient client, String clientId, ExecuteCommandEntity req, String partialAnswer, String sessionId, String idea, ResponseBodyEmitter emitter) {
         String partialReasoning = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.getLatestReasoning(sessionId);
         java.util.List<ToolCallback> dyn = (mcpToolCatalogService != null && clientId != null)
-                ? mcpToolCatalogService.resolveDynamicToolCallbacks(clientId, mcpToolCatalogService.needsFor(sessionId), req.getMessage(),
+                ? mcpToolCatalogService.resolveDynamicToolCallbacks(req.getRunId(), sessionId, clientId, mcpToolCatalogService.needsFor(sessionId), req.getMessage(),
                         agentToolRegistry != null ? agentToolRegistry.getTools(clientId) : java.util.List.of())
                 : java.util.List.of();
         boolean attachTools = !dyn.isEmpty();
@@ -835,6 +846,13 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             spec = spec.options(org.springframework.ai.openai.OpenAiChatOptions.builder()
                     .toolCallbacks(reqTools.toArray(new ToolCallback[0])).build());
         }
+        java.util.Map<String, Object> steerToolContext = new java.util.HashMap<>();
+        if (sessionId != null && !sessionId.isBlank()) steerToolContext.put("sessionId", sessionId);
+        if (req.getRunId() != null && !req.getRunId().isBlank()) steerToolContext.put("agent.run_id", req.getRunId());
+        steerToolContext.put("stepLabel", "引导重做");
+        cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilities.put(steerToolContext,
+                cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FIXED_STEER);
+        spec = spec.toolContext(steerToolContext);
         StringBuilder buf = new StringBuilder();
         final ChatResponse[] last = new ChatResponse[1];
         // 引导重做：流式逐 token 推；思考不关（与设计一致，引导要让模型重新想）。

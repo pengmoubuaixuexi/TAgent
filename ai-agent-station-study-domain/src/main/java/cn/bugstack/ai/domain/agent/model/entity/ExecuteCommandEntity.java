@@ -23,6 +23,13 @@ public class ExecuteCommandEntity {
 
     private String sessionId;
 
+    /**
+     * P2-A1：一次 dispatch -> execute() 的运行边界。
+     * <p>用于动态工具租约隔离：同一次执行内 request_tool 首次解析出的工具 identity
+     * 后续 step 复用；执行结束 cleanupRun(runId)。steer / answer_now / retry 仍属于同一 run。
+     */
+    private String runId;
+
     /** P1.2.3 多租户隔离：用户 ID（X-User-Id header），为空时回退 sessionId */
     private String userId;
 

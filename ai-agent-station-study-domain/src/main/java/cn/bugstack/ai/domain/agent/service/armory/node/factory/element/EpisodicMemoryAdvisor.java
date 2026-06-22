@@ -133,21 +133,15 @@ public class EpisodicMemoryAdvisor implements BaseAdvisor {
                 sb.append(i + 1).append(". ").append(otherEpisodes.get(i)).append("\n");
             }
         }
-        sb.append("\n--------\n").append(userText);
-
-        // 保留原始 SystemMessage，避免 ChatMemory advisor 后续拿不到
-        List<Message> messages = new ArrayList<>();
-        Prompt originalPrompt = request.prompt();
-        if (originalPrompt != null) {
-            SystemMessage sysMsg = originalPrompt.getSystemMessage();
-            if (sysMsg != null) messages.add(sysMsg);
-        }
-        messages.add(new UserMessage(sb.toString()));
-
+        Map<String, Object> nextCtx = new java.util.LinkedHashMap<>();
+        if (ctx != null) nextCtx.putAll(ctx);
+        nextCtx.put(cn.bugstack.ai.domain.agent.service.prompt.ContextEnvelopeComposer.CTX_EPISODIC,
+                sb.toString().trim());
         return ChatClientRequest.builder()
-                // 透传 options，否则 per-request 动态工具回调会丢（见 LongTermMemoryAdvisor 同样修复）。
-                .prompt(Prompt.builder().messages(messages).chatOptions(originalPrompt.getOptions()).build())
-                .context(ctx)
+                // P2-B-2：Episodic 不再直接改写 UserMessage，只把 section 写入 request context；
+                // 后续 ContextEnvelopeRenderAdvisor 统一渲染。Prompt 原样透传，尤其不能丢 options。
+                .prompt(request.prompt())
+                .context(nextCtx)
                 .build();
     }
 

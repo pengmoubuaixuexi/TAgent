@@ -51,6 +51,11 @@ public class DefaultAutoAgentExecuteStrategyFactory {
 
         boolean isCompleted = false;
 
+        /** P0-B2b-Step3：质量交付状态（独立于完成/路由）；Step3 enforce 唯一写入，Step4 只读。 */
+        @lombok.Builder.Default
+        private cn.bugstack.ai.domain.agent.model.valobj.enums.QualityVerificationStatus qualityVerificationStatus =
+                cn.bugstack.ai.domain.agent.model.valobj.enums.QualityVerificationStatus.NOT_ASSESSED;
+
         /** P2.2.4：SSE 关闭后置 true，各 step 入口检查跳过 LLM 调用 */
         private final AtomicBoolean cancelled = new AtomicBoolean(false);
 

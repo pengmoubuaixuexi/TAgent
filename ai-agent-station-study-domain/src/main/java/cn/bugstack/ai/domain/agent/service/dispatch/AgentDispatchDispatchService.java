@@ -18,6 +18,7 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyEmitter
 
 import javax.annotation.Resource;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 
@@ -63,11 +64,15 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
 
     @Override
     public void dispatch(ExecuteCommandEntity requestParameter, ResponseBodyEmitter emitter) throws Exception {
+        if (requestParameter.getRunId() == null || requestParameter.getRunId().isBlank()) {
+            requestParameter.setRunId(UUID.randomUUID().toString());
+        }
         String agentId = requestParameter.getAiAgentId();
 
         // 防串请求/泄漏：进入即清掉本 session 可能残留的旧 need（上一次请求若在"交给异步策略执行"前同步失败，
         // 策略 finally 不会跑、clearNeeds 漏掉）。本轮 need 写在这之后；若本轮也没成功交出去，由方法末尾 finally 兜底清。
         final String __needSid = requestParameter.getSessionId();
+        final String __runId = requestParameter.getRunId();
         if (mcpToolCatalogService != null && __needSid != null && !__needSid.isBlank()) {
             mcpToolCatalogService.clearNeeds(__needSid);
         }
@@ -166,7 +171,7 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
                     }
                 }
             });
-            __handedOff = true; // 已成功交给异步策略执行 → 本轮 need 的清理归策略 finally 的 clearNeeds
+            __handedOff = true; // 已成功交给异步策略执行 → 本轮 need/lease 的清理归策略 finally
         } catch (RejectedExecutionException e) {
             log.warn("线程池已满，拒绝执行 agent={} strategy={}", finalAgentId, finalStrategy);
             emitter.send("{\"error\":\"service_unavailable\",\"message\":\"Server too busy, please retry later\",\"status\":503}");
@@ -177,6 +182,9 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
             // 这里兜底清掉本轮已写入的 need，避免 session 维度泄漏 + 下次同 session 读到旧 need。
             if (!__handedOff && mcpToolCatalogService != null && __needSid != null && !__needSid.isBlank()) {
                 mcpToolCatalogService.clearNeeds(__needSid);
+            }
+            if (!__handedOff && mcpToolCatalogService != null && __runId != null && !__runId.isBlank()) {
+                mcpToolCatalogService.cleanupRun(__runId);
             }
         }
     }

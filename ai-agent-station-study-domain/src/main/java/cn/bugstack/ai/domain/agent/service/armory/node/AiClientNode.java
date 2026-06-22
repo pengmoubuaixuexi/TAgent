@@ -11,6 +11,7 @@ import cn.bugstack.ai.domain.agent.service.armory.node.factory.element.LongTermM
 import cn.bugstack.ai.domain.agent.service.armory.node.factory.element.ReadOnlyChatMemoryAdvisor;
 import cn.bugstack.ai.domain.agent.service.execute.common.McpToolMetrics;
 import cn.bugstack.ai.domain.agent.service.execute.common.MeteredToolCallback;
+import cn.bugstack.ai.domain.agent.service.prompt.ContextEnvelopeRenderAdvisor;
 import cn.bugstack.ai.domain.agent.service.router.AgentToolRegistry;
 import cn.bugstack.wrench.design.framework.tree.StrategyHandler;
 import com.alibaba.fastjson.JSON;
@@ -131,6 +132,9 @@ public class AiClientNode extends AbstractArmorySupport {
             for (String advisorBeanName : advisorBeanNameList) {
                 advisors.add(getBean(advisorBeanName));
             }
+            // P2-B-2：LTM/Episodic 只采集 section 到 request.context，统一由 render advisor 渲染单个 envelope。
+            // 无 ctx.envelope.* 时 no-op；不需要改 DB advisor 配置。
+            advisors.add(new ContextEnvelopeRenderAdvisor());
 
             Advisor[] advisorArray = advisors.toArray(new Advisor[]{});
 
@@ -175,7 +179,8 @@ public class AiClientNode extends AbstractArmorySupport {
             }
 
             ChatClient chatClient = ChatClient.builder(chatModel)
-                    .defaultSystem(defaultSystem.toString())
+                    // P2-B-1：公共信任边界 prepend 到 defaultSystem 之前（不改 DB prompt 内容）。固定前缀，prompt cache 仍稳定。
+                    .defaultSystem(cn.bugstack.ai.domain.agent.service.prompt.SystemPolicyComposer.prepend(defaultSystem.toString()))
                     .defaultToolCallbacks(meteredTools)
                     .defaultAdvisors(advisorArray)
                     .build();

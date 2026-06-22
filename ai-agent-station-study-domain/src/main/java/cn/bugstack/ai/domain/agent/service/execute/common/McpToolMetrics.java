@@ -56,6 +56,7 @@ public class McpToolMetrics {
     private static final String METRIC_CIRCUIT_OPEN = "mcp.client.circuit.open";
     private static final String METRIC_CONSECUTIVE_FAILURES = "mcp.client.consecutive_failures";
     private static final String METRIC_APPROVAL_DENIED = "mcp.tool.approval.denied";
+    private static final String METRIC_POLICY_RESOLUTION = "agent.tool.policy.resolution";
 
     private static final int LAST_ERROR_BUFFER_SIZE = 3;
     private static final int LAST_ERROR_MESSAGE_MAX_CHARS = 200;
@@ -133,6 +134,11 @@ public class McpToolMetrics {
      */
     public void recordApprovalDenied(String toolName, String reason) {
         registry.counter(METRIC_APPROVAL_DENIED, "tool", safe(toolName), "reason", safe(reason)).increment();
+    }
+
+    /** P1-A1：请求级工具 policy 的解析状态；state 仅允许 explicit/missing/invalid 三个低基数值。 */
+    public void recordToolPolicyResolution(String state) {
+        registry.counter(METRIC_POLICY_RESOLUTION, "state", safe(state)).increment();
     }
 
     /** 工具调用瞬态错误重试。 */

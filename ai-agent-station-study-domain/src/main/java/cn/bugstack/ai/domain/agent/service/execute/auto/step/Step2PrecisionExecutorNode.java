@@ -62,7 +62,7 @@ public class Step2PrecisionExecutorNode extends AbstractExecuteSupport{
         // 注入当前 agent 真实工具清单，防止 LLM 幻觉不存在的工具
         String executorClientId = aiAgentClientFlowConfigVO.getClientId();
         List<ToolCallback> dynamicToolCallbacks = mcpToolCatalogService != null
-                ? mcpToolCatalogService.resolveDynamicToolCallbacks(executorClientId,
+                ? mcpToolCatalogService.resolveDynamicToolCallbacks(requestParameter.getRunId(), requestParameter.getSessionId(), executorClientId,
                         mcpToolCatalogService.needsFor(requestParameter.getSessionId()), requestParameter.getMessage(),
                         agentToolRegistry != null ? agentToolRegistry.getTools(executorClientId) : List.of())
                 : List.of();
@@ -118,7 +118,9 @@ public class Step2PrecisionExecutorNode extends AbstractExecuteSupport{
                                 .param(LTM_RETRIEVAL_QUERY_KEY, steerAwareRetrievalQuery(dynamicContext, requestParameter))
                                 .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 1024))
                         .options(step2Opts),
-                dynamicContext, "step2_precision_executor", "精准执行", () -> finalPrompt, requestParameter.getSessionId());
+                dynamicContext, "step2_precision_executor", "精准执行",
+                cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.AUTO_STEP2_EXECUTION,
+                () -> finalPrompt, requestParameter.getSessionId());
 
         if (executionResult == null) throw new BizException("step2: executionResult is null", "LLM returned null for Step2PrecisionExecutorNode");
         // P2.7 16.2：发送 thinking 事件展示执行推理
