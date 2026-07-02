@@ -43,6 +43,16 @@ public class Step3ParseStepsNode extends AbstractExecuteSupport {
         
         Map<String, String> stepsMap = parseExecutionSteps(planningResult);
 
+        // 2026-07-02 兜底：规划未产出可解析的"第N步"步骤时（如建议/知识类题被规划步写成散文，
+        // 尤其早期 8013 通用 prompt 缺规划师约束），不要吐"成功解析 0 个执行步骤"的空 artifact，
+        // 而是把整段规划内容当作单个步骤交给 Step4 合成，保证最终仍有答案。
+        // 根因层已在规划 system prompt(8013_p2 → 专职规划师)修复，此处为防任何 agent 复发的结构兜底。
+        if (stepsMap.isEmpty()) {
+            log.warn("[flow-step3] 规划未解析出任何步骤(0步)，兜底为单步交 Step4 合成，避免空答案。planningLen={}",
+                    planningResult.length());
+            stepsMap.put("第1步", "第1步：根据下述规划内容直接完成用户任务并给出最终答案\n" + planningResult);
+        }
+
         // 2026-05-07 DAG 依赖解析：从每个 step 内容里抽出"依赖：第X步" / "需要先完成第X步"
         // 类型 Map<stepNumber, Set<依赖的stepNumber>>，无依赖的 step 是空 set（可立即执行）
         Map<Integer, Set<Integer>> stepDependencies = parseStepDependencies(stepsMap);

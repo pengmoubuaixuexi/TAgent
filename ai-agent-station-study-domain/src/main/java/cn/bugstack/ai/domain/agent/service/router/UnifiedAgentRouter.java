@@ -31,6 +31,14 @@ public class UnifiedAgentRouter {
     private static final String ROUTE_PROMPT_TEMPLATE = """
             你是智能体路由器。请根据用户问题，从候选智能体中选择最匹配的一个；并判断：被选中的智能体当前能力是否足以完成该问题，如果可能缺少某类外部工具能力，用一句中文描述这个"可能缺失的工具能力"。
 
+            ## 路由置信度要求
+            - 必须输出 confidence，表示“所选 agent_id 与当前用户问题在领域、任务形态、工具能力上的匹配确定性”，不是 missing_tool_descs 的置信度。
+            - 0.90~1.00：用户意图与该 Agent 高度匹配，且没有同等合理的其他 Agent。
+            - 0.70~0.89：大体匹配，但存在领域边界重叠、工具能力不完全覆盖，或通用 Agent 也能合理承接。
+            - 0.40~0.69：只是勉强匹配，候选 Agent 之间难以判断，或当前没有合适专用 Agent。
+            - 0.00~0.39：不确定或无合适 Agent。
+            - 如果只是因为某个 Agent 带有通用搜索/计算工具，但领域并不匹配，不要给高置信度；应优先按任务领域匹配。
+
             ## 执行模式说明
             - [Fixed] 单轮问答：适合闲聊、知识问答、代码解释、翻译、总结、文案撰写等一次即可完成的任务。
             - [Auto] 多步自动执行：适合需要分析、执行、监督、修正循环的任务。
@@ -106,6 +114,26 @@ public class UnifiedAgentRouter {
     @Value("${agent.intent-router.client-id:router-small}")
     private String routerClientId;
 
+    /** 路由置信度低于该阈值时，不直接使用专用 Agent，而是降级到同策略的通用 Agent。 */
+    @Value("${agent.intent-router.low-confidence-fallback.enabled:true}")
+    private boolean lowConfidenceFallbackEnabled;
+
+    @Value("${agent.intent-router.low-confidence-fallback.threshold:0.90}")
+    private double lowConfidenceFallbackThreshold;
+
+    @Value("${agent.intent-router.low-confidence-fallback.fixed-agent-id:8011}")
+    private String lowConfidenceFixedAgentId;
+
+    @Value("${agent.intent-router.low-confidence-fallback.auto-agent-id:8012}")
+    private String lowConfidenceAutoAgentId;
+
+    @Value("${agent.intent-router.low-confidence-fallback.flow-agent-id:8013}")
+    private String lowConfidenceFlowAgentId;
+
+    /** 进入执行前是否推断 missing_tool_descs 并写给动态补工具。默认关闭，优先让执行过程中的 request_tool 补。 */
+    @Value("${agent.dynamic-tools.enabled:false}")
+    private boolean dynamicToolInferenceEnabled;
+
     public String route(String query) {
         RouteDecision decision = routeDecision(query);
         return decision != null ? decision.agentId() : null;
@@ -127,6 +155,7 @@ public class UnifiedAgentRouter {
         }
 
         RouteDecision decision = parseRouteDecision(result, agents);
+        decision = normalizeRouteDecision(decision);
         if (decision != null && decision.agentId() != null) {
             log.info("[UnifiedRouter] route hit query='{}' -> agent='{}' missingTools={} confidence={}",
                     query, decision.agentId(), decision.missingToolDescs(), decision.confidence());
@@ -135,6 +164,69 @@ public class UnifiedAgentRouter {
 
         log.warn("[UnifiedRouter] invalid route decision: {}", result);
         return RouteDecision.empty(result);
+    }
+
+    /**
+     * 统一路由决策后处理：
+     * <ul>
+     *     <li>默认不把路由阶段的 missing_tool_descs 传给执行层，避免 description 误差直接变成错误补工具。</li>
+     *     <li>低置信度专用 Agent 降级到同策略通用 Agent：Fixed→8011、Auto→8012、Flow→8013。</li>
+     * </ul>
+     */
+    private RouteDecision normalizeRouteDecision(RouteDecision decision) {
+        if (decision == null || decision.agentId() == null || decision.agentId().isBlank()) {
+            return decision;
+        }
+
+        RouteDecision normalized = dynamicToolInferenceEnabled
+                ? decision
+                : new RouteDecision(decision.agentId(), List.of(), decision.confidence(), decision.rawResponse());
+
+        if (!isLowConfidence(normalized.confidence())) {
+            return normalized;
+        }
+
+        String fallbackAgentId = resolveLowConfidenceFallbackAgentId(normalized.agentId());
+        if (fallbackAgentId == null || fallbackAgentId.isBlank() || fallbackAgentId.equals(normalized.agentId())) {
+            return normalized;
+        }
+
+        log.info("[UnifiedRouter] low-confidence fallback originalAgent={} fallbackAgent={} confidence={} threshold={}",
+                normalized.agentId(), fallbackAgentId, normalized.confidence(), lowConfidenceFallbackThreshold);
+        return new RouteDecision(fallbackAgentId, List.of(), normalized.confidence(), normalized.rawResponse());
+    }
+
+    private boolean isLowConfidence(Double confidence) {
+        if (!lowConfidenceFallbackEnabled) {
+            return false;
+        }
+        return confidence == null || confidence < lowConfidenceFallbackThreshold;
+    }
+
+    private String resolveLowConfidenceFallbackAgentId(String routedAgentId) {
+        AiAgentVO routedAgent = repository.queryAiAgentByAgentId(routedAgentId);
+        if (routedAgent == null || routedAgent.getStrategy() == null) {
+            return enabledAgentIdOrNull(lowConfidenceFixedAgentId);
+        }
+        String fallback = switch (routedAgent.getStrategy()) {
+            case "fixedAgentExecuteStrategy" -> lowConfidenceFixedAgentId;
+            case "autoAgentExecuteStrategy" -> lowConfidenceAutoAgentId;
+            case "flowAgentExecuteStrategy" -> lowConfidenceFlowAgentId;
+            default -> lowConfidenceFixedAgentId;
+        };
+        return enabledAgentIdOrNull(fallback);
+    }
+
+    private String enabledAgentIdOrNull(String agentId) {
+        if (agentId == null || agentId.isBlank()) {
+            return null;
+        }
+        AiAgentVO agent = repository.queryAiAgentByAgentId(agentId);
+        if (agent == null || agent.getStatus() == null || agent.getStatus() != 1) {
+            log.warn("[UnifiedRouter] low-confidence fallback agent '{}' not enabled or not found", agentId);
+            return null;
+        }
+        return agentId;
     }
 
     /**

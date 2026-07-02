@@ -365,7 +365,7 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
         if (isCompleted) {
             summaryPrompt = String.format(aiAgentClientFlowConfigVO.getStepPrompt(),
                     effectiveUserQuestion(requestParameter, dynamicContext),
-                    dynamicContext.getExecutionHistory().toString());
+                    buildFinalSummaryProcess(dynamicContext));
         } else {
             summaryPrompt = String.format("""
                     虽然任务未完全执行完成，但请基于已有的执行过程，尽力回答用户的原始问题：
@@ -385,9 +385,43 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
                     请基于现有信息给出用户问题的答案：
                     """,
                     effectiveUserQuestion(requestParameter, dynamicContext),
-                    dynamicContext.getExecutionHistory().toString());
+                    buildFinalSummaryProcess(dynamicContext));
         }
         return summaryPrompt;
+    }
+
+    /**
+     * Step4 只需要基于本轮执行产出和质检意见做最终整理，不需要完整 Step1 分析。
+     *
+     * <p>历史上 executionHistory 会先由 Step2 append「分析+执行」，再由 Step3 append「分析+执行+监督」，
+     * 导致 Step4 入模时 Step1/Step2 重复出现。Step1 中的画像/历史动机容易和 chat memory 叠加，
+     * 把最终总结拉向上一轮话题。因此正常 finalize 时优先用当前上下文里的 Step2/Step3 精简视图；
+     * 异常/半截路径缺少字段时再回退到旧 executionHistory，避免丢信息。</p>
+     */
+    private static String buildFinalSummaryProcess(DefaultAutoAgentExecuteStrategyFactory.DynamicContext dynamicContext) {
+        String executionResult = dynamicContext.getValue("executionResult");
+        String supervisionResult = dynamicContext.getValue("supervisionResult");
+
+        boolean hasExecution = executionResult != null && !executionResult.isBlank();
+        boolean hasSupervision = supervisionResult != null && !supervisionResult.isBlank();
+        if (!hasExecution && !hasSupervision) {
+            return dynamicContext.getExecutionHistory().toString();
+        }
+
+        StringBuilder sb = new StringBuilder();
+        if (hasExecution) {
+            sb.append("=== 第 2 步执行记录 ===\n")
+                    .append("【执行阶段】")
+                    .append(executionResult)
+                    .append("\n");
+        }
+        if (hasSupervision) {
+            sb.append("=== 第 3 步监督记录 ===\n")
+                    .append("【监督阶段】")
+                    .append(supervisionResult)
+                    .append("\n");
+        }
+        return sb.toString();
     }
 
     /**

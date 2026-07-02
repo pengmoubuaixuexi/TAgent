@@ -81,6 +81,13 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
     @Resource
     protected McpToolCatalogService dynamicMcpToolCatalogService;
 
+    /**
+     * P0（Codex #2）工具调用实证台账：Step3 质检 / Step4 汇总读它，把"本轮真实调用了哪些工具、返回了什么"
+     * 作为客观实证注入 prompt，消除 Step3"查无工具调用记录→反咬编造"的误判。可选注入，未装配时跳过（零影响）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    protected cn.bugstack.ai.domain.agent.service.execute.common.ToolCallLedger toolCallLedger;
+
     /** ask_user 人工补充 gate；用于判断「非执行步元工具豁免」提示是否提及 ask_user（功能关则不提，免幻觉）。 */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     protected cn.bugstack.ai.domain.agent.service.security.UserInputGate userInputGate;
@@ -578,6 +585,9 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         if (sessionId != null && !sessionId.isBlank()) tc.put("sessionId", sessionId);
         if (runId != null && !runId.isBlank()) tc.put("agent.run_id", runId);
         if (stepLabel != null && !stepLabel.isBlank()) tc.put("stepLabel", stepLabel);
+        // P0（Codex #2）：只有 Auto 执行路径打开工具调用事实摘要台账开关，让 MeteredToolCallback 记账供 Step3 质检取证；
+        // Fixed/Flow 用各自的 buildToolContext（不注入此开关）→ 不记账 → 不产生"只记不清"的泄漏。
+        tc.put(cn.bugstack.ai.domain.agent.service.execute.common.ToolCallLedger.CTX_ENABLED_KEY, "true");
         cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilities.put(tc, profile);
         return tc;
     }
@@ -681,6 +691,17 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
      * Step1/Step2 用它替代裸 getMessage() 作为"用户问题"，让引导持久贯穿且不破坏 reflexion（原问题保留）。
      * 无引导时 == 原始 message，零影响。
      */
+    /**
+     * 工具实证台账 key：优先 runId（按 runId 隔离，防 E2E 同 session 多题串扰），回退 sessionId。
+     * 与 {@link cn.bugstack.ai.domain.agent.service.execute.common.MeteredToolCallback} 写入侧同源
+     * （写入侧从 ToolContext 的 {@code agent.run_id} 取）。
+     */
+    protected String toolLedgerKey(ExecuteCommandEntity req, DefaultAutoAgentExecuteStrategyFactory.DynamicContext ctx) {
+        String runId = ctx != null ? ctx.getValue("runId") : null;
+        if (runId != null && !runId.isBlank()) return runId;
+        return req != null ? req.getSessionId() : null;
+    }
+
     protected static String effectiveUserQuestion(ExecuteCommandEntity req, DefaultAutoAgentExecuteStrategyFactory.DynamicContext ctx) {
         String base = (req == null || req.getMessage() == null) ? "" : req.getMessage().trim();
         String supp = ctx == null ? null : ctx.getSteerSupplement();
@@ -751,6 +772,8 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         // 优先从 dynamicContext 拿 sessionId（execute 入口塞入），dag-step 线程读 MDC 拿不到。
         String __sidFromCtx = dynamicContext.getValue("sessionId");
         String __sid = (__sidFromCtx != null && !__sidFromCtx.isBlank()) ? __sidFromCtx : MDC.get("sessionId");
+        // 2026-06-23 修跨题串扰：reasoning_content 注入缓存按 runId 隔离（execute 入口保证非空），避免同 session 多题串。
+        String __runId = dynamicContext.getValue("runId");
         // G1-C：把 sessionId 写回 MDC，让 Reactor 自动上下文传播（ReactorContextPropagationConfig）在 blockLast 订阅时
         // 捕获它，再恢复到 boundedElastic 工具执行线程上 —— MeteredToolCallback 才能 MDC.get("sessionId") 拿到、触发审批。
         // 线程池 wrap 的 finally 会在任务结束统一还原 MDC，不会泄漏到下个任务。
@@ -762,7 +785,7 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         // 立即回答 finalize（stepName 含 answer_now）那一发关思考：与 scopeSession 同机制（订阅在调用线程，filter 读 ThreadLocal）。
         // 其余步骤 __noThink=false，scopeNoThinking 退化为 no-op → 零影响。
         boolean __noThink = stepName != null && stepName.contains("answer_now");
-        try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(__sid);
+        try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(__sid, __runId);
              AutoCloseable __noThinkScope = __noThink
                      ? cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeNoThinking(__sid)
                      : (AutoCloseable) () -> {}) {

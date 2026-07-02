@@ -32,6 +32,10 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService mcpToolCatalogService;
 
+    /** P0（Codex #2）工具调用实证台账；每轮 execute 结束按 runId 清理防泄漏。可选注入。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.execute.common.ToolCallLedger toolCallLedger;
+
     /** per-session 活跃执行上下文，用于支持 cancelExecute() */
     private final ConcurrentHashMap<String, DefaultFlowAgentExecuteStrategyFactory.DynamicContext> activeContexts = new ConcurrentHashMap<>();
 
@@ -52,14 +56,18 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy {
         // v1.3.2：sessionId 显式放进 dynamicContext，避免 dag-step 线程读 MDC 拿不到
         // ReasoningContentFilter.scopeSession 从这里取，按 session 隔离 reasoning_content 缓存
         dynamicContext.setValue("sessionId", executeCommandEntity.getSessionId());
-        dynamicContext.setValue("runId", executeCommandEntity.getRunId());
+        // 2026-06-23 修跨题串扰：runId 必须每次执行唯一（ReasoningContentFilter 注入缓存按它隔离）；未带则生成。
+        String effectiveRunId = (executeCommandEntity.getRunId() != null && !executeCommandEntity.getRunId().isBlank())
+                ? executeCommandEntity.getRunId()
+                : (executeCommandEntity.getSessionId() + "-run-" + java.util.UUID.randomUUID());
+        dynamicContext.setValue("runId", effectiveRunId);
         dynamicContext.setValue("userId", executeCommandEntity.getUserId());
         dynamicContext.setValue("tenantId", executeCommandEntity.getTenantId());
         dynamicContext.setValue("agentId", executeCommandEntity.getAiAgentId());
 
         // 注册到 activeContexts 以支持 cancelExecute()
         String sessionId = executeCommandEntity.getSessionId();
-        String runId = executeCommandEntity.getRunId();
+        String runId = effectiveRunId;
         if (sessionId != null) activeContexts.put(sessionId, dynamicContext);
         // 引用计数器跨轮泄漏修复（2026-05-31）：每轮入口清一次，让引用从 [1] 起；
         // 轮内多步检索仍连续累加。
@@ -90,6 +98,10 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy {
             if (sessionId != null) activeContexts.remove(sessionId);
             if (sessionId != null && mcpToolCatalogService != null) mcpToolCatalogService.clearNeeds(sessionId);
             if (runId != null && mcpToolCatalogService != null) mcpToolCatalogService.cleanupRun(runId);
+            // 2026-06-23：清掉本次 runId 的 reasoning_content 注入缓存（按 runId 隔离后只增不减，须在此清理防泄漏）
+            cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearRun(runId);
+            // P0（Codex #2）：清掉本次 runId 的工具调用实证台账（按 runId 隔离，须在此清理防泄漏）
+            if (runId != null && toolCallLedger != null) toolCallLedger.clear(runId);
         }
     }
 

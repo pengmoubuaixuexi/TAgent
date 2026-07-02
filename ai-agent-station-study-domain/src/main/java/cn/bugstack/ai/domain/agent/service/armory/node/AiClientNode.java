@@ -50,6 +50,9 @@ public class AiClientNode extends AbstractArmorySupport {
     @Resource
     private McpToolMetrics mcpToolMetrics;
 
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.execute.common.McpClientRegistry mcpClientRegistry;
+
     /** G1-C：人工审批 gate（可选），装配时 setter 注入到 MeteredToolCallback */
     @Resource
     private cn.bugstack.ai.domain.agent.service.security.HumanApprovalGate humanApprovalGate;
@@ -57,6 +60,10 @@ public class AiClientNode extends AbstractArmorySupport {
     /** H3-A：工具调用进度 SSE emitter，装配时 setter 注入到 MeteredToolCallback */
     @Resource
     private cn.bugstack.ai.domain.agent.service.execute.common.ToolCallProgressEmitter toolCallProgressEmitter;
+
+    /** P0（Codex #2）工具调用实证台账，装配时 setter 注入到 MeteredToolCallback，供 Step3 质检取证 */
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.execute.common.ToolCallLedger toolCallLedger;
 
     @Value("${agent.mcp.return-error-on-failure:true}")
     private boolean returnToolErrorOnFailure;
@@ -115,12 +122,24 @@ public class AiClientNode extends AbstractArmorySupport {
 
             // 3. MCP 服务（个别 MCP 初始化失败时已被 AiClientToolMcpNode 跳过，这里做容错查找）
             List<McpSyncClient> mcpSyncClients = new ArrayList<>();
+            List<ToolCallback> rawToolList = new ArrayList<>();
             List<String> mcpBeanNameList = aiClientVO.getMcpBeanNameList();
             for (String mcpBeanName : mcpBeanNameList) {
                 try {
-                    mcpSyncClients.add(getBean(mcpBeanName));
+                    McpSyncClient client = getBean(mcpBeanName);
+                    String mcpId = extractToolMcpId(mcpBeanName);
+                    if (mcpId != null) {
+                        ToolCallback[] callbacks = mcpClientRegistry.getToolCallbacksForAssembly(mcpId, client);
+                        mcpClientRegistry.registerCallbacks(mcpId, callbacks);
+                        rawToolList.addAll(java.util.Arrays.asList(callbacks));
+                    } else {
+                        mcpSyncClients.add(client);
+                    }
                 } catch (org.springframework.beans.factory.NoSuchBeanDefinitionException ex) {
                     log.warn("[AiClientNode] MCP bean {} 缺失，跳过：{}", mcpBeanName, ex.getMessage());
+                } catch (Exception ex) {
+                    log.warn("[AiClientNode] MCP bean {} listTools/reconnect failed during client assembly, skipped: {}",
+                            mcpBeanName, ex.toString());
                 }
             }
 
@@ -142,9 +161,12 @@ public class AiClientNode extends AbstractArmorySupport {
             // P1.5.1：从 MCP provider 拿到原始 ToolCallback 后逐一装饰，metric 才能采到
             // 2026-05-07 #1 Prompt Cache：MCP server 注册顺序不稳定 → 工具按 toolDefinition.name() 排序
             // 排序后工具 schema 在 prompt 中的位置 byte 稳定，OpenAI/Anthropic 能命中前缀 cache
-            ToolCallback[] rawTools = new SyncMcpToolCallbackProvider(
-                    mcpSyncClients.toArray(new McpSyncClient[]{})).getToolCallbacks();
-            List<ToolCallback> sortedRaw = new ArrayList<>(java.util.Arrays.asList(rawTools));
+            if (!mcpSyncClients.isEmpty()) {
+                ToolCallback[] rawTools = new SyncMcpToolCallbackProvider(
+                        mcpSyncClients.toArray(new McpSyncClient[]{})).getToolCallbacks();
+                rawToolList.addAll(java.util.Arrays.asList(rawTools));
+            }
+            List<ToolCallback> sortedRaw = new ArrayList<>(rawToolList);
             sortedRaw.sort(java.util.Comparator.comparing(t ->
                     t.getToolDefinition() == null ? "" : t.getToolDefinition().name()));
             List<ToolCallback> meteredToolList = new ArrayList<>(sortedRaw.size());
@@ -161,6 +183,7 @@ public class AiClientNode extends AbstractArmorySupport {
                         mcpToolCallMaxAttempts, mcpToolCallRetryDelayMs);
                 metered.setHumanApprovalGate(humanApprovalGate); // G1-C
                 metered.setToolCallProgressEmitter(toolCallProgressEmitter); // H3-A
+                metered.setToolCallLedger(toolCallLedger); // P0 Codex#2：工具调用实证台账
                 meteredToolList.add(metered);
             }
             // LLM 工具名大小写幻觉不再用 alias 翻倍 prompt 解决，
@@ -215,6 +238,14 @@ public class AiClientNode extends AbstractArmorySupport {
             }
         }
         return new ArrayList<>(names);
+    }
+
+    private String extractToolMcpId(String mcpBeanName) {
+        if (mcpBeanName == null || mcpBeanName.isBlank()) {
+            return null;
+        }
+        String prefix = AiAgentEnumVO.AI_CLIENT_TOOL_MCP.getBeanName("");
+        return mcpBeanName.startsWith(prefix) ? mcpBeanName.substring(prefix.length()) : null;
     }
 
     private List<String> mergeAdvisorBeanNames(List<String> local, List<String> agentMemory) {

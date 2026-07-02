@@ -16,7 +16,6 @@ import cn.bugstack.ai.domain.agent.service.execute.common.ToolPromptHintRegistry
 import cn.bugstack.ai.domain.agent.service.security.HumanApprovalGate;
 import io.modelcontextprotocol.client.McpSyncClient;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.ai.mcp.SyncMcpToolCallbackProvider;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -73,6 +72,10 @@ public class McpToolCatalogService {
 
     @Resource
     private ToolCallProgressEmitter toolCallProgressEmitter;
+
+    /** P0（Codex #2）工具调用事实摘要台账；动态 request_tool 装载的工具也要记账，否则 Auto Step3 对动态工具(如 search_papers)仍误判编造。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.execute.common.ToolCallLedger toolCallLedger;
 
     @Resource
     private ToolDescriptionTranslator toolDescriptionTranslator;
@@ -238,7 +241,18 @@ public class McpToolCatalogService {
                 if (lease == null || !needs.contains(lease.originalNeed()) || !lease.isAvailable()) {
                     continue;
                 }
-                ToolCallback callback = materializeLease(lease);
+                ToolCallback callback;
+                try {
+                    callback = materializeLease(lease);
+                } catch (DynamicToolUnavailableException e) {
+                    log.warn("[DynamicTools] skip unavailable leased tool runId={} need={} identity={} reason={}",
+                            runId, lease.originalNeed(), lease.toolIdentity(), e.getMessage());
+                    continue;
+                } catch (Exception e) {
+                    log.warn("[DynamicTools] skip failed leased tool runId={} need={} identity={} error={}",
+                            runId, lease.originalNeed(), lease.toolIdentity(), e.toString());
+                    continue;
+                }
                 String name = callback != null && callback.getToolDefinition() != null
                         ? callback.getToolDefinition().name() : null;
                 coveredNeeds.add(lease.originalNeed());
@@ -259,7 +273,17 @@ public class McpToolCatalogService {
                 matched = matchToolsByNeed(uncoveredNeeds, query, currentToolNames, resultToolNames);
             }
             for (MatchedTool mt : matched) {
-                ToolCallback callback = ensureToolCallback(mt.tool());
+                ToolCallback callback;
+                try {
+                    callback = ensureToolCallback(mt.tool());
+                } catch (Exception e) {
+                    log.warn("[DynamicTools] skip failed matched tool runId={} need={} mcpId={} tool={} error={}",
+                            runId, mt.need(),
+                            mt.tool() != null ? mt.tool().getMcpId() : null,
+                            mt.tool() != null ? mt.tool().getToolName() : null,
+                            e.toString());
+                    continue;
+                }
                 if (callback != null) {
                     String name = callback.getToolDefinition() != null ? callback.getToolDefinition().name() : null;
                     if (name != null && resultToolNames.add(name)) {
@@ -290,7 +314,17 @@ public class McpToolCatalogService {
 
         List<ToolCallback> result = new ArrayList<>();
         for (AiMcpToolCatalogVO tool : matched) {
-            ToolCallback callback = ensureToolCallback(tool);
+            ToolCallback callback;
+            try {
+                callback = ensureToolCallback(tool);
+            } catch (Exception e) {
+                log.warn("[DynamicTools] skip failed matched tool clientId={} mcpId={} tool={} error={}",
+                        clientId,
+                        tool != null ? tool.getMcpId() : null,
+                        tool != null ? tool.getToolName() : null,
+                        e.toString());
+                continue;
+            }
             if (callback != null) {
                 result.add(callback);
             }
@@ -577,7 +611,14 @@ public class McpToolCatalogService {
                 aiClientToolMcpNode.registerMcpBean(config.getMcpId(), client);
                 mcpClientRegistry.register(config.getMcpId(), config, client, aiClientToolMcpNode::createMcpSyncClient);
             }
-            ToolCallback[] callbacks = new SyncMcpToolCallbackProvider(List.of(client)).getToolCallbacks();
+            ToolCallback[] callbacks;
+            try {
+                callbacks = mcpClientRegistry.getToolCallbacksForAssembly(config.getMcpId(), client);
+            } catch (Exception ex) {
+                log.warn("[DynamicTools] mcp callbacks unavailable after reconnect mcpId={}: {}",
+                        config.getMcpId(), ex.toString());
+                return new ToolCallback[0];
+            }
             mcpClientRegistry.registerCallbacks(config.getMcpId(), callbacks);
             return callbacks;
         }
@@ -689,6 +730,7 @@ public class McpToolCatalogService {
                 mcpClientRegistry, mcpId);
         metered.setHumanApprovalGate(humanApprovalGate);
         metered.setToolCallProgressEmitter(toolCallProgressEmitter);
+        metered.setToolCallLedger(toolCallLedger); // P0 Codex#2：动态工具也记账，Step3 才看得到 search_papers 等 request_tool 装载的工具
         return metered;
     }
 

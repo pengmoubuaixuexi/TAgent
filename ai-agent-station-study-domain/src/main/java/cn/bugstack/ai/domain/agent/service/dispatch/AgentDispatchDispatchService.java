@@ -59,8 +59,8 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
     private String fallbackAgentId;
 
     /** M1：前端已选定 agent（不走路由）时，是否仍推断可能缺失的工具能力（一次 router-small 调用）。 */
-    @Value("${agent.dynamic-tools.infer-on-selected-agent:true}")
-    private boolean inferMissingToolOnSelectedAgent;
+    @Value("${agent.dynamic-tools.enabled:false}")
+    private boolean dynamicToolInferenceEnabled;
 
     @Override
     public void dispatch(ExecuteCommandEntity requestParameter, ResponseBodyEmitter emitter) throws Exception {
@@ -88,12 +88,14 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
                     agentId = fallbackAgentId;
                     log.info("统一路由未命中，fallback 到 {}", fallbackAgentId);
                 }
+                if (routeDecision != null) {
+                    requestParameter.setRouteConfidence(routeDecision.confidence());
+                }
                 if (routeDecision != null && routeDecision.hasMissingToolDesc()) {
                     // 多条 need 用换行连成单串，按 sessionId 写入统一 store（下游 resolveDynamicToolCallbacks 拆开、各取 top-k 再并集）
                     if (mcpToolCatalogService != null) {
                         mcpToolCatalogService.setNeeds(requestParameter.getSessionId(), routeDecision.missingToolDescJoined());
                     }
-                    requestParameter.setRouteConfidence(routeDecision.confidence());
                 }
                 requestParameter.setAiAgentId(agentId);
                 log.info("[Dispatch] 统一路由选中 agent: {} missingTool='{}'",
@@ -101,7 +103,7 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
             } else {
                 throw new BizException("未配置路由器且未指定 agentId");
             }
-        } else if (unifiedAgentRouter != null && inferMissingToolOnSelectedAgent) {
+        } else if (unifiedAgentRouter != null && dynamicToolInferenceEnabled) {
             // M1：前端已选定 agent，不走路由，但仍推断该 agent 可能缺失的工具能力（可多条），给动态补挂用
             java.util.List<String> missing = unifiedAgentRouter.inferMissingTool(agentId, requestParameter.getMessage());
             if (missing != null && !missing.isEmpty()) {

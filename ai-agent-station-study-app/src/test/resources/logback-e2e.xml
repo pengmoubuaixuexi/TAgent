@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!--
+      2026-05-20：E2E 测试场景下必须显式声明 LOGSTASH appender，否则
+      @SpringBootTest(properties = {"logging.config=classpath:logback-e2e.xml"}) 会把主
+      logback-spring.xml 覆盖掉，导致所有日志（含 llm.wire / step.transition / mcp.tool.call）
+      只进 CONSOLE 和本地文件，不进 ES。
+
+      索引名 ai-agent-station-log-YYYY.MM.DD 由 logstash pipeline 控制，appender 仅负责 TCP 推送。
+    -->
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level %logger{0} - %m%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <appender name="E2E_FILE" class="ch.qos.logback.core.FileAppender">
+        <file>${E2E_LOG_FILE:-docs/dev-ops/test/e2e-100-run.log}</file>
+        <append>false</append>
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level %logger{0} - %m%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- Logstash JSON 结构化日志直推：与主 logback-spring.xml LOGSTASH appender 字段对齐。
+         localhost:4560 是默认 logstash beats/tcp 端口，请确保跑 E2E 前 ELK stack 已起。 -->
+    <appender name="LOGSTASH" class="net.logstash.logback.appender.LogstashTcpSocketAppender">
+        <destination>localhost:4560</destination>
+        <keepAliveDuration>1 minute</keepAliveDuration>
+        <reconnectionDelay>5 seconds</reconnectionDelay>
+        <writeBufferSize>16384</writeBufferSize>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <includeContext>false</includeContext>
+            <!-- 与 logback-spring.xml 的白名单保持一致；新加的观测字段也一并放行 -->
+            <includeMdcKeyName>requestId</includeMdcKeyName>
+            <includeMdcKeyName>traceId</includeMdcKeyName>
+            <includeMdcKeyName>spanId</includeMdcKeyName>
+            <includeMdcKeyName>userId</includeMdcKeyName>
+            <includeMdcKeyName>tenantId</includeMdcKeyName>
+            <includeMdcKeyName>sessionId</includeMdcKeyName>
+            <includeMdcKeyName>agentId</includeMdcKeyName>
+            <includeMdcKeyName>billingScope</includeMdcKeyName>
+            <includeMdcKeyName>step</includeMdcKeyName>
+            <includeMdcKeyName>model</includeMdcKeyName>
+            <includeMdcKeyName>clientId</includeMdcKeyName>
+            <includeMdcKeyName>promptTokens</includeMdcKeyName>
+            <includeMdcKeyName>completionTokens</includeMdcKeyName>
+            <includeMdcKeyName>totalTokens</includeMdcKeyName>
+            <includeMdcKeyName>cachedTokens</includeMdcKeyName>
+            <includeMdcKeyName>latencyMs</includeMdcKeyName>
+            <includeMdcKeyName>toolName</includeMdcKeyName>
+            <includeMdcKeyName>toolLatencyMs</includeMdcKeyName>
+            <!-- 2026-05-20 完整链路观测扩字段 -->
+            <includeMdcKeyName>qid</includeMdcKeyName>
+            <includeMdcKeyName>llmHop</includeMdcKeyName>
+            <includeMdcKeyName>transitionFrom</includeMdcKeyName>
+            <includeMdcKeyName>toolInputFull</includeMdcKeyName>
+            <includeMdcKeyName>toolResultFull</includeMdcKeyName>
+            <includeMdcKeyName>toolInputChars</includeMdcKeyName>
+            <includeMdcKeyName>toolRawResultChars</includeMdcKeyName>
+            <includeMdcKeyName>toolResultChars</includeMdcKeyName>
+            <customFields>{"app":"ai-agent-station-study","runMode":"e2e"}</customFields>
+        </encoder>
+    </appender>
+
+    <!-- 异步包装：与主配置一致，避免 TCP 阻塞业务线程；neverBlock=true，断网时静默丢日志而不阻塞 E2E -->
+    <appender name="ASYNC_LOGSTASH" class="ch.qos.logback.classic.AsyncAppender">
+        <discardingThreshold>0</discardingThreshold>
+        <queueSize>4096</queueSize>
+        <neverBlock>true</neverBlock>
+        <includeCallerData>false</includeCallerData>
+        <appender-ref ref="LOGSTASH"/>
+    </appender>
+
+    <!-- ES 7.17 未开安全认证时每个请求都会带 299 提示，压成 ERROR 降噪 -->
+    <logger name="org.elasticsearch.client.RestClient" level="ERROR"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="E2E_FILE"/>
+        <appender-ref ref="ASYNC_LOGSTASH"/>
+    </root>
+</configuration>

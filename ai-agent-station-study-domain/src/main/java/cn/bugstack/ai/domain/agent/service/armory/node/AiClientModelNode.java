@@ -11,7 +11,6 @@ import cn.bugstack.wrench.design.framework.tree.StrategyHandler;
 import com.alibaba.fastjson.JSON;
 import io.modelcontextprotocol.client.McpSyncClient;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.ai.mcp.SyncMcpToolCallbackProvider;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.openai.api.OpenAiApi;
@@ -59,6 +58,10 @@ public class AiClientModelNode extends AbstractArmorySupport {
     /** H3-A：工具调用进度 SSE emitter，装配时 setter 注入到 MeteredToolCallback */
     @Resource
     private cn.bugstack.ai.domain.agent.service.execute.common.ToolCallProgressEmitter toolCallProgressEmitter;
+
+    /** P0（Codex #2）工具调用实证台账，装配时 setter 注入到 MeteredToolCallback，供 Step3 质检取证 */
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.execute.common.ToolCallLedger toolCallLedger;
 
     @Value("${agent.mcp.return-error-on-failure:true}")
     private boolean returnToolErrorOnFailure;
@@ -131,12 +134,18 @@ public class AiClientModelNode extends AbstractArmorySupport {
             List<ToolCallback> allRawCallbacks = new ArrayList<>();
             for (String toolMcpId : modelVO.getToolMcpIds()) {
                 try {
-                    McpSyncClient mcpSyncClient = getBean(AiAgentEnumVO.AI_CLIENT_TOOL_MCP.getBeanName(toolMcpId));
-                    ToolCallback[] mcpCallbacks = new SyncMcpToolCallbackProvider(List.of(mcpSyncClient)).getToolCallbacks();
+                    McpSyncClient mcpSyncClient = mcpClientRegistry.getClient(toolMcpId);
+                    if (mcpSyncClient == null) {
+                        mcpSyncClient = getBean(AiAgentEnumVO.AI_CLIENT_TOOL_MCP.getBeanName(toolMcpId));
+                    }
+                    ToolCallback[] mcpCallbacks = mcpClientRegistry.getToolCallbacksForAssembly(toolMcpId, mcpSyncClient);
                     mcpClientRegistry.registerCallbacks(toolMcpId, mcpCallbacks);
                     allRawCallbacks.addAll(java.util.Arrays.asList(mcpCallbacks));
                 } catch (org.springframework.beans.factory.NoSuchBeanDefinitionException ex) {
                     log.warn("[AiClientModelNode] MCP {} 缺失，跳过: {}", toolMcpId, ex.getMessage());
+                } catch (Exception ex) {
+                    log.warn("[AiClientModelNode] MCP {} listTools/reconnect failed during assembly, skipped: {}",
+                            toolMcpId, ex.toString());
                 }
             }
 
@@ -164,6 +173,7 @@ public class AiClientModelNode extends AbstractArmorySupport {
                         mcpClientRegistry, toolMcpId);
                 metered.setHumanApprovalGate(humanApprovalGate); // G1-C
                 metered.setToolCallProgressEmitter(toolCallProgressEmitter); // H3-A
+                metered.setToolCallLedger(toolCallLedger); // P0 Codex#2：工具调用实证台账
                 meteredCallbacks[i] = metered;
                 if (hint != null && !hint.isBlank()) {
                     log.debug("[AiClientModelNode] applied prompt hint to tool {}: {}", toolName, hint);

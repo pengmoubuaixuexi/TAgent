@@ -67,6 +67,12 @@ public class Step3QualitySupervisorNode extends AbstractExecuteSupport {
      * → 真 shadow，旧裁决控制流不变。供 {@link cn.bugstack.ai.domain.agent.service.execute.common.SupervisionVerdictParser} 旁路解析。
      */
     private static final String SHADOW_VERDICT_TRAILER_HINT =
+            // 2026-06-22 用户决策：质检门槛此前太严（任何"可优化"都判 OPTIMIZE → 永不 PASS → 空转到 maxStep）。
+            // 此处统一定义"达标即过"的判定标准，代码尾注对所有 Auto agent 生效，无需逐个改 DB _p3。
+            "\n\n【裁决标准 - 重要】先按下述标准在三者中择一，不要因为\"还能更好/锦上添花\"就不通过：\n" +
+            "- PASS：答案已充分解决用户问题、可直接交付。即便仍有可改进空间，只要不影响交付，就判 PASS。\n" +
+            "- OPTIMIZE：基本可用可交付，但存在实质性可改进点——把改进点作为附带建议给出即可，不要求重做。\n" +
+            "- FAIL：存在错误、跑题、严重遗漏或不可用，必须重做。\n" +
             "\n\n【机器可读标记 - 必填】在全文最末另起一行，输出且仅输出一行如下 HTML 注释（系统采集用，不要做展示性描述）：\n" +
             "<!-- AUTO_QUALITY_VERDICT: VERDICT -->\n" +
             "必须保留 <!-- 和 --> 注释定界符；只把 VERDICT 替换为 PASS、FAIL、OPTIMIZE 三者之一（只能选一个、大写）。不要原样输出 VERDICT，不要添加竖线、代码围栏或其他机器字段。";
@@ -108,6 +114,18 @@ public class Step3QualitySupervisorNode extends AbstractExecuteSupport {
         String supervisionPrompt = String.format(aiAgentClientFlowConfigVO.getStepPrompt(), effectiveUserQuestion(requestParameter, dynamicContext), executionResult)
                 + metaToolPromptHint(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.AUTO_STEP3_QUALITY,
                 requestParameter.getSessionId());
+
+        // P0（Codex #2）核心修复：注入本轮"真实工具调用实证"（系统运行时台账，非模型自述）。
+        // 根因——Step3 此前只拿到 Step2 的散文 executionResult，看不到"到底真调了哪些工具、返回了什么"
+        //（内部工具循环的 ToolResponseMessage 不过 advisor、也不进 ChatMemory），于是 Step2 把真实工具数据
+        // 揉成流畅答案时，Step3 反咬"查无工具调用记录→编造/无来源"，误判 FAIL/HALLUCINATION 逼空返工
+        //（实测 Q65：search_papers 真调 8 次返回真实论文仍被判编造）。无工具调用时 renderEvidence 返空串，零注入。
+        if (toolCallLedger != null) {
+            String toolEvidence = toolCallLedger.renderEvidence(toolLedgerKey(requestParameter, dynamicContext));
+            if (!toolEvidence.isEmpty()) {
+                supervisionPrompt = supervisionPrompt + toolEvidence;
+            }
+        }
 
         // T11 B：reflexion 开关开时追加结构化 critique JSON 输出要求（不动 DB stepPrompt）
         if (reflexionEnabled) {
@@ -212,9 +230,11 @@ public class Step3QualitySupervisorNode extends AbstractExecuteSupport {
             log.info("❌ 质量检查未通过（enforce），需要重新执行");
             dynamicContext.setCurrentTask("根据质量监督的建议重新执行任务");
             dynamicContext.setQualityVerificationStatus(cn.bugstack.ai.domain.agent.model.valobj.enums.QualityVerificationStatus.VERIFIED_FAIL);
-        } else { // optimize
-            log.info("🔧 质量检查建议优化（enforce），继续改进");
-            dynamicContext.setCurrentTask("根据质量监督的建议优化执行结果");
+        } else { // optimize → 达标交付（2026-06-22 用户决策）
+            // OPTIMIZE 视为"基本可用可交付"：直接置完成进 Step4，不再回 Step1 空转。
+            // 改进建议随下方 stepSummary 的【监督阶段】写入 executionHistory → Step4 最终合成 prompt 即可见、自然并入。
+            log.info("🔧 质量检查为 OPTIMIZE（enforce）→ 视为达标交付，改进建议并入最终合成");
+            dynamicContext.setCompleted(true);
             dynamicContext.setQualityVerificationStatus(cn.bugstack.ai.domain.agent.model.valobj.enums.QualityVerificationStatus.VERIFIED_OPTIMIZE);
         }
 
@@ -223,6 +243,9 @@ public class Step3QualitySupervisorNode extends AbstractExecuteSupport {
         // 达上限 / reflexion 关闭）统一 clear，避免 C 阶段 Step2 读到上一轮残留的 record。
         boolean reflexionTriggered = false;
         if (reflexionEnabled && failed) {
+            // FAIL：先带建议回 Step2 重做，最多 reflexionMaxRetries(agent.reflexion.max-retries,默认2) 次；
+            // 重试到上限仍 FAIL，则回 Step1 重新分析。整体再由 maxStep 兜底（step>maxStep → Step4）。
+            // 2026-06-23 用户确认保留此原始两级回退（OPTIMIZE 已改为达标收尾，FAIL 维持原样）。
             Integer retries = dynamicContext.getValue(CTX_REFLEXION_RETRIES);
             int n = retries == null ? 0 : retries;
             if (n < reflexionMaxRetries) {

@@ -11,6 +11,7 @@ import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
@@ -72,8 +73,93 @@ public class AdvisorChainOrderContractTest {
         assertTrue(snapshot.messages().get(2).text().contains("对话历史摘要"));
         assertTrue(snapshot.messages().get(3).text().contains("历史回答"));
         String user = snapshot.messages().get(4).text();
-        assertTrue(user.contains("长期记忆"));
-        assertTrue(user.contains("当前会话已聊到"));
         assertTrue(user.endsWith("请规划周末行程"));
+    }
+
+    @Test
+    public void readOnlyChatMemoryCanBeDisabledPerRequestWithZeroRetrieveSize() {
+        ChatMemory chatMemory = mock(ChatMemory.class);
+        when(chatMemory.get("tenant-1:user-1:session-1")).thenReturn(List.of(
+                new UserMessage("old question"),
+                new AssistantMessage("old answer")));
+
+        var memory = new ReadOnlyChatMemoryAdvisor(chatMemory, 1);
+        CapturingChatModel model = new CapturingChatModel().forStableId("MEMORY-ZERO");
+        ChatClient client = ChatClient.builder(model)
+                .defaultSystem("trusted system")
+                .defaultAdvisors(memory)
+                .build();
+
+        client.prompt().user("current question")
+                .advisors(a -> a
+                        .param("chat_memory_conversation_id", "tenant-1:user-1:session-1")
+                        .param("chat_memory_response_size", 0))
+                .call().content();
+
+        WireSnapshot snapshot = model.lastSnapshot();
+        assertEquals(List.of("SYSTEM", "USER"), snapshot.roles());
+        assertTrue(snapshot.messages().stream().noneMatch(m -> m.text().contains("old question")));
+        assertTrue(snapshot.messages().stream().noneMatch(m -> m.text().contains("old answer")));
+        assertTrue(snapshot.messages().get(1).text().contains("current question"));
+    }
+
+    @Test
+    public void readOnlyChatMemoryHonorsPositiveRetrieveSize() {
+        ChatMemory chatMemory = mock(ChatMemory.class);
+        when(chatMemory.get("tenant-1:user-1:session-1")).thenReturn(List.of(
+                new UserMessage("old question 1"),
+                new AssistantMessage("old answer 1"),
+                new UserMessage("old question 2"),
+                new AssistantMessage("old answer 2")));
+
+        var memory = new ReadOnlyChatMemoryAdvisor(chatMemory, 1);
+        CapturingChatModel model = new CapturingChatModel().forStableId("MEMORY-LIMIT");
+        ChatClient client = ChatClient.builder(model)
+                .defaultSystem("trusted system")
+                .defaultAdvisors(memory)
+                .build();
+
+        client.prompt().user("current question")
+                .advisors(a -> a
+                        .param("chat_memory_conversation_id", "tenant-1:user-1:session-1")
+                        .param("chat_memory_response_size", 1))
+                .call().content();
+
+        WireSnapshot snapshot = model.lastSnapshot();
+        assertEquals(List.of("SYSTEM", "USER", "ASSISTANT", "USER"), snapshot.roles());
+        assertTrue(snapshot.messages().stream().noneMatch(m -> m.text().contains("old question 1")));
+        assertTrue(snapshot.messages().stream().noneMatch(m -> m.text().contains("old answer 1")));
+        assertTrue(snapshot.messages().stream().anyMatch(m -> m.text().contains("old question 2")));
+        assertTrue(snapshot.messages().stream().anyMatch(m -> m.text().contains("old answer 2")));
+        assertTrue(snapshot.messages().get(3).text().contains("current question"));
+    }
+
+    @Test
+    public void readOnlyChatMemoryDropsDanglingTrailingUserBeforeCurrentUser() {
+        ChatMemory chatMemory = mock(ChatMemory.class);
+        when(chatMemory.get("tenant-1:user-1:session-1")).thenReturn(List.of(
+                new UserMessage("stable history question"),
+                new AssistantMessage("stable history answer"),
+                new UserMessage("dangling historical question")));
+
+        var memory = new ReadOnlyChatMemoryAdvisor(chatMemory, 1);
+        CapturingChatModel model = new CapturingChatModel().forStableId("MEMORY-DANGLING-USER");
+        ChatClient client = ChatClient.builder(model)
+                .defaultSystem("trusted system")
+                .defaultAdvisors(memory)
+                .build();
+
+        client.prompt().user("current question")
+                .advisors(a -> a
+                        .param("chat_memory_conversation_id", "tenant-1:user-1:session-1")
+                        .param("chat_memory_response_size", 1024))
+                .call().content();
+
+        WireSnapshot snapshot = model.lastSnapshot();
+        assertEquals(List.of("SYSTEM", "USER", "ASSISTANT", "USER"), snapshot.roles());
+        assertTrue(snapshot.messages().stream().anyMatch(m -> m.text().contains("stable history question")));
+        assertTrue(snapshot.messages().stream().anyMatch(m -> m.text().contains("stable history answer")));
+        assertTrue(snapshot.messages().stream().noneMatch(m -> m.text().contains("dangling historical question")));
+        assertTrue(snapshot.messages().get(3).text().contains("current question"));
     }
 }

@@ -67,8 +67,7 @@ public class AutoNodeStep3EnforceContractTest {
         var optimizeNode = new AutoNodeTestSeams.Step3();
         optimizeNode.result("<!-- AUTO_QUALITY_VERDICT: OPTIMIZE -->");
         optimizeNode.run(request(), optimize);
-        assertFalse(optimize.isCompleted());
-        assertTrue(optimize.getCurrentTask().contains("优化"));
+        assertTrue(optimize.isCompleted());
         assertEquals(QualityVerificationStatus.VERIFIED_OPTIMIZE, optimize.getQualityVerificationStatus());
         assertEquals(0, optimizeNode.repairCalls());
     }
@@ -109,7 +108,7 @@ public class AutoNodeStep3EnforceContractTest {
         optimizeNode.repairResult("<!-- AUTO_QUALITY_VERDICT: OPTIMIZE -->");
         optimizeNode.run(request(), optimize);
         assertEquals(QualityVerificationStatus.VERIFIED_OPTIMIZE, optimize.getQualityVerificationStatus());
-        assertTrue(optimize.getCurrentTask().contains("优化"));
+        assertTrue(optimize.isCompleted());
     }
 
     @Test

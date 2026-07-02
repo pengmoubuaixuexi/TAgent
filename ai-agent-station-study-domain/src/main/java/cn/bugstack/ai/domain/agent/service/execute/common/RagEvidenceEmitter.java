@@ -134,9 +134,36 @@ public class RagEvidenceEmitter {
             item.put("ref", ref);
             item.put("source", extractSource(doc, ref));
             item.put("snippet", normalize(doc.getText()));
+            putScore(item, doc);
             items.add(item);
         }
         return items;
+    }
+
+    /**
+     * 2026-06-22 评估采集：给每条 evidence 附上检索分,供事后量化 RAG 检索质量。<b>只读 Document、零副作用、生产安全</b>
+     * （score/distance 本就是数字相似度,不含 PII；前端忽略未知字段）。
+     * <ul>
+     *   <li>{@code score}: {@link Document#getScore()} 相似度（高=更相关），纯向量/部分混合路径有值；</li>
+     *   <li>{@code distance}: PgVector 余弦距离（低=更相关），key 与 {@code LongTermMemoryService.extractDistance} 一致；</li>
+     *   <li>{@code bm25_score}: 词法检索分（混合检索 BM25 路径写入,如有）。</li>
+     * </ul>
+     * 注意：rerank 只重排不写回分数,故这里拿到的是<b>检索阶段</b>分；最终 rerank 顺序已体现在 ref 排序里。
+     */
+    static void putScore(Map<String, Object> item, Document doc) {
+        try {
+            Double score = doc.getScore();
+            if (score != null) item.put("score", score);
+            Map<String, Object> meta = doc.getMetadata();
+            if (meta != null) {
+                Object dist = meta.get("distance");
+                if (dist != null) item.put("distance", dist);
+                Object bm25 = meta.get("bm25_score");
+                if (bm25 != null) item.put("bm25_score", bm25);
+            }
+        } catch (Exception ignored) {
+            // 取分失败绝不能影响 evidence 主体
+        }
     }
 
     /** 从 metadata 按优先级找 source；都没有用 Document.id 或 doc-N fallback。 */

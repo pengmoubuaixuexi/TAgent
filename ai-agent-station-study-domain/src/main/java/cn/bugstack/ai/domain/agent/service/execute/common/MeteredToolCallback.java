@@ -73,6 +73,17 @@ public class MeteredToolCallback implements ToolCallback {
         this.toolCallProgressEmitter = emitter;
     }
 
+    /**
+     * P0（Codex #2）工具调用实证台账（可选）。setter 注入同 humanApprovalGate 模式。
+     * 为 null → 不记账，工具调用行为完全不变。仅用于让 Step3 质检/Step4 汇总看到"本轮真实调了什么、返回了什么"，
+     * 消除"查无工具记录→反咬编造"的误判。
+     */
+    private volatile ToolCallLedger toolCallLedger;
+
+    public void setToolCallLedger(ToolCallLedger ledger) {
+        this.toolCallLedger = ledger;
+    }
+
     /** H3-A：工具调用进度 SSE 的 status 枚举。 */
     private static final String STATUS_SUCCESS = "success";
     private static final String STATUS_BLOCKED = "blocked";
@@ -179,15 +190,19 @@ public class MeteredToolCallback implements ToolCallback {
         String name = safeName();
         String effectiveInput = normalizeToolInput(name, toolInput);
         return invoke(name, toolInput, effectiveInput, resolveSessionId(null), resolveStepLabel(null),
-                () -> delegate.get().call(effectiveInput));
+                null, () -> delegate.get().call(effectiveInput));
     }
 
     @Override
     public String call(String toolInput, ToolContext toolContext) {
         String name = safeName();
         String effectiveInput = normalizeToolInput(name, toolInput);
+        // 工具调用事实摘要台账：仅当 ToolContext 带开关 agent.tool_ledger_enabled=true（只有 Auto 质检路径注入）时才记账，
+        // 且需拿到 buildToolContext 注入的 agent.run_id（按 runId 隔离）。Fixed/Flow 不注入开关 → 不记 → 不会"只记不清"。
+        boolean ledgerOn = "true".equals(readContext(toolContext, ToolCallLedger.CTX_ENABLED_KEY));
+        String ledgerRunId = ledgerOn ? readContext(toolContext, "agent.run_id") : null;
         return invoke(name, toolInput, effectiveInput, resolveSessionId(toolContext), resolveStepLabel(toolContext),
-                () -> delegate.get().call(effectiveInput, toolContext));
+                ledgerRunId, () -> delegate.get().call(effectiveInput, toolContext));
     }
 
     /**
@@ -236,7 +251,7 @@ public class MeteredToolCallback implements ToolCallback {
     }
 
     private String invoke(String name, String originalInput, String effectiveInput,
-                          String sessionId, String stepLabel, Invocation inv) {
+                          String sessionId, String stepLabel, String runId, Invocation inv) {
         long start = System.currentTimeMillis();
         boolean success = false;
         RuntimeException failure = null;
@@ -368,9 +383,19 @@ public class MeteredToolCallback implements ToolCallback {
                 if (STATUS_ERROR.equals(progressStatus)) {
                     progress.emitError(sessionId, name, summarizeFailure(failure), latency, stepLabel);
                 } else {
+                    // 2026-06-22 评估采集：把工具真实返回(rawResultForTrace=未 normalize/截断 的原始响应)透给 emitter；
+                    // emitter 端按 agent.tool-progress.result-preview.enabled 决定是否落进 SSE(默认关,生产不推)。
                     progress.emitEnd(sessionId, name, progressStatus, latency,
-                            returnedResultChars >= 0 ? returnedResultChars : 0, stepLabel);
+                            returnedResultChars >= 0 ? returnedResultChars : 0, stepLabel, null, rawResultForTrace);
                 }
+            }
+            // P0（Codex #2）工具调用事实摘要台账：记本轮真实调用（工具名/状态/返回字符数/形态，不含返回内容），
+            // 供 Auto Step3 质检确认"确实调过工具/有返回"，消除"查无工具记录→反咬编造"。
+            // runId 已在 call(ctx) 入口按开关 agent.tool_ledger_enabled 网关过（关=null=不记）；ledger 为 null 时 no-op。
+            ToolCallLedger ledger = this.toolCallLedger;
+            if (ledger != null && runId != null && !runId.isBlank()) {
+                ledger.record(runId, name, progressStatus,
+                        rawResultChars >= 0 ? rawResultChars : 0, rawResultForTrace);
             }
         }
     }

@@ -744,6 +744,8 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         // 优先从 dynamicContext 拿 sessionId（execute 入口塞入），dag-step 线程读 MDC 拿不到。
         String __sidFromCtx = dynamicContext.getValue("sessionId");
         String __sid = (__sidFromCtx != null && !__sidFromCtx.isBlank()) ? __sidFromCtx : MDC.get("sessionId");
+        // 2026-06-23 修跨题串扰：reasoning_content 注入缓存按 runId 隔离（execute 入口保证非空），避免同 session 多题串。
+        String __runId = dynamicContext.getValue("runId");
         // G1-C：写回 MDC，让 Reactor 自动上下文传播在 blockLast 订阅时捕获、恢复到 boundedElastic 工具线程，
         // MeteredToolCallback 才能拿到 sessionId 触发审批。线程池 wrap 的 finally 会统一还原 MDC。
         if (__sid != null && !__sid.isBlank()) MDC.put("sessionId", __sid);
@@ -754,7 +756,7 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         // 立即回答 finalize（stepName 含 answer_now）那一发关思考：与 scopeSession 同机制（订阅在调用线程，filter 读 ThreadLocal）。
         // 其余步骤 __noThink=false，scopeNoThinking 退化为 no-op → 零影响。
         boolean __noThink = stepName != null && stepName.contains("answer_now");
-        try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(__sid);
+        try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(__sid, __runId);
              AutoCloseable __noThinkScope = __noThink
                      ? cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeNoThinking(__sid)
                      : (AutoCloseable) () -> {}) {

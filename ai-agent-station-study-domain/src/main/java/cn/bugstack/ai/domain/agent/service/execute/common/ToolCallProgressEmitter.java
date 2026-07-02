@@ -5,6 +5,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyEmitter;
 
@@ -44,6 +45,15 @@ public class ToolCallProgressEmitter {
     @Resource
     private ApprovalChannelRegistry approvalChannelRegistry;
 
+    /**
+     * 2026-06-22 评估采集开关：开后 {@code tool_call_end} 携带工具真实返回(截断 {@value #DEFAULT_RESULT_PREVIEW_MAX_CHARS} 字，可配 agent.tool-progress.result-preview.max-chars)。
+     * <p><b>默认 false —— 生产环境必须保持关闭</b>：SSE 出口是 PII 脱敏边界，把原始工具返回推到前端会越过该边界
+     * （见 PII 策略：只在 SSE 出口/日志/回放端点脱敏）。仅在 E2E 评估跑(application-dev)临时设 true 采集。
+     * <p>注入路径用 @Value；测试用构造的实例此字段为默认 false，需要时直接 set。</p>
+     */
+    @Value("${agent.tool-progress.result-preview.enabled:false}")
+    private boolean resultPreviewEnabled;
+
     /** Spring 注入路径；测试可用此构造手动装配。 */
     public ToolCallProgressEmitter() {}
 
@@ -81,6 +91,15 @@ public class ToolCallProgressEmitter {
     }
 
     public void emitEnd(String sessionId, String toolName, String status, long latencyMs, int resultChars, String step, String callId) {
+        emitEnd(sessionId, toolName, status, latencyMs, resultChars, step, callId, null);
+    }
+
+    /**
+     * 2026-06-22 评估采集：带工具真实返回的终态。{@code resultPreview} 仅在 {@link #resultPreviewEnabled} 为 true 时
+     * 才写入 SSE（默认关，生产不推，见字段注释）。其余字段与既有 {@code tool_call_end} 完全一致。
+     */
+    public void emitEnd(String sessionId, String toolName, String status, long latencyMs, int resultChars,
+                        String step, String callId, String resultPreview) {
         ResponseBodyEmitter emitter = lookupEmitter(sessionId);
         if (emitter == null) return;
         Map<String, Object> data = new LinkedHashMap<>();
@@ -91,6 +110,9 @@ public class ToolCallProgressEmitter {
         data.put("status", status);
         data.put("latencyMs", latencyMs);
         data.put("resultChars", resultChars);
+        if (resultPreviewEnabled) {
+            putIfPresent(data, "resultPreview", truncateResult(resultPreview));
+        }
         data.put("timestamp", System.currentTimeMillis());
         sendEvent(emitter, "tool_call_end", data, sessionId, toolName);
     }
@@ -189,6 +211,28 @@ public class ToolCallProgressEmitter {
         if (input == null) return "";
         if (input.length() <= INPUT_PREVIEW_MAX_CHARS) return input;
         return input.substring(0, INPUT_PREVIEW_MAX_CHARS) + "...(truncated, full=" + input.length() + ")";
+    }
+
+    /**
+     * 评估用工具返回预览默认上限（字符）。2026-07-01 由 2000 提到 8000（对齐 {@code MeteredToolCallback.toolResultFull}）：
+     * 2000 太短——LLM 判官吃 trace 里的 resultPreview 核对"答案里的具体信息(标题/作者/链接/数据)是否真来自工具返回"，
+     * Q65 单次 search_papers 返回 1.1 万字时前 2000 字还没到具体论文标题，判官核对不上→误判编造。8000 字足够核对
+     * 绝大多数具体信息，又不至于把判官 prompt 撑爆。抽成可配置以便 E2E 按需再放宽。
+     */
+    static final int DEFAULT_RESULT_PREVIEW_MAX_CHARS = 8000;
+
+    /**
+     * 工具返回预览上限（字符）。仅在 {@link #resultPreviewEnabled}=true（E2E 采集）时生效；
+     * 生产开关关=根本不 emit resultPreview，本值无影响，PII 边界不破。测试用构造实例时 @Value 不注入，取字段初值。
+     */
+    @Value("${agent.tool-progress.result-preview.max-chars:8000}")
+    private int resultPreviewMaxChars = DEFAULT_RESULT_PREVIEW_MAX_CHARS;
+
+    String truncateResult(String input) {
+        if (input == null) return "";
+        int max = resultPreviewMaxChars > 0 ? resultPreviewMaxChars : DEFAULT_RESULT_PREVIEW_MAX_CHARS;
+        if (input.length() <= max) return input;
+        return input.substring(0, max) + "...(truncated, full=" + input.length() + ")";
     }
 
     /** 元工具卡片用更宽的上限：ask_user 一次可能问很多条问题，300 字会被截断。 */

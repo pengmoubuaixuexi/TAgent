@@ -85,6 +85,21 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
     private final ConcurrentMap<String, List<String>> sessionReasonings = new ConcurrentHashMap<>();
 
     /**
+     * 所有 filter 实例的弱注册表：filter 是 per-API 实例，{@link #clearRun(String)} 要跨所有实例清掉某 runId 的缓存，
+     * 故需静态登记。runId 隔离后 {@code sessionReasonings} 以 runId 为 key 只增不减，必须在执行结束按 runId 清理防泄漏。
+     */
+    private static final java.util.Set<ReasoningContentFilter> INSTANCES =
+            java.util.Collections.newSetFromMap(new ConcurrentHashMap<>());
+
+    /** 执行结束时清掉该 runId 的注入缓存（跨所有 per-API filter 实例）。在 execute() finally 调用，与 cleanupRun(runId) 同处。 */
+    public static void clearRun(String runId) {
+        if (runId == null || runId.isBlank()) return;
+        for (ReasoningContentFilter f : INSTANCES) {
+            f.sessionReasonings.remove(runId);
+        }
+    }
+
+    /**
      * 立即回答专用旁路缓存：按 sessionId 记录"最近一次（含被 cancel 截断的半截）reasoning_content"，供 finalize 读取。
      * <p>
      * 与上面 per-instance 的 {@link #sessionReasonings}（roundtrip 注入用）<b>相互独立</b>：static 跨所有 filter 实例共享，
@@ -120,6 +135,7 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
         if (frag != null) {
             log.info("[ReasoningFilter] 关思考注入已启用，片段={}", frag);
         }
+        INSTANCES.add(this);
     }
 
     /**
@@ -134,12 +150,40 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
      */
     private static final ThreadLocal<String> CURRENT_SESSION_ID = new ThreadLocal<>();
 
+    /**
+     * 2026-06-23 修跨题串扰：注入缓存 {@link #sessionReasonings} 改按"每次执行唯一的 runId"隔离，而非 sessionId。
+     * <p>根因：E2E/生产同一 sessionId 下连续/并发跑多道题时，reasoning_content 缓存按 sessionId 共享且跨题累加，
+     * 请求侧"取末尾 K 条"会把<b>别题</b>的 reasoning 注入本题的 tool_calls assistant，模型顺着被污染的"自己的思考"
+     * 答成别题（如 JVM 题答出编程语言排名）。runId 在一次执行内稳定、跨执行唯一，天然隔离并发与累加。
+     * <p>为空时回退 sessionId（保持旧行为，零影响）。{@link #LATEST_REASONING}/no-think 仍按 sessionId。</p>
+     */
+    private static final ThreadLocal<String> CURRENT_RUN_ID = new ThreadLocal<>();
+
     /** 调用方在 streaming LLM 调用前后包一层。{@code @return} AutoCloseable 用于 try-with-resources 清理。*/
     public static AutoCloseable scopeSession(String sessionId) {
         if (sessionId != null && !sessionId.isBlank()) {
             CURRENT_SESSION_ID.set(sessionId);
         }
         return CURRENT_SESSION_ID::remove;
+    }
+
+    /**
+     * 同时绑定 sessionId（供 LATEST_REASONING / 日志）与 runId（供注入缓存隔离）。
+     * runId 空白时注入缓存回退到 sessionId（旧行为）。
+     */
+    public static AutoCloseable scopeSession(String sessionId, String runId) {
+        if (sessionId != null && !sessionId.isBlank()) CURRENT_SESSION_ID.set(sessionId);
+        if (runId != null && !runId.isBlank()) CURRENT_RUN_ID.set(runId);
+        return () -> { CURRENT_SESSION_ID.remove(); CURRENT_RUN_ID.remove(); };
+    }
+
+    /** 注入缓存隔离键：优先 runId（每次执行唯一），回退 sessionId。 */
+    private String resolveReasoningKey(String sessionId) {
+        String rid = CURRENT_RUN_ID.get();
+        if (rid != null && !rid.isBlank()) return rid;
+        String mdcRun = MDC.get("runId");
+        if (mdcRun != null && !mdcRun.isBlank()) return mdcRun;
+        return sessionId;
     }
 
     /**
@@ -178,7 +222,9 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
     public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
         // filter 入口在调用者同步线程上跑（subscribe 时触发），此时 ThreadLocal/MDC 仍可用
         String sessionId = resolveSessionId();
-        List<String> reasonings = sessionReasonings.computeIfAbsent(sessionId,
+        // 注入缓存按 runId 隔离（跨题/并发不串扰）；sessionId 仍用于 LATEST_REASONING / 日志。
+        String reasoningKey = resolveReasoningKey(sessionId);
+        List<String> reasonings = sessionReasonings.computeIfAbsent(reasoningKey,
                 k -> Collections.synchronizedList(new ArrayList<>()));
 
         // 简单 LRU：sessionMap 过大时清掉一些（仅一致性提醒，不严格 LRU，避免锁）

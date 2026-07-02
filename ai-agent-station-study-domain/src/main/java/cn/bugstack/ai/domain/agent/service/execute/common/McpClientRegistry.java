@@ -130,6 +130,52 @@ public class McpClientRegistry {
     }
 
     /**
+     * List tool callbacks during model assembly.
+     *
+     * <p>This is intentionally different from {@link #getFreshCallback(String)}: at assembly time
+     * there may be no toolName -> mcpId index yet, because the index is built from listTools().
+     * If a reused SSE session has expired, listTools() is exactly the first operation that fails.
+     * Rebuild once by mcpId, then retry through the new client.
+     */
+    public ToolCallback[] getToolCallbacksForAssembly(String mcpId, McpSyncClient fallbackClient) throws Exception {
+        if (mcpId == null) {
+            return new ToolCallback[0];
+        }
+
+        AtomicLong failFast = failFastUntil.get(mcpId);
+        if (failFast != null && failFast.get() > System.currentTimeMillis()) {
+            throw new IllegalStateException("MCP circuit is open for mcpId=" + mcpId);
+        }
+
+        synchronized (locks.computeIfAbsent(mcpId, k -> new Object())) {
+            McpSyncClient client = clientRegistry.get(mcpId);
+            if (client == null) {
+                client = fallbackClient;
+            }
+            if (client == null) {
+                return new ToolCallback[0];
+            }
+
+            try {
+                ToolCallback[] callbacks = new SyncMcpToolCallbackProvider(List.of(client)).getToolCallbacks();
+                lastProbeOkTime.computeIfAbsent(mcpId, k -> new AtomicLong(0)).set(System.currentTimeMillis());
+                AtomicLong fail = lastProbeFailTime.get(mcpId);
+                if (fail != null) fail.set(0);
+                return callbacks;
+            } catch (Exception first) {
+                lastProbeFailTime.computeIfAbsent(mcpId, k -> new AtomicLong(0)).set(System.currentTimeMillis());
+                log.warn("[McpRegistry] assembly listTools failed for mcpId={}, will recreate once: {}",
+                        mcpId, first.toString());
+                ToolCallback[] recreated = doRecreateCallbacks(mcpId, client, "assembly-list-tools");
+                if (recreated != null) {
+                    return recreated;
+                }
+                throw first;
+            }
+        }
+    }
+
+    /**
      * 注册工具回调并建立反向索引（在 AiClientModelNode 装配时调用）
      */
     public void registerCallbacks(String mcpId, ToolCallback[] callbacks) {
@@ -309,6 +355,15 @@ public class McpClientRegistry {
     }
 
     private ToolCallback doRecreate(String mcpId, String toolName, McpSyncClient oldClient, String trigger) {
+        ToolCallback[] newCallbacks = doRecreateCallbacks(mcpId, oldClient, trigger);
+        if (newCallbacks == null) {
+            return null;
+        }
+        AtomicReference<ToolCallback> ref = callbackRegistry.get(toolName);
+        return ref != null ? ref.get() : null;
+    }
+
+    private ToolCallback[] doRecreateCallbacks(String mcpId, McpSyncClient oldClient, String trigger) {
         try {
             log.info("[McpRegistry] recreating client for mcpId={}", mcpId);
             AiClientToolMcpVO config = configRegistry.get(mcpId);
@@ -342,6 +397,9 @@ public class McpClientRegistry {
             failFastUntil.get(mcpId).set(0);
             long now = System.currentTimeMillis();
             lastReconnectTime.computeIfAbsent(mcpId, k -> new AtomicLong(0)).set(now);
+            lastProbeOkTime.computeIfAbsent(mcpId, k -> new AtomicLong(0)).set(now);
+            AtomicLong probeFail = lastProbeFailTime.get(mcpId);
+            if (probeFail != null) probeFail.set(0);
 
             log.info("[McpRegistry] recreated mcpId={} trigger={} successfully, {} callbacks updated",
                     mcpId, trigger, newCallbacks.length);
@@ -349,11 +407,10 @@ public class McpClientRegistry {
                 mcpToolMetrics.recordClientReconnect(mcpId, trigger);
             }
 
-            AtomicReference<ToolCallback> ref = callbackRegistry.get(toolName);
-            return ref != null ? ref.get() : null;
+            return newCallbacks;
 
         } catch (Exception e) {
-            int failures = consecutiveFailures.get(mcpId).incrementAndGet();
+            int failures = consecutiveFailures.computeIfAbsent(mcpId, k -> new AtomicInteger(0)).incrementAndGet();
             log.error("[McpRegistry] recreate failed for mcpId={} trigger={} failures={}", mcpId, trigger, failures, e);
             if (mcpToolMetrics != null) {
                 mcpToolMetrics.recordClientReconnectFailure(mcpId, trigger, e);
@@ -364,7 +421,7 @@ public class McpClientRegistry {
 
             if (failures >= CIRCUIT_BREAKER_THRESHOLD) {
                 long until = System.currentTimeMillis() + CIRCUIT_BREAKER_COOLDOWN_MS;
-                failFastUntil.get(mcpId).set(until);
+                failFastUntil.computeIfAbsent(mcpId, k -> new AtomicLong(0)).set(until);
                 log.error("[McpRegistry] circuit OPEN for mcpId={} until={}ms", mcpId, until);
                 if (mcpToolMetrics != null) {
                     mcpToolMetrics.recordCircuitOpen(mcpId);

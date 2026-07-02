@@ -139,7 +139,10 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
 
         String content = "";
         String sessionId = requestParameter.getSessionId();
-        String runId = requestParameter.getRunId();
+        // 2026-06-23 修跨题串扰：runId 每次执行唯一（ReasoningContentFilter 注入缓存按它隔离）；未带则生成。
+        String runId = (requestParameter.getRunId() != null && !requestParameter.getRunId().isBlank())
+                ? requestParameter.getRunId()
+                : (requestParameter.getSessionId() + "-run-" + java.util.UUID.randomUUID());
 
         // 注册取消标志以支持 cancelExecute()
         AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -229,8 +232,8 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
                     for (int attempt = 1; attempt <= streamingRetryMaxAttempts; attempt++) {
                         buf.setLength(0);
                         last[0] = null;
-                    // v1.3.2：scopeSession 让 ReasoningContentFilter 按 session 隔离缓存
-                    try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(sessionId)) {
+                    // v1.3.2：scopeSession 让 ReasoningContentFilter 隔离缓存；2026-06-23 改按 runId 隔离防跨题串
+                    try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(sessionId, runId)) {
                         // 立即回答 mid-stream 截断触发器：answer_now emit 它 → takeUntilOther 优雅完成 → 拿到半截
                         reactor.core.publisher.Sinks.One<Object> __trigger = reactor.core.publisher.Sinks.one();
                         if (sessionId != null) cancelTriggers.put(sessionId, __trigger);
@@ -358,6 +361,8 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             if (sessionId != null && mcpToolCatalogService != null) mcpToolCatalogService.clearNeeds(sessionId);
             if (runId != null && mcpToolCatalogService != null) mcpToolCatalogService.cleanupRun(runId);
             cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearLatestReasoning(sessionId);
+            // 2026-06-23：清掉本次 runId 的 reasoning_content 注入缓存（按 runId 隔离后只增不减，须在此清理防泄漏）
+            cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearRun(runId);
         }
     }
 
