@@ -208,11 +208,10 @@ public class ConversationTurnMemoryService implements IConversationTurnMemorySer
         String tid = req.getTenantId();
         String uid = req.getUserId();
         String sid = req.getSessionId();
+        if (uid == null || uid.isBlank()) return sid;
         if (tid == null || tid.isBlank()) {
-            if (uid == null || uid.isBlank()) return sid;
             return uid + ":" + sid;
         }
-        if (uid == null || uid.isBlank()) return tid + ":" + sid;
         return tid + ":" + uid + ":" + sid;
     }
 

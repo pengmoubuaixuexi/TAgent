@@ -149,8 +149,14 @@ public class E2E100LlmJudgeTest {
         // 缺了它判官会把 Agent 正确的相对时间（如当前=2026-07 时说"下个月=7月"）误判成"编造具体时间/无来源"。
         String nowText = txt(t, "startTime");
 
-        String content = callJudge(baseUrl, apiKey, buildPrompt(category, question, capped, financeSafety, memoryContext, toolContext, stmContext, ragContext, nowText));
+        String prompt = buildPrompt(category, question, capped, financeSafety, memoryContext, toolContext, stmContext, ragContext, nowText);
+        String content = callJudge(baseUrl, apiKey, prompt);
         ObjectNode verdict = parseVerdict(content);
+        // json_object 之后仍极少数返回非法 JSON → 同 prompt 再判一次，避免该题白丢（此前 Q12/Q72 即 PARSE_FAIL）
+        if ("PARSE_FAIL".equals(verdict.path("verdict").asText(""))) {
+            content = callJudge(baseUrl, apiKey, prompt);
+            verdict = parseVerdict(content);
+        }
         verdict.put("no", no).put("category", category).put("status", status);
         return verdict;
     }
@@ -308,6 +314,9 @@ public class E2E100LlmJudgeTest {
         body.put("stream", false);
         body.put("max_tokens", 3000);
         body.put("temperature", 0);
+        // deepseek 支持 response_format=json_object：解码层保证返回合法可解析 JSON（消除"吐散文/```围栏/半截"这类 PARSE_FAIL）。
+        // 前提是 prompt 内必须含 "JSON" 字样 + 字段示例——buildPrompt 末尾正好满足，故安全启用。仅保证是 JSON，字段仍靠下方 parseVerdict 校验。
+        body.set("response_format", M.createObjectNode().put("type", "json_object"));
         ArrayNode msgs = body.putArray("messages");
         ObjectNode um = msgs.addObject();
         um.put("role", "user");

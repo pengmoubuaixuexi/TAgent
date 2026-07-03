@@ -1,5 +1,20 @@
 # Changelog
 
+## [v1.17.0] - 2026-07-03
+
+### 更新
+
+- 新增 Streamable HTTP MCP transport 支持，可通过 URL 与 headers 装配第三方 MCP 服务，并复用现有 MCP 生命周期管理。
+- 新增百度千帆 web-search Streamable MCP 示例 SQL，使用占位 Authorization header。
+- 管理员用户列表改为数据库条件分页，避免全量拉取后在内存分页。
+- E2E LLM Judge 增加 JSON object 响应格式与解析失败重试。
+
+### 修复
+
+- 修复缺少稳定 userId 时把 sessionId 当作用户身份写入长期/情景记忆的问题。
+- 修复匿名会话 conversationId 被误解析为用户维度，可能污染用户级记忆的问题。
+- 修复管理员用户分页在大数据量或异常页码下的性能与越界风险。
+
 ## [v1.16.0] - 2026-07-02
 
 ### 更新

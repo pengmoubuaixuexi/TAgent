@@ -894,6 +894,11 @@ public class AgentRepository implements IAgentRepository {
                 transportConfigStdio.setStdio(stdio);
                 mcpVO.setTransportConfigStdio(transportConfigStdio);
                 return true;
+            } else if ("streamable-http".equals(transportType) || "streamablehttp".equals(transportType)) {
+                AiClientToolMcpVO.TransportConfigStreamableHttp streamableHttp = objectMapper.readValue(
+                        transportConfig, AiClientToolMcpVO.TransportConfigStreamableHttp.class);
+                mcpVO.setTransportConfigStreamableHttp(streamableHttp);
+                return true;
             }
             log.warn("skip mcp config: unsupported transport_type mcpId={} name={} type={}",
                     toolMcp.getMcpId(), toolMcp.getMcpName(), toolMcp.getTransportType());

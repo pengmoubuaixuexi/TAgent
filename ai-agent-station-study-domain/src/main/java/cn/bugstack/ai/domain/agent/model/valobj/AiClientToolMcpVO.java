@@ -55,6 +55,11 @@ public class AiClientToolMcpVO {
      */
     private TransportConfigStdio transportConfigStdio;
 
+    /**
+     * 传输配置 - streamable-http
+     */
+    private TransportConfigStreamableHttp transportConfigStreamableHttp;
+
     @Data
     @Builder
     @AllArgsConstructor
@@ -78,6 +83,17 @@ public class AiClientToolMcpVO {
             private List<String> args;
             private Map<String, String> env;
         }
+    }
+
+    @Data
+    @Builder
+    @AllArgsConstructor
+    @NoArgsConstructor
+    public static class TransportConfigStreamableHttp {
+        /** 完整 MCP 端点 URL，如 https://qianfan.baidubce.com/v2/tools/web-search/mcp */
+        private String url;
+        /** 自定义请求头（如 Authorization: Bearer xxx）；streamable-http 走 header 认证，不在 URL 带 key */
+        private Map<String, String> headers;
     }
 
 }

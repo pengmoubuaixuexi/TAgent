@@ -102,17 +102,24 @@ public class AiAgentController implements IAiAgentService {
 
             // P1.2.3 多租户隔离：userId/tenantId 来源优先级：
             //   DTO 字段 > MDC（MdcTraceFilter 已从 X-User-Id / X-Tenant-Id header 解析） > fallback
+            //   记忆身份修正(2026-07-03)：userId 只取稳定身份(DTO > MDC header)，去掉 sessionId 兜底——
+            //   否则未登录/匿名会把一次性 sessionId 当作 userId 写进 LTM/情景记忆，污染数据且跨会话取不到。
+            //   无稳定 userId 时保持 null：下游 LongTermMemoryAdvisor / EpisodicMemoryAdvisor 已 gate(userId 空则不写用户级记忆)，
+            //   chat_memory 仍按 conversationId(含 sessionId)维度正常保存。
             String userId = coalesce(
                     request.getUserId(),
-                    MDC.get("userId"),
-                    request.getSessionId());
+                    MDC.get("userId"));
             String tenantId = coalesce(
                     request.getTenantId(),
                     MDC.get("tenantId"),
                     "default");
 
-            // 写回 MDC，确保 ThreadPoolConfig.wrap() 捕获到并接力到 worker 线程
-            MDC.put("userId", userId);
+            // 写回 MDC，确保 ThreadPoolConfig.wrap() 捕获到并接力到 worker 线程；userId 为空时移除，避免脏值/NPE
+            if (userId != null && !userId.isBlank()) {
+                MDC.put("userId", userId);
+            } else {
+                MDC.remove("userId");
+            }
             MDC.put("tenantId", tenantId);
 
             // 2. 构建执行命令实体

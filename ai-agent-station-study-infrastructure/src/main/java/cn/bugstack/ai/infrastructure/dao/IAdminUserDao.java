@@ -97,4 +97,26 @@ public interface IAdminUserDao {
      */
     AdminUser queryByUsernameAndPassword(@Param("username") String username, @Param("password") String password);
 
+    /**
+     * 按条件分页查询管理员用户（条件与分页均下推到 DB，避免全量拉取内存过滤）。
+     * @param userId   精确匹配用户ID，null 时忽略
+     * @param username 模糊匹配用户名，null 时忽略
+     * @param status   状态，null 时忽略
+     * @param offset   偏移量（(pageNum-1)*pageSize）
+     * @param limit    每页大小
+     * @return 当前页管理员用户列表
+     */
+    List<AdminUser> queryPageByCondition(@Param("userId") String userId,
+                                         @Param("username") String username,
+                                         @Param("status") Integer status,
+                                         @Param("offset") int offset,
+                                         @Param("limit") int limit);
+
+    /**
+     * 按同一组条件统计总数（用于分页 total）。
+     */
+    long countByCondition(@Param("userId") String userId,
+                          @Param("username") String username,
+                          @Param("status") Integer status);
+
 }

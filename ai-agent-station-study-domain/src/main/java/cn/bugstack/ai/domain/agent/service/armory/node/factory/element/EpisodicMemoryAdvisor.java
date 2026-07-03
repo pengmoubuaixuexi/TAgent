@@ -179,7 +179,7 @@ public class EpisodicMemoryAdvisor implements BaseAdvisor {
         String[] parts = conversationId.split(":");
         if (parts.length >= 3) return parts[1];
         if (parts.length == 2) return parts[0];
-        return conversationId;
+        return null;
     }
 
     private String resolveSessionIdForEvidence(Map<String, Object> context) {

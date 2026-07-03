@@ -333,33 +333,22 @@ public class AdminUserAdminController implements IAdminUserAdminService {
         try {
             log.info("根据条件查询管理员用户列表请求：{}", request);
             
-            // 这里可以根据查询条件进行过滤，暂时先查询所有
-            List<AdminUser> adminUsers = adminUserDao.queryAll();
-            
-            // 根据查询条件进行过滤
-            List<AdminUser> filteredUsers = adminUsers.stream()
-                    .filter(user -> {
-                        boolean match = true;
-                        if (StringUtils.hasText(request.getUserId())) {
-                            match = match && user.getUserId().equals(request.getUserId());
-                        }
-                        if (StringUtils.hasText(request.getUsername())) {
-                            match = match && user.getUsername().contains(request.getUsername());
-                        }
-                        if (request.getStatus() != null) {
-                            match = match && user.getStatus().equals(request.getStatus());
-                        }
-                        return match;
-                    })
-                    .collect(Collectors.toList());
-            
-            // 分页处理
-            int pageNum = request.getPageNum() != null ? request.getPageNum() : 1;
+            // 参数归一化 + 边界校验（避免 subList 越界、超大 pageSize 拖库）
+            int pageNum = request.getPageNum() != null && request.getPageNum() > 0 ? request.getPageNum() : 1;
             int pageSize = request.getPageSize() != null ? request.getPageSize() : 10;
-            int startIndex = (pageNum - 1) * pageSize;
-            int endIndex = Math.min(startIndex + pageSize, filteredUsers.size());
-            
-            List<AdminUser> pagedUsers = filteredUsers.subList(startIndex, endIndex);
+            if (pageSize < 1) pageSize = 10;
+            if (pageSize > 100) pageSize = 100;
+            int offset = (pageNum - 1) * pageSize;
+
+            String userIdCond = StringUtils.hasText(request.getUserId()) ? request.getUserId() : null;
+            String usernameCond = StringUtils.hasText(request.getUsername()) ? request.getUsername() : null;
+            Integer statusCond = request.getStatus();
+
+            // 条件与分页下推到 DB（LIMIT/OFFSET），不再 queryAll 全量拉进 JVM 内存过滤/subList 分页
+            List<AdminUser> pagedUsers = adminUserDao.queryPageByCondition(userIdCond, usernameCond, statusCond, offset, pageSize);
+            long total = adminUserDao.countByCondition(userIdCond, usernameCond, statusCond);
+            log.info("查询管理员用户列表 total={} pageNum={} pageSize={} returned={}", total, pageNum, pageSize, pagedUsers.size());
+
             List<AdminUserResponseDTO> responseDTOs = pagedUsers.stream()
                     .map(this::convertToAdminUserResponseDTO)
                     .collect(Collectors.toList());

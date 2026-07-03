@@ -107,7 +107,7 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
         switch (transportType) {
             case "sse" -> {
                 AiClientToolMcpVO.TransportConfigSse transportConfigSse = aiClientToolMcpVO.getTransportConfigSse();
-                // Example: http://127.0.0.1:9999/sse?apikey=${MCP_API_KEY}
+                // http://127.0.0.1:9999/sse?apikey=DElk89iu8Ehhnbu
                 String originalBaseUri = transportConfigSse.getBaseUri();
                 String baseUri;
                 String sseEndpoint;
@@ -154,6 +154,35 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
 
                 log.info("Tool Stdio MCP Initialized {}", init_stdio);
                 return mcpClient;
+            }
+            case "streamable-http", "streamablehttp" -> {
+                AiClientToolMcpVO.TransportConfigStreamableHttp cfg = aiClientToolMcpVO.getTransportConfigStreamableHttp();
+                // 完整 URL 拆成 baseUrl(scheme://host) + endpoint(path[?query])：WebClient.baseUrl 只接 host，路径走 endpoint()
+                java.net.URI uri = java.net.URI.create(cfg.getUrl());
+                String baseUrl = uri.getScheme() + "://" + uri.getAuthority();
+                String endpoint = (uri.getRawPath() == null || uri.getRawPath().isBlank()) ? "/mcp" : uri.getRawPath();
+                if (uri.getRawQuery() != null && !uri.getRawQuery().isBlank()) {
+                    endpoint = endpoint + "?" + uri.getRawQuery();
+                }
+
+                // header 认证走 WebClient.defaultHeader（streamable-http 不在 URL 带 key，避开 query 参数被 strip 的已知问题）
+                org.springframework.web.reactive.function.client.WebClient.Builder webClientBuilder =
+                        org.springframework.web.reactive.function.client.WebClient.builder().baseUrl(baseUrl);
+                if (cfg.getHeaders() != null) {
+                    cfg.getHeaders().forEach(webClientBuilder::defaultHeader);
+                }
+
+                var streamableTransport = io.modelcontextprotocol.client.transport.WebClientStreamableHttpTransport
+                        .builder(webClientBuilder)
+                        .endpoint(endpoint)
+                        .build();
+
+                McpSyncClient mcpSyncClient = McpClient.sync(streamableTransport)
+                        .requestTimeout(Duration.ofSeconds(aiClientToolMcpVO.getRequestTimeout())).build();
+                var init_streamable = mcpSyncClient.initialize();
+
+                log.info("Tool Streamable-HTTP MCP Initialized {}", init_streamable);
+                return mcpSyncClient;
             }
         }
 
