@@ -49,4 +49,10 @@ public class AutoAgentRequestDTO implements Serializable {
      */
     private Integer maxStep;
 
+    /**
+     * Flow Agent 是否在 Step3 计划解析后暂停并等待用户确认。
+     * null 时使用服务端配置；false 时保持原来的直接执行流程。
+     */
+    private Boolean planReviewEnabled;
+
 }

@@ -16,7 +16,6 @@ import org.springframework.ai.tool.ToolCallback;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
-import java.util.Set;
 
 /**
  * 步骤1：MCP工具能力分析节点
@@ -66,9 +65,10 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
                 agentToolRegistry != null ? agentToolRegistry.getTools(executorClientId) : List.of());
         cn.bugstack.ai.domain.agent.service.execute.common.ExecutorToolCatalog v1Catalog =
                 storeExecutorToolCatalogSnapshot(dynamicContext, FLOW_TOOL_CATALOG_V1_KEY, executorClientId, dynamicToolCallbacks, 1);
-        String toolListBlock = renderToolRuntimeForPrompt(v1Catalog, executorClientId);
-        log.info("[Step1] inject tools for executor clientId={} hasTools={}",
-                executorClientId, agentToolRegistry.hasAnyTools(executorClientId));
+        String toolListBlock = renderStep1ToolRuntimeForPrompt(v1Catalog, executorClientId);
+        log.info("[Step1] inject tools for executor clientId={} hasTools={} requestToolEnabled={} sessionNeeds={}",
+                executorClientId, agentToolRegistry.hasAnyTools(executorClientId), requestToolEnabled,
+                mcpToolCatalogService.needsFor(requestParameter.getSessionId()));
 
         // 引导感知：本步 prompt 包成 Supplier，每轮按最新 currentTask 重建（引导后 currentTask 已折入引导，修复"重跑仍用原始询问"）
         final String toolListBlockForPrompt = toolListBlock;
@@ -78,6 +78,14 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
 
                         ## 重要说明
                         **本阶段仅进行工具能力分析，不执行用户的实际请求。**
+                        但 request_tool 是允许使用的元工具：它只负责按能力描述装载真实工具，不属于业务/执行类工具，也不算执行用户请求。
+
+                        ## 必须先做的判断
+                        在输出工具能力分析前，先判断用户任务是否需要外部能力：
+                        - 天气、路线、地图、地点/POI、开放时间、票价、交通班次、实时资讯、网页检索等，都属于外部能力。
+                        - 如果【实际可用工具】为空，或缺少这些外部能力，请先调用 request_tool，一次性在 needs 中列出所缺能力。
+                        - 调用 request_tool 并收到装载结果后，再基于【实际可用工具】和 request_tool 返回的真实工具继续分析。
+                        - 只有 request_tool 未匹配到工具、工具不可用，或任务确实不需要外部能力时，才允许写降级策略。
 
                         ## 实际可用工具（必读）
                         %s
@@ -86,29 +94,29 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
                         %s
 
                         ## 分析要求
-                        基于上面【实际可用工具】列表（这是当前 Agent 真实装配，不要超出此范围）+ 用户请求，给出工具能力分析：
+                        基于上面【实际可用工具】列表、request_tool 返回的真实装载结果（如有）和用户请求，给出工具能力分析：
 
                         ### 1. 任务匹配度
                         - 用户请求属于什么类别（信息检索 / 内容生成 / 计算 / 工具操作 / 纯对话 等）
-                        - 上面列出的工具中，哪些能直接满足？哪些不能？匹配度（高/中/低）
+                        - 真实可用工具中，哪些能直接满足？哪些不能？匹配度（高/中/低）
 
-                        ### 2. 工具使用建议（仅针对已列出的工具）
+                        ### 2. 工具使用建议（仅针对真实可用工具）
                         - 给出**真实存在**的工具的调用方式、参数提示
-                        - **严禁**引用上面列表里没有的工具（如自己脑补 web_search / summarize / run_code 等）
+                        - **严禁**引用【实际可用工具】和 request_tool 装载结果之外的工具（如自己脑补 web_search / summarize / run_code 等）
 
                         ### 3. 降级策略
-                        - 如果实际工具不能完成需求，应该如何基于 LLM 自身知识给出合理回复
+                        - 如果 request_tool 未能装载到所需工具，或实际工具不能完成需求，应该如何基于 LLM 自身知识给出合理回复
                         - 哪些信息能直接给（基础知识），哪些必须告知用户"无法检索/无法执行"
 
                         ### 4. 后续规划建议
                         - 建议规划阶段（Step2）只规划"使用上面列出的真实工具"或"纯知识回答"两种路径
                         - 提醒执行阶段（Step4）：禁止虚构工具调用过程
 
-                        请基于上面给出的真实工具列表进行分析，禁止编造工具。""",
+                        请先完成必要的 request_tool 装载，再基于真实工具列表进行分析，禁止编造工具。""",
                 toolListBlockForPrompt,
                 dynamicContext.getCurrentTask()
         ) + metaToolPromptHint(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_STEP1_TOOL_ANALYSIS,
-                requestParameter.getSessionId()));
+                requestParameter.getSessionId()) + flowStep1RequestToolDirective());
 
         // 2026-05-07 流式 UX：step_start → 流式 token → step_end（折叠为"MCP 工具分析 已完成"）
         org.springframework.ai.openai.OpenAiChatOptions.Builder step1OptionsBuilder =
@@ -155,6 +163,42 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
 
         recordTransition("flow_step1_mcp_analysis", dynamicContext);
         return router(requestParameter, dynamicContext);
+    }
+
+    private String renderStep1ToolRuntimeForPrompt(cn.bugstack.ai.domain.agent.service.execute.common.ExecutorToolCatalog catalog,
+                                                   String clientId) {
+        String rendered = cn.bugstack.ai.domain.agent.service.prompt.RuntimeToolPromptComposer.renderToolRuntime(catalog);
+        if (rendered != null && !rendered.isBlank()) {
+            return rendered;
+        }
+        if (requestToolEnabled) {
+            return "<tool_runtime>\n"
+                    + "  <no_business_tools client_id=\"" + escapeXmlForStep1(clientId) + "\">"
+                    + "当前 Agent 尚未装载业务 MCP 工具。若用户任务需要外部能力，请优先调用 request_tool 描述所缺能力，"
+                    + "不要直接退化为模型知识回答。"
+                    + "</no_business_tools>\n"
+                    + "</tool_runtime>";
+        }
+        return renderToolRuntimeForPrompt(catalog, clientId);
+    }
+
+    private static String escapeXmlForStep1(String value) {
+        if (value == null) return "";
+        return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
+    }
+
+    private String flowStep1RequestToolDirective() {
+        if (!requestToolEnabled) {
+            return "";
+        }
+        return """
+
+                ## Flow Step1 动态补工具要求
+                request_tool 是本阶段允许使用的元工具，不属于业务/执行类工具，也不算执行用户的实际请求。
+                当【实际可用工具】为空，或缺少完成用户任务所必需的外部能力时，请先调用 request_tool，在 needs 中逐条描述缺失能力，
+                为后续规划和执行步骤装载真实工具。尤其是涉及天气、地图路线、地点/POI、开放时间、票价、交通班次、实时资讯等外部信息的任务，
+                不要直接退化为模型知识回答；只有 request_tool 未匹配到工具或工具不可用时，才在分析里说明降级策略。
+                """;
     }
 
     @Override

@@ -1,17 +1,29 @@
 package cn.bugstack.ai.domain.agent.service.execute.flow;
 
+import cn.bugstack.ai.domain.agent.adapter.repository.IAgentRepository;
 import cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity;
 import cn.bugstack.ai.domain.agent.model.entity.ExecuteCommandEntity;
+import cn.bugstack.ai.domain.agent.service.IArmoryService;
 import cn.bugstack.ai.domain.agent.service.IExecuteStrategy;
+import cn.bugstack.ai.domain.agent.service.execute.flow.plan.FlowPlanReviewService;
+import cn.bugstack.ai.domain.agent.service.execute.flow.plan.FlowPlanReviewState;
+import cn.bugstack.ai.domain.agent.service.execute.flow.plan.FlowPlanReviewValidationResult;
+import cn.bugstack.ai.domain.agent.service.execute.flow.plan.IFlowPlanReviewResumeService;
+import cn.bugstack.ai.domain.agent.service.execute.flow.step.Step4ExecuteStepsNode;
 import cn.bugstack.ai.domain.agent.service.execute.flow.step.factory.DefaultFlowAgentExecuteStrategyFactory;
 import cn.bugstack.wrench.design.framework.tree.StrategyHandler;
 import com.alibaba.fastjson.JSON;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyEmitter;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadPoolExecutor;
 
 /**
  * 流程执行策略
@@ -20,10 +32,25 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 @Slf4j
 @Service("flowAgentExecuteStrategy")
-public class FlowAgentExecuteStrategy implements IExecuteStrategy {
+public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanReviewResumeService {
 
     @Resource
     private DefaultFlowAgentExecuteStrategyFactory defaultFlowAgentExecuteStrategyFactory;
+
+    @Resource
+    private IAgentRepository repository;
+
+    @Resource
+    private Step4ExecuteStepsNode step4ExecuteStepsNode;
+
+    @Resource
+    private ThreadPoolExecutor threadPoolExecutor;
+
+    @Autowired(required = false)
+    private FlowPlanReviewService flowPlanReviewService;
+
+    @Autowired(required = false)
+    private IArmoryService armoryService;
 
     @Resource
     private cn.bugstack.ai.domain.agent.service.execute.common.LongTermMemoryTurnSnapshot longTermMemoryTurnSnapshot;
@@ -102,6 +129,140 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy {
             cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearRun(runId);
             // P0（Codex #2）：清掉本次 runId 的工具调用实证台账（按 runId 隔离，须在此清理防泄漏）
             if (runId != null && toolCallLedger != null) toolCallLedger.clear(runId);
+        }
+    }
+
+    @Override
+    public void resumeReviewedPlan(FlowPlanReviewState state,
+                                   FlowPlanReviewValidationResult approvedPlan,
+                                   ResponseBodyEmitter emitter) {
+        if (state == null || approvedPlan == null || !approvedPlan.isValid()) {
+            sendSseObject(emitter, "message", AutoAgentExecuteResultEntity.createErrorResult(
+                    "Invalid reviewed plan", state != null ? state.getSessionId() : null));
+            try {
+                emitter.complete();
+            } catch (Exception ignored) {
+            }
+            return;
+        }
+
+        threadPoolExecutor.execute(() -> {
+            ExecuteCommandEntity request = ExecuteCommandEntity.builder()
+                    .aiAgentId(state.getAgentId())
+                    .message(state.getOriginalMessage())
+                    .sessionId(state.getSessionId())
+                    .runId(state.getRunId())
+                    .userId(state.getUserId())
+                    .tenantId(state.getTenantId())
+                    .maxStep(4)
+                    .build();
+            DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext =
+                    new DefaultFlowAgentExecuteStrategyFactory.DynamicContext();
+            dynamicContext.setExecutionHistory(new StringBuilder());
+            dynamicContext.setCurrentTask(state.getOriginalMessage());
+            dynamicContext.setStep(4);
+            dynamicContext.setValue("emitter", emitter);
+            dynamicContext.setValue("sessionId", state.getSessionId());
+            dynamicContext.setValue("runId", state.getRunId());
+            dynamicContext.setValue("userId", state.getUserId());
+            dynamicContext.setValue("tenantId", state.getTenantId());
+            dynamicContext.setValue("agentId", state.getAgentId());
+            dynamicContext.setValue("planningResult", state.getPlanningResult());
+            dynamicContext.setValue("mcpToolsAnalysis", state.getMcpToolsAnalysis());
+            dynamicContext.setValue("stepsMap", approvedPlan.getStepsMap());
+            dynamicContext.setValue("stepDependencies", approvedPlan.getStepDependencies());
+            dynamicContext.setValue("planReviewResumed", Boolean.TRUE);
+            dynamicContext.setAiAgentClientFlowConfigVOMap(repository.queryAiAgentClientFlowConfig(state.getAgentId()));
+
+            String sessionId = state.getSessionId();
+            String runId = state.getRunId();
+            if (sessionId != null) {
+                activeContexts.put(sessionId, dynamicContext);
+            }
+            if (sessionRefCounter != null && sessionId != null && !sessionId.isBlank()) {
+                sessionRefCounter.clear(sessionId);
+            }
+            emitter.onCompletion(dynamicContext::cancel);
+            emitter.onTimeout(dynamicContext::cancel);
+            emitter.onError(e -> dynamicContext.cancel());
+
+            try {
+                putMdc("agentId", state.getAgentId());
+                putMdc("sessionId", state.getSessionId());
+                putMdc("userId", state.getUserId());
+                putMdc("tenantId", state.getTenantId());
+                ensureAgentArmedForPlanResume(state.getAgentId(), runId, sessionId);
+                if (mcpToolCatalogService != null) {
+                    mcpToolCatalogService.setNeeds(sessionId, state.getMcpNeeds());
+                }
+
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("runId", runId);
+                payload.put("sessionId", sessionId);
+                payload.put("stepCount", approvedPlan.getStepsMap() != null ? approvedPlan.getStepsMap().size() : 0);
+                sendSseObject(emitter, "plan_review_resumed", payload);
+
+                String apply = step4ExecuteStepsNode.apply(request, dynamicContext);
+                log.info("[FlowPlanReview] resumed Step4 result runId={} result={}", runId, apply);
+                sendSseObject(emitter, "message", AutoAgentExecuteResultEntity.createCompleteResult(sessionId));
+            } catch (Exception e) {
+                log.error("[FlowPlanReview] resume failed runId={} sessionId={}", runId, sessionId, e);
+                sendSseObject(emitter, "message", AutoAgentExecuteResultEntity.createErrorResult(e.getMessage(), sessionId));
+            } finally {
+                if (flowPlanReviewService != null) flowPlanReviewService.deletePendingPlan(runId);
+                longTermMemoryTurnSnapshot.clearSession(sessionId);
+                if (sessionId != null) activeContexts.remove(sessionId);
+                if (sessionId != null && mcpToolCatalogService != null) mcpToolCatalogService.clearNeeds(sessionId);
+                if (runId != null && mcpToolCatalogService != null) mcpToolCatalogService.cleanupRun(runId);
+                cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearRun(runId);
+                if (runId != null && toolCallLedger != null) toolCallLedger.clear(runId);
+                clearMdc("agentId", "sessionId", "userId", "tenantId");
+                try {
+                    emitter.complete();
+                } catch (Exception ignored) {
+                }
+            }
+        });
+    }
+
+    private void ensureAgentArmedForPlanResume(String agentId, String runId, String sessionId) {
+        if (armoryService == null || agentId == null || agentId.isBlank()) {
+            return;
+        }
+        if (armoryService.isAgentArmed(agentId)) {
+            return;
+        }
+        log.info("[FlowPlanReview] resume armory ensure agentId={} runId={} sessionId={}", agentId, runId, sessionId);
+        armoryService.ensureArmed(agentId);
+    }
+
+    private void sendSseObject(ResponseBodyEmitter emitter, String event, Object payload) {
+        if (emitter == null || payload == null) {
+            return;
+        }
+        try {
+            StringBuilder frame = new StringBuilder();
+            if (event != null && !"message".equals(event)) {
+                frame.append("event: ").append(event).append('\n');
+            }
+            frame.append("data: ").append(JSON.toJSONString(payload)).append("\n\n");
+            synchronized (emitter) {
+                emitter.send(frame.toString());
+            }
+        } catch (Exception e) {
+            log.debug("[FlowPlanReview] send SSE failed event={} err={}", event, e.getMessage());
+        }
+    }
+
+    private void putMdc(String key, String value) {
+        if (value != null && !value.isBlank()) {
+            MDC.put(key, value);
+        }
+    }
+
+    private void clearMdc(String... keys) {
+        for (String key : keys) {
+            MDC.remove(key);
         }
     }
 

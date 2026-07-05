@@ -411,10 +411,16 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             AiAgentClientFlowConfigVO execConfig = dynamicContext.getAiAgentClientFlowConfigVOMap()
                     .get(AiClientTypeEnumVO.EXECUTOR_CLIENT.getCode());
             String executorClientId = execConfig != null ? execConfig.getClientId() : null;
-            String dynamicMissingToolDesc = dynamicContext.getValue("dynamicMissingToolDesc");
-            String dynamicToolQuery = dynamicContext.getValue("dynamicToolQuery");
             String runId = dynamicContext.getValue("runId");
             String leaseSessionId = dynamicContext.getValue("sessionId");
+            String latestSessionNeeds = mcpToolCatalogService != null ? mcpToolCatalogService.needsFor(leaseSessionId) : null;
+            String dynamicMissingToolDesc = latestSessionNeeds != null && !latestSessionNeeds.isBlank()
+                    ? latestSessionNeeds
+                    : dynamicContext.getValue("dynamicMissingToolDesc");
+            String dynamicToolQuery = dynamicContext.getValue("dynamicToolQuery");
+            if (dynamicMissingToolDesc != null && !dynamicMissingToolDesc.isBlank()) {
+                dynamicContext.setValue("dynamicMissingToolDesc", dynamicMissingToolDesc);
+            }
             List<ToolCallback> dynamicToolCallbacks = mcpToolCatalogService != null
                     ? mcpToolCatalogService.resolveDynamicToolCallbacks(runId, leaseSessionId, executorClientId, dynamicMissingToolDesc, dynamicToolQuery,
                             agentToolRegistry != null ? agentToolRegistry.getTools(executorClientId) : List.of())

@@ -38,6 +38,11 @@ public class ExecuteCommandEntity {
 
     private Integer maxStep;
 
+    /**
+     * Flow Agent 是否在 Step3 后进入计划确认；null 时由服务端配置决定。
+     */
+    private Boolean planReviewEnabled;
+
     // 2026-06-19：原 dynamicMissingToolDesc(路由产出的"可能缺失工具能力"描述/need)字段已退休，
     // 改为按 sessionId 存进 McpToolCatalogService.sessionNeeds（路由 setNeeds / 中途 request_tool appendNeed
     // / step needsFor / 执行结束 clearNeeds）。统一来源，便于 manager 中途追加；代价是需显式清理（见该类）。

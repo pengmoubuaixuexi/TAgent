@@ -2,10 +2,12 @@ package cn.bugstack.ai.domain.agent.service.execute.flow.step;
 
 import cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity;
 import cn.bugstack.ai.domain.agent.model.entity.ExecuteCommandEntity;
+import cn.bugstack.ai.domain.agent.service.execute.flow.plan.FlowPlanReviewService;
 import cn.bugstack.ai.domain.agent.service.execute.flow.step.factory.DefaultFlowAgentExecuteStrategyFactory;
 import cn.bugstack.wrench.design.framework.tree.StrategyHandler;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.HashMap;
@@ -29,6 +31,9 @@ public class Step3ParseStepsNode extends AbstractExecuteSupport {
 
     @Resource
     private Step4ExecuteStepsNode step4ExecuteStepsNode;
+
+    @Autowired(required = false)
+    private FlowPlanReviewService flowPlanReviewService;
 
     @Override
     protected String doApply(ExecuteCommandEntity requestParameter, DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext) throws Exception {
@@ -88,6 +93,10 @@ public class Step3ParseStepsNode extends AbstractExecuteSupport {
         dynamicContext.setStep(dynamicContext.getStep() + 1);
 
         recordTransition("flow_step3_parse_steps", dynamicContext);
+        if (flowPlanReviewService != null
+                && flowPlanReviewService.tryPauseForReview(requestParameter, dynamicContext, stepsMap, stepDependencies)) {
+            return "flow plan review required";
+        }
         return router(requestParameter, dynamicContext);
     }
 

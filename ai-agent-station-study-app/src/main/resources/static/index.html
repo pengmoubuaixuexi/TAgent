@@ -54,6 +54,9 @@
   .tool-card .tool-input { margin-top:7px; color:#94a3b8; }
   .tool-card .tool-input code { color:#f8fafc; background:#020617; border:1px solid #1f2937; border-radius:6px; padding:1px 5px; white-space:normal; word-break:break-word; }
   .tool-card .tool-detail { margin-top:7px; color:#cbd5e1; }
+  .tool-card .tool-quick { border:1px solid #92400e; background:#d97706; color:#fff; border-radius:6px; padding:3px 8px; font-size:11px; line-height:1.2; white-space:nowrap; cursor:pointer; }
+  .tool-card .tool-quick:hover { background:#b45309; }
+  .tool-card .tool-quick:disabled { opacity:.55; cursor:not-allowed; }
   .tool-card.running { border-color:#2563eb; }
   .tool-card.success { border-color:#059669; }
   .tool-card.blocked,
@@ -158,6 +161,11 @@
           onchange="state.maxStep=parseInt(this.value)||5"
           class="w-12 bg-gray-800 border border-gray-700 rounded px-1.5 py-1 text-sm text-gray-200 text-center focus:outline-none focus:border-blue-500">
       </div>
+      <label class="flex items-center gap-1 text-xs text-gray-500" title="Flow 模式下在执行前确认 Step2 生成的计划">
+        <input id="planReviewToggle" type="checkbox" onchange="state.planReviewEnabled=this.checked"
+          class="accent-amber-500">
+        计划确认
+      </label>
       <span class="text-xs text-gray-500">|</span>
       <!-- User Info -->
       <div class="flex items-center gap-2">
@@ -249,6 +257,27 @@
     </div>
   </div>
 
+  <div id="planReviewModal" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+    <div data-plan-review-root class="bg-[#0b1120] rounded-2xl p-6 border border-gray-700 w-full max-w-3xl max-h-[86vh] overflow-hidden shadow-2xl flex flex-col">
+      <div class="flex items-start justify-between gap-4 mb-4">
+        <div>
+          <h3 class="text-lg font-bold text-white">确认执行计划</h3>
+          <p id="planReviewMeta" class="text-xs text-amber-300 mt-1"></p>
+        </div>
+        <button id="planReviewCloseBtn" type="button" class="text-gray-500 hover:text-white text-xl">&times;</button>
+      </div>
+      <div id="planReviewSteps" class="plan-review-steps flex-1 overflow-y-auto pr-1 space-y-3 scrollbar"></div>
+      <div id="planReviewNotice" class="plan-review-notice text-xs mt-3 text-amber-300"></div>
+      <div class="flex flex-wrap items-center justify-between gap-3 pt-4 mt-2 border-t border-gray-800">
+        <button id="planReviewCopyBtn" type="button" class="text-xs border border-gray-700 bg-gray-800 text-gray-200 rounded-md px-3 py-1.5 hover:bg-gray-700">复制 runId</button>
+        <div class="flex gap-2">
+          <button id="planReviewAddBtn" type="button" class="text-xs border border-gray-700 bg-gray-800 text-gray-200 rounded-md px-3 py-1.5 hover:bg-gray-700">添加步骤</button>
+          <button id="planReviewConfirmBtn" type="button" class="text-xs bg-amber-600 text-white rounded-md px-3 py-1.5 hover:bg-amber-700 disabled:opacity-60">确认并执行</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- D 段：ask_user —— AI 主动请求用户补充信息（与审批独立通道，按 inputId 各解各的，不串话） -->
   <div id="userInputModal" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
     <div class="bg-gray-900 rounded-2xl p-6 border border-indigo-700/70 w-full max-w-xl shadow-2xl">
@@ -295,7 +324,7 @@
         class="bg-indigo-600/70 hover:bg-indigo-600 disabled:opacity-50 text-white px-3 py-1.5 rounded-full transition text-sm font-medium shadow">
         💬 引导
       </button>
-      <span class="text-xs text-gray-400">运行中 · 在下方输入框补充引导后回车 / 点「引导」，或点「立即回答」收尾</span>
+      <span id="interveneHint" class="text-xs text-gray-400">运行中 · 在下方输入框补充引导后回车 / 点「引导」，或点「立即回答」收尾</span>
     </div>
     <div class="max-w-4xl mx-auto flex gap-3">
       <button onclick="newSession()" title="新会话"
@@ -331,12 +360,14 @@ let state = {
   sessionId: null,
   currentAgentId: null,
   maxStep: 5,
+  planReviewEnabled: false,
   sending: false,
   agents: [],
   pendingApproval: null,
   approvalQueue: [],   // DAG 并行下多个步骤同时要审批：排队逐个弹，避免后者覆盖前者
   approvalTimer: null,
-  interventionEnabled: false  // 立即回答总开关，由 ack 事件 intervention 字段决定
+  interventionEnabled: false,  // 立即回答总开关，由 ack 事件 intervention 字段决定
+  flowStep4Active: false       // Flow Step4 后端不消费引导，前端进入 Step4 后置灰引导按钮
 };
 
 // ==================== INIT ====================
@@ -406,6 +437,8 @@ function showLoginError(msg) {
 }
 
 function doLogout() {
+  try { localStorage.removeItem(pendingFlowPlanStorageKey()); } catch (e) {}
+  try { localStorage.removeItem(activeConversationStorageKey()); } catch (e) {}
   localStorage.removeItem('agent_login');
   resetHistoryPagination(); // 第 70 轮：退出登录也要清历史分页状态，避免下次登录残留旧监听
   state.userId = null; state.username = null; state.sessionId = null;
@@ -419,8 +452,18 @@ async function showChat() {
   document.getElementById('chatScreen').classList.remove('hidden');
   document.getElementById('userDisplay').textContent = state.username;
   document.getElementById('userAvatar').textContent = (state.username || 'U')[0].toUpperCase();
-  newSession();
   await loadAgents();
+  const pendingPlan = loadPendingFlowPlan();
+  if (pendingPlan) {
+    await restorePendingFlowPlanAfterRefresh(pendingPlan);
+    return;
+  }
+  const active = loadActiveConversation();
+  if (active && active.conversationId) {
+    const restored = await loadConversation(active.conversationId, { keepHistoryPanelHidden: true });
+    if (restored) return;
+  }
+  newSession({ preservePendingPlan: true });
 }
 
 async function loadAgents() {
@@ -446,7 +489,10 @@ function onAgentChange() {
   state.currentAgentId = document.getElementById('agentSelect').value;
 }
 
-function newSession() {
+function newSession(options = {}) {
+  if (!options.preservePendingPlan) {
+    clearPendingFlowPlan();
+  }
   // 第 70 轮：先退出历史分页模式，否则旧会话挂的 scroll 监听 + 哨兵会立刻把旧历史加载回空页面
   resetHistoryPagination();
   // 清掉上个会话可能残留的待审批队列 + 收起弹窗，避免跨会话串
@@ -455,8 +501,683 @@ function newSession() {
   hideApprovalModal();
   state.sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
   document.getElementById('sessionInfo').textContent = 'Session: ' + state.sessionId.substring(0, 28) + '...';
+  saveActiveConversation(state.sessionId);
   document.getElementById('messageArea').innerHTML =
     '<div class="text-center text-gray-600 text-sm py-8"><p class="text-4xl mb-3">🆕</p><p>新会话已开始</p></div>';
+}
+
+function activeConversationStorageKey() {
+  return `agent_active_conversation_${state.userId || 'anonymous'}`;
+}
+
+function conversationIdForSession(sessionId) {
+  if (!sessionId) return '';
+  if (!state.userId) return sessionId;
+  return `default:${state.userId}:${sessionId}`;
+}
+
+function saveActiveConversation(sessionId = state.sessionId, conversationId = null) {
+  if (!sessionId) return;
+  try {
+    localStorage.setItem(activeConversationStorageKey(), JSON.stringify({
+      sessionId,
+      conversationId: conversationId || conversationIdForSession(sessionId),
+      savedAt: Date.now()
+    }));
+  } catch (e) {
+    console.warn('save active conversation failed', e);
+  }
+}
+
+function loadActiveConversation() {
+  try {
+    const raw = localStorage.getItem(activeConversationStorageKey());
+    if (!raw) return null;
+    const value = JSON.parse(raw);
+    if (!value || !value.sessionId || !value.conversationId) return null;
+    return value;
+  } catch (e) {
+    localStorage.removeItem(activeConversationStorageKey());
+    return null;
+  }
+}
+
+function pendingFlowPlanStorageKey() {
+  return `agent_pending_flow_plan_${state.userId || 'anonymous'}`;
+}
+
+function savePendingFlowPlan(payload, snapshot = {}) {
+  if (!payload || !payload.runId) return;
+  const record = {
+    ...payload,
+    conversationId: payload.conversationId || conversationIdForSession(payload.sessionId || state.sessionId),
+    turnSnapshot: snapshot || {},
+    savedAt: Date.now()
+  };
+  try {
+    localStorage.setItem(pendingFlowPlanStorageKey(), JSON.stringify(record));
+  } catch (e) {
+    try {
+      const compact = { ...record, turnSnapshot: { ...(snapshot || {}), assistantHtml: '' } };
+      localStorage.setItem(pendingFlowPlanStorageKey(), JSON.stringify(compact));
+    } catch (e2) {
+      console.warn('save pending flow plan failed', e2);
+    }
+  }
+}
+
+function loadPendingFlowPlan() {
+  try {
+    const raw = localStorage.getItem(pendingFlowPlanStorageKey());
+    if (!raw) return null;
+    const payload = JSON.parse(raw);
+    if (!payload || !payload.runId) return null;
+    if (payload.expiresAt && Number(payload.expiresAt) <= Date.now()) {
+      localStorage.removeItem(pendingFlowPlanStorageKey());
+      return null;
+    }
+    return payload;
+  } catch (e) {
+    localStorage.removeItem(pendingFlowPlanStorageKey());
+    return null;
+  }
+}
+
+function clearPendingFlowPlan(runId) {
+  try {
+    const payload = loadPendingFlowPlan();
+    if (!runId || (payload && payload.runId === runId)) {
+      localStorage.removeItem(pendingFlowPlanStorageKey());
+    }
+  } catch (e) {
+    localStorage.removeItem(pendingFlowPlanStorageKey());
+  }
+}
+
+async function restorePendingFlowPlanAfterRefresh(payload = null) {
+  payload = payload || loadPendingFlowPlan();
+  if (!payload) return;
+  const sessionId = payload.sessionId || state.sessionId;
+  const conversationId = payload.conversationId || conversationIdForSession(sessionId);
+  const loaded = conversationId
+    ? await loadConversation(conversationId, { keepHistoryPanelHidden: true, saveActive: true })
+    : false;
+  if (!loaded) {
+    resetHistoryPagination();
+    state.sessionId = sessionId;
+    document.getElementById('sessionInfo').textContent = 'Session: ' + state.sessionId.substring(0, 28) + '...';
+    saveActiveConversation(sessionId, conversationId);
+    document.getElementById('messageArea').innerHTML = '';
+  }
+
+  const snapshot = payload.turnSnapshot || {};
+  if (snapshot.userMessage) {
+    addMessage('user', snapshot.userMessage);
+  }
+  const aiMsg = addMessage('assistant', '', false, snapshot.agentId || payload.agentId);
+  const authorEl = aiMsg.querySelector('.msg-author');
+  if (authorEl && snapshot.assistantAuthor) authorEl.textContent = snapshot.assistantAuthor;
+  const msgContent = aiMsg.querySelector('.msg-content');
+  if (snapshot.assistantHtml) {
+    msgContent.innerHTML = snapshot.assistantHtml;
+    rebindRestoredMessageInteractions(msgContent);
+    const restoredCard = findRestoredPlanReviewCard(msgContent, payload.runId);
+    if (restoredCard) {
+      bindRestoredPlanReviewCard(restoredCard, payload, aiMsg);
+      return;
+    }
+  } else {
+    msgContent.innerHTML = '<div class="steps-container"></div><div class="final-answer mt-3"></div>';
+  }
+  const stepsContainer = msgContent.querySelector('.steps-container') || msgContent;
+  createRestoredPlanReviewRow(payload, aiMsg, stepsContainer);
+}
+
+function createRestoredPlanReviewRow(payload, aiMsg, stepsContainer) {
+  const card = document.createElement('div');
+  card.className = 'tool-card blocked fade-in';
+  card.dataset.planReviewCard = 'true';
+  card.dataset.runId = payload && payload.runId ? payload.runId : '';
+  card.innerHTML = `
+    <div class="tool-head">
+      <span class="tool-chev">▣</span>
+      <span class="tool-action">确认计划</span>
+      <span class="tool-name" title="执行计划">执行计划</span>
+      <span class="tool-summary">${escapeHtml(restoredPlanSummary(payload))}</span>
+      <span class="tool-status">待确认</span>
+      <button type="button" class="tool-quick" data-action="quick-confirm">确认</button>
+    </div>
+  `;
+  bindRestoredPlanReviewCard(card, payload, aiMsg);
+  stepsContainer.appendChild(card);
+}
+
+function bindRestoredPlanReviewCard(card, payload, aiMsg) {
+  if (!card) return;
+  card.dataset.planReviewCard = 'true';
+  if (payload && payload.runId) card.dataset.runId = payload.runId;
+  const head = card.querySelector('.tool-head');
+  const quickBtn = card.querySelector('[data-action="quick-confirm"]');
+  if (!head || !quickBtn) return;
+  head.onclick = (event) => {
+    if (event.target && event.target.closest('[data-action="quick-confirm"]')) return;
+    openRestoredPlanReviewModal(payload, aiMsg, card);
+  };
+  quickBtn.onclick = (event) => {
+    event.stopPropagation();
+    confirmRestoredFlowPlan(payload, Array.isArray(payload.steps) ? payload.steps : [], aiMsg, card);
+  };
+}
+
+function findRestoredPlanReviewCard(root, runId) {
+  if (!root) return null;
+  if (runId) {
+    const exact = root.querySelector(`[data-plan-review-card="true"][data-run-id="${cssEscape(runId)}"]`);
+    if (exact) return exact;
+  }
+  return root.querySelector('[data-plan-review-card="true"]') || root.querySelector('.tool-card.blocked [data-action="quick-confirm"]')?.closest('.tool-card');
+}
+
+function rebindRestoredMessageInteractions(root) {
+  if (!root) return;
+  root.querySelectorAll('.step-head').forEach(head => {
+    head.onclick = () => head.closest('.step-card')?.classList.toggle('collapsed');
+  });
+  root.querySelectorAll('.tool-head').forEach(head => {
+    const card = head.closest('.tool-card');
+    if (!card || card.dataset.planReviewCard === 'true' || card.querySelector('[data-action="quick-confirm"]')) return;
+    head.onclick = () => card.classList.toggle('collapsed');
+  });
+  root.querySelectorAll('.evidence-head').forEach(head => {
+    head.onclick = () => head.closest('.evidence-card')?.classList.toggle('collapsed');
+  });
+}
+
+function cssEscape(value) {
+  if (window.CSS && typeof window.CSS.escape === 'function') {
+    return window.CSS.escape(String(value));
+  }
+  return String(value).replace(/["\\]/g, '\\$&');
+}
+
+function restoredPlanSummary(payload) {
+  const steps = Array.isArray(payload && payload.steps) ? payload.steps : [];
+  const parts = [`${steps.length || 0} 个步骤`];
+  if (payload && payload.expiresAt) parts.push(`有效至 ${new Date(payload.expiresAt).toLocaleString()}`);
+  return parts.join(' · ');
+}
+
+function openRestoredPlanReviewModal(payload, aiMsg, card) {
+  const modal = document.getElementById('planReviewModal');
+  const list = document.getElementById('planReviewSteps');
+  const meta = document.getElementById('planReviewMeta');
+  const notice = document.getElementById('planReviewNotice');
+  const confirmBtn = document.getElementById('planReviewConfirmBtn');
+  const addBtn = document.getElementById('planReviewAddBtn');
+  const copyBtn = document.getElementById('planReviewCopyBtn');
+  const closeBtn = document.getElementById('planReviewCloseBtn');
+  if (!modal || !list || !meta || !notice || !confirmBtn || !addBtn || !copyBtn || !closeBtn) return;
+  const expiresText = payload && payload.expiresAt ? new Date(payload.expiresAt).toLocaleString() : '';
+  list.innerHTML = '';
+  meta.innerHTML = `runId: <code class="bg-gray-950 border border-gray-700 rounded px-1 text-gray-100">${escapeHtml(payload.runId || '')}</code>${expiresText ? ` · 有效期至 ${escapeHtml(expiresText)}` : ''}`;
+  notice.textContent = '';
+  notice.className = 'plan-review-notice text-xs mt-3 text-amber-300';
+  const steps = Array.isArray(payload.steps) ? payload.steps : [];
+  steps.forEach(step => addRestoredPlanReviewStepRow(list, step));
+  if (!steps.length) addRestoredPlanReviewStepRow(list, { title: '', content: '', dependsOn: [] });
+  renumberRestoredPlanRows(modal);
+
+  closeBtn.onclick = () => modal.classList.add('hidden');
+  modal.onclick = (event) => { if (event.target === modal) modal.classList.add('hidden'); };
+  copyBtn.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(payload.runId || '');
+      setRestoredPlanNotice(modal, 'runId 已复制。', false);
+    } catch (e) {
+      setRestoredPlanNotice(modal, '复制失败，请手动选择 runId。', true);
+    }
+  };
+  addBtn.onclick = () => {
+    addRestoredPlanReviewStepRow(list, { title: '', content: '', dependsOn: [] });
+    renumberRestoredPlanRows(modal);
+  };
+  confirmBtn.disabled = false;
+  confirmBtn.textContent = '确认并执行';
+  confirmBtn.onclick = () => confirmRestoredFlowPlan(payload, collectRestoredPlanSteps(modal), aiMsg, card, modal);
+  modal.classList.remove('hidden');
+}
+
+function addRestoredPlanReviewStepRow(list, step) {
+  const row = document.createElement('div');
+  row.className = 'plan-review-row border border-gray-700 bg-gray-950 rounded-lg p-3';
+  const deps = Array.isArray(step.dependsOn) ? step.dependsOn.join(',') : '';
+  row.innerHTML = `
+    <div class="flex items-center gap-2 mb-2">
+      <span class="plan-step-no text-xs font-semibold text-amber-300 min-w-12"></span>
+      <input data-field="title" class="flex-1 border border-gray-700 bg-gray-900 text-gray-100 placeholder-gray-500 rounded-md px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-amber-700 focus:border-amber-600" value="${escapeHtml(step.title || '')}" placeholder="步骤标题">
+      <button type="button" data-action="delete-step" class="text-xs border border-gray-700 bg-gray-900 text-gray-300 rounded-md px-2 py-1 hover:bg-gray-800">删除</button>
+    </div>
+    <textarea data-field="content" class="w-full border border-gray-700 bg-gray-900 text-gray-100 placeholder-gray-500 rounded-md px-2 py-2 text-sm leading-relaxed min-h-24 focus:outline-none focus:ring-2 focus:ring-amber-700 focus:border-amber-600" placeholder="步骤内容">${escapeHtml(step.content || '')}</textarea>
+    <label class="block text-xs text-gray-400 mt-2">
+      依赖步骤
+      <input data-field="dependsOn" class="ml-2 w-40 border border-gray-700 bg-gray-900 text-gray-100 placeholder-gray-500 rounded-md px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-amber-700 focus:border-amber-600" value="${escapeHtml(deps)}" placeholder="如 1,2">
+    </label>
+  `;
+  row.querySelector('[data-action="delete-step"]').addEventListener('click', () => {
+    const parent = row.parentElement;
+    if (parent && parent.querySelectorAll('.plan-review-row').length > 1) {
+      row.remove();
+      renumberRestoredPlanRows(parent.closest('[data-plan-review-root]') || parent);
+    }
+  });
+  list.appendChild(row);
+}
+
+function renumberRestoredPlanRows(card) {
+  if (!card) return;
+  card.querySelectorAll('.plan-review-row').forEach((row, idx) => {
+    const no = row.querySelector('.plan-step-no');
+    if (no) no.textContent = `第 ${idx + 1} 步`;
+  });
+}
+
+function collectRestoredPlanSteps(card) {
+  if (!card) return [];
+  return Array.from(card.querySelectorAll('.plan-review-row')).map((row, idx) => ({
+    stepNo: idx + 1,
+    title: row.querySelector('[data-field="title"]').value.trim(),
+    content: row.querySelector('[data-field="content"]').value.trim(),
+    dependsOn: parseRestoredDependsInput(row.querySelector('[data-field="dependsOn"]').value)
+  }));
+}
+
+function parseRestoredDependsInput(value) {
+  const seen = new Set();
+  return String(value || '')
+    .split(/[,\s，、]+/)
+    .map(x => parseInt(x, 10))
+    .filter(n => Number.isInteger(n) && n > 0 && !seen.has(n) && seen.add(n));
+}
+
+function setRestoredPlanNotice(card, text, isError) {
+  const notice = card && card.querySelector('.plan-review-notice');
+  if (!notice) return;
+  notice.textContent = text || '';
+  notice.className = `plan-review-notice text-xs mt-3 ${isError ? 'text-red-400' : 'text-amber-300'}`;
+}
+
+async function confirmRestoredFlowPlan(payload, steps, aiMsg, card, modal) {
+  const btn = modal ? document.getElementById('planReviewConfirmBtn') : card.querySelector('[data-action="quick-confirm"]');
+  try {
+    if (btn) { btn.disabled = true; btn.textContent = '执行中...'; }
+    const statusEl = card.querySelector('.tool-status');
+    const summaryEl = card.querySelector('.tool-summary');
+    if (statusEl) statusEl.textContent = '执行中';
+    if (summaryEl) summaryEl.textContent = '计划已提交，正在继续执行';
+    state.sending = true;
+    state.finalizing = false;
+    state.flowStep4Active = false;
+    const ac = new AbortController();
+    state.abortController = ac;
+    setSendBtn(true);
+    const res = await fetch(API + '/flow/plan-review/confirm', {
+      method: 'POST',
+      signal: ac.signal,
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        runId: payload.runId,
+        sessionId: payload.sessionId || state.sessionId,
+        steps
+      })
+    });
+    if (!res.ok || !res.body) throw new Error('确认计划失败：HTTP ' + res.status);
+    if (modal) modal.classList.add('hidden');
+    await consumeRestoredPlanSse(res, aiMsg, card, payload);
+    clearPendingFlowPlan(payload.runId);
+    if (statusEl) statusEl.textContent = '已确认';
+    if (summaryEl) summaryEl.textContent = '计划已确认并执行完成';
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      appendRestoredCancelledMarker(aiMsg);
+      if (modal) setRestoredPlanNotice(modal, '执行已取消。', true);
+    } else {
+      if (e && e.planExpired) clearPendingFlowPlan(payload.runId);
+      const statusEl = card.querySelector('.tool-status');
+      const summaryEl = card.querySelector('.tool-summary');
+      if (statusEl) statusEl.textContent = '确认失败';
+      if (summaryEl) summaryEl.textContent = e.message || '确认计划失败';
+      if (modal) setRestoredPlanNotice(modal, e.message || '确认计划失败。', true);
+    }
+    if (btn) {
+      if (e && e.planExpired) {
+        btn.disabled = true;
+        btn.textContent = '已过期';
+      } else {
+        btn.disabled = false;
+        btn.textContent = modal ? '确认并执行' : '确认';
+      }
+    }
+  } finally {
+    state.sending = false;
+    state.abortController = null;
+    state.flowStep4Active = false;
+    setSendBtn(false);
+    showAnswerNow(false);
+    scrollBottom(true);
+  }
+}
+
+function setRestoredPlanCardStatus(card, status, summary) {
+  if (!card) return;
+  const className = status === 'success' ? 'success'
+    : (status === 'error' ? 'error' : (status === 'running' ? 'running' : 'blocked'));
+  card.className = `tool-card ${className} fade-in`;
+  const statusEl = card.querySelector('.tool-status');
+  const summaryEl = card.querySelector('.tool-summary');
+  const quickBtn = card.querySelector('[data-action="quick-confirm"]');
+  if (statusEl) {
+    statusEl.textContent = status === 'success' ? '已确认'
+      : (status === 'error' ? '确认失败' : (status === 'running' ? '执行中' : '待确认'));
+  }
+  if (summaryEl && summary) summaryEl.textContent = summary;
+  if (quickBtn) {
+    quickBtn.disabled = status === 'success' || status === 'running';
+    quickBtn.textContent = status === 'success' ? '已确认'
+      : (status === 'running' ? '执行中' : '确认');
+  }
+}
+
+function appendRestoredCancelledMarker(aiMsg) {
+  if (!aiMsg) return;
+  aiMsg.classList.remove('typing');
+  const c = aiMsg.querySelector('.msg-content');
+  if (c && !c.querySelector('.cancel-marker')) {
+    c.insertAdjacentHTML('beforeend', '<div class="cancel-marker text-xs text-gray-500 mt-2">⏹ 已取消</div>');
+  }
+}
+
+function ensureRestoredExecutionContainers(aiMsg) {
+  const msgContent = aiMsg && aiMsg.querySelector('.msg-content');
+  if (!msgContent) return {};
+  let stepsContainer = msgContent.querySelector('.steps-container');
+  if (!stepsContainer) {
+    stepsContainer = document.createElement('div');
+    stepsContainer.className = 'steps-container';
+    msgContent.appendChild(stepsContainer);
+  }
+  let finalAnswerEl = msgContent.querySelector('.final-answer');
+  if (!finalAnswerEl) {
+    finalAnswerEl = document.createElement('div');
+    finalAnswerEl.className = 'final-answer mt-3';
+    msgContent.appendChild(finalAnswerEl);
+  }
+  return { stepsContainer, finalAnswerEl };
+}
+
+async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload) {
+  const { stepsContainer, finalAnswerEl } = ensureRestoredExecutionContainers(aiMsg);
+  const stepBuffers = {};
+  const toolProgressByName = {};
+  let fullContent = '';
+  let curEvent = 'message';
+  let curData = '';
+
+  function depBadgeHtml(dependsOn) {
+    if (!Array.isArray(dependsOn) || dependsOn.length === 0) return '';
+    const depNames = dependsOn.map(did => {
+      const dc = stepBuffers[did];
+      return dc ? dc.displayName : did;
+    }).join(' / ');
+    return `<span class="step-dep" title="此步骤依赖以下步骤完成后才能执行">依赖: ${escapeHtml(depNames)}</span>`;
+  }
+
+  function depPendingMessage(dependsOn) {
+    if (!Array.isArray(dependsOn) || dependsOn.length === 0) {
+      return '<span class="text-gray-500">⏳ 等待执行中...</span>';
+    }
+    const depNames = dependsOn.map(did => {
+      const dc = stepBuffers[did];
+      return dc ? dc.displayName : did;
+    }).join('、');
+    return `<span class="text-gray-500">⏳ 依赖 ${escapeHtml(depNames)} 完成后开始执行</span>`;
+  }
+
+  function createPendingStepCard(stepId, displayName, dependsOn) {
+    if (!stepsContainer) return null;
+    const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card):not(.tool-card)');
+    if (placeholder) placeholder.remove();
+    const card = document.createElement('div');
+    card.className = 'step-card pending collapsed fade-in';
+    card.innerHTML = `
+      <div class="step-head">
+        <span class="chev">▾</span>
+        <span class="step-name">${escapeHtml(displayName || stepId)}</span>
+        <span class="step-status">等待中</span>
+      </div>
+      <div class="step-body">${depPendingMessage(dependsOn)}</div>
+    `;
+    card.querySelector('.step-head').addEventListener('click', () => card.classList.toggle('collapsed'));
+    stepsContainer.appendChild(card);
+    stepBuffers[stepId] = { card, body: card.querySelector('.step-body'), buf: '', displayName, dependsOn, status: 'pending' };
+    scrollBottom();
+    return stepBuffers[stepId];
+  }
+
+  function activateStepCard(stepId, displayName, dependsOn) {
+    if (!stepsContainer) return null;
+    let entry = stepBuffers[stepId];
+    if (!entry) {
+      const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card):not(.tool-card)');
+      if (placeholder) placeholder.remove();
+      const card = document.createElement('div');
+      card.className = 'step-card running fade-in';
+      card.innerHTML = `
+        <div class="step-head">
+          <span class="chev">▾</span>
+          <span class="step-name">${escapeHtml(displayName || stepId)}</span>
+          ${depBadgeHtml(dependsOn)}
+          <span class="step-status">进行中…</span>
+        </div>
+        <div class="step-body"></div>
+      `;
+      card.querySelector('.step-head').addEventListener('click', () => card.classList.toggle('collapsed'));
+      stepsContainer.appendChild(card);
+      entry = { card, body: card.querySelector('.step-body'), buf: '', displayName, dependsOn, status: 'running' };
+      stepBuffers[stepId] = entry;
+    } else {
+      entry.card.classList.remove('pending', 'collapsed');
+      entry.card.classList.add('running');
+      const head = entry.card.querySelector('.step-head');
+      const oldBadge = head.querySelector('.step-dep');
+      if (oldBadge) oldBadge.remove();
+      const status = head.querySelector('.step-status');
+      const badgeHtml = depBadgeHtml(dependsOn);
+      if (badgeHtml) status.insertAdjacentHTML('beforebegin', badgeHtml);
+      status.textContent = '进行中…';
+      entry.body.innerHTML = '';
+      entry.buf = '';
+      entry.dependsOn = dependsOn;
+      entry.status = 'running';
+    }
+    scrollBottom();
+    return entry;
+  }
+
+  function getOrCreateStepCard(stepId, displayName, dependsOn) {
+    return stepBuffers[stepId] || activateStepCard(stepId, displayName, dependsOn);
+  }
+
+  function restoredToolStatusText(status) {
+    const map = {
+      running: '调用中',
+      success: '已完成',
+      blocked: '已拦截',
+      approval_denied: '已拒绝',
+      approval_timeout: '审批超时',
+      approval_unavailable: '无审批通道',
+      error: '调用失败'
+    };
+    return map[status] || status || '未知';
+  }
+
+  function restoredToolStatusClass(status) {
+    return ['success', 'blocked', 'approval_denied', 'approval_timeout', 'approval_unavailable', 'error'].includes(status)
+      ? status
+      : 'running';
+  }
+
+  function restoredToolBody(payload, status, detail) {
+    const lines = [];
+    if (payload && payload.inputPreview) lines.push(`输入: ${payload.inputPreview}`);
+    if (detail) lines.push(String(detail));
+    if (payload && payload.detail && payload.detail !== detail) lines.push(String(payload.detail));
+    if (!lines.length && status === 'running') lines.push('工具调用中...');
+    return escapeHtml(lines.join('\n'));
+  }
+
+  function createRestoredToolCard(payload) {
+    if (!stepsContainer) return null;
+    const toolName = (payload && payload.toolName) || 'unknown_tool';
+    const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card):not(.tool-card)');
+    if (placeholder) placeholder.remove();
+    const card = document.createElement('div');
+    card.className = 'tool-card running fade-in';
+    card.innerHTML = `
+      <div class="tool-head">
+        <span class="tool-chev">▾</span>
+        <span class="tool-action">工具</span>
+        <span class="tool-name" title="${escapeHtml(toolName)}">${escapeHtml(toolName)}</span>
+        <span class="tool-summary">${escapeHtml((payload && payload.step) ? `阶段：${payload.step}` : '执行中')}</span>
+        <span class="tool-status">${restoredToolStatusText('running')}</span>
+      </div>
+      <div class="tool-body">${restoredToolBody(payload || {}, 'running', '')}</div>
+    `;
+    card.querySelector('.tool-head').addEventListener('click', () => card.classList.toggle('collapsed'));
+    stepsContainer.appendChild(card);
+    const entry = { card, toolName, status: 'running', payload: { ...(payload || {}) } };
+    if (!toolProgressByName[toolName]) toolProgressByName[toolName] = [];
+    toolProgressByName[toolName].push(entry);
+    scrollBottom();
+    return entry;
+  }
+
+  function finishRestoredToolCard(payload, status, detail) {
+    const toolName = (payload && payload.toolName) || 'unknown_tool';
+    const normalized = restoredToolStatusClass(status);
+    const queue = toolProgressByName[toolName] || [];
+    let entry = queue.find(x => x.status === 'running');
+    if (!entry) entry = createRestoredToolCard({ toolName });
+    if (!entry) return;
+    entry.status = normalized;
+    entry.payload = { ...(entry.payload || {}), ...(payload || {}) };
+    entry.card.className = `tool-card ${normalized} collapsed fade-in`;
+    const statusEl = entry.card.querySelector('.tool-status');
+    const summaryEl = entry.card.querySelector('.tool-summary');
+    const bodyEl = entry.card.querySelector('.tool-body');
+    if (statusEl) statusEl.textContent = restoredToolStatusText(normalized);
+    if (summaryEl) {
+      const parts = [];
+      if (entry.payload.step) parts.push(`阶段：${entry.payload.step}`);
+      if (typeof entry.payload.latencyMs === 'number') parts.push(`${entry.payload.latencyMs}ms`);
+      if (typeof entry.payload.resultChars === 'number') parts.push(`${entry.payload.resultChars}字`);
+      summaryEl.textContent = parts.join(' · ') || restoredToolStatusText(normalized);
+    }
+    if (bodyEl) bodyEl.innerHTML = restoredToolBody(entry.payload, normalized, detail);
+    scrollBottom();
+  }
+
+  function dispatchEvent() {
+    if (!curData) { curEvent = 'message'; return; }
+    let payload = null;
+    try { payload = JSON.parse(curData); } catch (e) { /* ignore malformed frame */ }
+    if (!payload) { curEvent = 'message'; curData = ''; return; }
+
+    if (curEvent === 'step_pending') {
+      if (!stepBuffers[payload.stepId]) {
+        createPendingStepCard(payload.stepId, payload.displayName, payload.dependsOn);
+      }
+    } else if (curEvent === 'step_start') {
+      if (String(payload.stepId || '').startsWith('flow_step4')) {
+        state.flowStep4Active = true;
+        showAnswerNow(true);
+      }
+      activateStepCard(payload.stepId, payload.displayName, payload.dependsOn);
+    } else if (curEvent === 'token') {
+      const sid = payload.stepId || 'fixed_strategy';
+      const card = getOrCreateStepCard(sid, sid);
+      if (card) {
+        if (payload.token === '[DONE]') {
+          card.body.innerHTML = renderMarkdown(card.buf);
+        } else {
+          card.buf += payload.token || '';
+          const wasAtBottom = card.body.scrollHeight - card.body.scrollTop - card.body.clientHeight < 60;
+          card.body.innerHTML = renderMarkdown(card.buf);
+          if (wasAtBottom) card.body.scrollTop = card.body.scrollHeight;
+        }
+      }
+    } else if (curEvent === 'step_end') {
+      const card = stepBuffers[payload.stepId];
+      if (card) {
+        card.card.classList.remove('running');
+        card.card.classList.add('done', 'collapsed');
+        const status = card.card.querySelector('.step-status');
+        if (status) status.textContent = payload.summary || ((card.displayName || payload.stepId) + ' 已完成');
+      }
+    } else if (curEvent === 'ack') {
+      if (payload && payload.intervention) {
+        state.interventionEnabled = true;
+        showAnswerNow(true);
+      }
+    } else if (curEvent === 'tool_call_start') {
+      createRestoredToolCard(payload);
+    } else if (curEvent === 'tool_call_end') {
+      finishRestoredToolCard(payload, payload.status || 'success', '');
+    } else if (curEvent === 'tool_call_error') {
+      finishRestoredToolCard(payload, 'error', payload.error || '');
+    } else if (curEvent === 'plan_review_resumed') {
+      clearPendingFlowPlan(payload.runId || (restoredPayload && restoredPayload.runId));
+      setRestoredPlanCardStatus(planCard, 'success', '计划已确认，开始执行');
+    } else if (curEvent === 'plan_review_error') {
+      const runId = payload.runId || (restoredPayload && restoredPayload.runId);
+      if (payload.errorCode === 'plan_expired') clearPendingFlowPlan(runId);
+      const msg = (payload.errors || []).join('；') || payload.errorCode || '计划校验失败';
+      setRestoredPlanCardStatus(planCard, 'error', msg);
+      if (finalAnswerEl) finalAnswerEl.innerHTML = `<span class="text-red-400">计划校验失败：${escapeHtml(msg)}</span>`;
+      const err = new Error(msg);
+      err.planExpired = payload.errorCode === 'plan_expired';
+      throw err;
+    } else if (curEvent === 'message' || curEvent === '') {
+      if (payload.type === 'summary') {
+        fullContent = payload.content || '';
+        if (finalAnswerEl) finalAnswerEl.innerHTML = renderMarkdown(fullContent);
+      } else if (payload.type === 'error') {
+        if (finalAnswerEl) finalAnswerEl.innerHTML = `<span class="text-red-400">❌ ${escapeHtml(payload.content || '')}</span>`;
+      }
+    }
+    curEvent = 'message';
+    curData = '';
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) { dispatchEvent(); break; }
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.substring(0, idx).replace(/\r$/, '');
+      buffer = buffer.substring(idx + 1);
+      if (line === '') {
+        dispatchEvent();
+      } else if (line.startsWith('event: ')) {
+        curEvent = line.substring(7).trim();
+      } else if (line.startsWith('data: ')) {
+        curData += (curData ? '\n' : '') + line.substring(6);
+      }
+    }
+  }
 }
 
 // ==================== SEND MESSAGE ====================
@@ -467,9 +1188,11 @@ async function sendMessage() {
   if (!message) return;
   // aiAgentId 为空时走后端统一路由（自动模式）
   if (!state.sessionId) newSession();
+  saveActiveConversation(state.sessionId);
 
   state.sending = true;
   state.finalizing = false;  // 新一轮：清掉上一轮「已点立即回答」的终态，引导/立即回答恢复可用
+  state.flowStep4Active = false;
   input.value = ''; input.style.height = '';
   const ac = new AbortController();
   state.abortController = ac;
@@ -500,13 +1223,11 @@ async function sendMessage() {
         message: message,
         sessionId: state.sessionId,
         userId: state.userId,
-        maxStep: state.maxStep
+        maxStep: state.maxStep,
+        planReviewEnabled: !!state.planReviewEnabled
       })
     });
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
     let fullContent = '';
 
     // 2026-05-07 流式 UX：step 卡片管理
@@ -520,6 +1241,7 @@ async function sendMessage() {
     const evidenceContainer = msgContent.querySelector('.rag-evidence-container');
     const stepBuffers = {}; // stepId → { card, body, buf, displayName }
     const toolProgressByName = {}; // toolName → running entries queue
+    const planReviewEntriesByRunId = {};
 
     function depBadgeHtml(dependsOn) {
       if (!Array.isArray(dependsOn) || dependsOn.length === 0) return '';
@@ -615,6 +1337,14 @@ async function sendMessage() {
     // token 事件：必须 step_start 后才有 entry；防御性：没有就当 fixed 单 step 处理
     function getOrCreateStepCard(stepId, displayName, dependsOn) {
       return stepBuffers[stepId] || activateStepCard(stepId, displayName, dependsOn);
+    }
+
+    function appendCancelledMarker() {
+      aiMsg.classList.remove('typing');
+      const c = aiMsg.querySelector('.msg-content');
+      if (c && !c.querySelector('.cancel-marker')) {
+        c.insertAdjacentHTML('beforeend', '<div class="cancel-marker text-xs text-gray-500 mt-2">⏹ 已取消</div>');
+      }
     }
 
     function toolStatusText(status) {
@@ -1014,6 +1744,258 @@ async function sendMessage() {
       scrollBottom();
     }
 
+    function renderPlanReviewCard(payload) {
+      createPlanReviewProgressRow(payload);
+      savePendingFlowPlan(payload, {
+        userMessage: message,
+        agentId: payload && payload.agentId ? payload.agentId : state.currentAgentId,
+        assistantAuthor: aiAuthorEl ? aiAuthorEl.textContent : '',
+        assistantHtml: msgContent.innerHTML
+      });
+    }
+
+    function planReviewSummary(payload) {
+      const steps = Array.isArray(payload && payload.steps) ? payload.steps : [];
+      const parts = [`${steps.length || 0} 个步骤`];
+      if (payload && payload.expiresAt) {
+        parts.push(`有效至 ${new Date(payload.expiresAt).toLocaleString()}`);
+      }
+      return parts.join(' · ');
+    }
+
+    function createPlanReviewProgressRow(payload) {
+      const runId = payload && payload.runId ? payload.runId : '';
+      const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card):not(.tool-card)');
+      if (placeholder) placeholder.remove();
+      const card = document.createElement('div');
+      card.className = 'tool-card blocked fade-in';
+      card.dataset.planReviewCard = 'true';
+      card.dataset.runId = runId;
+      card.innerHTML = `
+        <div class="tool-head">
+          <span class="tool-chev">▣</span>
+          <span class="tool-action">确认计划</span>
+          <span class="tool-name" title="执行计划">执行计划</span>
+          <span class="tool-summary">${escapeHtml(planReviewSummary(payload))}</span>
+          <span class="tool-status">待确认</span>
+          <button type="button" class="tool-quick" data-action="quick-confirm">确认</button>
+        </div>
+      `;
+      const entry = { card, payload: {...payload}, status: 'pending' };
+      if (runId) planReviewEntriesByRunId[runId] = entry;
+      card.querySelector('.tool-head').addEventListener('click', (event) => {
+        if (event.target && event.target.closest('[data-action="quick-confirm"]')) return;
+        openPlanReviewModal(entry);
+      });
+      card.querySelector('[data-action="quick-confirm"]').addEventListener('click', (event) => {
+        event.stopPropagation();
+        confirmPlanReview(entry.payload, {
+          steps: Array.isArray(entry.payload.steps) ? entry.payload.steps : [],
+          entry,
+          quick: true
+        });
+      });
+      stepsContainer.appendChild(card);
+      scrollBottom();
+      return entry;
+    }
+
+    function openPlanReviewModal(entry) {
+      const payload = entry && entry.payload ? entry.payload : {};
+      const steps = Array.isArray(payload && payload.steps) ? payload.steps : [];
+      const modal = document.getElementById('planReviewModal');
+      const list = document.getElementById('planReviewSteps');
+      const meta = document.getElementById('planReviewMeta');
+      const notice = document.getElementById('planReviewNotice');
+      const confirmBtn = document.getElementById('planReviewConfirmBtn');
+      const addBtn = document.getElementById('planReviewAddBtn');
+      const copyBtn = document.getElementById('planReviewCopyBtn');
+      const closeBtn = document.getElementById('planReviewCloseBtn');
+      if (!modal || !list || !meta || !notice || !confirmBtn || !addBtn || !copyBtn || !closeBtn) return;
+      const expiresText = payload && payload.expiresAt ? new Date(payload.expiresAt).toLocaleString() : '';
+      modal.dataset.runId = payload.runId || '';
+      list.innerHTML = '';
+      meta.innerHTML = `runId: <code class="bg-gray-950 border border-gray-700 rounded px-1 text-gray-100">${escapeHtml(payload.runId || '')}</code>${expiresText ? ` · 有效期至 ${escapeHtml(expiresText)}` : ''}`;
+      notice.textContent = '';
+      notice.className = 'plan-review-notice text-xs mt-3 text-amber-300';
+      steps.forEach(step => addPlanReviewStepRow(list, step));
+      if (!steps.length) addPlanReviewStepRow(list, { title: '', content: '', dependsOn: [] });
+      renumberPlanReviewRows(modal);
+
+      const warnings = []
+        .concat(payload.validationErrors || [])
+        .concat(payload.validationWarnings || []);
+      if (warnings.length) {
+        setPlanReviewNotice(modal, warnings.join('；'), true);
+      }
+
+      closeBtn.onclick = () => modal.classList.add('hidden');
+      modal.onclick = (event) => {
+        if (event.target === modal) modal.classList.add('hidden');
+      };
+      copyBtn.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(payload.runId || '');
+          setPlanReviewNotice(modal, 'runId 已复制。', false);
+        } catch (e) {
+          setPlanReviewNotice(modal, '复制失败，请手动选择 runId。', true);
+        }
+      };
+      addBtn.onclick = () => {
+        addPlanReviewStepRow(list, { title: '', content: '', dependsOn: [] });
+        renumberPlanReviewRows(modal);
+      };
+      confirmBtn.disabled = entry && entry.status === 'running';
+      confirmBtn.textContent = entry && entry.status === 'success' ? '已确认' : '确认并执行';
+      confirmBtn.onclick = () => confirmPlanReview(payload, { modal, entry });
+      modal.classList.remove('hidden');
+    }
+
+    function addPlanReviewStepRow(list, step) {
+      const row = document.createElement('div');
+      row.className = 'plan-review-row border border-gray-700 bg-gray-950 rounded-lg p-3';
+      const deps = Array.isArray(step.dependsOn) ? step.dependsOn.join(',') : '';
+      row.innerHTML = `
+        <div class="flex items-center gap-2 mb-2">
+          <span class="plan-step-no text-xs font-semibold text-amber-300 min-w-12"></span>
+          <input data-field="title" class="flex-1 border border-gray-700 bg-gray-900 text-gray-100 placeholder-gray-500 rounded-md px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-amber-700 focus:border-amber-600" value="${escapeHtml(step.title || '')}" placeholder="步骤标题">
+          <button type="button" data-action="delete-step" class="text-xs border border-gray-700 bg-gray-900 text-gray-300 rounded-md px-2 py-1 hover:bg-gray-800">删除</button>
+        </div>
+        <textarea data-field="content" class="w-full border border-gray-700 bg-gray-900 text-gray-100 placeholder-gray-500 rounded-md px-2 py-2 text-sm leading-relaxed min-h-24 focus:outline-none focus:ring-2 focus:ring-amber-700 focus:border-amber-600" placeholder="步骤内容">${escapeHtml(step.content || '')}</textarea>
+        <label class="block text-xs text-gray-400 mt-2">
+          依赖步骤
+          <input data-field="dependsOn" class="ml-2 w-40 border border-gray-700 bg-gray-900 text-gray-100 placeholder-gray-500 rounded-md px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-amber-700 focus:border-amber-600" value="${escapeHtml(deps)}" placeholder="如 1,2">
+        </label>
+      `;
+      row.querySelector('[data-action="delete-step"]').addEventListener('click', () => {
+        const parent = row.parentElement;
+        if (parent && parent.querySelectorAll('.plan-review-row').length > 1) {
+          row.remove();
+          renumberPlanReviewRows(parent.closest('[data-plan-review-root]') || parent);
+        }
+      });
+      list.appendChild(row);
+    }
+
+    function renumberPlanReviewRows(card) {
+      if (!card) return;
+      card.querySelectorAll('.plan-review-row').forEach((row, idx) => {
+        const no = row.querySelector('.plan-step-no');
+        if (no) no.textContent = `第 ${idx + 1} 步`;
+      });
+    }
+
+    function collectPlanReviewSteps(card) {
+      if (!card) return [];
+      return Array.from(card.querySelectorAll('.plan-review-row')).map((row, idx) => ({
+        stepNo: idx + 1,
+        title: row.querySelector('[data-field="title"]').value.trim(),
+        content: row.querySelector('[data-field="content"]').value.trim(),
+        dependsOn: parseDependsInput(row.querySelector('[data-field="dependsOn"]').value)
+      }));
+    }
+
+    function parseDependsInput(value) {
+      const seen = new Set();
+      return String(value || '')
+        .split(/[,\s，、]+/)
+        .map(x => parseInt(x, 10))
+        .filter(n => Number.isInteger(n) && n > 0 && !seen.has(n) && seen.add(n));
+    }
+
+    function setPlanReviewNotice(card, text, isError) {
+      const notice = card && card.querySelector('.plan-review-notice');
+      if (!notice) return;
+      notice.textContent = text || '';
+      notice.className = `plan-review-notice text-xs mt-3 ${isError ? 'text-red-400' : 'text-amber-300'}`;
+    }
+
+    function setPlanReviewEntryStatus(entry, status, summary) {
+      if (!entry || !entry.card) return;
+      entry.status = status;
+      const className = status === 'success' ? 'success'
+        : (status === 'error' ? 'error' : 'running');
+      entry.card.className = `tool-card ${className} fade-in`;
+      const statusEl = entry.card.querySelector('.tool-status');
+      const summaryEl = entry.card.querySelector('.tool-summary');
+      const quickBtn = entry.card.querySelector('[data-action="quick-confirm"]');
+      if (statusEl) {
+        statusEl.textContent = status === 'success' ? '已确认'
+          : (status === 'error' ? '确认失败' : '执行中');
+      }
+      if (summaryEl && summary) summaryEl.textContent = summary;
+      if (quickBtn) {
+        quickBtn.disabled = status !== 'pending' && status !== 'error';
+        quickBtn.textContent = status === 'success' ? '已确认'
+          : (status === 'running' ? '执行中' : '确认');
+      }
+    }
+
+    async function confirmPlanReview(payload, options = {}) {
+      const modal = options.modal || null;
+      const entry = options.entry || (payload && payload.runId ? planReviewEntriesByRunId[payload.runId] : null);
+      const btn = modal ? document.getElementById('planReviewConfirmBtn') : (entry && entry.card ? entry.card.querySelector('[data-action="quick-confirm"]') : null);
+      const steps = Array.isArray(options.steps) ? options.steps : collectPlanReviewSteps(modal);
+      let completed = false;
+      try {
+        if (btn) {
+          btn.disabled = true;
+          btn.textContent = '执行中...';
+          btn.classList.add('opacity-70');
+        }
+        setPlanReviewEntryStatus(entry, 'running', '计划已提交，正在继续执行');
+        if (modal) setPlanReviewNotice(modal, '计划已提交，正在继续执行。', false);
+        state.sending = true;
+        state.finalizing = false;
+        const ac = new AbortController();
+        state.abortController = ac;
+        setSendBtn(true);
+        const resumeRes = await fetch(API + '/flow/plan-review/confirm', {
+          method: 'POST',
+          signal: ac.signal,
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            runId: payload.runId,
+            sessionId: payload.sessionId || state.sessionId,
+            steps
+          })
+        });
+        if (!resumeRes.ok || !resumeRes.body) {
+          throw new Error('确认计划失败：HTTP ' + resumeRes.status);
+        }
+        await consumeSseResponse(resumeRes);
+        completed = true;
+        clearPendingFlowPlan(payload.runId);
+        setPlanReviewEntryStatus(entry, 'success', '计划已确认并执行完成');
+        if (modal) setPlanReviewNotice(modal, '计划已确认并执行完成。', false);
+        if (btn) btn.textContent = '已确认';
+        if (modal) modal.classList.add('hidden');
+      } catch (e) {
+        if (e && e.name === 'AbortError') {
+          appendCancelledMarker();
+          if (modal) setPlanReviewNotice(modal, '执行已取消。', true);
+        } else {
+          setPlanReviewEntryStatus(entry, 'error', '确认计划失败');
+          if (modal) setPlanReviewNotice(modal, e.message || '确认计划失败。', true);
+        }
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = modal ? '确认并执行' : '确认';
+          btn.classList.remove('opacity-70');
+        }
+      } finally {
+        state.sending = false;
+        state.abortController = null;
+        setSendBtn(false);
+        showAnswerNow(false);
+        if (completed && btn) {
+          btn.disabled = true;
+          btn.classList.add('opacity-70');
+        }
+        scrollBottom(true);
+      }
+    }
+
     let curEvent = 'message';
     let curData = '';
 
@@ -1030,6 +2012,10 @@ async function sendMessage() {
         }
       } else if (curEvent === 'step_start') {
         // 真正开始执行：从 pending 切到 running（如果之前没 pending 也会自动新建）
+        if (String(payload.stepId || '').startsWith('flow_step4')) {
+          state.flowStep4Active = true;
+          showAnswerNow(true);
+        }
         activateStepCard(payload.stepId, payload.displayName, payload.dependsOn);
       } else if (curEvent === 'token') {
         const sid = payload.stepId || 'fixed_strategy';
@@ -1082,6 +2068,17 @@ async function sendMessage() {
         renderRagEvidence(payload);
       } else if (curEvent === 'memory_evidence') {
         renderMemoryEvidence(payload);
+      } else if (curEvent === 'plan_review_required') {
+        renderPlanReviewCard(payload);
+      } else if (curEvent === 'plan_review_resumed') {
+        const entry = payload && payload.runId ? planReviewEntriesByRunId[payload.runId] : null;
+        if (payload && payload.runId) clearPendingFlowPlan(payload.runId);
+        setPlanReviewEntryStatus(entry, 'success', '计划已确认，开始执行');
+      } else if (curEvent === 'plan_review_error') {
+        const entry = payload && payload.runId ? planReviewEntriesByRunId[payload.runId] : null;
+        if (payload && payload.errorCode === 'plan_expired') clearPendingFlowPlan(payload.runId);
+        setPlanReviewEntryStatus(entry, 'error', '计划校验失败');
+        finalAnswerEl.innerHTML = `<span class="text-red-400">计划校验失败：${escapeHtml((payload.errors || []).join('；') || payload.errorCode || '')}</span>`;
       } else if (curEvent === 'thinking') {
         // 老的 thinking 事件，弱化显示
         // （保留兼容，不渲染避免噪音）
@@ -1101,7 +2098,13 @@ async function sendMessage() {
       curData = '';
     }
 
-    while (true) {
+    async function consumeSseResponse(response) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      curEvent = 'message';
+      curData = '';
+      while (true) {
       const {done, value} = await reader.read();
       if (done) { dispatchEvent(); break; }
       buffer += decoder.decode(value, {stream: true});
@@ -1122,13 +2125,14 @@ async function sendMessage() {
         // 其他行（id:/retry:）忽略
       }
     }
+    }
+
+    await consumeSseResponse(res);
     scrollBottom();
   } catch(e) {
     if (e && e.name === 'AbortError') {
       // 用户点了「取消」：保留已生成的内容，仅追加一条停止标记，不当作错误
-      aiMsg.classList.remove('typing');
-      const c = aiMsg.querySelector('.msg-content');
-      if (c) c.insertAdjacentHTML('beforeend', '<div class="text-xs text-gray-500 mt-2">⏹ 已取消</div>');
+      appendCancelledMarker();
     } else {
       aiMsg.querySelector('.msg-content').innerHTML = `<span class="text-red-400">❌ 请求失败: ${escapeHtml(e.message)}</span>`;
       aiMsg.classList.remove('typing');
@@ -1136,6 +2140,7 @@ async function sendMessage() {
   } finally {
     state.sending = false;
     state.abortController = null;
+    state.flowStep4Active = false;
     setSendBtn(false);  // 恢复「发送」
     showAnswerNow(false);
     clearApprovalTimer();
@@ -1148,14 +2153,34 @@ function showAnswerNow(show) {
   const visible = show && state.sending && state.interventionEnabled;
   const bar = document.getElementById('interveneBar');
   if (bar) bar.classList.toggle('hidden', !visible);
-  // 终态（已点立即回答）下不再点亮按钮：立即回答收尾中、引导已失效（后端会无视后续 steerIdea）
-  const enable = visible && !state.finalizing;
+  // 终态（已点立即回答）下不再点亮按钮；Flow Step4 后端不消费引导，前端同步置灰引导。
+  const answerEnable = visible && !state.finalizing;
+  const steerEnable = answerEnable && !state.flowStep4Active;
   const an = document.getElementById('answerNowBtn');
-  if (an && enable) { an.disabled = false; an.textContent = '⚡ 立即回答'; }
+  if (an) {
+    an.disabled = !answerEnable;
+    an.textContent = state.finalizing ? '⚡ 收尾中…' : '⚡ 立即回答';
+  }
   const st = document.getElementById('steerBtn');
-  if (st && enable) { st.disabled = false; st.textContent = '💬 引导'; }
+  if (st) {
+    st.disabled = !steerEnable;
+    st.textContent = state.flowStep4Active ? '💬 Step4不可引导' : '💬 引导';
+    st.title = state.flowStep4Active
+      ? 'Flow 执行阶段不支持引导；可以继续使用立即回答收尾'
+      : '在下方输入框写下新想法后点此（或直接回车），Agent 在当前步重做并纳入考虑，不丢弃已有进展';
+  }
+  const hint = document.getElementById('interveneHint');
+  if (hint) {
+    hint.textContent = state.flowStep4Active
+      ? 'Flow 执行阶段不支持引导 · 可以点「立即回答」基于已有结果收尾'
+      : '运行中 · 在下方输入框补充引导后回车 / 点「引导」，或点「立即回答」收尾';
+  }
   const box = document.getElementById('msgInput');
-  if (box) box.placeholder = visible ? '运行中：在此输入引导内容，回车即发送引导…' : '输入消息...';
+  if (box) {
+    box.placeholder = visible
+      ? (state.flowStep4Active ? 'Flow 执行阶段不支持引导，可等待执行或点立即回答…' : '运行中：在此输入引导内容，回车即发送引导…')
+      : '输入消息...';
+  }
 }
 
 // 发送/取消 双态按钮：发送中显示红色「取消」（不禁用），否则蓝色「发送」
@@ -1201,7 +2226,9 @@ async function cancelSend() {
 function onComposerKey(e) {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
-    if (state.sending && state.interventionEnabled) steer();
+    if (state.sending && state.interventionEnabled) {
+      if (!state.flowStep4Active) steer();
+    }
     else sendMessage();
   }
 }
@@ -1209,6 +2236,7 @@ function onComposerKey(e) {
 // 引导：复用主输入框的内容，POST /steer，后端在当前步重做并纳入想法（不丢弃进度、不关思考）
 async function steer() {
   if (!state.sessionId || !state.sending) return;
+  if (state.flowStep4Active) return;
   const box = document.getElementById('msgInput');
   const idea = ((box && box.value) || '').trim();
   if (!idea) { if (box) box.focus(); return; }  // 空则聚焦输入框，提示用户先输入
@@ -1225,7 +2253,12 @@ async function steer() {
     if (btn) { btn.disabled = false; btn.textContent = '💬 引导'; }
   } finally {
     // 引导后流会继续，1.5s 后恢复按钮（仍在流式中时）
-    setTimeout(() => { if (btn && state.sending) { btn.disabled = false; btn.textContent = '💬 引导'; } }, 1500);
+    setTimeout(() => {
+      if (btn && state.sending && !state.flowStep4Active && !state.finalizing) {
+        btn.disabled = false;
+        btn.textContent = '💬 引导';
+      }
+    }, 1500);
   }
 }
 
@@ -1247,8 +2280,7 @@ async function answerNow() {
   } catch (e) {
     // 仅网络层失败才回滚终态；请求成功后保持引导/立即回答置灰
     state.finalizing = false;
-    if (btn) { btn.disabled = false; btn.textContent = '⚡ 立即回答'; }
-    if (st) { st.disabled = false; }
+    showAnswerNow(true);
   }
 }
 
@@ -1788,12 +2820,17 @@ function resetHistoryPagination() {
   if (sentinel) sentinel.remove();
 }
 
-async function loadConversation(conversationId) {
+async function loadConversation(conversationId, options = {}) {
   // 从 conversationId 提取 sessionId
   const parts = conversationId.split(':');
   state.sessionId = parts[parts.length - 1];
   document.getElementById('sessionInfo').textContent = 'Session: ' + state.sessionId.substring(0, 28) + '...';
-  document.getElementById('historyPanel').classList.add('hidden');
+  if (options.keepHistoryPanelHidden !== false) {
+    document.getElementById('historyPanel').classList.add('hidden');
+  }
+  if (options.saveActive !== false) {
+    saveActiveConversation(state.sessionId, conversationId);
+  }
 
   // 重置分页状态。第 70 轮：bump generation 作废之前会话 in-flight 的 loadHistoryEarlier，
   // 同时记录本次加载的 myGen，首屏返回后校验，防止用户快速切换两个历史会话时旧结果覆盖新会话
@@ -1814,7 +2851,7 @@ async function loadConversation(conversationId) {
     if (myGen !== historyPage.generation) return;
     if (data.code !== '0000' || !data.data) {
       area.innerHTML = '<div class="text-center text-gray-500 py-4">加载失败</div>';
-      return;
+      return false;
     }
     const payload = data.data;
     const messages = payload.messages || [];
@@ -1833,8 +2870,10 @@ async function loadConversation(conversationId) {
     setupHistoryScrollWatcher();
   } catch(e) {
     area.innerHTML = '<div class="text-center text-red-400 py-4">加载失败</div>';
+    return false;
   }
   scrollBottom(true);
+  return true;
 }
 
 // 顶部哨兵：用于触发"加载更早"

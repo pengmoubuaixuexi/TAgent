@@ -6,12 +6,17 @@ import cn.bugstack.ai.api.dto.AgentFeedbackRequestDTO;
 import cn.bugstack.ai.api.dto.ArmoryAgentRequestDTO;
 import cn.bugstack.ai.api.dto.ArmoryApiRequestDTO;
 import cn.bugstack.ai.api.dto.AutoAgentRequestDTO;
+import cn.bugstack.ai.api.dto.FlowPlanReviewConfirmRequestDTO;
 import cn.bugstack.ai.api.response.Response;
 import cn.bugstack.ai.domain.agent.model.entity.ExecuteCommandEntity;
 import cn.bugstack.ai.domain.agent.model.valobj.AiAgentVO;
 import cn.bugstack.ai.domain.agent.service.IAgentDispatchService;
 import cn.bugstack.ai.domain.agent.service.IArmoryService;
 import cn.bugstack.ai.domain.agent.service.armory.node.factory.DefaultArmoryStrategyFactory;
+import cn.bugstack.ai.domain.agent.service.execute.flow.plan.FlowPlanReviewPreparedPlan;
+import cn.bugstack.ai.domain.agent.service.execute.flow.plan.FlowPlanReviewService;
+import cn.bugstack.ai.domain.agent.service.execute.flow.plan.FlowPlanReviewStep;
+import cn.bugstack.ai.domain.agent.service.execute.flow.plan.IFlowPlanReviewResumeService;
 import cn.bugstack.ai.domain.agent.service.security.ApprovalChannelRegistry;
 import cn.bugstack.ai.domain.agent.service.security.PiiMasker;
 import cn.bugstack.ai.types.common.Constants;
@@ -29,6 +34,7 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyEmitter
 
 import javax.annotation.Resource;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 
 /**
@@ -50,6 +56,12 @@ public class AiAgentController implements IAiAgentService {
 
     @Resource
     private ApprovalChannelRegistry approvalChannelRegistry;
+
+    @Resource
+    private FlowPlanReviewService flowPlanReviewService;
+
+    @Resource
+    private IFlowPlanReviewResumeService flowPlanReviewResumeService;
 
     /** 执行干预（立即回答/引导）总开关；false 时端点拒绝、ack 不带 intervention=true，前端据此不渲染按钮。 */
     @org.springframework.beans.factory.annotation.Value("${agent.intervention.enabled:true}")
@@ -130,6 +142,7 @@ public class AiAgentController implements IAiAgentService {
                     .userId(userId)
                     .tenantId(tenantId)
                     .maxStep(request.getMaxStep())
+                    .planReviewEnabled(request.getPlanReviewEnabled())
                     .build();
 
             // 3. 调度处理
@@ -145,6 +158,71 @@ public class AiAgentController implements IAiAgentService {
                 errorEmitter.complete();
             } catch (Exception ex) {
                 log.error("发送错误信息失败：{}", ex.getMessage(), ex);
+            }
+            return errorEmitter;
+        }
+    }
+
+    @RequestMapping(value = "flow/plan-review/confirm", method = RequestMethod.POST)
+    public ResponseBodyEmitter confirmFlowPlanReview(@RequestBody FlowPlanReviewConfirmRequestDTO request,
+                                                     HttpServletResponse response) {
+        try {
+            response.setContentType("text/event-stream");
+            response.setCharacterEncoding("UTF-8");
+            response.setHeader("Cache-Control", "no-cache");
+            response.setHeader("Connection", "keep-alive");
+            response.setHeader("X-Accel-Buffering", "no");
+            response.setBufferSize(0);
+
+            ResponseBodyEmitter emitter = new ResponseBodyEmitter(Long.MAX_VALUE);
+            String sessionId = request != null ? request.getSessionId() : null;
+            if (sessionId != null && !sessionId.isBlank()) {
+                approvalChannelRegistry.register(sessionId, emitter);
+                emitter.onCompletion(() -> approvalChannelRegistry.unregister(sessionId, emitter));
+                emitter.onTimeout(() -> approvalChannelRegistry.unregister(sessionId, emitter));
+                emitter.onError(e -> approvalChannelRegistry.unregister(sessionId, emitter));
+                userInputGate.reset(sessionId);
+            }
+
+            Map<String, Object> ack = new LinkedHashMap<>();
+            ack.put("sessionId", sessionId != null ? sessionId : "");
+            ack.put("runId", request != null ? request.getRunId() : null);
+            ack.put("planReviewResume", true);
+            ack.put("intervention", interventionEnabled);
+            ack.put("timestamp", System.currentTimeMillis());
+            sendSseObject(emitter, "ack", ack);
+
+            List<FlowPlanReviewStep> steps = toPlanReviewSteps(request != null ? request.getSteps() : null);
+            FlowPlanReviewPreparedPlan preparedPlan = flowPlanReviewService.prepareApprovedPlan(
+                    request != null ? request.getRunId() : null,
+                    sessionId,
+                    steps);
+            if (!preparedPlan.isReady()) {
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("runId", request != null ? request.getRunId() : null);
+                payload.put("sessionId", sessionId);
+                payload.put("errorCode", preparedPlan.getErrorCode());
+                payload.put("errors", preparedPlan.getErrors());
+                payload.put("warnings", preparedPlan.getWarnings());
+                sendSseObject(emitter, "plan_review_error", payload);
+                sendSseObject(emitter, "message",
+                        cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity.createErrorResult(
+                                String.join("; ", preparedPlan.getErrors()), sessionId));
+                emitter.complete();
+                return emitter;
+            }
+
+            flowPlanReviewResumeService.resumeReviewedPlan(preparedPlan.getState(), preparedPlan.getValidation(), emitter);
+            return emitter;
+        } catch (Exception e) {
+            log.error("Flow plan review confirm failed", e);
+            ResponseBodyEmitter errorEmitter = new ResponseBodyEmitter();
+            try {
+                sendSseObject(errorEmitter, "message",
+                        cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity.createErrorResult(
+                                e.getMessage(), request != null ? request.getSessionId() : null));
+                errorEmitter.complete();
+            } catch (Exception ignored) {
             }
             return errorEmitter;
         }
@@ -387,6 +465,40 @@ public class AiAgentController implements IAiAgentService {
         agentDispatchService.cancelExecute(sessionId);
         log.info("[Cancel] sessionId={}", sessionId);
         return Response.<Boolean>builder().code(ResponseCode.SUCCESS.getCode()).info("已取消").data(true).build();
+    }
+
+    private List<FlowPlanReviewStep> toPlanReviewSteps(List<FlowPlanReviewConfirmRequestDTO.Step> requestSteps) {
+        if (requestSteps == null || requestSteps.isEmpty()) {
+            return List.of();
+        }
+        List<FlowPlanReviewStep> steps = new ArrayList<>();
+        for (int i = 0; i < requestSteps.size(); i++) {
+            FlowPlanReviewConfirmRequestDTO.Step step = requestSteps.get(i);
+            if (step == null) {
+                continue;
+            }
+            steps.add(FlowPlanReviewStep.builder()
+                    .stepNo(step.getStepNo() != null ? step.getStepNo() : i + 1)
+                    .title(step.getTitle())
+                    .content(step.getContent())
+                    .dependsOn(step.getDependsOn())
+                    .build());
+        }
+        return steps;
+    }
+
+    private void sendSseObject(ResponseBodyEmitter emitter, String event, Object payload) throws Exception {
+        if (emitter == null || payload == null) {
+            return;
+        }
+        StringBuilder frame = new StringBuilder();
+        if (event != null && !event.isBlank() && !"message".equals(event)) {
+            frame.append("event: ").append(event).append('\n');
+        }
+        frame.append("data: ").append(JSON.toJSONString(payload)).append("\n\n");
+        synchronized (emitter) {
+            emitter.send(frame.toString());
+        }
     }
 
     /** 取第一个非空非空白的字符串值 */
