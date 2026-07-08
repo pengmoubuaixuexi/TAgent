@@ -21,6 +21,7 @@ import org.springframework.stereotype.Component;
 import jakarta.annotation.Resource;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CancellationException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -188,7 +189,13 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
 
             recordTransition("flow_step4_execute_steps", dynamicContext);
             return "所有规划步骤执行完成";
+        } catch (CancellationException e) {
+            log.info("[Cancel] flow step4 execution cancelled: {}", e.getMessage());
+            throw e;
         } catch (Exception e) {
+            if (dynamicContext.isCancelled() || Thread.currentThread().isInterrupted()) {
+                throw new CancellationException("execution cancelled during flow step4");
+            }
             log.error("第四步执行失败", e);
             recordTransition("flow_step4_execute_steps_failed", dynamicContext);
             return "执行步骤失败: " + e.getMessage();
@@ -237,6 +244,9 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         } else {
             // 按顺序执行每个步骤
             for (Integer stepNumber : stepNumbers) {
+                if (dynamicContext.isCancelled() || Thread.currentThread().isInterrupted()) {
+                    throw new CancellationException("execution cancelled before step " + stepNumber);
+                }
                 // 立即回答：停止调度剩余子步，已完成的产出交给 finalizeNow 整合
                 if (dynamicContext.isFinalizeRequested()) {
                     log.info("[AnswerNow][flow] 串行执行中收到立即回答，停止调度第{}步及之后", stepNumber);
@@ -311,10 +321,16 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             CompletableFuture<Void> f = CompletableFuture.allOf(depFutures).thenRunAsync(() -> {
                 MDC.put("step", "flow_step4_dag_" + stepNumber);
                 try {
+                    if (dynamicContext.isCancelled() || Thread.currentThread().isInterrupted()) {
+                        throw new CancellationException("execution cancelled before step " + stepNumber);
+                    }
                     // 立即回答：已触发则未启动的子步直接跳过，让 future 快速完成，控制权尽快回到 finalizeNow
                     if (stepContent != null && !dynamicContext.isFinalizeRequested()) {
                         executeStep(executorChatClient, stepNumber, stepKey, stepContent, dynamicContext, d);
                     }
+                } catch (CancellationException e) {
+                    log.info("[Cancel] DAG step {} skipped/cancelled: {}", stepNumber, e.getMessage());
+                    throw e;
                 } catch (Exception e) {
                     // 单步失败不阻断依赖它的后续步骤（与旧行为一致：失败也视为"完成"）
                     log.error("[DAG] 第{}步 执行异常: {}", stepNumber, e.toString());
@@ -333,6 +349,9 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             log.warn("[DAG] 检测到环/无法满足的依赖，剩余步骤 {} 退化为串行执行", unscheduled);
             CompletableFuture.allOf(futures.values().toArray(new CompletableFuture[0])).join();
             for (Integer n : unscheduled) {
+                if (dynamicContext.isCancelled() || Thread.currentThread().isInterrupted()) {
+                    throw new CancellationException("execution cancelled before fallback step " + n);
+                }
                 String stepKey = "第" + n + "步";
                 String stepContent = resolveStepContent(stepsMap, stepKey);
                 if (stepContent != null) {
@@ -485,7 +504,13 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                 Thread.sleep(1000);
             }
 
+        } catch (CancellationException e) {
+            log.info("[Cancel] step {} execution cancelled: {}", stepNumber, e.getMessage());
+            throw e;
         } catch (Exception e) {
+            if (dynamicContext.isCancelled() || Thread.currentThread().isInterrupted()) {
+                throw new CancellationException("execution cancelled during step " + stepNumber);
+            }
             log.error("执行步骤 {} 时发生错误: {}", stepNumber, e.getMessage());
             dynamicContext.setValue("step" + stepNumber + "Error", e.getMessage());
 

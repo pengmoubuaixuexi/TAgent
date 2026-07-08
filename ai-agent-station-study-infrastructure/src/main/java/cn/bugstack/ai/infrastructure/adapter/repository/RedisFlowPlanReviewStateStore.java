@@ -48,6 +48,23 @@ public class RedisFlowPlanReviewStateStore implements FlowPlanReviewStateStore {
     }
 
     @Override
+    public void update(FlowPlanReviewState state) {
+        if (state == null || state.getRunId() == null || state.getRunId().isBlank()) {
+            return;
+        }
+        Long expiresAt = state.getExpiresAt();
+        if (expiresAt == null) {
+            return;
+        }
+        long ttlMillis = expiresAt - System.currentTimeMillis();
+        if (ttlMillis <= 0) {
+            delete(state.getRunId());
+            return;
+        }
+        stringRedisTemplate.opsForValue().set(buildKey(state.getRunId()), JSON.toJSONString(state), Duration.ofMillis(ttlMillis));
+    }
+
+    @Override
     public void delete(String runId) {
         if (runId == null || runId.isBlank()) {
             return;

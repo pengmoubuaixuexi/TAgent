@@ -648,6 +648,7 @@ function createRestoredPlanReviewRow(payload, aiMsg, stepsContainer) {
       <button type="button" class="tool-quick" data-action="quick-confirm">确认</button>
     </div>
   `;
+  applyPlanReviewCardStatus(card, payload && payload.status ? payload.status : 'PENDING', restoredPlanSummary(payload), payload && payload.lastError);
   bindRestoredPlanReviewCard(card, payload, aiMsg);
   stepsContainer.appendChild(card);
 }
@@ -656,6 +657,7 @@ function bindRestoredPlanReviewCard(card, payload, aiMsg) {
   if (!card) return;
   card.dataset.planReviewCard = 'true';
   if (payload && payload.runId) card.dataset.runId = payload.runId;
+  applyPlanReviewCardStatus(card, payload && payload.status ? payload.status : (card.dataset.planReviewStatus || 'PENDING'), null, payload && payload.lastError);
   const head = card.querySelector('.tool-head');
   const quickBtn = card.querySelector('[data-action="quick-confirm"]');
   if (!head || !quickBtn) return;
@@ -665,6 +667,7 @@ function bindRestoredPlanReviewCard(card, payload, aiMsg) {
   };
   quickBtn.onclick = (event) => {
     event.stopPropagation();
+    if (!planReviewCanExecute(payload && payload.status ? payload.status : card.dataset.planReviewStatus)) return;
     confirmRestoredFlowPlan(payload, Array.isArray(payload.steps) ? payload.steps : [], aiMsg, card);
   };
 }
@@ -707,6 +710,97 @@ function restoredPlanSummary(payload) {
   return parts.join(' · ');
 }
 
+function normalizePlanReviewStatus(status) {
+  const value = String(status || 'PENDING').trim().toUpperCase();
+  if (value === 'SUCCESS') return 'COMPLETED';
+  if (value === 'ERROR') return 'FAILED';
+  if (value === 'CANCELED') return 'CANCELLED';
+  if (['PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED'].includes(value)) return value;
+  return 'PENDING';
+}
+
+function planReviewCanExecute(status) {
+  const normalized = normalizePlanReviewStatus(status);
+  return normalized === 'PENDING' || normalized === 'FAILED' || normalized === 'CANCELLED';
+}
+
+function planReviewStatusMeta(status, summary, lastError) {
+  const normalized = normalizePlanReviewStatus(status);
+  const hasError = lastError && String(lastError).trim();
+  const defaults = {
+    PENDING: '\u7b49\u5f85\u786e\u8ba4\u6267\u884c\u8ba1\u5212',
+    RUNNING: '\u8ba1\u5212\u5df2\u786e\u8ba4\uff0c\u6b63\u5728\u7ee7\u7eed\u6267\u884c',
+    COMPLETED: '\u8ba1\u5212\u5df2\u6267\u884c\u5b8c\u6210',
+    FAILED: hasError ? `\u6267\u884c\u5931\u8d25\uff1a${lastError}` : '\u6267\u884c\u5931\u8d25',
+    CANCELLED: '\u5df2\u53d6\u6d88\uff0c\u53ef\u91cd\u65b0\u6267\u884c',
+    EXPIRED: '\u8ba1\u5212\u5df2\u8fc7\u671f\uff0c\u8bf7\u91cd\u65b0\u89c4\u5212'
+  };
+  const statusText = {
+    PENDING: '\u5f85\u786e\u8ba4',
+    RUNNING: '\u6267\u884c\u4e2d',
+    COMPLETED: '\u5df2\u5b8c\u6210',
+    FAILED: '\u6267\u884c\u5931\u8d25',
+    CANCELLED: '\u5df2\u53d6\u6d88',
+    EXPIRED: '\u5df2\u8fc7\u671f'
+  };
+  const buttonText = {
+    PENDING: '\u786e\u8ba4',
+    RUNNING: '\u6267\u884c\u4e2d',
+    COMPLETED: '\u5df2\u5b8c\u6210',
+    FAILED: '\u91cd\u65b0\u6267\u884c',
+    CANCELLED: '\u91cd\u65b0\u6267\u884c',
+    EXPIRED: '\u5df2\u8fc7\u671f'
+  };
+  const cardClass = normalized === 'COMPLETED' ? 'success'
+    : (normalized === 'FAILED' || normalized === 'EXPIRED' ? 'error'
+      : (normalized === 'RUNNING' ? 'running' : 'blocked'));
+  return {
+    status: normalized,
+    cardClass,
+    statusText: statusText[normalized],
+    buttonText: buttonText[normalized],
+    buttonDisabled: !planReviewCanExecute(normalized),
+    summary: summary || defaults[normalized]
+  };
+}
+
+function applyPlanReviewCardStatus(card, status, summary, lastError) {
+  if (!card) return null;
+  const meta = planReviewStatusMeta(status, summary, lastError);
+  card.dataset.planReviewStatus = meta.status;
+  card.className = `tool-card ${meta.cardClass} fade-in`;
+  const statusEl = card.querySelector('.tool-status');
+  const summaryEl = card.querySelector('.tool-summary');
+  const quickBtn = card.querySelector('[data-action="quick-confirm"]');
+  if (statusEl) statusEl.textContent = meta.statusText;
+  if (summaryEl) summaryEl.textContent = meta.summary;
+  if (quickBtn) {
+    quickBtn.disabled = meta.buttonDisabled;
+    quickBtn.textContent = meta.buttonText;
+  }
+  return meta;
+}
+
+function removePlanCancelledMarker(aiMsg) {
+  const root = aiMsg && aiMsg.querySelector ? aiMsg.querySelector('.msg-content') : aiMsg;
+  if (!root || !root.querySelectorAll) return;
+  root.querySelectorAll('.cancel-marker').forEach(el => el.remove());
+}
+
+function updatePendingFlowPlanStatus(runId, patch = {}) {
+  try {
+    const payload = loadPendingFlowPlan();
+    if (!payload || !runId || payload.runId !== runId) return;
+    localStorage.setItem(pendingFlowPlanStorageKey(), JSON.stringify({
+      ...payload,
+      ...patch,
+      savedAt: Date.now()
+    }));
+  } catch (e) {
+    console.warn('update pending flow plan failed', e);
+  }
+}
+
 function openRestoredPlanReviewModal(payload, aiMsg, card) {
   const modal = document.getElementById('planReviewModal');
   const list = document.getElementById('planReviewSteps');
@@ -743,6 +837,9 @@ function openRestoredPlanReviewModal(payload, aiMsg, card) {
   };
   confirmBtn.disabled = false;
   confirmBtn.textContent = '确认并执行';
+  const statusMeta = planReviewStatusMeta(payload && payload.status ? payload.status : (card && card.dataset.planReviewStatus), null, payload && payload.lastError);
+  confirmBtn.disabled = statusMeta.buttonDisabled;
+  confirmBtn.textContent = statusMeta.status === 'PENDING' ? '\u786e\u8ba4\u5e76\u6267\u884c' : statusMeta.buttonText;
   confirmBtn.onclick = () => confirmRestoredFlowPlan(payload, collectRestoredPlanSteps(modal), aiMsg, card, modal);
   modal.classList.remove('hidden');
 }
@@ -808,7 +905,21 @@ function setRestoredPlanNotice(card, text, isError) {
 
 async function confirmRestoredFlowPlan(payload, steps, aiMsg, card, modal) {
   const btn = modal ? document.getElementById('planReviewConfirmBtn') : card.querySelector('[data-action="quick-confirm"]');
+  const submittedSteps = (Array.isArray(steps) ? steps : []).map((step, idx) => ({
+    stepNo: idx + 1,
+    title: String(step && step.title ? step.title : '').trim(),
+    content: String(step && step.content ? step.content : '').trim(),
+    dependsOn: Array.isArray(step && step.dependsOn) ? [...step.dependsOn] : []
+  }));
   try {
+    removePlanCancelledMarker(aiMsg);
+    if (payload) {
+      payload.steps = submittedSteps;
+      payload.status = 'RUNNING';
+      payload.lastError = null;
+    }
+    applyPlanReviewCardStatus(card, 'RUNNING', null, null);
+    updatePendingFlowPlanStatus(payload.runId, { status: 'RUNNING', lastError: null, steps: submittedSteps });
     if (btn) { btn.disabled = true; btn.textContent = '执行中...'; }
     const statusEl = card.querySelector('.tool-status');
     const summaryEl = card.querySelector('.tool-summary');
@@ -827,26 +938,51 @@ async function confirmRestoredFlowPlan(payload, steps, aiMsg, card, modal) {
       body: JSON.stringify({
         runId: payload.runId,
         sessionId: payload.sessionId || state.sessionId,
-        steps
+        steps: submittedSteps
       })
     });
     if (!res.ok || !res.body) throw new Error('确认计划失败：HTTP ' + res.status);
     if (modal) modal.classList.add('hidden');
     await consumeRestoredPlanSse(res, aiMsg, card, payload);
+    const finalStatus = normalizePlanReviewStatus(payload.status || (card && card.dataset.planReviewStatus) || 'COMPLETED');
+    if (finalStatus !== 'COMPLETED' && finalStatus !== 'RUNNING') {
+      const err = new Error(payload.lastError || planReviewStatusMeta(finalStatus).summary);
+      err.planStatus = finalStatus;
+      err.planExpired = finalStatus === 'EXPIRED';
+      throw err;
+    }
     clearPendingFlowPlan(payload.runId);
+    if (payload) payload.status = 'COMPLETED';
+    applyPlanReviewCardStatus(card, 'COMPLETED', null, null);
     if (statusEl) statusEl.textContent = '已确认';
     if (summaryEl) summaryEl.textContent = '计划已确认并执行完成';
   } catch (e) {
     if (e && e.name === 'AbortError') {
       appendRestoredCancelledMarker(aiMsg);
+      if (payload) {
+        payload.status = 'CANCELLED';
+        payload.lastError = '\u6267\u884c\u5df2\u53d6\u6d88';
+      }
+      applyPlanReviewCardStatus(card, 'CANCELLED', null, payload && payload.lastError);
+      updatePendingFlowPlanStatus(payload.runId, { status: 'CANCELLED', lastError: payload && payload.lastError, steps: submittedSteps });
       if (modal) setRestoredPlanNotice(modal, '执行已取消。', true);
     } else {
       if (e && e.planExpired) clearPendingFlowPlan(payload.runId);
+      const nextStatus = e && e.planStatus ? e.planStatus : (e && e.planExpired ? 'EXPIRED' : 'FAILED');
+      if (payload) {
+        payload.status = nextStatus;
+        payload.lastError = e.message || payload.lastError || '';
+      }
+      applyPlanReviewCardStatus(card, nextStatus, null, payload && payload.lastError);
+      if (nextStatus !== 'EXPIRED') {
+        updatePendingFlowPlanStatus(payload.runId, { status: nextStatus, lastError: payload && payload.lastError, steps: submittedSteps });
+      }
       const statusEl = card.querySelector('.tool-status');
       const summaryEl = card.querySelector('.tool-summary');
       if (statusEl) statusEl.textContent = '确认失败';
       if (summaryEl) summaryEl.textContent = e.message || '确认计划失败';
       if (modal) setRestoredPlanNotice(modal, e.message || '确认计划失败。', true);
+      applyPlanReviewCardStatus(card, nextStatus, null, payload && payload.lastError);
     }
     if (btn) {
       if (e && e.planExpired) {
@@ -856,6 +992,11 @@ async function confirmRestoredFlowPlan(payload, steps, aiMsg, card, modal) {
         btn.disabled = false;
         btn.textContent = modal ? '确认并执行' : '确认';
       }
+    }
+    if (btn && payload) {
+      const retryMeta = planReviewStatusMeta(payload.status);
+      btn.disabled = retryMeta.buttonDisabled;
+      btn.textContent = modal && retryMeta.status === 'PENDING' ? '\u786e\u8ba4\u5e76\u6267\u884c' : retryMeta.buttonText;
     }
   } finally {
     state.sending = false;
@@ -869,6 +1010,8 @@ async function confirmRestoredFlowPlan(payload, steps, aiMsg, card, modal) {
 
 function setRestoredPlanCardStatus(card, status, summary) {
   if (!card) return;
+  applyPlanReviewCardStatus(card, status, summary, null);
+  return;
   const className = status === 'success' ? 'success'
     : (status === 'error' ? 'error' : (status === 'running' ? 'running' : 'blocked'));
   card.className = `tool-card ${className} fade-in`;
@@ -1135,8 +1278,22 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
     } else if (curEvent === 'tool_call_error') {
       finishRestoredToolCard(payload, 'error', payload.error || '');
     } else if (curEvent === 'plan_review_resumed') {
-      clearPendingFlowPlan(payload.runId || (restoredPayload && restoredPayload.runId));
+      if (restoredPayload) restoredPayload.status = 'RUNNING';
       setRestoredPlanCardStatus(planCard, 'success', '计划已确认，开始执行');
+      setRestoredPlanCardStatus(planCard, 'RUNNING', '\u8ba1\u5212\u5df2\u786e\u8ba4\uff0c\u6b63\u5728\u7ee7\u7eed\u6267\u884c');
+    } else if (curEvent === 'plan_review_status') {
+      const runId = payload.runId || (restoredPayload && restoredPayload.runId);
+      const status = normalizePlanReviewStatus(payload.status);
+      if (restoredPayload) {
+        restoredPayload.status = status;
+        restoredPayload.lastError = payload.lastError || '';
+      }
+      setRestoredPlanCardStatus(planCard, status, null);
+      if (status === 'COMPLETED') {
+        clearPendingFlowPlan(runId);
+      } else if (status === 'FAILED' || status === 'CANCELLED') {
+        updatePendingFlowPlanStatus(runId, { status, lastError: payload.lastError || '' });
+      }
     } else if (curEvent === 'plan_review_error') {
       const runId = payload.runId || (restoredPayload && restoredPayload.runId);
       if (payload.errorCode === 'plan_expired') clearPendingFlowPlan(runId);
@@ -1145,6 +1302,7 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
       if (finalAnswerEl) finalAnswerEl.innerHTML = `<span class="text-red-400">计划校验失败：${escapeHtml(msg)}</span>`;
       const err = new Error(msg);
       err.planExpired = payload.errorCode === 'plan_expired';
+      err.planStatus = payload.status || (payload.errorCode === 'plan_expired' ? 'EXPIRED' : 'FAILED');
       throw err;
     } else if (curEvent === 'message' || curEvent === '') {
       if (payload.type === 'summary') {
@@ -1781,7 +1939,8 @@ async function sendMessage() {
           <button type="button" class="tool-quick" data-action="quick-confirm">确认</button>
         </div>
       `;
-      const entry = { card, payload: {...payload}, status: 'pending' };
+      const entry = { card, payload: {...payload}, status: normalizePlanReviewStatus(payload && payload.status) };
+      applyPlanReviewCardStatus(card, entry.status, planReviewSummary(payload), payload && payload.lastError);
       if (runId) planReviewEntriesByRunId[runId] = entry;
       card.querySelector('.tool-head').addEventListener('click', (event) => {
         if (event.target && event.target.closest('[data-action="quick-confirm"]')) return;
@@ -1789,6 +1948,7 @@ async function sendMessage() {
       });
       card.querySelector('[data-action="quick-confirm"]').addEventListener('click', (event) => {
         event.stopPropagation();
+        if (!planReviewCanExecute(entry.status)) return;
         confirmPlanReview(entry.payload, {
           steps: Array.isArray(entry.payload.steps) ? entry.payload.steps : [],
           entry,
@@ -1847,6 +2007,9 @@ async function sendMessage() {
       };
       confirmBtn.disabled = entry && entry.status === 'running';
       confirmBtn.textContent = entry && entry.status === 'success' ? '已确认' : '确认并执行';
+      const statusMeta = planReviewStatusMeta(entry && entry.status, null, payload && payload.lastError);
+      confirmBtn.disabled = statusMeta.buttonDisabled;
+      confirmBtn.textContent = statusMeta.status === 'PENDING' ? '\u786e\u8ba4\u5e76\u6267\u884c' : statusMeta.buttonText;
       confirmBtn.onclick = () => confirmPlanReview(payload, { modal, entry });
       modal.classList.remove('hidden');
     }
@@ -1912,7 +2075,10 @@ async function sendMessage() {
 
     function setPlanReviewEntryStatus(entry, status, summary) {
       if (!entry || !entry.card) return;
-      entry.status = status;
+      entry.status = normalizePlanReviewStatus(status);
+      if (entry.payload) entry.payload.status = entry.status;
+      applyPlanReviewCardStatus(entry.card, entry.status, summary, entry.payload && entry.payload.lastError);
+      return;
       const className = status === 'success' ? 'success'
         : (status === 'error' ? 'error' : 'running');
       entry.card.className = `tool-card ${className} fade-in`;
@@ -1935,9 +2101,15 @@ async function sendMessage() {
       const modal = options.modal || null;
       const entry = options.entry || (payload && payload.runId ? planReviewEntriesByRunId[payload.runId] : null);
       const btn = modal ? document.getElementById('planReviewConfirmBtn') : (entry && entry.card ? entry.card.querySelector('[data-action="quick-confirm"]') : null);
-      const steps = Array.isArray(options.steps) ? options.steps : collectPlanReviewSteps(modal);
+      const steps = (Array.isArray(options.steps) ? options.steps : collectPlanReviewSteps(modal)).map((step, idx) => ({
+        stepNo: idx + 1,
+        title: String(step && step.title ? step.title : '').trim(),
+        content: String(step && step.content ? step.content : '').trim(),
+        dependsOn: Array.isArray(step && step.dependsOn) ? [...step.dependsOn] : []
+      }));
       let completed = false;
       try {
+        removePlanCancelledMarker(aiMsg);
         if (btn) {
           btn.disabled = true;
           btn.textContent = '执行中...';
@@ -1945,6 +2117,18 @@ async function sendMessage() {
         }
         setPlanReviewEntryStatus(entry, 'running', '计划已提交，正在继续执行');
         if (modal) setPlanReviewNotice(modal, '计划已提交，正在继续执行。', false);
+        if (entry) entry.planReviewError = null;
+        if (payload) {
+          payload.steps = steps;
+          payload.status = 'RUNNING';
+          payload.lastError = null;
+        }
+        if (entry && entry.payload) {
+          entry.payload.steps = steps;
+          entry.payload.status = 'RUNNING';
+          entry.payload.lastError = null;
+        }
+        updatePendingFlowPlanStatus(payload.runId, { status: 'RUNNING', lastError: null, steps });
         state.sending = true;
         state.finalizing = false;
         const ac = new AbortController();
@@ -1964,8 +2148,22 @@ async function sendMessage() {
           throw new Error('确认计划失败：HTTP ' + resumeRes.status);
         }
         await consumeSseResponse(resumeRes);
+        if (entry && entry.planReviewError) {
+          const err = new Error(entry.planReviewError);
+          err.planStatus = entry.status;
+          err.planExpired = entry.status === 'EXPIRED';
+          throw err;
+        }
+        const finalStatus = normalizePlanReviewStatus(entry && entry.status ? entry.status : 'COMPLETED');
+        if (finalStatus !== 'COMPLETED' && finalStatus !== 'RUNNING') {
+          const err = new Error(entry && entry.payload && entry.payload.lastError ? entry.payload.lastError : planReviewStatusMeta(finalStatus).summary);
+          err.planStatus = finalStatus;
+          err.planExpired = finalStatus === 'EXPIRED';
+          throw err;
+        }
         completed = true;
         clearPendingFlowPlan(payload.runId);
+        if (payload) payload.status = 'COMPLETED';
         setPlanReviewEntryStatus(entry, 'success', '计划已确认并执行完成');
         if (modal) setPlanReviewNotice(modal, '计划已确认并执行完成。', false);
         if (btn) btn.textContent = '已确认';
@@ -1973,14 +2171,31 @@ async function sendMessage() {
       } catch (e) {
         if (e && e.name === 'AbortError') {
           appendCancelledMarker();
+          if (payload) {
+            payload.status = 'CANCELLED';
+            payload.lastError = '\u6267\u884c\u5df2\u53d6\u6d88';
+          }
+          setPlanReviewEntryStatus(entry, 'CANCELLED', null);
+          updatePendingFlowPlanStatus(payload.runId, { status: 'CANCELLED', lastError: payload && payload.lastError, steps });
           if (modal) setPlanReviewNotice(modal, '执行已取消。', true);
         } else {
-          setPlanReviewEntryStatus(entry, 'error', '确认计划失败');
+          const nextStatus = e && e.planStatus ? e.planStatus : (e && e.planExpired ? 'EXPIRED' : 'FAILED');
+          if (payload) {
+            payload.status = nextStatus;
+            payload.lastError = e.message || payload.lastError || '';
+          }
+          setPlanReviewEntryStatus(entry, nextStatus, null);
+          if (nextStatus === 'EXPIRED') {
+            clearPendingFlowPlan(payload.runId);
+          } else {
+            updatePendingFlowPlanStatus(payload.runId, { status: nextStatus, lastError: payload && payload.lastError, steps });
+          }
           if (modal) setPlanReviewNotice(modal, e.message || '确认计划失败。', true);
         }
         if (btn) {
-          btn.disabled = false;
-          btn.textContent = modal ? '确认并执行' : '确认';
+          const retryMeta = planReviewStatusMeta(payload && payload.status);
+          btn.disabled = retryMeta.buttonDisabled;
+          btn.textContent = modal && retryMeta.status === 'PENDING' ? '确认并执行' : retryMeta.buttonText;
           btn.classList.remove('opacity-70');
         }
       } finally {
@@ -2072,13 +2287,39 @@ async function sendMessage() {
         renderPlanReviewCard(payload);
       } else if (curEvent === 'plan_review_resumed') {
         const entry = payload && payload.runId ? planReviewEntriesByRunId[payload.runId] : null;
-        if (payload && payload.runId) clearPendingFlowPlan(payload.runId);
+        if (entry && entry.payload) entry.payload.status = 'RUNNING';
         setPlanReviewEntryStatus(entry, 'success', '计划已确认，开始执行');
+        setPlanReviewEntryStatus(entry, 'RUNNING', '\u8ba1\u5212\u5df2\u786e\u8ba4\uff0c\u6b63\u5728\u7ee7\u7eed\u6267\u884c');
+      } else if (curEvent === 'plan_review_status') {
+        const entry = payload && payload.runId ? planReviewEntriesByRunId[payload.runId] : null;
+        const status = normalizePlanReviewStatus(payload && payload.status);
+        if (entry && entry.payload) {
+          entry.payload.status = status;
+          entry.payload.lastError = payload.lastError || '';
+        }
+        setPlanReviewEntryStatus(entry, status, null);
+        if (payload && payload.runId && status === 'COMPLETED') {
+          clearPendingFlowPlan(payload.runId);
+        } else if (payload && payload.runId && (status === 'FAILED' || status === 'CANCELLED')) {
+          updatePendingFlowPlanStatus(payload.runId, { status, lastError: payload.lastError || '' });
+        }
       } else if (curEvent === 'plan_review_error') {
         const entry = payload && payload.runId ? planReviewEntriesByRunId[payload.runId] : null;
         if (payload && payload.errorCode === 'plan_expired') clearPendingFlowPlan(payload.runId);
         setPlanReviewEntryStatus(entry, 'error', '计划校验失败');
         finalAnswerEl.innerHTML = `<span class="text-red-400">计划校验失败：${escapeHtml((payload.errors || []).join('；') || payload.errorCode || '')}</span>`;
+        {
+          const msg = (payload.errors || []).join('；') || payload.errorCode || '计划校验失败';
+          const status = normalizePlanReviewStatus(payload && payload.status ? payload.status : (payload && payload.errorCode === 'plan_expired' ? 'EXPIRED' : 'PENDING'));
+          if (entry) {
+            entry.planReviewError = msg;
+            if (entry.payload) {
+              entry.payload.status = status;
+              entry.payload.lastError = msg;
+            }
+          }
+          setPlanReviewEntryStatus(entry, status, msg);
+        }
       } else if (curEvent === 'thinking') {
         // 老的 thinking 事件，弱化显示
         // （保留兼容，不渲染避免噪音）

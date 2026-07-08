@@ -34,7 +34,17 @@ public class FlowPlanReviewState implements Serializable {
 
     private List<FlowPlanReviewStep> steps;
 
+    private String status;
+
+    private List<FlowPlanReviewStep> approvedSteps;
+
+    private Integer attemptCount;
+
+    private String lastError;
+
     private Long createdAt;
+
+    private Long updatedAt;
 
     private Long expiresAt;
 

@@ -32,6 +32,14 @@ public class FlowPlanReviewService {
     private static final Pattern STEP_KEY_PATTERN = Pattern.compile("\\u7b2c\\s*(\\d+)\\s*\\u6b65");
     private static final Pattern DEPENDS_LINE_PATTERN = Pattern.compile("(?im)^\\s*(?:[-*+]\\s*)?(?:\\*+)?\\s*(DEPENDS_ON|\\u4f9d\\u8d56\\u6b65\\u9aa4)\\s*(?:\\*+)?\\s*[:\\uff1a].*$");
     private static final Pattern PLAN_HEADER_PATTERN = Pattern.compile("(?is)^\\s*#{0,6}\\s*\\u7b2c\\s*\\d+\\s*\\u6b65\\s*[:\\uff1a].*(?:\\r?\\n|$)");
+    public static final String STATUS_PENDING = "PENDING";
+    public static final String STATUS_RUNNING = "RUNNING";
+    public static final String STATUS_COMPLETED = "COMPLETED";
+    public static final String STATUS_FAILED = "FAILED";
+    public static final String STATUS_CANCELLED = "CANCELLED";
+    public static final String STATUS_EXPIRED = "EXPIRED";
+
+    private final Object stateTransitionLock = new Object();
 
     @Autowired(required = false)
     private FlowPlanReviewStateStore stateStore;
@@ -82,7 +90,10 @@ public class FlowPlanReviewService {
                 .mcpToolsAnalysis(dynamicContext.getValue("mcpToolsAnalysis"))
                 .mcpNeeds(mcpToolCatalogService != null ? mcpToolCatalogService.needsFor(request.getSessionId()) : null)
                 .steps(reviewSteps)
+                .status(STATUS_PENDING)
+                .attemptCount(0)
                 .createdAt(now)
+                .updatedAt(now)
                 .expiresAt(now + effectiveTtlSeconds * 1000)
                 .build();
 
@@ -106,43 +117,86 @@ public class FlowPlanReviewService {
         if (stateStore == null) {
             return FlowPlanReviewPreparedPlan.failed("plan_review_disabled", List.of("Plan review is not enabled"));
         }
-        Optional<FlowPlanReviewState> optionalState = stateStore.find(runId);
-        if (optionalState.isEmpty()) {
-            return FlowPlanReviewPreparedPlan.failed("plan_expired", List.of("The pending plan has expired or was already consumed"));
-        }
-        FlowPlanReviewState state = optionalState.get();
-        long now = System.currentTimeMillis();
-        if (state.getExpiresAt() != null && state.getExpiresAt() < now) {
-            stateStore.delete(runId);
-            return FlowPlanReviewPreparedPlan.failed("plan_expired", List.of("The pending plan has expired; please generate a fresh plan"));
-        }
-        if (sessionId != null && !sessionId.isBlank()
-                && state.getSessionId() != null && !state.getSessionId().equals(sessionId)) {
-            return FlowPlanReviewPreparedPlan.failed("session_mismatch", List.of("runId does not belong to the current session"));
-        }
+        synchronized (stateTransitionLock) {
+            Optional<FlowPlanReviewState> optionalState = stateStore.find(runId);
+            if (optionalState.isEmpty()) {
+                return FlowPlanReviewPreparedPlan.failed("plan_expired", List.of("The pending plan has expired or was already consumed"));
+            }
+            FlowPlanReviewState state = optionalState.get();
+            long now = System.currentTimeMillis();
+            if (state.getExpiresAt() != null && state.getExpiresAt() < now) {
+                state.setStatus(STATUS_EXPIRED);
+                state.setUpdatedAt(now);
+                stateStore.update(state);
+                return FlowPlanReviewPreparedPlan.failed("plan_expired", List.of("The pending plan has expired; please generate a fresh plan"));
+            }
+            if (sessionId != null && !sessionId.isBlank()
+                    && state.getSessionId() != null && !state.getSessionId().equals(sessionId)) {
+                return FlowPlanReviewPreparedPlan.failed("session_mismatch", List.of("runId does not belong to the current session"));
+            }
 
-        FlowPlanReviewValidationResult validation = validateSteps(normalizeSubmittedSteps(submittedSteps));
-        if (!validation.isValid()) {
+            String status = normalizeStatus(state.getStatus());
+            if (STATUS_RUNNING.equals(status)) {
+                return failedWithState("plan_running", List.of("The plan is already running"), state, null);
+            }
+            if (STATUS_COMPLETED.equals(status)) {
+                return failedWithState("plan_completed", List.of("The plan has already completed"), state, null);
+            }
+            if (STATUS_EXPIRED.equals(status)) {
+                return failedWithState("plan_expired", List.of("The pending plan has expired; please generate a fresh plan"), state, null);
+            }
+
+            List<FlowPlanReviewStep> normalizedSteps = normalizeSubmittedSteps(submittedSteps);
+            FlowPlanReviewValidationResult validation = validateSteps(normalizedSteps);
+            if (!validation.isValid()) {
+                return failedWithState("invalid_plan", validation.getErrors(), state, validation);
+            }
+
+            state.setApprovedSteps(normalizedSteps);
+            state.setStatus(STATUS_RUNNING);
+            state.setAttemptCount((state.getAttemptCount() == null ? 0 : state.getAttemptCount()) + 1);
+            state.setLastError(null);
+            state.setUpdatedAt(now);
+            stateStore.update(state);
+
             return FlowPlanReviewPreparedPlan.builder()
-                    .ready(false)
-                    .errorCode("invalid_plan")
-                    .errors(validation.getErrors())
+                    .ready(true)
+                    .errors(List.of())
                     .warnings(validation.getWarnings())
                     .state(state)
                     .validation(validation)
                     .build();
         }
-        return FlowPlanReviewPreparedPlan.builder()
-                .ready(true)
-                .errors(List.of())
-                .warnings(validation.getWarnings())
-                .state(state)
-                .validation(validation)
-                .build();
     }
 
     public void deletePendingPlan(String runId) {
-        stateStore.delete(runId);
+        if (stateStore != null) {
+            stateStore.delete(runId);
+        }
+    }
+
+    public void markExecutionCompleted(String runId) {
+        markExecutionCompleted(runId, null);
+    }
+
+    public void markExecutionCompleted(String runId, Integer expectedAttemptCount) {
+        updateExecutionStatus(runId, STATUS_COMPLETED, null, expectedAttemptCount);
+    }
+
+    public void markExecutionFailed(String runId, String error) {
+        markExecutionFailed(runId, error, null);
+    }
+
+    public void markExecutionFailed(String runId, String error, Integer expectedAttemptCount) {
+        updateExecutionStatus(runId, STATUS_FAILED, error, expectedAttemptCount);
+    }
+
+    public void markExecutionCancelled(String runId, String reason) {
+        markExecutionCancelled(runId, reason, null);
+    }
+
+    public void markExecutionCancelled(String runId, String reason, Integer expectedAttemptCount) {
+        updateExecutionStatus(runId, STATUS_CANCELLED, reason, expectedAttemptCount);
     }
 
     public FlowPlanReviewValidationResult validateSteps(List<FlowPlanReviewStep> rawSteps) {
@@ -235,6 +289,9 @@ public class FlowPlanReviewService {
             payload.put("createdAt", state.getCreatedAt());
             payload.put("expiresAt", state.getExpiresAt());
             payload.put("expiresInSeconds", effectiveTtlSeconds);
+            payload.put("status", normalizeStatus(state.getStatus()));
+            payload.put("attemptCount", state.getAttemptCount());
+            payload.put("lastError", state.getLastError());
             payload.put("valid", validation != null && validation.isValid());
             payload.put("validationErrors", validation != null ? validation.getErrors() : List.of());
             payload.put("validationWarnings", validation != null ? validation.getWarnings() : List.of());
@@ -346,6 +403,67 @@ public class FlowPlanReviewService {
                 .stepsMap(stepsMap)
                 .stepDependencies(depsMap)
                 .build();
+    }
+
+    private void updateExecutionStatus(String runId, String status, String error, Integer expectedAttemptCount) {
+        if (stateStore == null || runId == null || runId.isBlank()) {
+            return;
+        }
+        synchronized (stateTransitionLock) {
+            Optional<FlowPlanReviewState> optionalState = stateStore.find(runId);
+            if (optionalState.isEmpty()) {
+                return;
+            }
+            FlowPlanReviewState state = optionalState.get();
+            long now = System.currentTimeMillis();
+            if (state.getExpiresAt() != null && state.getExpiresAt() < now) {
+                state.setStatus(STATUS_EXPIRED);
+                state.setUpdatedAt(now);
+                stateStore.update(state);
+                return;
+            }
+            if (expectedAttemptCount != null && !expectedAttemptCount.equals(state.getAttemptCount())) {
+                log.info("[FlowPlanReview] skip stale status update runId={} expectedAttempt={} currentAttempt={} targetStatus={}",
+                        runId, expectedAttemptCount, state.getAttemptCount(), status);
+                return;
+            }
+            state.setStatus(status);
+            state.setLastError(error == null || error.isBlank() ? null : truncate(error, 1000));
+            state.setUpdatedAt(now);
+            stateStore.update(state);
+        }
+    }
+
+    private FlowPlanReviewPreparedPlan failedWithState(String errorCode,
+                                                       List<String> errors,
+                                                       FlowPlanReviewState state,
+                                                       FlowPlanReviewValidationResult validation) {
+        return FlowPlanReviewPreparedPlan.builder()
+                .ready(false)
+                .errorCode(errorCode)
+                .errors(errors == null ? List.of() : errors)
+                .warnings(validation != null ? validation.getWarnings() : List.of())
+                .state(state)
+                .validation(validation)
+                .build();
+    }
+
+    public String normalizeStatus(String status) {
+        if (status == null || status.isBlank()) {
+            return STATUS_PENDING;
+        }
+        String normalized = status.trim().toUpperCase();
+        return switch (normalized) {
+            case STATUS_RUNNING, STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED, STATUS_EXPIRED -> normalized;
+            default -> STATUS_PENDING;
+        };
+    }
+
+    private String truncate(String value, int maxLength) {
+        if (value == null || value.length() <= maxLength) {
+            return value;
+        }
+        return value.substring(0, Math.max(0, maxLength - 3)) + "...";
     }
 
     private int extractStepNo(String key, int fallbackNo) {

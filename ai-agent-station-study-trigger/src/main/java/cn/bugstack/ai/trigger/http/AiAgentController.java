@@ -204,6 +204,11 @@ public class AiAgentController implements IAiAgentService {
                 payload.put("errorCode", preparedPlan.getErrorCode());
                 payload.put("errors", preparedPlan.getErrors());
                 payload.put("warnings", preparedPlan.getWarnings());
+                if (preparedPlan.getState() != null) {
+                    payload.put("status", preparedPlan.getState().getStatus());
+                    payload.put("lastError", preparedPlan.getState().getLastError());
+                    payload.put("attemptCount", preparedPlan.getState().getAttemptCount());
+                }
                 sendSseObject(emitter, "plan_review_error", payload);
                 sendSseObject(emitter, "message",
                         cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity.createErrorResult(

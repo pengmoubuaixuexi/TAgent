@@ -22,6 +22,7 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyEmitter
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadPoolExecutor;
 
@@ -122,8 +123,8 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
             }
         } finally {
             longTermMemoryTurnSnapshot.clearSession(sessionId);
-            if (sessionId != null) activeContexts.remove(sessionId);
-            if (sessionId != null && mcpToolCatalogService != null) mcpToolCatalogService.clearNeeds(sessionId);
+            boolean removedActiveContext = sessionId != null && activeContexts.remove(sessionId, dynamicContext);
+            if (sessionId != null && mcpToolCatalogService != null && removedActiveContext) mcpToolCatalogService.clearNeeds(sessionId);
             if (runId != null && mcpToolCatalogService != null) mcpToolCatalogService.cleanupRun(runId);
             // 2026-06-23：清掉本次 runId 的 reasoning_content 注入缓存（按 runId 隔离后只增不减，须在此清理防泄漏）
             cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearRun(runId);
@@ -158,6 +159,7 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
                     .build();
             DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext =
                     new DefaultFlowAgentExecuteStrategyFactory.DynamicContext();
+            Integer planReviewAttemptCount = state.getAttemptCount();
             dynamicContext.setExecutionHistory(new StringBuilder());
             dynamicContext.setCurrentTask(state.getOriginalMessage());
             dynamicContext.setStep(4);
@@ -172,6 +174,7 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
             dynamicContext.setValue("stepsMap", approvedPlan.getStepsMap());
             dynamicContext.setValue("stepDependencies", approvedPlan.getStepDependencies());
             dynamicContext.setValue("planReviewResumed", Boolean.TRUE);
+            dynamicContext.setValue("planReviewAttemptCount", planReviewAttemptCount);
             dynamicContext.setAiAgentClientFlowConfigVOMap(repository.queryAiAgentClientFlowConfig(state.getAgentId()));
 
             String sessionId = state.getSessionId();
@@ -186,6 +189,10 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
             emitter.onTimeout(dynamicContext::cancel);
             emitter.onError(e -> dynamicContext.cancel());
 
+            boolean[] completed = {false};
+            boolean[] cancelled = {false};
+            String[] failureMessage = {null};
+
             try {
                 putMdc("agentId", state.getAgentId());
                 putMdc("sessionId", state.getSessionId());
@@ -199,23 +206,51 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
                 Map<String, Object> payload = new LinkedHashMap<>();
                 payload.put("runId", runId);
                 payload.put("sessionId", sessionId);
+                payload.put("status", FlowPlanReviewService.STATUS_RUNNING);
                 payload.put("stepCount", approvedPlan.getStepsMap() != null ? approvedPlan.getStepsMap().size() : 0);
                 sendSseObject(emitter, "plan_review_resumed", payload);
 
                 String apply = step4ExecuteStepsNode.apply(request, dynamicContext);
                 log.info("[FlowPlanReview] resumed Step4 result runId={} result={}", runId, apply);
-                sendSseObject(emitter, "message", AutoAgentExecuteResultEntity.createCompleteResult(sessionId));
+                if (dynamicContext.isCancelled()) {
+                    cancelled[0] = true;
+                    failureMessage[0] = "execution cancelled";
+                } else {
+                    completed[0] = true;
+                    sendSseObject(emitter, "message", AutoAgentExecuteResultEntity.createCompleteResult(sessionId));
+                }
+            } catch (CancellationException e) {
+                cancelled[0] = true;
+                failureMessage[0] = e.getMessage();
+                log.info("[FlowPlanReview] resume cancelled runId={} sessionId={} msg={}", runId, sessionId, e.getMessage());
             } catch (Exception e) {
+                if (dynamicContext.isCancelled()) {
+                    cancelled[0] = true;
+                }
+                failureMessage[0] = e.getMessage();
                 log.error("[FlowPlanReview] resume failed runId={} sessionId={}", runId, sessionId, e);
                 sendSseObject(emitter, "message", AutoAgentExecuteResultEntity.createErrorResult(e.getMessage(), sessionId));
             } finally {
-                if (flowPlanReviewService != null) flowPlanReviewService.deletePendingPlan(runId);
+                if (flowPlanReviewService != null) {
+                    if (completed[0]) {
+                        flowPlanReviewService.markExecutionCompleted(runId, planReviewAttemptCount);
+                        sendPlanReviewStatus(emitter, runId, sessionId, FlowPlanReviewService.STATUS_COMPLETED, null);
+                    } else if (cancelled[0] || dynamicContext.isCancelled()) {
+                        flowPlanReviewService.markExecutionCancelled(runId, failureMessage[0], planReviewAttemptCount);
+                        sendPlanReviewStatus(emitter, runId, sessionId, FlowPlanReviewService.STATUS_CANCELLED, failureMessage[0]);
+                    } else {
+                        flowPlanReviewService.markExecutionFailed(runId, failureMessage[0], planReviewAttemptCount);
+                        sendPlanReviewStatus(emitter, runId, sessionId, FlowPlanReviewService.STATUS_FAILED, failureMessage[0]);
+                    }
+                }
                 longTermMemoryTurnSnapshot.clearSession(sessionId);
-                if (sessionId != null) activeContexts.remove(sessionId);
-                if (sessionId != null && mcpToolCatalogService != null) mcpToolCatalogService.clearNeeds(sessionId);
-                if (runId != null && mcpToolCatalogService != null) mcpToolCatalogService.cleanupRun(runId);
-                cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearRun(runId);
-                if (runId != null && toolCallLedger != null) toolCallLedger.clear(runId);
+                boolean removedActiveContext = sessionId != null && activeContexts.remove(sessionId, dynamicContext);
+                if (sessionId != null && mcpToolCatalogService != null && removedActiveContext) mcpToolCatalogService.clearNeeds(sessionId);
+                if (removedActiveContext) {
+                    if (runId != null && mcpToolCatalogService != null) mcpToolCatalogService.cleanupRun(runId);
+                    cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearRun(runId);
+                    if (runId != null && toolCallLedger != null) toolCallLedger.clear(runId);
+                }
                 clearMdc("agentId", "sessionId", "userId", "tenantId");
                 try {
                     emitter.complete();
@@ -223,6 +258,20 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
                 }
             }
         });
+    }
+
+    private void sendPlanReviewStatus(ResponseBodyEmitter emitter,
+                                      String runId,
+                                      String sessionId,
+                                      String status,
+                                      String error) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("runId", runId);
+        payload.put("sessionId", sessionId);
+        payload.put("status", status);
+        payload.put("lastError", error);
+        payload.put("timestamp", System.currentTimeMillis());
+        sendSseObject(emitter, "plan_review_status", payload);
     }
 
     private void ensureAgentArmedForPlanResume(String agentId, String runId, String sessionId) {
@@ -272,6 +321,11 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
         if (ctx != null) {
             ctx.cancel();
             ctx.fireCancelTrigger();  // 立即截断在飞流式调用，不等当前 LLM 调用跑完才在下个 checkpoint 生效
+            if (flowPlanReviewService != null && Boolean.TRUE.equals(ctx.getValue("planReviewResumed"))) {
+                String runId = ctx.getValue("runId");
+                Integer attemptCount = ctx.getValue("planReviewAttemptCount");
+                flowPlanReviewService.markExecutionCancelled(runId, "execution cancelled by user", attemptCount);
+            }
             log.info("[FlowAgent] cancelExecute called for sessionId={}", sessionId);
         }
     }

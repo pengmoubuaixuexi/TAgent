@@ -9,6 +9,8 @@ public interface FlowPlanReviewStateStore {
 
     Optional<FlowPlanReviewState> find(String runId);
 
+    void update(FlowPlanReviewState state);
+
     void delete(String runId);
 
 }
