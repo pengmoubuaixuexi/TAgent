@@ -59,7 +59,7 @@ public class Step1AnalyzerNode extends AbstractExecuteSupport {
         // 引导感知：本步 prompt 包成 Supplier，每轮按最新 currentTask(%5) 重建（引导后 currentTask 已折入引导）
         final AiAgentClientFlowConfigVO step1Config = aiAgentClientFlowConfigVO;
         java.util.function.Supplier<String> analysisPromptSupplier = () -> appendCurrentTimeContext(String.format(step1Config.getStepPrompt(),
-                effectiveUserQuestion(requestParameter, dynamicContext),
+                effectiveUserQuestionForStep(requestParameter, dynamicContext, 1),
                 dynamicContext.getStep(),
                 dynamicContext.getMaxStep(),
                 !dynamicContext.getExecutionHistory().isEmpty() ? dynamicContext.getExecutionHistory().toString() : "[首次执行]",

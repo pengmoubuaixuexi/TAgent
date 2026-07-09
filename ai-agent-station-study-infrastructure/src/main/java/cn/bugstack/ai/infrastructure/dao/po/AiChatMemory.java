@@ -26,6 +26,8 @@ public class AiChatMemory {
 
     private String agentId;
 
+    private String runId;
+
     /** USER / ASSISTANT / SYSTEM */
     private String messageType;
 

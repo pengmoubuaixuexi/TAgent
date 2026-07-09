@@ -81,6 +81,9 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
     @Resource
     protected McpToolCatalogService dynamicMcpToolCatalogService;
 
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    protected cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService runSnapshotService;
+
     /** ask_user 人工补充 gate；用于判断「非执行步元工具豁免」提示是否提及 ask_user（功能关则不提，免幻觉）。 */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     protected cn.bugstack.ai.domain.agent.service.security.UserInputGate userInputGate;
@@ -111,7 +114,7 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
             return List.of();
         }
         return dynamicMcpToolCatalogService.resolveDynamicToolCallbacks(requestParameter.getRunId(), requestParameter.getSessionId(), clientId,
-                dynamicMcpToolCatalogService.needsFor(requestParameter.getSessionId()), requestParameter.getMessage(),
+                dynamicMcpToolCatalogService.needsFor(requestParameter.getSessionId()), effectiveInitialTask(requestParameter),
                 dynamicAgentToolRegistry != null ? dynamicAgentToolRegistry.getTools(clientId) : List.of());
     }
 
@@ -202,9 +205,46 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
 
     protected String buildLtmRetrievalQuery(ExecuteCommandEntity req, String stage) {
         if (req == null) return "";
-        String message = req.getMessage();
+        String message = effectiveInitialTask(req);
         if (message == null) message = "";
         return message;
+    }
+
+    protected String effectiveInitialTask(ExecuteCommandEntity req) {
+        if (req == null) return "";
+        String message = req.getMessage() == null ? "" : req.getMessage().trim();
+        String redoContext = req.getRedoContextPrompt();
+        if (redoContext == null || redoContext.isBlank()) {
+            return message;
+        }
+        return redoContext.trim() + "\n\n【用户本次修订指令】\n" + message;
+    }
+
+    protected String effectiveTaskForStep(ExecuteCommandEntity req,
+                                          DefaultFlowAgentExecuteStrategyFactory.DynamicContext ctx,
+                                          int stepOrdinal) {
+        String base = ctx != null && ctx.getCurrentTask() != null && !ctx.getCurrentTask().isBlank()
+                ? ctx.getCurrentTask()
+                : effectiveInitialTask(req);
+        if (req == null || !matchesRedoTargetStep(req, stepOrdinal)) {
+            return base;
+        }
+        String targetContext = req.getRedoTargetStepContextPrompt();
+        if (targetContext == null || targetContext.isBlank()) {
+            return base;
+        }
+        return base + "\n\n" + targetContext.trim();
+    }
+
+    protected boolean matchesRedoTargetStep(ExecuteCommandEntity req, int stepOrdinal) {
+        Integer target = req == null ? null : req.getRedoFromStep();
+        if (target == null) {
+            return false;
+        }
+        if (stepOrdinal >= 4) {
+            return target >= 4;
+        }
+        return target == stepOrdinal;
     }
 
     /**
@@ -320,6 +360,7 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
     protected LlmCallContext buildCallContext(String stepName, String promptText, String resultText, String model) {
         return LlmCallContext.builder()
                 .sessionId(firstNonBlank(MDC.get("sessionId"), MDC.get("requestId")))
+                .runId(firstNonBlank(MDC.get("runId"), MDC.get("agent.run_id")))
                 .userId(MDC.get("userId"))
                 .tenantId(MDC.get("tenantId"))
                 .agentId(MDC.get("agentId"))
@@ -372,6 +413,7 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
                 if (result.getContent() != null) {
                     result.setContent(cn.bugstack.ai.domain.agent.service.security.OutputFilter.stripThinkTags(result.getContent()));
                 }
+                recordSseResultSnapshot(dynamicContext, result);
                 // 发送SSE格式的数据
                 String sseData = "data: " + JSON.toJSONString(result) + "\n\n";
                 // 并行 DAG 步骤共用一个 emitter，ResponseBodyEmitter.send 非线程安全 →
@@ -381,6 +423,82 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         } catch (IOException e) {
             log.error("发送SSE结果失败：{}", e.getMessage(), e);
         }
+    }
+
+    protected void recordSseResultSnapshot(DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
+                                           AutoAgentExecuteResultEntity result) {
+        if (result == null || result.getContent() == null || result.getContent().isBlank()) {
+            return;
+        }
+        String type = result.getType();
+        if ("complete".equals(type)) {
+            return;
+        }
+        if (result.getSubType() != null && !result.getSubType().isBlank()) {
+            return;
+        }
+        String title = switch (type == null ? "" : type) {
+            case "summary" -> "最终回答";
+            case "execution" -> result.getStep() != null ? "执行步骤 " + result.getStep() : "执行步骤";
+            case "supervision" -> "质量监督";
+            case "error" -> "执行错误";
+            default -> result.getStep() != null ? "Step " + result.getStep() : "运行结果";
+        };
+        String stepId = (type == null || type.isBlank() ? "result" : type) + ":" + (result.getStep() != null ? result.getStep() : "final");
+        Integer stepNo = result.getStep();
+        Integer currentFlowStep = dynamicContext.getStep();
+        if ("execution".equals(type) && currentFlowStep != null && currentFlowStep == 4 && result.getStep() != null) {
+            String content = result.getContent();
+            if (content != null && content.contains("已完成所有规划步骤")) {
+                return;
+            }
+            String planTitle = extractFlowStep4Title(content);
+            stepId = "flow_step4_execute_step_" + result.getStep();
+            title = "Step4_execute" + result.getStep() + (planTitle == null ? "" : " · " + planTitle);
+            type = "flow_step4_execution";
+            stepNo = result.getStep();
+        }
+        String status = "error".equals(type)
+                ? cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_FAILED
+                : cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_COMPLETED;
+        recordRunStep(dynamicContext, stepId, title, type, stepNo, result.getContent(), status);
+    }
+
+    private String extractFlowStep4Title(String content) {
+        if (content == null || content.isBlank()) {
+            return null;
+        }
+        String marker = " 执行完成:";
+        int index = content.indexOf(marker);
+        if (index <= 0) {
+            return null;
+        }
+        String title = content.substring(0, index).trim();
+        return title.isBlank() ? null : title;
+    }
+
+    protected void recordRunStep(DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
+                                 String stepId,
+                                 String title,
+                                 String type,
+                                 Integer stepNo,
+                                 String content,
+                                 String status) {
+        if (runSnapshotService == null || dynamicContext == null || content == null || content.isBlank()) {
+            return;
+        }
+        String runId = dynamicContext.getValue("runId");
+        if (runId == null || runId.isBlank()) {
+            runId = firstNonBlank(MDC.get("runId"), MDC.get("agent.run_id"));
+        }
+        runSnapshotService.recordStep(runId, stepId, title, type, stepNo, content, status);
+    }
+
+    protected String safeStepId(String value) {
+        if (value == null || value.isBlank()) {
+            return "untitled";
+        }
+        return value.trim().replaceAll("[^A-Za-z0-9_\\-\\u4e00-\\u9fa5]+", "_");
     }
 
     /** P2.7 16.2 Thinking Visualization 开关；与 auto 侧共用同一配置项 */
@@ -393,6 +511,8 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
      */
     protected void sendThinkingEvent(DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
                                      String title, String content, String sessionId) {
+        recordRunStep(dynamicContext, "thinking:" + safeStepId(title), title, "thinking", null, content,
+                cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_COMPLETED);
         if (!thinkingVisEnabled) return;
         try {
             ResponseBodyEmitter emitter = dynamicContext.getValue("emitter");

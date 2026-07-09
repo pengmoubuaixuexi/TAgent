@@ -108,7 +108,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         if (dynamicContext.isFinalizeRequested()) {
             dynamicContext.setValue("sessionId", request.getSessionId());
             dynamicContext.setValue("dynamicMissingToolDesc", mcpToolCatalogService.needsFor(request.getSessionId()));
-            dynamicContext.setValue("dynamicToolQuery", request.getMessage());
+            dynamicContext.setValue("dynamicToolQuery", dynamicToolQuery(request, dynamicContext));
             return finalizeNow(request, dynamicContext);
         }
         // 进入执行阶段：禁止引导（flow step4 不消费 steerIdea；steerExecute 据此忽略，避免无意义断流）
@@ -119,7 +119,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             // 把 sessionId 暂存到 dynamicContext，executeStep / handleStepExecutionError 沿用历史约定取它发 SSE / mirror WM
             dynamicContext.setValue("sessionId", request.getSessionId());
             dynamicContext.setValue("dynamicMissingToolDesc", mcpToolCatalogService.needsFor(request.getSessionId()));
-            dynamicContext.setValue("dynamicToolQuery", request.getMessage());
+            dynamicContext.setValue("dynamicToolQuery", dynamicToolQuery(request, dynamicContext));
 
             // 获取配置信息
             AiAgentClientFlowConfigVO aiAgentClientFlowConfigVO = dynamicContext.getAiAgentClientFlowConfigVOMap().get(AiClientTypeEnumVO.EXECUTOR_CLIENT.getCode());
@@ -151,7 +151,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             broadcastStepPending(stepsMap, dynamicContext, request.getSessionId());
 
             // 按顺序执行规划步骤
-            executeStepsInOrder(executorChatClient, stepsMap, dynamicContext);
+            executeStepsInOrder(executorChatClient, stepsMap, dynamicContext, request);
 
             // 立即回答（在 DAG 执行途中点的）：已停止调度未启动子步，这里基于已完成产出直接整合作答
             if (dynamicContext.isFinalizeRequested()) {
@@ -210,7 +210,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
     /**
      * 按顺序执行规划步骤
      */
-    private void executeStepsInOrder(ChatClient executorChatClient, Map<String, String> stepsMap, DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext) {
+    private void executeStepsInOrder(ChatClient executorChatClient, Map<String, String> stepsMap, DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext, ExecuteCommandEntity request) {
         if (stepsMap == null || stepsMap.isEmpty()) {
             log.warn("步骤映射为空，无法执行");
             return;
@@ -240,7 +240,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         Map<Integer, Set<Integer>> deps = (Map<Integer, Set<Integer>>) dynamicContext.getValue("stepDependencies");
         if (planDagEnabled && stepNumbers.size() > 1) {
             executeStepsAsDag(executorChatClient, stepsMap, stepNumbers,
-                    deps != null ? deps : Collections.emptyMap(), dynamicContext);
+                    deps != null ? deps : Collections.emptyMap(), dynamicContext, request);
         } else {
             // 按顺序执行每个步骤
             for (Integer stepNumber : stepNumbers) {
@@ -255,7 +255,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                 String stepKey = "第" + stepNumber + "步";
                 String stepContent = resolveStepContent(stepsMap, stepKey);
                 if (stepContent != null) {
-                    executeStep(executorChatClient, stepNumber, stepKey, stepContent, dynamicContext,
+                    executeStep(executorChatClient, stepNumber, stepKey, stepContent, dynamicContext, request,
                             deps != null ? deps.getOrDefault(stepNumber, Collections.emptySet())
                                          : Collections.emptySet());
                 } else {
@@ -277,7 +277,8 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
      */
     private void executeStepsAsDag(ChatClient executorChatClient, Map<String, String> stepsMap,
                                     List<Integer> stepNumbers, Map<Integer, Set<Integer>> deps,
-                                    DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext) {
+                                    DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
+                                    ExecuteCommandEntity request) {
         // 2026-05-29 依赖驱动调度（取代旧的"整层屏障"）：每个步骤"自己的依赖一完成就启动"，
         // 不再等同层最慢的步骤。例：1、3 同为起始层，1 先完成 → 依赖 1 的 2 立刻开跑，不必等 3。
         // 用 Kahn 拓扑序保证构建 future 时其依赖的 future 已存在；有环的节点排不进拓扑序 → 末尾串行兜底，绝不卡死。
@@ -326,7 +327,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                     }
                     // 立即回答：已触发则未启动的子步直接跳过，让 future 快速完成，控制权尽快回到 finalizeNow
                     if (stepContent != null && !dynamicContext.isFinalizeRequested()) {
-                        executeStep(executorChatClient, stepNumber, stepKey, stepContent, dynamicContext, d);
+                        executeStep(executorChatClient, stepNumber, stepKey, stepContent, dynamicContext, request, d);
                     }
                 } catch (CancellationException e) {
                     log.info("[Cancel] DAG step {} skipped/cancelled: {}", stepNumber, e.getMessage());
@@ -355,7 +356,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                 String stepKey = "第" + n + "步";
                 String stepContent = resolveStepContent(stepsMap, stepKey);
                 if (stepContent != null) {
-                    executeStep(executorChatClient, n, stepKey, stepContent, dynamicContext,
+                    executeStep(executorChatClient, n, stepKey, stepContent, dynamicContext, request,
                             deps.getOrDefault(n, Collections.emptySet()));
                 }
             }
@@ -414,6 +415,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
      */
     private void executeStep(ChatClient executorChatClient, Integer stepNumber, String stepKey,
                              String stepContent, DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
+                             ExecuteCommandEntity request,
                              Set<Integer> dependsOnNumbers) {
         log.info("\n--- 开始执行 {} {}---", stepKey,
                 dependsOnNumbers != null && !dependsOnNumbers.isEmpty() ? "(依赖: " + dependsOnNumbers + ") " : "");
@@ -446,7 +448,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                     : List.of();
             storeExecutorToolCatalogSnapshot(dynamicContext, FLOW_TOOL_CATALOG_V3_KEY,
                     executorClientId, dynamicToolCallbacks, 3);
-            String stepExecPrompt = buildStepExecutionPrompt(stepContent, dynamicContext, dependsOnNumbers, executorClientId, dynamicToolCallbacks);
+            String stepExecPrompt = buildStepExecutionPrompt(stepContent, dynamicContext, request, dependsOnNumbers, executorClientId, dynamicToolCallbacks);
             stepExecPrompt = appendCurrentTimeContext(stepExecPrompt);
             // 子步用窄角色 system 覆盖 EXECUTOR_CLIENT 的领域人设，防每个子步都照"攻略编写者"吐整份完整攻略。
             // 整合步(buildFinalDeliverable)不走这里，仍用 DB 的 8010_p3 产出完整交付物。
@@ -567,6 +569,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
      */
     private String buildStepExecutionPrompt(String stepContent,
                                              DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
+                                             ExecuteCommandEntity request,
                                              Set<Integer> dependsOnNumbers,
                                              String executorClientId,
                                              List<ToolCallback> dynamicToolCallbacks) {
@@ -610,7 +613,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         }
 
         sb.append("**步骤内容:**\n").append(stepContent).append("\n\n");
-        sb.append("**用户原始请求:**\n").append(dynamicContext.getCurrentTask()).append("\n\n");
+        sb.append("**用户原始请求:**\n").append(effectiveTaskForStep(request, dynamicContext, 4)).append("\n\n");
 
         // 2. 执行要求 + 反幻觉约束
         sb.append("**执行要求:**\n");
@@ -958,7 +961,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
     private String buildFlowAnswerNowPrompt(DefaultFlowAgentExecuteStrategyFactory.DynamicContext ctx, ExecuteCommandEntity request) {
         StringBuilder sb = new StringBuilder();
         sb.append("用户在执行过程中点击了【立即回答】，要求基于目前已有的（可能不完整的）信息立刻作答。\n\n");
-        sb.append("**用户原始问题:**\n").append(ctx.getCurrentTask() != null ? ctx.getCurrentTask() : request.getMessage()).append("\n\n");
+        sb.append("**用户原始问题:**\n").append(effectiveTaskForStep(request, ctx, 4)).append("\n\n");
 
         @SuppressWarnings("unchecked")
         Map<String, String> stepsMap = (Map<String, String>) ctx.getValue("stepsMap");
@@ -991,13 +994,21 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         return sb.toString();
     }
 
+    private String dynamicToolQuery(ExecuteCommandEntity request, DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext) {
+        String currentTask = dynamicContext != null ? dynamicContext.getCurrentTask() : null;
+        if (currentTask != null && !currentTask.isBlank()) {
+            return currentTask;
+        }
+        return request != null ? request.getMessage() : "";
+    }
+
     private String buildFinalDeliverable(DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext, ExecuteCommandEntity request, ChatClient finalWriterChatClient, String finalWriterClientId) {
         String stepResults = collectStepResults(dynamicContext);
         if (stepResults.isBlank()) {
             return null;
         }
 
-        String prompt = appendCurrentTimeContext(buildFinalSynthesisPrompt(dynamicContext, stepResults));
+        String prompt = appendCurrentTimeContext(buildFinalSynthesisPrompt(dynamicContext, request, stepResults));
         List<ToolCallback> dynamicToolCallbacks = resolveAgentDynamicToolCallbacks(request, finalWriterClientId);
         // 2026-05-07 流式 UX：最终合成步骤独立 step_start/end，折叠为"最终合成 已完成"
         ChatClient.ChatClientRequestSpec specFinal = finalWriterChatClient.prompt()
@@ -1035,7 +1046,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         return stepResults.toString().trim();
     }
 
-    private String buildFinalSynthesisPrompt(DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext, String stepResults) {
+    private String buildFinalSynthesisPrompt(DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext, ExecuteCommandEntity request, String stepResults) {
         return """
                 你是 Flow Agent 的最终答案整理器。请只基于下面的步骤结果，整理出直接面向用户的最终回答。
 
@@ -1053,7 +1064,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                 5. 如果步骤里有对用户有价值的图片路径或链接，可以自然保留；否则不要为了展示工具过程而保留。
                 6. 用清晰的 Markdown 输出，内容要完整、自然、可直接交付。
                 """.formatted(
-                dynamicContext.getCurrentTask() == null ? "" : dynamicContext.getCurrentTask(),
+                effectiveTaskForStep(request, dynamicContext, 4),
                 stepResults);
     }
 

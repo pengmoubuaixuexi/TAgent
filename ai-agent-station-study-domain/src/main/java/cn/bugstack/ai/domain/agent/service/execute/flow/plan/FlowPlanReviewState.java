@@ -26,6 +26,14 @@ public class FlowPlanReviewState implements Serializable {
 
     private String originalMessage;
 
+    private String sourceRunId;
+
+    private Integer redoFromStep;
+
+    private String redoContextPrompt;
+
+    private String redoTargetStepContextPrompt;
+
     private String planningResult;
 
     private String mcpToolsAnalysis;

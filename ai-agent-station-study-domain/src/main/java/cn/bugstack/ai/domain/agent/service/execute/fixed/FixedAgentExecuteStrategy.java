@@ -87,6 +87,9 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private IConversationTurnMemoryService conversationTurnMemoryService;
 
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService runSnapshotService;
+
     /**
      * 2026-05-08：流式适配。advisor.after() 在 stream 模式下拿不到 ChatResponse output，
      * Fixed 在节点级聚合完整文本后直接调 LongTermMemoryAdvisor.triggerExtractionAsync 触发抽取。
@@ -143,6 +146,9 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         String runId = (requestParameter.getRunId() != null && !requestParameter.getRunId().isBlank())
                 ? requestParameter.getRunId()
                 : (requestParameter.getSessionId() + "-run-" + java.util.UUID.randomUUID());
+        requestParameter.setRunId(runId);
+        MDC.put("runId", runId);
+        MDC.put("agent.run_id", runId);
 
         // 注册取消标志以支持 cancelExecute()
         AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -177,7 +183,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             // 2026-05-07 #1 Prompt Cache：current_date 从 system 占位符移到 user message 末尾，
             // 避免每天 system prompt byte 漂移导致 OpenAI 自动 cache 全失效。
             // system prompt 里 {current_date} 占位符若仍被 Spring AI 替换为空也无妨——它脱敏为空字符串
-            String userMessage = requestParameter.getMessage()
+            String userMessage = effectiveTaskForFixed(requestParameter)
                     + (content.isEmpty() ? "" : "，" + content)
                     + "\n\n（当前日期：" + LocalDate.now() + "）";
 
@@ -185,7 +191,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             String clientId = config.getClientId();
             List<ToolCallback> dynamicToolCallbacks = mcpToolCatalogService != null
                     ? mcpToolCatalogService.resolveDynamicToolCallbacks(runId, requestParameter.getSessionId(), clientId,
-                            mcpToolCatalogService.needsFor(requestParameter.getSessionId()), requestParameter.getMessage(),
+                            mcpToolCatalogService.needsFor(requestParameter.getSessionId()), effectiveInitialTask(requestParameter),
                             agentToolRegistry != null ? agentToolRegistry.getTools(clientId) : List.of())
                     : List.of();
             if (agentToolRegistry != null && clientId != null) {
@@ -322,6 +328,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
                     preC = u.getCompletionTokens() != null ? u.getCompletionTokens() : 0L;
                 }
                 content = fixedFinalizeNow(chatClient, config.getClientId(), requestParameter, stepResult, sessionId, preP, preC, emitter);
+                recordFixedRunStep(runId, stepId, displayName, aiAgentClientList.size() == 1 ? 1 : idx, content);
                 break;
             }
 
@@ -330,6 +337,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             if (__steer != null && !__steer.isBlank()) {
                 content = fixedSteerRerun(chatClient, config.getClientId(), requestParameter, stepResult, sessionId, __steer, emitter);
             }
+            recordFixedRunStep(runId, stepId, displayName, aiAgentClientList.size() == 1 ? 1 : idx, content);
         }
 
         log.info("智能体对话请求，结果 {} {}", requestParameter.getAiAgentId(), content);
@@ -616,9 +624,29 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
 
     private String buildLtmRetrievalQuery(ExecuteCommandEntity req, String stage) {
         if (req == null) return "";
-        String message = req.getMessage();
-        if (message == null) message = "";
-        return message;
+        return effectiveInitialTask(req);
+    }
+
+    private String effectiveInitialTask(ExecuteCommandEntity req) {
+        if (req == null) return "";
+        String message = req.getMessage() == null ? "" : req.getMessage().trim();
+        String redoContext = req.getRedoContextPrompt();
+        if (redoContext == null || redoContext.isBlank()) {
+            return message;
+        }
+        return redoContext.trim() + "\n\n【用户本次修订指令】\n" + message;
+    }
+
+    private String effectiveTaskForFixed(ExecuteCommandEntity req) {
+        String base = effectiveInitialTask(req);
+        if (req == null || req.getRedoFromStep() == null || req.getRedoFromStep() != 1) {
+            return base;
+        }
+        String targetContext = req.getRedoTargetStepContextPrompt();
+        if (targetContext == null || targetContext.isBlank()) {
+            return base;
+        }
+        return base + "\n\n" + targetContext.trim();
     }
 
     private String buildConversationId(ExecuteCommandEntity req) {
@@ -685,14 +713,14 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         String partialReasoning = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.getLatestReasoning(sessionId);
         // 工具：常驻 + 补充（用于 prompt 工具清单 + 回调挂载）
         java.util.List<ToolCallback> dyn = (answerNowFinalizeTools && mcpToolCatalogService != null && clientId != null)
-                ? mcpToolCatalogService.resolveDynamicToolCallbacks(req.getRunId(), sessionId, clientId, mcpToolCatalogService.needsFor(sessionId), req.getMessage(),
+                ? mcpToolCatalogService.resolveDynamicToolCallbacks(req.getRunId(), sessionId, clientId, mcpToolCatalogService.needsFor(sessionId), effectiveInitialTask(req),
                         agentToolRegistry != null ? agentToolRegistry.getTools(clientId) : java.util.List.of())
                 : java.util.List.of();
         boolean attachTools = !dyn.isEmpty();
 
         StringBuilder sb = new StringBuilder();
         sb.append("用户在你回答过程中点击了【立即回答】，要求立刻给出最终答案。\n\n");
-        sb.append("**用户原始问题:**\n").append(req.getMessage()).append("\n\n");
+        sb.append("**用户原始问题:**\n").append(effectiveTaskForFixed(req)).append("\n\n");
         if (partialAnswer != null && !partialAnswer.isBlank()) {
             sb.append("**你已经写出的部分回答（可能为半截）:**\n").append(partialAnswer).append("\n\n");
         }
@@ -801,7 +829,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
     private String fixedSteerRerun(ChatClient client, String clientId, ExecuteCommandEntity req, String partialAnswer, String sessionId, String idea, ResponseBodyEmitter emitter) {
         String partialReasoning = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.getLatestReasoning(sessionId);
         java.util.List<ToolCallback> dyn = (mcpToolCatalogService != null && clientId != null)
-                ? mcpToolCatalogService.resolveDynamicToolCallbacks(req.getRunId(), sessionId, clientId, mcpToolCatalogService.needsFor(sessionId), req.getMessage(),
+                ? mcpToolCatalogService.resolveDynamicToolCallbacks(req.getRunId(), sessionId, clientId, mcpToolCatalogService.needsFor(sessionId), effectiveInitialTask(req),
                         agentToolRegistry != null ? agentToolRegistry.getTools(clientId) : java.util.List.of())
                 : java.util.List.of();
         boolean attachTools = !dyn.isEmpty();
@@ -809,7 +837,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         StringBuilder sb = new StringBuilder();
         sb.append("【用户在你回答途中补充了新想法，请重做回答并把它纳入考虑，不要丢弃已有进展】\n");
         sb.append("用户补充：").append(idea).append("\n\n");
-        sb.append("**用户原始问题:**\n").append(req.getMessage()).append("\n\n");
+        sb.append("**用户原始问题:**\n").append(effectiveTaskForFixed(req)).append("\n\n");
         if (partialAnswer != null && !partialAnswer.isBlank()) {
             sb.append("**你刚才已写出的部分回答（可能半截）:**\n").append(partialAnswer).append("\n\n");
         }
@@ -900,6 +928,18 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         } catch (Exception e) {
             log.error("发送最终结果失败：{}", e.getMessage(), e);
         }
+    }
+
+    private void recordFixedRunStep(String runId, String stepId, String displayName, Integer stepNo, String content) {
+        if (runSnapshotService == null || runId == null || runId.isBlank() || content == null || content.isBlank()) {
+            return;
+        }
+        String clean = OutputFilter.cleanForUser(content);
+        if (clean == null || clean.isBlank()) {
+            return;
+        }
+        runSnapshotService.recordStep(runId, stepId, displayName, "fixed", stepNo, clean,
+                cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_COMPLETED);
     }
     
     /**

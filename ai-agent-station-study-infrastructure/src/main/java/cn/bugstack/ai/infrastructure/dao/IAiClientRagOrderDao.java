@@ -82,12 +82,14 @@ public interface IAiClientRagOrderDao {
     List<AiClientRagOrder> queryAll();
 
     /**
-     * 按 SHA-256 + knowledge_tag 查重计数。
+     * 按 SHA-256 + knowledge_tag + user_id 查重计数。
      * @param fileHash 文件 SHA-256
      * @param knowledgeTag 知识库标签
+     * @param userId 用户ID；为空时仅匹配历史匿名记录
      * @return 命中条数（>0 即存在）
      */
-    int countByFileHashAndTag(@org.apache.ibatis.annotations.Param("fileHash") String fileHash,
-                               @org.apache.ibatis.annotations.Param("knowledgeTag") String knowledgeTag);
+    int countByFileHashTagAndUser(@org.apache.ibatis.annotations.Param("fileHash") String fileHash,
+                                  @org.apache.ibatis.annotations.Param("knowledgeTag") String knowledgeTag,
+                                  @org.apache.ibatis.annotations.Param("userId") String userId);
 
 }

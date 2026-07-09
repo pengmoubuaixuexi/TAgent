@@ -61,7 +61,7 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
                 .get(AiClientTypeEnumVO.EXECUTOR_CLIENT.getCode());
         String executorClientId = executorConfig != null ? executorConfig.getClientId() : aiAgentClientFlowConfigVO.getClientId();
         List<ToolCallback> dynamicToolCallbacks = mcpToolCatalogService.resolveDynamicToolCallbacks(requestParameter.getRunId(), requestParameter.getSessionId(), executorClientId,
-                mcpToolCatalogService.needsFor(requestParameter.getSessionId()), requestParameter.getMessage(),
+                mcpToolCatalogService.needsFor(requestParameter.getSessionId()), effectiveInitialTask(requestParameter),
                 agentToolRegistry != null ? agentToolRegistry.getTools(executorClientId) : List.of());
         cn.bugstack.ai.domain.agent.service.execute.common.ExecutorToolCatalog v1Catalog =
                 storeExecutorToolCatalogSnapshot(dynamicContext, FLOW_TOOL_CATALOG_V1_KEY, executorClientId, dynamicToolCallbacks, 1);
@@ -114,7 +114,7 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
 
                         请先完成必要的 request_tool 装载，再基于真实工具列表进行分析，禁止编造工具。""",
                 toolListBlockForPrompt,
-                dynamicContext.getCurrentTask()
+                effectiveTaskForStep(requestParameter, dynamicContext, 1)
         ) + metaToolPromptHint(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_STEP1_TOOL_ANALYSIS,
                 requestParameter.getSessionId()) + flowStep1RequestToolDirective());
 

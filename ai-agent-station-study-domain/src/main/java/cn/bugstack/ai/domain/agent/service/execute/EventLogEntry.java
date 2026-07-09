@@ -13,6 +13,7 @@ import lombok.Data;
 public class EventLogEntry {
 
     private String sessionId;
+    private String runId;
     /** 用户ID：从 ExecuteCommandEntity 或 MDC 提取 */
     private String userId;
     /** 租户ID：缺省 "default" */

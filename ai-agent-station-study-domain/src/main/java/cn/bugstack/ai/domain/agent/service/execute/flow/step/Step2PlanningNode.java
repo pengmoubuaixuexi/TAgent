@@ -62,7 +62,7 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         final String mcpToolsAnalysisForPrompt = mcpToolsAnalysis;
         final String toolRuntimeForPrompt = renderToolRuntimeForPrompt(v2Catalog, executorClientId);
         java.util.function.Supplier<String> planningPromptSupplier = () -> {
-            String planningPrompt = buildStructuredPlanningPrompt(dynamicContext.getCurrentTask(), mcpToolsAnalysisForPrompt, toolRuntimeForPrompt);
+            String planningPrompt = buildStructuredPlanningPrompt(effectiveTaskForStep(requestParameter, dynamicContext, 2), mcpToolsAnalysisForPrompt, toolRuntimeForPrompt);
             String refined = planningPrompt + "\n\n## ⚠️ 工具映射验证反馈\n" +
                     "\n\n**请根据上述验证反馈重新生成规划，确保：**\n" +
                     "1. 只使用验证报告中列出的有效工具\n" +

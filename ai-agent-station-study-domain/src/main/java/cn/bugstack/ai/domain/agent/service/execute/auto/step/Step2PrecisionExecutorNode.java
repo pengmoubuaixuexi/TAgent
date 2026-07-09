@@ -57,13 +57,13 @@ public class Step2PrecisionExecutorNode extends AbstractExecuteSupport{
                     + " for agentId=" + requestParameter.getAiAgentId());
         }
 
-        String executionPrompt = String.format(aiAgentClientFlowConfigVO.getStepPrompt(), effectiveUserQuestion(requestParameter, dynamicContext), analysisResult);
+        String executionPrompt = String.format(aiAgentClientFlowConfigVO.getStepPrompt(), effectiveUserQuestionForStep(requestParameter, dynamicContext, 2), analysisResult);
 
         // 注入当前 agent 真实工具清单，防止 LLM 幻觉不存在的工具
         String executorClientId = aiAgentClientFlowConfigVO.getClientId();
         List<ToolCallback> dynamicToolCallbacks = mcpToolCatalogService != null
                 ? mcpToolCatalogService.resolveDynamicToolCallbacks(requestParameter.getRunId(), requestParameter.getSessionId(), executorClientId,
-                        mcpToolCatalogService.needsFor(requestParameter.getSessionId()), requestParameter.getMessage(),
+                        mcpToolCatalogService.needsFor(requestParameter.getSessionId()), effectiveInitialTask(requestParameter),
                         agentToolRegistry != null ? agentToolRegistry.getTools(executorClientId) : List.of())
                 : List.of();
         if (agentToolRegistry != null && executorClientId != null) {

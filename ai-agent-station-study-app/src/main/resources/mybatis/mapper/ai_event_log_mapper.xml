@@ -5,6 +5,7 @@
     <resultMap id="AiEventLogMap" type="cn.bugstack.ai.infrastructure.dao.po.AiEventLog">
         <id     column="id"                property="id"/>
         <result column="session_id"        property="sessionId"/>
+        <result column="run_id"            property="runId"/>
         <result column="user_id"           property="userId"/>
         <result column="tenant_id"         property="tenantId"/>
         <result column="agent_id"          property="agentId"/>
@@ -22,9 +23,9 @@
 
     <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiEventLog" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO ai_event_log
-            (session_id, user_id, tenant_id, agent_id, billing_scope, step_name, step_index, input_prompt, output_text, model, prompt_tokens, completion_tokens, latency_ms, created_at)
+            (session_id, run_id, user_id, tenant_id, agent_id, billing_scope, step_name, step_index, input_prompt, output_text, model, prompt_tokens, completion_tokens, latency_ms, created_at)
         VALUES
-            (#{sessionId}, #{userId}, #{tenantId}, #{agentId}, #{billingScope}, #{stepName}, #{stepIndex}, #{inputPrompt}, #{outputText}, #{model}, #{promptTokens}, #{completionTokens}, #{latencyMs}, NOW())
+            (#{sessionId}, #{runId}, #{userId}, #{tenantId}, #{agentId}, #{billingScope}, #{stepName}, #{stepIndex}, #{inputPrompt}, #{outputText}, #{model}, #{promptTokens}, #{completionTokens}, #{latencyMs}, NOW())
     </insert>
 
 </mapper>

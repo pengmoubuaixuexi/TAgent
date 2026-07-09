@@ -30,6 +30,28 @@ public class ExecuteCommandEntity {
      */
     private String runId;
 
+    /**
+     * Source run id for step redo.
+     */
+    private String sourceRunId;
+
+    /**
+     * 1-based snapshot step ordinal to redo from.
+     */
+    private Integer redoFromStep;
+
+    /**
+     * Extra context for the model when replaying a historical step. This is not
+     * used as the user-visible message.
+     */
+    private String redoContextPrompt;
+
+    /**
+     * Extra context visible only to the target step selected by /runId-stepN.
+     * Downstream steps should not consume the old target step as current facts.
+     */
+    private String redoTargetStepContextPrompt;
+
     /** P1.2.3 多租户隔离：用户 ID（X-User-Id header），为空时回退 sessionId */
     private String userId;
 

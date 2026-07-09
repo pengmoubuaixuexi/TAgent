@@ -63,6 +63,9 @@ public class AiAgentController implements IAiAgentService {
     @Resource
     private IFlowPlanReviewResumeService flowPlanReviewResumeService;
 
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService runSnapshotService;
+
     /** 执行干预（立即回答/引导）总开关；false 时端点拒绝、ack 不带 intervention=true，前端据此不渲染按钮。 */
     @org.springframework.beans.factory.annotation.Value("${agent.intervention.enabled:true}")
     private boolean interventionEnabled;
@@ -91,6 +94,13 @@ public class AiAgentController implements IAiAgentService {
             // 1. 创建流式输出对象
             ResponseBodyEmitter emitter = new ResponseBodyEmitter(Long.MAX_VALUE);
             String sessionId = request != null ? request.getSessionId() : null;
+            String runId = request != null ? coalesce(request.getRunId(), java.util.UUID.randomUUID().toString())
+                    : java.util.UUID.randomUUID().toString();
+            if (request != null) {
+                request.setRunId(runId);
+            }
+            MDC.put("runId", runId);
+            MDC.put("agent.run_id", runId);
             if (sessionId != null && !sessionId.isBlank()) {
                 approvalChannelRegistry.register(sessionId, emitter);
                 emitter.onCompletion(() -> approvalChannelRegistry.unregister(sessionId, emitter));
@@ -104,10 +114,12 @@ public class AiAgentController implements IAiAgentService {
             // 让浏览器 Network 面板第一个 chunk 在 < 50ms 出现。后续 IntentRouter / advisor
             // 任何阻塞都不会影响"已连接"的视觉反馈，前端立刻把"思考中..."替换为已连接动画
             try {
-                String ackSid = sessionId != null ? sessionId : "";
-                emitter.send("event: ack\ndata: {\"sessionId\":\"" + ackSid + "\",\"intervention\":"
-                        + interventionEnabled + ",\"timestamp\":"
-                        + System.currentTimeMillis() + "}\n\n");
+                Map<String, Object> ack = new LinkedHashMap<>();
+                ack.put("sessionId", sessionId != null ? sessionId : "");
+                ack.put("runId", runId);
+                ack.put("intervention", interventionEnabled);
+                ack.put("timestamp", System.currentTimeMillis());
+                sendSseObject(emitter, "ack", ack);
             } catch (Exception ackEx) {
                 log.debug("ack 发送失败（不影响主流程）: {}", ackEx.getMessage());
             }
@@ -134,11 +146,79 @@ public class AiAgentController implements IAiAgentService {
             }
             MDC.put("tenantId", tenantId);
 
+            String effectiveAgentId = request.getAiAgentId();
+            String redoContextPrompt = null;
+            String redoTargetStepContextPrompt = null;
+            if (request.getSourceRunId() != null && !request.getSourceRunId().isBlank()) {
+                if (runSnapshotService == null) {
+                    sendSseObject(emitter, "message",
+                            cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity.createErrorResult(
+                                    "Run snapshot service is not available", sessionId));
+                    emitter.complete();
+                    return emitter;
+                }
+                java.util.Optional<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot> sourceSnapshotOpt =
+                        runSnapshotService.find(request.getSourceRunId());
+                if (sourceSnapshotOpt.isEmpty()
+                        || (sessionId != null && !sessionId.isBlank()
+                        && !sessionId.equals(sourceSnapshotOpt.get().getSessionId()))) {
+                    sendSseObject(emitter, "message",
+                            cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity.createErrorResult(
+                                    "历史运行快照不存在或已过期，请重新发起任务。", sessionId));
+                    emitter.complete();
+                    return emitter;
+                }
+                cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot sourceSnapshot = sourceSnapshotOpt.get();
+                if (cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_RUNNING.equals(sourceSnapshot.getStatus())) {
+                    sendSseObject(emitter, "message",
+                            cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity.createErrorResult(
+                                    "历史运行仍在执行中，完成、取消或失败后才能重做。", sessionId));
+                    emitter.complete();
+                    return emitter;
+                }
+                if (sourceSnapshot.getAgentId() == null || sourceSnapshot.getAgentId().isBlank()) {
+                    sendSseObject(emitter, "message",
+                            cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity.createErrorResult(
+                                    "历史运行缺少 Agent 信息，无法重做，请重新发起任务。", sessionId));
+                    emitter.complete();
+                    return emitter;
+                }
+                effectiveAgentId = sourceSnapshot.getAgentId();
+                java.util.Optional<String> redoContext = runSnapshotService.buildRedoContext(
+                        request.getSourceRunId(), request.getRedoFromStep(), sessionId);
+                if (redoContext.isEmpty()) {
+                    sendSseObject(emitter, "message",
+                            cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity.createErrorResult(
+                                    "历史运行快照不存在或已过期，请重新发起任务。", sessionId));
+                    emitter.complete();
+                    return emitter;
+                }
+                redoContextPrompt = redoContext.get();
+                redoTargetStepContextPrompt = runSnapshotService.buildRedoTargetStepContext(
+                        request.getSourceRunId(), request.getRedoFromStep(), sessionId).orElse(null);
+                List<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunStepSnapshot> inherited =
+                        runSnapshotService.inheritedSteps(request.getSourceRunId(), request.getRedoFromStep(), sessionId);
+                if (!inherited.isEmpty()) {
+                    Map<String, Object> replay = new LinkedHashMap<>();
+                    replay.put("sourceRunId", request.getSourceRunId());
+                    replay.put("redoFromStep", request.getRedoFromStep());
+                    replay.put("runId", runId);
+                    replay.put("sessionId", sessionId);
+                    replay.put("steps", inherited);
+                    sendSseObject(emitter, "run_replay_context", replay);
+                }
+            }
+
             // 2. 构建执行命令实体
             ExecuteCommandEntity executeCommandEntity = ExecuteCommandEntity.builder()
-                    .aiAgentId(request.getAiAgentId())
+                    .aiAgentId(effectiveAgentId)
                     .message(request.getMessage())
                     .sessionId(request.getSessionId())
+                    .runId(runId)
+                    .sourceRunId(request.getSourceRunId())
+                    .redoFromStep(request.getRedoFromStep())
+                    .redoContextPrompt(redoContextPrompt)
+                    .redoTargetStepContextPrompt(redoTargetStepContextPrompt)
                     .userId(userId)
                     .tenantId(tenantId)
                     .maxStep(request.getMaxStep())
@@ -176,6 +256,11 @@ public class AiAgentController implements IAiAgentService {
 
             ResponseBodyEmitter emitter = new ResponseBodyEmitter(Long.MAX_VALUE);
             String sessionId = request != null ? request.getSessionId() : null;
+            String runId = request != null ? request.getRunId() : null;
+            if (runId != null && !runId.isBlank()) {
+                MDC.put("runId", runId);
+                MDC.put("agent.run_id", runId);
+            }
             if (sessionId != null && !sessionId.isBlank()) {
                 approvalChannelRegistry.register(sessionId, emitter);
                 emitter.onCompletion(() -> approvalChannelRegistry.unregister(sessionId, emitter));
@@ -515,6 +600,50 @@ public class AiAgentController implements IAiAgentService {
     }
 
     /** 查用户的会话历史列表 */
+    @RequestMapping(value = "run-snapshots", method = RequestMethod.GET)
+    public Response<List<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot>> listRunSnapshots(
+            @RequestParam("sessionId") String sessionId,
+            @RequestParam(value = "limit", required = false) Integer limit) {
+        if (runSnapshotService == null) {
+            return Response.<List<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot>>builder()
+                    .code(ResponseCode.SUCCESS.getCode())
+                    .info(ResponseCode.SUCCESS.getInfo())
+                    .data(List.of())
+                    .build();
+        }
+        return Response.<List<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot>>builder()
+                .code(ResponseCode.SUCCESS.getCode())
+                .info(ResponseCode.SUCCESS.getInfo())
+                .data(runSnapshotService.listRecent(sessionId, limit != null ? limit : 10))
+                .build();
+    }
+
+    @RequestMapping(value = "run-snapshots/{runId}", method = RequestMethod.GET)
+    public Response<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot> getRunSnapshot(
+            @PathVariable("runId") String runId,
+            @RequestParam(value = "sessionId", required = false) String sessionId) {
+        if (runSnapshotService == null) {
+            return Response.<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot>builder()
+                    .code(ResponseCode.UN_ERROR.getCode())
+                    .info("Run snapshot service is not available")
+                    .data(null)
+                    .build();
+        }
+        java.util.Optional<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot> snapshot = runSnapshotService.find(runId);
+        if (snapshot.isEmpty() || (sessionId != null && !sessionId.isBlank() && !sessionId.equals(snapshot.get().getSessionId()))) {
+            return Response.<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot>builder()
+                    .code(ResponseCode.UN_ERROR.getCode())
+                    .info("run snapshot not found")
+                    .data(null)
+                    .build();
+        }
+        return Response.<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot>builder()
+                .code(ResponseCode.SUCCESS.getCode())
+                .info(ResponseCode.SUCCESS.getInfo())
+                .data(snapshot.get())
+                .build();
+    }
+
     @RequestMapping(value = "conversations", method = RequestMethod.GET)
     public Response<List<Map<String, Object>>> getUserConversations(@RequestParam("userId") String userId) {
         try {
@@ -625,6 +754,7 @@ public class AiAgentController implements IAiAgentService {
                 m.put("id", r.getId());
                 m.put("messageType", r.getMessageType());
                 m.put("agentId", r.getAgentId());
+                m.put("runId", r.getRunId());
                 // 展示点脱敏：DB 里存的是 USER + ASSISTANT 原文
                 m.put("content", PiiMasker.mask(r.getContent()));
                 m.put("createdAt", r.getCreatedAt() != null ? r.getCreatedAt().toString() : null);

@@ -38,6 +38,21 @@ public class AutoAgentRequestDTO implements Serializable {
      */
     private String sessionId;
 
+    /**
+     * Optional client supplied run id. When blank the server generates one.
+     */
+    private String runId;
+
+    /**
+     * Source run id for step redo.
+     */
+    private String sourceRunId;
+
+    /**
+     * 1-based snapshot step ordinal to redo from.
+     */
+    private Integer redoFromStep;
+
     /** P1.2.3 多租户隔离：用户 ID（可选，缺失时从 X-User-Id header 读） */
     private String userId;
 

@@ -35,7 +35,7 @@ public class RootNode extends AbstractExecuteSupport {
         // 上下文信息
         dynamicContext.setExecutionHistory(new StringBuilder());
         // 当前任务信息
-        dynamicContext.setCurrentTask(requestParameter.getMessage());
+        dynamicContext.setCurrentTask(effectiveInitialTask(requestParameter));
 
         return router(requestParameter, dynamicContext);
     }

@@ -326,7 +326,10 @@
       </button>
       <span id="interveneHint" class="text-xs text-gray-400">运行中 · 在下方输入框补充引导后回车 / 点「引导」，或点「立即回答」收尾</span>
     </div>
-    <div class="max-w-4xl mx-auto flex gap-3">
+    <div class="max-w-4xl mx-auto relative">
+      <div id="runCommandPalette" class="hidden absolute left-0 right-0 bottom-full mb-2 bg-[#111827] border border-gray-700 rounded-lg shadow-2xl overflow-hidden z-30"></div>
+      <div id="runRedoHint" class="hidden mb-2 text-xs text-cyan-200 bg-cyan-950/40 border border-cyan-800/70 rounded-md px-3 py-2"></div>
+      <div class="flex gap-3">
       <button onclick="newSession()" title="新会话"
         class="bg-gray-800 hover:bg-gray-700 text-gray-400 px-3 py-3 rounded-lg transition text-sm shrink-0">
         + 新会话
@@ -334,11 +337,12 @@
       <textarea id="msgInput" rows="1" placeholder="输入消息..."
         class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition resize-none"
         onkeydown="onComposerKey(event)"
-        oninput="this.style.height='';this.style.height=Math.min(this.scrollHeight,200)+'px'"></textarea>
+        oninput="onComposerInput(this)"></textarea>
       <button onclick="onSendBtn()" id="sendBtn"
         class="bg-blue-600 hover:bg-blue-700 active:bg-blue-800 disabled:opacity-50 disabled:cursor-not-allowed text-white px-6 py-3 rounded-lg transition font-medium">
         发送
       </button>
+      </div>
     </div>
     <div class="max-w-4xl mx-auto mt-2 flex justify-between text-xs text-gray-600">
       <span id="sessionInfo">Session: --</span>
@@ -364,10 +368,11 @@ let state = {
   sending: false,
   agents: [],
   pendingApproval: null,
-  approvalQueue: [],   // DAG 并行下多个步骤同时要审批：排队逐个弹，避免后者覆盖前者
+  approvalQueue: [],
   approvalTimer: null,
-  interventionEnabled: false,  // 立即回答总开关，由 ack 事件 intervention 字段决定
-  flowStep4Active: false       // Flow Step4 后端不消费引导，前端进入 Step4 后置灰引导按钮
+  interventionEnabled: false,
+  flowStep4Active: false,
+  selectedRunRedo: null
 };
 
 // ==================== INIT ====================
@@ -614,7 +619,7 @@ async function restorePendingFlowPlanAfterRefresh(payload = null) {
   if (snapshot.userMessage) {
     addMessage('user', snapshot.userMessage);
   }
-  const aiMsg = addMessage('assistant', '', false, snapshot.agentId || payload.agentId);
+  const aiMsg = addMessage('assistant', '', false, snapshot.agentId || payload.agentId, payload.runId);
   const authorEl = aiMsg.querySelector('.msg-author');
   if (authorEl && snapshot.assistantAuthor) authorEl.textContent = snapshot.assistantAuthor;
   const msgContent = aiMsg.querySelector('.msg-content');
@@ -1267,6 +1272,7 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
         if (status) status.textContent = payload.summary || ((card.displayName || payload.stepId) + ' 已完成');
       }
     } else if (curEvent === 'ack') {
+      if (payload && payload.runId) setMessageRunId(aiMsg, payload.runId);
       if (payload && payload.intervention) {
         state.interventionEnabled = true;
         showAnswerNow(true);
@@ -1308,6 +1314,7 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
       if (payload.type === 'summary') {
         fullContent = payload.content || '';
         if (finalAnswerEl) finalAnswerEl.innerHTML = renderMarkdown(fullContent);
+        setFinalAnswerCopy(aiMsg, fullContent);
       } else if (payload.type === 'error') {
         if (finalAnswerEl) finalAnswerEl.innerHTML = `<span class="text-red-400">❌ ${escapeHtml(payload.content || '')}</span>`;
       }
@@ -1339,11 +1346,264 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
 }
 
 // ==================== SEND MESSAGE ====================
+let runPaletteSeq = 0;
+
+function onComposerInput(el) {
+  if (!el) return;
+  el.style.height = '';
+  el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+  const parsed = parseRunRedoCommand(el.value || '');
+  if (!parsed) {
+    state.selectedRunRedo = null;
+  }
+  renderRunRedoHint(parsed || state.selectedRunRedo);
+  refreshRunCommandPalette(el.value || '');
+}
+
+function parseRunRedoCommand(text) {
+  const raw = String(text || '');
+  const match = raw.match(/^\/(.+)-step(\d+)\s+([\s\S]*)$/);
+  if (!match) return null;
+  const sourceRunId = match[1].trim();
+  const redoFromStep = Number(match[2]);
+  const message = match[3].trim();
+  if (!sourceRunId || !redoFromStep) return null;
+  const selected = state.selectedRunRedo;
+  return {
+    sourceRunId,
+    redoFromStep,
+    message,
+    stepTitle: selected && selected.sourceRunId === sourceRunId && selected.redoFromStep === redoFromStep ? selected.stepTitle : '',
+    stepLabel: selected && selected.sourceRunId === sourceRunId && selected.redoFromStep === redoFromStep ? selected.stepLabel : `Step${redoFromStep}`,
+    originalMessage: selected && selected.sourceRunId === sourceRunId ? selected.originalMessage : ''
+  };
+}
+
+function renderRunRedoHint(info) {
+  const el = document.getElementById('runRedoHint');
+  if (!el) return;
+  if (!info || !info.sourceRunId || !info.redoFromStep) {
+    el.classList.add('hidden');
+    el.innerHTML = '';
+    return;
+  }
+  el.classList.remove('hidden');
+  const label = info.stepLabel || `Step${info.redoFromStep}`;
+  const title = info.stepTitle ? ` · ${escapeHtml(info.stepTitle)}` : '';
+  el.innerHTML = `
+    <span>基于 <code class="bg-gray-950 border border-cyan-900 rounded px-1">${escapeHtml(shortRunId(info.sourceRunId))}</code> 的 ${escapeHtml(label)}${title} 重做</span>
+    <button type="button" class="ml-2 text-cyan-300 hover:text-white" onclick="clearRunRedoSelection()">清除</button>
+  `;
+}
+
+function clearRunRedoSelection() {
+  state.selectedRunRedo = null;
+  const input = document.getElementById('msgInput');
+  if (input) {
+    input.value = input.value.replace(/^\/(.+)-step(\d+)\s*/, '');
+    onComposerInput(input);
+    input.focus();
+  }
+  hideRunCommandPalette();
+}
+
+function shouldShowRunPalette(value) {
+  const v = String(value || '').trim();
+  if (/^\/.+-step\d+$/.test(v)) return false;
+  return v === '/run' || v.startsWith('/run ') || /^\/[A-Za-z0-9][A-Za-z0-9_\-]{2,}$/.test(v);
+}
+
+function parseRunLookupCommand(value) {
+  const v = String(value || '').trim();
+  if (!shouldShowRunPalette(v)) return null;
+  if (v === '/run' || v.startsWith('/run ')) {
+    return { mode: 'runs', query: v.replace(/^\/run\s*/, '').trim() };
+  }
+  if (v.startsWith('/')) {
+    return { mode: 'steps', runId: v.slice(1).trim() };
+  }
+  return null;
+}
+
+async function refreshRunCommandPalette(value) {
+  const palette = document.getElementById('runCommandPalette');
+  if (!palette) return;
+  const text = String(value || '');
+  const command = parseRunLookupCommand(text);
+  if (!command) {
+    hideRunCommandPalette();
+    return;
+  }
+  if (!state.sessionId) {
+    hideRunCommandPalette();
+    return;
+  }
+  const seq = ++runPaletteSeq;
+  palette.classList.remove('hidden');
+  palette.innerHTML = '<div class="px-4 py-3 text-sm text-gray-400">加载历史运行...</div>';
+  try {
+    if (command.mode === 'steps') {
+      const res = await fetch(`${API}/run-snapshots/${encodeURIComponent(command.runId)}?sessionId=${encodeURIComponent(state.sessionId)}`);
+      const json = await res.json();
+      if (seq !== runPaletteSeq) return;
+      if (!json || json.code !== '0000' || !json.data) {
+        palette.innerHTML = '<div class="px-4 py-3 text-sm text-amber-300">运行快照不存在或已过期</div>';
+        return;
+      }
+      renderRunStepPalette(json.data);
+    } else {
+      const res = await fetch(`${API}/run-snapshots?sessionId=${encodeURIComponent(state.sessionId)}&limit=8`);
+      const json = await res.json();
+      if (seq !== runPaletteSeq) return;
+      const snapshots = json && json.code === '0000' && Array.isArray(json.data) ? json.data : [];
+      renderRunCommandPalette(snapshots, command.query || '');
+    }
+  } catch (e) {
+    if (seq !== runPaletteSeq) return;
+    palette.innerHTML = '<div class="px-4 py-3 text-sm text-red-300">运行快照加载失败</div>';
+  }
+}
+
+function hideRunCommandPalette() {
+  const palette = document.getElementById('runCommandPalette');
+  if (palette) {
+    palette.classList.add('hidden');
+    palette.innerHTML = '';
+  }
+}
+
+function renderRunCommandPalette(snapshots, query) {
+  const palette = document.getElementById('runCommandPalette');
+  if (!palette) return;
+  const q = String(query || '').toLowerCase();
+  const rows = [];
+  (snapshots || []).forEach(snapshot => {
+    const runId = snapshot.runId || '';
+    if (q && !runId.toLowerCase().includes(q) && !(snapshot.originalMessage || '').toLowerCase().includes(q)) return;
+    rows.push(`
+      <button type="button" class="w-full text-left px-4 py-3 hover:bg-gray-800 border-b border-gray-800"
+        onclick="selectRunSnapshot('${escapeJsAttr(runId)}')">
+        <div class="text-xs text-gray-400 flex items-center gap-2">
+        <span class="font-mono text-cyan-200">${escapeHtml(shortRunId(runId))}</span>
+        <span>${escapeHtml(snapshot.agentName || snapshot.agentType || 'Agent')}</span>
+        <span class="ml-auto">${escapeHtml(runStatusText(snapshot.status))}</span>
+        </div>
+        <div class="mt-1 text-xs text-gray-500 truncate">${escapeHtml(snapshot.originalMessage || '')}</div>
+        <div class="mt-1 text-[11px] text-gray-600">点击查看可重做步骤</div>
+      </button>
+    `);
+  });
+  palette.innerHTML = rows.length
+    ? `<div class="max-h-80 overflow-y-auto">${rows.join('')}</div>`
+    : '<div class="px-4 py-3 text-sm text-gray-400">没有可用的运行快照</div>';
+}
+
+function renderRunStepPalette(snapshot) {
+  const palette = document.getElementById('runCommandPalette');
+  if (!palette) return;
+  const runId = snapshot && snapshot.runId ? snapshot.runId : '';
+  const steps = snapshot && Array.isArray(snapshot.steps) ? snapshot.steps : [];
+  const rows = [];
+  rows.push(`
+    <div class="px-4 py-3 border-b border-gray-800 bg-gray-900/70">
+      <div class="text-xs text-gray-400 flex items-center gap-2">
+        <span class="font-mono text-cyan-200">${escapeHtml(shortRunId(runId))}</span>
+        <span>${escapeHtml(snapshot.agentName || snapshot.agentType || 'Agent')}</span>
+        <button type="button" class="ml-auto text-[11px] text-cyan-300 hover:text-white" onclick="copyRunIdFromPalette('${escapeJsAttr(runId)}')">复制 runId</button>
+      </div>
+      <div class="mt-1 text-xs text-gray-500 truncate">${escapeHtml(snapshot.originalMessage || '')}</div>
+    </div>
+  `);
+  steps.forEach(step => {
+    const ordinal = step.ordinal || step.stepNo || 1;
+    const label = runStepLabel(step);
+    rows.push(`
+      <button type="button" class="w-full text-left px-4 py-2 hover:bg-gray-800 border-b border-gray-800 flex gap-3 items-start"
+        onclick="selectRunStep('${escapeJsAttr(runId)}', ${Number(ordinal)}, '${escapeJsAttr(label)}', '${escapeJsAttr(step.title || '')}', '${escapeJsAttr(snapshot.originalMessage || '')}')">
+        <span class="text-xs text-cyan-300 font-mono shrink-0 pt-0.5">${escapeHtml(label)}</span>
+        <span class="min-w-0">
+          <span class="block text-sm text-gray-100 truncate">${escapeHtml(step.title || '运行步骤')}</span>
+          <span class="block text-xs text-gray-500 truncate">${escapeHtml(step.preview || '')}</span>
+        </span>
+      </button>
+    `);
+  });
+  palette.innerHTML = steps.length
+    ? `<div class="max-h-80 overflow-y-auto">${rows.join('')}</div>`
+    : '<div class="px-4 py-3 text-sm text-gray-400">这个运行还没有可重做步骤</div>';
+}
+
+function selectRunSnapshot(runId) {
+  const input = document.getElementById('msgInput');
+  if (!input) return;
+  input.value = `/${runId}`;
+  input.focus();
+  onComposerInput(input);
+}
+
+function selectRunStep(runId, ordinal, stepLabel, stepTitle, originalMessage) {
+  const input = document.getElementById('msgInput');
+  if (!input) return;
+  state.selectedRunRedo = {
+    sourceRunId: runId,
+    redoFromStep: ordinal,
+    stepLabel,
+    stepTitle,
+    originalMessage
+  };
+  input.value = `/${runId}-step${ordinal} `;
+  input.focus();
+  onComposerInput(input);
+  hideRunCommandPalette();
+}
+
+async function copyRunIdFromPalette(runId) {
+  await copyText(runId);
+}
+
+function runStepLabel(step) {
+  if (!step) return 'Step';
+  if (step.displayLabel) return String(step.displayLabel);
+  const id = String(step.stepId || '');
+  const m = id.match(/^flow_step4_execute_step_(\d+)$/);
+  if (m) return `Step4_execute${m[1]}`;
+  const fixed = id.match(/^fixed_strategy(?:_(\d+))?$/);
+  if (fixed) return fixed[1] ? `Fixed_${fixed[1]}` : 'Fixed';
+  if (id === 'summary:final' || id.startsWith('summary:')) return '最终回答';
+  return `Step${step.ordinal || step.stepNo || 1}`;
+}
+
+function shortRunId(runId) {
+  const s = String(runId || '');
+  return s.length > 12 ? s.slice(0, 8) + '...' + s.slice(-4) : s;
+}
+
+function runStatusText(status) {
+  const map = { RUNNING: '运行中', COMPLETED: '已完成', FAILED: '失败', CANCELLED: '已取消' };
+  return map[status] || status || '未知';
+}
+
+function escapeJs(s) {
+  return String(s || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '');
+}
+
+function escapeJsAttr(s) {
+  return escapeJs(s)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 async function sendMessage() {
   if (state.sending) return;
   const input = document.getElementById('msgInput');
-  const message = input.value.trim();
+  const rawMessage = input.value.trim();
+  const redoCommand = parseRunRedoCommand(rawMessage);
+  const message = redoCommand ? redoCommand.message : rawMessage;
   if (!message) return;
+  hideRunCommandPalette();
+  state.selectedRunRedo = redoCommand || null;
   // aiAgentId 为空时走后端统一路由（自动模式）
   if (!state.sessionId) newSession();
   saveActiveConversation(state.sessionId);
@@ -1352,12 +1612,16 @@ async function sendMessage() {
   state.finalizing = false;  // 新一轮：清掉上一轮「已点立即回答」的终态，引导/立即回答恢复可用
   state.flowStep4Active = false;
   input.value = ''; input.style.height = '';
+  renderRunRedoHint(null);
   const ac = new AbortController();
   state.abortController = ac;
   setSendBtn(true);  // 发送中：把「发送」变「取消」（红色、可点）
 
   // 添加用户消息
-  addMessage('user', message);
+  const userDisplayMessage = redoCommand
+    ? `基于历史运行 ${shortRunId(redoCommand.sourceRunId)} 的 ${redoCommand.stepLabel || `Step${redoCommand.redoFromStep}`} 进行修正：${message}`
+    : message;
+  addMessage('user', userDisplayMessage);
   // 添加 AI 占位
   const aiMsg = addMessage('assistant', '', true);
   // 顶部作者标题：手动选了 agent 直接显示「名称(id)」；自动模式先显示「路由中…」，收到 agent_routed 再替换
@@ -1382,7 +1646,9 @@ async function sendMessage() {
         sessionId: state.sessionId,
         userId: state.userId,
         maxStep: state.maxStep,
-        planReviewEnabled: !!state.planReviewEnabled
+        planReviewEnabled: !!state.planReviewEnabled,
+        sourceRunId: redoCommand ? redoCommand.sourceRunId : null,
+        redoFromStep: redoCommand ? redoCommand.redoFromStep : null
       })
     });
 
@@ -1495,6 +1761,30 @@ async function sendMessage() {
     // token 事件：必须 step_start 后才有 entry；防御性：没有就当 fixed 单 step 处理
     function getOrCreateStepCard(stepId, displayName, dependsOn) {
       return stepBuffers[stepId] || activateStepCard(stepId, displayName, dependsOn);
+    }
+
+    function renderInheritedRunSteps(payload) {
+      const steps = payload && Array.isArray(payload.steps) ? payload.steps : [];
+      steps.forEach(step => {
+        const ordinal = step.ordinal || step.stepNo || 1;
+        const label = runStepLabel(step);
+        const stepId = `inherited_${ordinal}_${step.stepId || ''}`;
+        if (stepBuffers[stepId]) return;
+        const card = document.createElement('div');
+        card.className = 'step-card done collapsed fade-in';
+        card.innerHTML = `
+          <div class="step-head">
+            <span class="chev">▾</span>
+            <span class="step-name">${escapeHtml(label)} · ${escapeHtml(step.title || '已沿用步骤')}</span>
+            <span class="step-status">已沿用</span>
+          </div>
+          <div class="step-body">${renderMarkdown(step.content || step.preview || '')}</div>
+        `;
+        card.querySelector('.step-head').addEventListener('click', () => card.classList.toggle('collapsed'));
+        stepsContainer.appendChild(card);
+        stepBuffers[stepId] = { card, body: card.querySelector('.step-body'), buf: step.content || '', displayName: step.title || `Step${ordinal}`, status: 'done' };
+      });
+      scrollBottom();
     }
 
     function appendCancelledMarker() {
@@ -2220,7 +2510,9 @@ async function sendMessage() {
       try { payload = JSON.parse(curData); } catch (e) { /* skip */ }
       if (!payload) { curEvent = 'message'; curData = ''; return; }
 
-      if (curEvent === 'step_pending') {
+      if (curEvent === 'run_replay_context') {
+        renderInheritedRunSteps(payload);
+      } else if (curEvent === 'step_pending') {
         // 2026-05-07 DAG UX：执行前先给所有步骤画占位卡片
         if (!stepBuffers[payload.stepId]) {
           createPendingStepCard(payload.stepId, payload.displayName, payload.dependsOn);
@@ -2255,6 +2547,7 @@ async function sendMessage() {
           card.card.querySelector('.step-status').textContent = payload.summary || (card.displayName + ' 已完成');
         }
       } else if (curEvent === 'ack') {
+        if (payload && payload.runId) setMessageRunId(aiMsg, payload.runId);
         // 2026-05-07 #2 TTFT：服务器已接收，立即给视觉反馈，避免空屏几秒
         if (!stepsContainer.querySelector('.step-card')) {
           stepsContainer.innerHTML = '<div class="text-xs text-gray-500 px-2 py-1 fade-in">⚡ 已连接，正在分析...</div>';
@@ -2328,6 +2621,7 @@ async function sendMessage() {
         if (payload.type === 'summary') {
           fullContent = payload.content || '';
           finalAnswerEl.innerHTML = renderMarkdown(fullContent);
+          setFinalAnswerCopy(aiMsg, fullContent);
         } else if (payload.type === 'error') {
           finalAnswerEl.innerHTML = `<span class="text-red-400">❌ ${escapeHtml(payload.content || '')}</span>`;
         } else if (payload.type === 'complete') {
@@ -2804,7 +3098,113 @@ function agentLabel(agentId) {
   return a ? `${a.agentName}(${a.agentId})` : `Agent ${agentId}`;
 }
 
-function addMessage(role, content, isPlaceholder, agentId) {
+function attachMessageActions(node, role, content, runId) {
+  if (!node || role !== 'assistant') return;
+  if (runId) setMessageRunId(node, runId);
+  if (content && String(content).trim()) setFinalAnswerCopy(node, content);
+}
+
+function setMessageRunId(aiMsg, runId) {
+  if (!aiMsg || !runId) return;
+  aiMsg.dataset.runId = runId;
+  const btn = aiMsg.querySelector('.msg-copy-run');
+  if (btn) {
+    btn.classList.remove('hidden');
+    btn.textContent = '复制 runId';
+    btn.disabled = false;
+  }
+}
+
+function setFinalAnswerCopy(aiMsg, content) {
+  if (!aiMsg || !content || !String(content).trim()) return;
+  const btn = aiMsg.querySelector('.msg-copy-final');
+  if (btn) {
+    btn.dataset.copyText = String(content);
+    btn.classList.remove('hidden');
+    btn.textContent = '复制回复';
+  }
+}
+
+async function copyMessageRunId(btn) {
+  const msg = btn && btn.closest ? btn.closest('[data-message-role="assistant"]') : null;
+  const runId = msg && msg.dataset ? msg.dataset.runId : '';
+  if (!runId) return;
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '校验中';
+  try {
+    const valid = await isRunSnapshotValid(runId);
+    if (!valid) {
+      flashButtonText(btn, 'runId 已过期', oldText);
+      return;
+    }
+    await copyText(runId);
+    flashButtonText(btn, '已复制', oldText);
+  } catch (e) {
+    flashButtonText(btn, '复制失败', oldText);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function copyFinalAnswerFromMessage(btn) {
+  const msg = btn && btn.closest ? btn.closest('[data-message-role="assistant"]') : null;
+  const text = (btn && btn.dataset && btn.dataset.copyText) || extractFinalAnswerText(msg);
+  if (!text || !String(text).trim()) return;
+  const oldText = btn.textContent;
+  try {
+    await copyText(text);
+    flashButtonText(btn, '已复制', oldText);
+  } catch (e) {
+    flashButtonText(btn, '复制失败', oldText);
+  }
+}
+
+function extractFinalAnswerText(msg) {
+  if (!msg) return '';
+  const finalEl = msg.querySelector('.final-answer');
+  if (finalEl && finalEl.textContent && finalEl.textContent.trim()) {
+    return finalEl.textContent.trim();
+  }
+  const content = msg.querySelector('.msg-content');
+  if (!content) return '';
+  const clone = content.cloneNode(true);
+  clone.querySelectorAll('.steps-container,.memory-evidence-container,.rag-evidence-container,.cancel-marker').forEach(el => el.remove());
+  return clone.textContent.trim();
+}
+
+async function isRunSnapshotValid(runId) {
+  if (!runId || !state.sessionId) return false;
+  const res = await fetch(`${API}/run-snapshots/${encodeURIComponent(runId)}?sessionId=${encodeURIComponent(state.sessionId)}`);
+  const json = await res.json();
+  return !!(json && json.code === '0000' && json.data && json.data.runId);
+}
+
+async function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    await navigator.clipboard.writeText(String(text || ''));
+    return;
+  }
+  const ta = document.createElement('textarea');
+  ta.value = String(text || '');
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  document.execCommand('copy');
+  ta.remove();
+}
+
+function flashButtonText(btn, text, restoreText) {
+  if (!btn) return;
+  btn.textContent = text;
+  setTimeout(() => {
+    btn.textContent = restoreText || '复制';
+  }, 1400);
+}
+
+function addMessage(role, content, isPlaceholder, agentId, runId) {
   const area = document.getElementById('messageArea');
   // 移除空状态。第 70 轮：排除历史顶部哨兵（它也带 .text-center），否则在历史会话里继续发消息会误删哨兵
   const empty = area.querySelector('.text-center:not(#historyTopSentinel)');
@@ -2812,6 +3212,8 @@ function addMessage(role, content, isPlaceholder, agentId) {
 
   const div = document.createElement('div');
   div.className = 'fade-in flex gap-3 ' + (role === 'user' ? 'flex-row-reverse' : '');
+  div.dataset.messageRole = role;
+  if (runId) div.dataset.runId = runId;
 
   const avatar = role === 'user'
     ? `<div class="w-8 h-8 bg-blue-600 rounded-full flex items-center justify-center text-xs font-bold shrink-0">${(state.username||'U')[0].toUpperCase()}</div>`
@@ -2824,12 +3226,17 @@ function addMessage(role, content, isPlaceholder, agentId) {
   div.innerHTML = `
     ${avatar}
     <div class="${bubbleClass} px-4 py-3 max-w-[80%]">
-      <div class="text-xs text-gray-500 mb-1 msg-author">${role === 'user' ? state.username : escapeHtml(agentLabel(agentId))}</div>
+      <div class="flex items-center gap-2 mb-1">
+        <div class="text-xs text-gray-500 msg-author flex-1 min-w-0 truncate">${role === 'user' ? state.username : escapeHtml(agentLabel(agentId))}</div>
+        ${role === 'assistant' ? `<button type="button" class="msg-copy-run ${runId ? '' : 'hidden'} text-[11px] text-cyan-300 hover:text-white shrink-0" onclick="copyMessageRunId(this)">复制 runId</button>` : ''}
+      </div>
       <div class="msg-content text-sm leading-relaxed ${isPlaceholder ? 'typing' : ''}">
         ${isPlaceholder ? '<span class="text-gray-500">思考中...</span>' : renderMarkdown(content)}
       </div>
+      ${role === 'assistant' ? '<div class="msg-actions mt-2 text-right"><button type="button" class="msg-copy-final hidden text-[11px] text-gray-400 hover:text-white" onclick="copyFinalAnswerFromMessage(this)">复制回复</button></div>' : ''}
     </div>
   `;
+  attachMessageActions(div, role, content, runId);
 
   area.appendChild(div);
   scrollBottom(true);
@@ -3103,7 +3510,7 @@ async function loadConversation(conversationId, options = {}) {
     area.innerHTML = '';
     // 先全部 append 消息（addMessage 会 scrollBottom，正常）
     messages.forEach(m => {
-      addMessage(m.messageType === 'USER' ? 'user' : 'assistant', m.content, false, m.agentId);
+      addMessage(m.messageType === 'USER' ? 'user' : 'assistant', m.content, false, m.agentId, m.runId);
     });
     // 再插入哨兵到顶部（避免 addMessage 内部 querySelector('.text-center') 误删它）
     insertHistoryTopSentinel(area);
@@ -3194,7 +3601,7 @@ async function loadHistoryEarlier() {
     const sentinel = document.getElementById('historyTopSentinel');
     const fragment = document.createDocumentFragment();
     messages.forEach(m => {
-      const node = buildMessageNode(m.messageType === 'USER' ? 'user' : 'assistant', m.content, m.agentId);
+      const node = buildMessageNode(m.messageType === 'USER' ? 'user' : 'assistant', m.content, m.agentId, m.runId);
       if (node) fragment.appendChild(node);
     });
     if (sentinel && sentinel.nextSibling) {
@@ -3219,9 +3626,11 @@ async function loadHistoryEarlier() {
 
 // 与 addMessage 同源的 DOM 构造，但只构造不挂载、不 scroll，供 prepend 使用。
 // 改 addMessage 时记得同步这里。
-function buildMessageNode(role, content, agentId) {
+function buildMessageNode(role, content, agentId, runId) {
   const div = document.createElement('div');
   div.className = 'fade-in flex gap-3 ' + (role === 'user' ? 'flex-row-reverse' : '');
+  div.dataset.messageRole = role;
+  if (runId) div.dataset.runId = runId;
 
   const avatar = role === 'user'
     ? `<div class="w-8 h-8 bg-blue-600 rounded-full flex items-center justify-center text-xs font-bold shrink-0">${(state.username||'U')[0].toUpperCase()}</div>`
@@ -3234,10 +3643,15 @@ function buildMessageNode(role, content, agentId) {
   div.innerHTML = `
     ${avatar}
     <div class="${bubbleClass} px-4 py-3 max-w-[80%]">
-      <div class="text-xs text-gray-500 mb-1 msg-author">${role === 'user' ? state.username : escapeHtml(agentLabel(agentId))}</div>
+      <div class="flex items-center gap-2 mb-1">
+        <div class="text-xs text-gray-500 msg-author flex-1 min-w-0 truncate">${role === 'user' ? state.username : escapeHtml(agentLabel(agentId))}</div>
+        ${role === 'assistant' ? `<button type="button" class="msg-copy-run ${runId ? '' : 'hidden'} text-[11px] text-cyan-300 hover:text-white shrink-0" onclick="copyMessageRunId(this)">复制 runId</button>` : ''}
+      </div>
       <div class="msg-content text-sm leading-relaxed">${renderMarkdown(content)}</div>
+      ${role === 'assistant' ? '<div class="msg-actions mt-2 text-right"><button type="button" class="msg-copy-final hidden text-[11px] text-gray-400 hover:text-white" onclick="copyFinalAnswerFromMessage(this)">复制回复</button></div>' : ''}
     </div>
   `;
+  attachMessageActions(div, role, content, runId);
   return div;
 }
 

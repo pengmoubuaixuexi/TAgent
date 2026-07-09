@@ -50,6 +50,9 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
     @Autowired(required = false)
     private SessionRefCounter sessionRefCounter;
 
+    @Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService runSnapshotService;
+
     /** 动态补工具能力描述(need)的统一存储入口；按 sessionId 写入，执行层读取。 */
     @Autowired(required = false)
     private cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService mcpToolCatalogService;
@@ -67,6 +70,8 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
         if (requestParameter.getRunId() == null || requestParameter.getRunId().isBlank()) {
             requestParameter.setRunId(UUID.randomUUID().toString());
         }
+        org.slf4j.MDC.put("runId", requestParameter.getRunId());
+        org.slf4j.MDC.put("agent.run_id", requestParameter.getRunId());
         String agentId = requestParameter.getAiAgentId();
 
         // 防串请求/泄漏：进入即清掉本 session 可能残留的旧 need（上一次请求若在"交给异步策略执行"前同步失败，
@@ -130,7 +135,8 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
         try {
             String safeName = aiAgentVO.getAgentName() == null ? ""
                     : aiAgentVO.getAgentName().replace("\\", "\\\\").replace("\"", "\\\"");
-            emitter.send("event: agent_routed\ndata: {\"agentId\":\"" + agentId + "\",\"agentName\":\"" + safeName + "\"}\n\n");
+            emitter.send("event: agent_routed\ndata: {\"agentId\":\"" + agentId + "\",\"agentName\":\"" + safeName
+                    + "\",\"runId\":\"" + requestParameter.getRunId() + "\"}\n\n");
         } catch (Exception ignore) {
         }
 
@@ -140,6 +146,9 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
         if (executeStrategy == null) {
             throw new BizException("不存在的执行策略: " + strategy);
         }
+        if (runSnapshotService != null) {
+            runSnapshotService.startRun(requestParameter, strategy, aiAgentVO.getAgentName());
+        }
 
         // 4. 异步执行（用 final 变量供 lambda 引用）
         final String finalAgentId = agentId;
@@ -148,15 +157,42 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
         try {
             threadPoolExecutor.execute(() -> {
                 String sessionId = requestParameter.getSessionId();
+                String oldRunId = org.slf4j.MDC.get("runId");
+                String oldAgentRunId = org.slf4j.MDC.get("agent.run_id");
+                String oldAgentId = org.slf4j.MDC.get("agentId");
+                String oldSessionId = org.slf4j.MDC.get("sessionId");
+                String oldUserId = org.slf4j.MDC.get("userId");
+                String oldTenantId = org.slf4j.MDC.get("tenantId");
                 try {
+                    putMdc("runId", requestParameter.getRunId());
+                    putMdc("agent.run_id", requestParameter.getRunId());
+                    putMdc("agentId", requestParameter.getAiAgentId());
+                    putMdc("sessionId", requestParameter.getSessionId());
+                    putMdc("userId", requestParameter.getUserId());
+                    putMdc("tenantId", requestParameter.getTenantId());
                     if (sessionRefCounter != null) sessionRefCounter.clear(sessionId);
                     finalStrategy1.execute(requestParameter, emitter);
+                    if (runSnapshotService != null) {
+                        runSnapshotService.markStatus(requestParameter.getRunId(),
+                                cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_COMPLETED,
+                                null);
+                    }
                 } catch (Exception e) {
                     // 取消（用户点取消 / 客户端断开）会抛 CancellationException，属正常中止，静默结束不报错给前端
                     if (e instanceof java.util.concurrent.CancellationException
                             || e.getCause() instanceof java.util.concurrent.CancellationException) {
+                        if (runSnapshotService != null) {
+                            runSnapshotService.markStatus(requestParameter.getRunId(),
+                                    cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_CANCELLED,
+                                    e.getMessage());
+                        }
                         log.info("[Dispatch] 执行已取消 agentId={} strategy={} sessionId={}", finalAgentId, finalStrategy, sessionId);
                     } else {
+                        if (runSnapshotService != null) {
+                            runSnapshotService.markStatus(requestParameter.getRunId(),
+                                    cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_FAILED,
+                                    e.getMessage());
+                        }
                         log.error("Agent执行异常：agentId={} strategy={} error={}", finalAgentId, finalStrategy, e.getMessage(), e);
                         try {
                             emitter.send("执行异常：" + e.getMessage());
@@ -171,11 +207,22 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
                     } catch (Exception e) {
                         log.error("完成流式输出失败：{}", e.getMessage(), e);
                     }
+                    restoreMdc("runId", oldRunId);
+                    restoreMdc("agent.run_id", oldAgentRunId);
+                    restoreMdc("agentId", oldAgentId);
+                    restoreMdc("sessionId", oldSessionId);
+                    restoreMdc("userId", oldUserId);
+                    restoreMdc("tenantId", oldTenantId);
                 }
             });
             __handedOff = true; // 已成功交给异步策略执行 → 本轮 need/lease 的清理归策略 finally
         } catch (RejectedExecutionException e) {
             log.warn("线程池已满，拒绝执行 agent={} strategy={}", finalAgentId, finalStrategy);
+            if (runSnapshotService != null) {
+                runSnapshotService.markStatus(requestParameter.getRunId(),
+                        cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_FAILED,
+                        e.getMessage());
+            }
             emitter.send("{\"error\":\"service_unavailable\",\"message\":\"Server too busy, please retry later\",\"status\":503}");
             emitter.complete();
         }
@@ -227,6 +274,22 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
             } catch (Exception e) {
                 log.debug("[Dispatch] cancelExecute on {} failed: {}", s.getClass().getSimpleName(), e.getMessage());
             }
+        }
+    }
+
+    private static void putMdc(String key, String value) {
+        if (value == null || value.isBlank()) {
+            org.slf4j.MDC.remove(key);
+        } else {
+            org.slf4j.MDC.put(key, value);
+        }
+    }
+
+    private static void restoreMdc(String key, String value) {
+        if (value == null) {
+            org.slf4j.MDC.remove(key);
+        } else {
+            org.slf4j.MDC.put(key, value);
         }
     }
 

@@ -102,6 +102,7 @@ public class MyBatisChatMemoryRepository implements ChatMemoryRepository {
         LocalDateTime now = LocalDateTime.now();
         String userId = extractUserId(conversationId);
         String agentId = cn.bugstack.ai.domain.agent.service.memory.ChatMemoryContext.getAgentId();
+        String runId = org.slf4j.MDC.get("runId");
         for (Message msg : messages) {
             String type = msg.getMessageType() == null ? null : msg.getMessageType().name();
             if (type == null || type.equals("TOOL")) continue;
@@ -109,6 +110,7 @@ public class MyBatisChatMemoryRepository implements ChatMemoryRepository {
                     .conversationId(conversationId)
                     .userId(userId)
                     .agentId(agentId)
+                    .runId(runId)
                     .messageType(type)
                     .content(msg.getText())
                     .createdAt(now)

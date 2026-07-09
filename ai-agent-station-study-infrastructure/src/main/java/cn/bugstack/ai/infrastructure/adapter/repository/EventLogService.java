@@ -29,6 +29,7 @@ public class EventLogService implements IEventLogService {
         try {
             AiEventLog po = AiEventLog.builder()
                     .sessionId(entry.getSessionId())
+                    .runId(firstNonBlank(entry.getRunId(), org.slf4j.MDC.get("runId"), org.slf4j.MDC.get("agent.run_id")))
                     .userId(entry.getUserId())
                     .tenantId(entry.getTenantId())
                     .agentId(entry.getAgentId())
@@ -51,5 +52,15 @@ public class EventLogService implements IEventLogService {
                     entry.getInputPrompt() == null ? 0 : entry.getInputPrompt().length(),
                     entry.getOutputText() == null ? 0 : entry.getOutputText().length(), e);
         }
+    }
+
+    private static String firstNonBlank(String... values) {
+        if (values == null) return null;
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value;
+            }
+        }
+        return null;
     }
 }

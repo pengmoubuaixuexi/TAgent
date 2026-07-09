@@ -52,7 +52,7 @@ public class AutoAgentExecuteStrategy implements IExecuteStrategy {
         DefaultAutoAgentExecuteStrategyFactory.DynamicContext dynamicContext = new DefaultAutoAgentExecuteStrategyFactory.DynamicContext();
         dynamicContext.setMaxStep(executeCommandEntity.getMaxStep() != null ? executeCommandEntity.getMaxStep() : 3);
         dynamicContext.setExecutionHistory(new StringBuilder());
-        dynamicContext.setCurrentTask(executeCommandEntity.getMessage());
+        dynamicContext.setCurrentTask(buildInitialTask(executeCommandEntity));
         dynamicContext.setValue("emitter", emitter);
         // v1.3.2：sessionId 显式放进 dynamicContext，避免 dag-step 线程读 MDC 拿不到（MdcTaskDecorator 未启用）
         // ReasoningContentFilter.scopeSession 从这里取，按 session 隔离 reasoning_content 缓存
@@ -62,6 +62,9 @@ public class AutoAgentExecuteStrategy implements IExecuteStrategy {
         String effectiveRunId = (executeCommandEntity.getRunId() != null && !executeCommandEntity.getRunId().isBlank())
                 ? executeCommandEntity.getRunId()
                 : (executeCommandEntity.getSessionId() + "-run-" + java.util.UUID.randomUUID());
+        executeCommandEntity.setRunId(effectiveRunId);
+        org.slf4j.MDC.put("runId", effectiveRunId);
+        org.slf4j.MDC.put("agent.run_id", effectiveRunId);
         dynamicContext.setValue("runId", effectiveRunId);
         dynamicContext.setValue("userId", executeCommandEntity.getUserId());
         dynamicContext.setValue("tenantId", executeCommandEntity.getTenantId());
@@ -115,6 +118,16 @@ public class AutoAgentExecuteStrategy implements IExecuteStrategy {
             ctx.fireCancelTrigger();  // 立即截断在飞流式调用，不等当前 LLM 调用跑完才在下个 checkpoint 生效
             log.info("[AutoAgent] cancelExecute called for sessionId={}", sessionId);
         }
+    }
+
+    private String buildInitialTask(ExecuteCommandEntity request) {
+        if (request == null) return "";
+        String message = request.getMessage() == null ? "" : request.getMessage().trim();
+        String redoContext = request.getRedoContextPrompt();
+        if (redoContext == null || redoContext.isBlank()) {
+            return message;
+        }
+        return redoContext.trim() + "\n\n【用户本次修订指令】\n" + message;
     }
 
     /** 立即回答：置 finalize 标记 + 截断当前在飞流式 call；各 step 入口/汇总节点据标记跳 finalize。 */

@@ -87,6 +87,7 @@ public class Step3ParseStepsNode extends AbstractExecuteSupport {
                 "analysis_progress", 
                 parseResult.toString(), 
                 requestParameter.getSessionId());
+        sendThinkingEvent(dynamicContext, "计划解析", parseResult.toString(), requestParameter.getSessionId());
         sendSseResult(dynamicContext, result);
         
         // 更新步骤

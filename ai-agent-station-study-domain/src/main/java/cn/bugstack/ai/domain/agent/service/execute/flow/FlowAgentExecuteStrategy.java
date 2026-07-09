@@ -79,7 +79,7 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
         // 创建动态上下文并初始化必要字段
         DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext = new DefaultFlowAgentExecuteStrategyFactory.DynamicContext();
         dynamicContext.setExecutionHistory(new StringBuilder());
-        dynamicContext.setCurrentTask(executeCommandEntity.getMessage());
+        dynamicContext.setCurrentTask(buildInitialTask(executeCommandEntity));
         dynamicContext.setValue("emitter", emitter);
         // v1.3.2：sessionId 显式放进 dynamicContext，避免 dag-step 线程读 MDC 拿不到
         // ReasoningContentFilter.scopeSession 从这里取，按 session 隔离 reasoning_content 缓存
@@ -88,6 +88,9 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
         String effectiveRunId = (executeCommandEntity.getRunId() != null && !executeCommandEntity.getRunId().isBlank())
                 ? executeCommandEntity.getRunId()
                 : (executeCommandEntity.getSessionId() + "-run-" + java.util.UUID.randomUUID());
+        executeCommandEntity.setRunId(effectiveRunId);
+        MDC.put("runId", effectiveRunId);
+        MDC.put("agent.run_id", effectiveRunId);
         dynamicContext.setValue("runId", effectiveRunId);
         dynamicContext.setValue("userId", executeCommandEntity.getUserId());
         dynamicContext.setValue("tenantId", executeCommandEntity.getTenantId());
@@ -153,6 +156,10 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
                     .message(state.getOriginalMessage())
                     .sessionId(state.getSessionId())
                     .runId(state.getRunId())
+                    .sourceRunId(state.getSourceRunId())
+                    .redoFromStep(state.getRedoFromStep())
+                    .redoContextPrompt(state.getRedoContextPrompt())
+                    .redoTargetStepContextPrompt(state.getRedoTargetStepContextPrompt())
                     .userId(state.getUserId())
                     .tenantId(state.getTenantId())
                     .maxStep(4)
@@ -161,7 +168,7 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
                     new DefaultFlowAgentExecuteStrategyFactory.DynamicContext();
             Integer planReviewAttemptCount = state.getAttemptCount();
             dynamicContext.setExecutionHistory(new StringBuilder());
-            dynamicContext.setCurrentTask(state.getOriginalMessage());
+            dynamicContext.setCurrentTask(buildInitialTask(request));
             dynamicContext.setStep(4);
             dynamicContext.setValue("emitter", emitter);
             dynamicContext.setValue("sessionId", state.getSessionId());
@@ -196,6 +203,8 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
             try {
                 putMdc("agentId", state.getAgentId());
                 putMdc("sessionId", state.getSessionId());
+                putMdc("runId", runId);
+                putMdc("agent.run_id", runId);
                 putMdc("userId", state.getUserId());
                 putMdc("tenantId", state.getTenantId());
                 ensureAgentArmedForPlanResume(state.getAgentId(), runId, sessionId);
@@ -251,7 +260,7 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
                     cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearRun(runId);
                     if (runId != null && toolCallLedger != null) toolCallLedger.clear(runId);
                 }
-                clearMdc("agentId", "sessionId", "userId", "tenantId");
+                clearMdc("agentId", "sessionId", "runId", "agent.run_id", "userId", "tenantId");
                 try {
                     emitter.complete();
                 } catch (Exception ignored) {
@@ -272,6 +281,16 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
         payload.put("lastError", error);
         payload.put("timestamp", System.currentTimeMillis());
         sendSseObject(emitter, "plan_review_status", payload);
+    }
+
+    private String buildInitialTask(ExecuteCommandEntity request) {
+        if (request == null) return "";
+        String message = request.getMessage() == null ? "" : request.getMessage().trim();
+        String redoContext = request.getRedoContextPrompt();
+        if (redoContext == null || redoContext.isBlank()) {
+            return message;
+        }
+        return redoContext.trim() + "\n\n【用户本次修订指令】\n" + message;
     }
 
     private void ensureAgentArmedForPlanResume(String agentId, String runId, String sessionId) {

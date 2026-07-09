@@ -59,6 +59,7 @@ public class ConversationTurnMemoryService implements IConversationTurnMemorySer
         if (conversationId == null || conversationId.isBlank()) return;
         String userMessage = request.getMessage();
         if (userMessage == null || userMessage.isBlank()) return;
+        String memoryUserMessage = buildMemoryUserMessage(request, userMessage);
 
         String cleanedOutput = OutputFilter.cleanForUser(finalOutput);
         if (cleanedOutput == null || cleanedOutput.isBlank()) return;
@@ -75,14 +76,16 @@ public class ConversationTurnMemoryService implements IConversationTurnMemorySer
                         .conversationId(conversationId)
                         .userId(userId)
                         .agentId(agentId)
+                        .runId(request.getRunId())
                         .messageType("USER")
-                        .content(userMessage)
+                        .content(memoryUserMessage)
                         .createdAt(now)
                         .build(),
                 AiChatMemory.builder()
                         .conversationId(conversationId)
                         .userId(userId)
                         .agentId(agentId)
+                        .runId(request.getRunId())
                         .messageType("ASSISTANT")
                         .content(cleanedOutput)
                         .createdAt(now.plusNanos(1))
@@ -213,6 +216,14 @@ public class ConversationTurnMemoryService implements IConversationTurnMemorySer
             return uid + ":" + sid;
         }
         return tid + ":" + uid + ":" + sid;
+    }
+
+    private String buildMemoryUserMessage(ExecuteCommandEntity request, String userMessage) {
+        if (request == null || request.getSourceRunId() == null || request.getSourceRunId().isBlank()) {
+            return userMessage;
+        }
+        String step = request.getRedoFromStep() != null ? "Step" + request.getRedoFromStep() : "指定步骤";
+        return "基于历史运行 " + request.getSourceRunId() + " 的 " + step + " 进行修正：" + userMessage;
     }
 
     private String extractUserId(String conversationId) {

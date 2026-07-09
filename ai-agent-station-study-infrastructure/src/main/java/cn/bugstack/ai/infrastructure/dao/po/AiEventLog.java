@@ -18,6 +18,7 @@ public class AiEventLog {
 
     private Long id;
     private String sessionId;
+    private String runId;
     /** V035 新增：用户ID，用于 per-user 聚合 */
     private String userId;
     /** V035 新增：租户ID */

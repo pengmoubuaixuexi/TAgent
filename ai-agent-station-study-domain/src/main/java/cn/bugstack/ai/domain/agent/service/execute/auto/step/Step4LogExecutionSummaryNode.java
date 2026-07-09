@@ -332,7 +332,7 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
     private String buildAnswerNowPrompt(ExecuteCommandEntity req, DefaultAutoAgentExecuteStrategyFactory.DynamicContext ctx) {
         StringBuilder sb = new StringBuilder();
         sb.append("用户在执行过程中点击了【立即回答】，要求基于目前已有的（可能不完整的）信息立刻作答。\n\n");
-        sb.append("**用户原始问题:**\n").append(effectiveUserQuestion(req, ctx)).append("\n\n");
+        sb.append("**用户原始问题:**\n").append(effectiveUserQuestionForStep(req, ctx, 4)).append("\n\n");
 
         String history = ctx.getExecutionHistory() != null ? ctx.getExecutionHistory().toString() : "";
         if (history != null && !history.isBlank()) {
@@ -364,7 +364,7 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
         String summaryPrompt;
         if (isCompleted) {
             summaryPrompt = String.format(aiAgentClientFlowConfigVO.getStepPrompt(),
-                    effectiveUserQuestion(requestParameter, dynamicContext),
+                    effectiveUserQuestionForStep(requestParameter, dynamicContext, 4),
                     buildFinalSummaryProcess(dynamicContext));
         } else {
             summaryPrompt = String.format("""
@@ -384,7 +384,7 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
                     
                     请基于现有信息给出用户问题的答案：
                     """,
-                    effectiveUserQuestion(requestParameter, dynamicContext),
+                    effectiveUserQuestionForStep(requestParameter, dynamicContext, 4),
                     buildFinalSummaryProcess(dynamicContext));
         }
         return summaryPrompt;

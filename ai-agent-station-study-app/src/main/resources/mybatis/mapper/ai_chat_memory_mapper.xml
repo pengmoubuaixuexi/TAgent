@@ -7,6 +7,7 @@
         <result column="conversation_id" property="conversationId"/>
         <result column="user_id"         property="userId"/>
         <result column="agent_id"        property="agentId"/>
+        <result column="run_id"          property="runId"/>
         <result column="message_type"    property="messageType"/>
         <result column="content"         property="content"/>
         <result column="created_at"      property="createdAt"/>
@@ -19,17 +20,17 @@
     </select>
 
     <select id="findByConversationId" parameterType="java.lang.String" resultMap="AiChatMemoryMap">
-        SELECT id, conversation_id, user_id, agent_id, message_type, content, created_at
+        SELECT id, conversation_id, user_id, agent_id, run_id, message_type, content, created_at
         FROM ai_chat_memory
         WHERE conversation_id = #{conversationId}
         ORDER BY created_at ASC, id ASC
     </select>
 
     <insert id="insertBatch" parameterType="java.util.List" useGeneratedKeys="true" keyProperty="id">
-        INSERT INTO ai_chat_memory (conversation_id, user_id, agent_id, message_type, content, created_at)
+        INSERT INTO ai_chat_memory (conversation_id, user_id, agent_id, run_id, message_type, content, created_at)
         VALUES
         <foreach collection="list" item="m" separator=",">
-            (#{m.conversationId}, #{m.userId}, #{m.agentId}, #{m.messageType}, #{m.content}, #{m.createdAt})
+            (#{m.conversationId}, #{m.userId}, #{m.agentId}, #{m.runId}, #{m.messageType}, #{m.content}, #{m.createdAt})
         </foreach>
     </insert>
 
@@ -60,14 +61,14 @@
     </select>
 
     <select id="findByConversationIdFull" parameterType="java.lang.String" resultMap="AiChatMemoryMap">
-        SELECT id, conversation_id, user_id, agent_id, message_type, content, created_at
+        SELECT id, conversation_id, user_id, agent_id, run_id, message_type, content, created_at
         FROM ai_chat_memory
         WHERE conversation_id = #{conversationId}
         ORDER BY created_at ASC, id ASC
     </select>
 
     <select id="findByConversationIdPaged" resultMap="AiChatMemoryMap">
-        SELECT id, conversation_id, user_id, agent_id, message_type, content, created_at
+        SELECT id, conversation_id, user_id, agent_id, run_id, message_type, content, created_at
         FROM ai_chat_memory
         WHERE conversation_id = #{conversationId}
         <if test="beforeId != null">

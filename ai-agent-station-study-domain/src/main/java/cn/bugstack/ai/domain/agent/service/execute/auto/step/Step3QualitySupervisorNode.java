@@ -111,7 +111,7 @@ public class Step3QualitySupervisorNode extends AbstractExecuteSupport {
 
         // 质检步元工具豁免（条件生效）。同规划步：若该步 DB 系统提示也有"禁止调用任何工具"，需同样改为
         // "禁止调用业务/执行类工具"才能让 request_tool 真触发，否则模型会"说而不做"。
-        String supervisionPrompt = String.format(aiAgentClientFlowConfigVO.getStepPrompt(), effectiveUserQuestion(requestParameter, dynamicContext), executionResult)
+        String supervisionPrompt = String.format(aiAgentClientFlowConfigVO.getStepPrompt(), effectiveUserQuestionForStep(requestParameter, dynamicContext, 3), executionResult)
                 + metaToolPromptHint(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.AUTO_STEP3_QUALITY,
                 requestParameter.getSessionId());
 

@@ -52,6 +52,7 @@ public class LlmObservationRecorder {
         String stepName = firstNonBlank(ctx.getStepName(), "unknown_step");
         String billingScope = firstNonBlank(ctx.getBillingScope(), inferBillingScope(stepName));
         String resolvedSessionId = resolveSessionBucket(ctx, stepName, billingScope);
+        String resolvedRunId = firstNonBlank(ctx.getRunId(), MDC.get("runId"), MDC.get("agent.run_id"));
         String resultText = firstNonBlank(ctx.getResultText(), extractResultText(response));
         boolean success = error == null && resultText != null && !resultText.isBlank();
 
@@ -68,6 +69,7 @@ public class LlmObservationRecorder {
             try {
                 eventLogService.log(EventLogEntry.builder()
                         .sessionId(resolvedSessionId)
+                        .runId(resolvedRunId)
                         .userId(firstNonBlank(ctx.getUserId(), MDC.get("userId")))
                         .tenantId(firstNonBlank(ctx.getTenantId(), MDC.get("tenantId")))
                         .agentId(firstNonBlank(ctx.getAgentId(), MDC.get("agentId")))
@@ -86,16 +88,18 @@ public class LlmObservationRecorder {
             }
         }
 
-        writeEsLog(ctx, stepName, model, resolvedSessionId, billingScope, promptTokens, completionTokens, totalTokens, cachedTokens, latencyMs, success, error);
+        writeEsLog(ctx, stepName, model, resolvedSessionId, resolvedRunId, billingScope, promptTokens, completionTokens, totalTokens, cachedTokens, latencyMs, success, error);
     }
 
     private void writeEsLog(LlmCallContext ctx, String stepName, String model,
-                            String resolvedSessionId, String billingScope, long promptTokens, long completionTokens, long totalTokens,
+                            String resolvedSessionId, String resolvedRunId, String billingScope, long promptTokens, long completionTokens, long totalTokens,
                             long cachedTokens, long latencyMs, boolean success, Throwable error) {
         String oldStep = MDC.get("step");
         String oldModel = MDC.get("model");
         String oldClientId = MDC.get("clientId");
         String oldSessionId = MDC.get("sessionId");
+        String oldRunId = MDC.get("runId");
+        String oldAgentRunId = MDC.get("agent.run_id");
         String oldUserId = MDC.get("userId");
         String oldTenantId = MDC.get("tenantId");
         String oldAgentId = MDC.get("agentId");
@@ -110,6 +114,8 @@ public class LlmObservationRecorder {
         putIfPresent("model", model);
         putIfPresent("clientId", ctx.getClientId());
         putIfPresent("sessionId", resolvedSessionId);
+        putIfPresent("runId", resolvedRunId);
+        putIfPresent("agent.run_id", resolvedRunId);
         putIfPresent("userId", firstNonBlank(ctx.getUserId(), MDC.get("userId")));
         putIfPresent("tenantId", firstNonBlank(ctx.getTenantId(), MDC.get("tenantId")));
         putIfPresent("agentId", firstNonBlank(ctx.getAgentId(), MDC.get("agentId")));
@@ -134,6 +140,8 @@ public class LlmObservationRecorder {
             restore("model", oldModel);
             restore("clientId", oldClientId);
             restore("sessionId", oldSessionId);
+            restore("runId", oldRunId);
+            restore("agent.run_id", oldAgentRunId);
             restore("userId", oldUserId);
             restore("tenantId", oldTenantId);
             restore("agentId", oldAgentId);

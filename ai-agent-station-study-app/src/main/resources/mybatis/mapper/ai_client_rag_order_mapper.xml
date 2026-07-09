@@ -82,10 +82,14 @@
         ORDER BY create_time DESC
     </select>
 
-    <!-- P2.3 12.5 按 SHA-256 + knowledge_tag 查重计数（同文件可导入不同知识库） -->
-    <select id="countByFileHashAndTag" resultType="int">
+    <!-- P2.3 12.5 按 SHA-256 + knowledge_tag + user_id 查重计数（同文件可导入不同用户/知识库） -->
+    <select id="countByFileHashTagAndUser" resultType="int">
         SELECT COUNT(*) FROM ai_client_rag_order
         WHERE file_hash = #{fileHash} AND knowledge_tag = #{knowledgeTag}
+          AND (
+            (#{userId} IS NULL AND user_id IS NULL)
+            OR user_id = #{userId}
+          )
     </select>
 
 </mapper>

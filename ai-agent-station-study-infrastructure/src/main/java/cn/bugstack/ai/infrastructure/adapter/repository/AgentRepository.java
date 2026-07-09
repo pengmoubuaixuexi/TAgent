@@ -720,13 +720,14 @@ public class AgentRepository implements IAgentRepository {
     }
 
     /**
-     * Claude 新增：按 SHA-256 查重，存在则返回 true。
+     * 按 SHA-256 + knowledge_tag + user_id 查重，存在则返回 true。
      * 用于 RagService.storeRagFile 入库前判断是否重复文件。
      */
     @Override
-    public boolean existsRagFileByHashAndTag(String fileHash, String knowledgeTag) {
+    public boolean existsRagFileByHashTagAndUser(String fileHash, String knowledgeTag, String userId) {
         if (fileHash == null || fileHash.isBlank()) return false;
-        return aiClientRagOrderDao.countByFileHashAndTag(fileHash, knowledgeTag) > 0;
+        String normalizedUserId = (userId == null || userId.isBlank()) ? null : userId;
+        return aiClientRagOrderDao.countByFileHashTagAndUser(fileHash, knowledgeTag, normalizedUserId) > 0;
     }
 
     @Override

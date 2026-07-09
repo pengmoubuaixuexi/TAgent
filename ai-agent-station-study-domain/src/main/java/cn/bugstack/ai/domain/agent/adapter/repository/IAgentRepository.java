@@ -59,12 +59,13 @@ public interface IAgentRepository {
     void createTagOrder(AiRagOrderVO aiRagOrderVO);
 
     /**
-     * 按文件 SHA-256 + knowledge_tag 查重，存在则跳过重复入库（同文件可导入不同知识库）
+     * 按文件 SHA-256 + knowledge_tag + user_id 查重，存在则跳过重复入库（同文件可导入不同用户/知识库）
      * @param fileHash 文件的 SHA-256 哈希
      * @param knowledgeTag 知识库标签
+     * @param userId 用户ID；为空时仅匹配历史匿名记录
      * @return true=已存在
      */
-    boolean existsRagFileByHashAndTag(String fileHash, String knowledgeTag);
+    boolean existsRagFileByHashTagAndUser(String fileHash, String knowledgeTag, String userId);
 
     /**
      * 查询可用的智能体列表

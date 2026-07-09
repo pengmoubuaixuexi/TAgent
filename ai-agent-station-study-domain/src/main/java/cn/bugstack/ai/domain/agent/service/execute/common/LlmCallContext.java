@@ -14,6 +14,7 @@ public class LlmCallContext {
     private String prompt;
     private String resultText;
     private String sessionId;
+    private String runId;
     private String userId;
     private String tenantId;
     private String agentId;

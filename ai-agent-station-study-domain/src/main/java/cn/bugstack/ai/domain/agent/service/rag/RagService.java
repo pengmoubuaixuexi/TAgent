@@ -89,7 +89,7 @@ public class RagService implements IRagService {
             // Claude 修复：原版只算了 hash 没用，现在真正做幂等去重——
             // 命中已存在则跳过整个 ① 切片 ② Contextual prefix 生成（每 chunk 一次小模型）
             // ③ embedding ④ vectorStore 写入 ⑤ ES 索引 ⑥ MySQL 插入。重复上传同份文件不再烧钱
-            if (fileHash != null && repository.existsRagFileByHashAndTag(fileHash, tag)) {
+            if (fileHash != null && repository.existsRagFileByHashTagAndUser(fileHash, tag, userId)) {
                 log.info("[RAG] 跳过重复文件 name='{}' size={} hash={}",
                         file.getOriginalFilename(), fileSize, fileHash);
                 seq++;
