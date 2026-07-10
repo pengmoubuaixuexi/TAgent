@@ -53,7 +53,9 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 
 ### 主链之外的关键控制链
 
-- **动态工具补充**：路由判断缺失能力 → PgVector 从工具目录中匹配真实 MCP 工具 → 与 Agent 常驻工具合并
+- **动态工具补充**：路由可预推断缺失能力，也可由执行期 `request_tool` 主动描述能力缺口 → PgVector 匹配真实 MCP 工具 → 与 Agent 常驻工具合并
+- **Flow 计划确认**：仅 Flow 策略在生成并解析计划后可暂停，用户确认或编辑计划后再进入 DAG 执行
+- **Run ID 快照重做**：Fixed、Auto、Flow 每次运行都会生成 Run ID；前端可通过 `/run` 查看近期快照，并用 `/runId-stepN` 从指定步骤修正重跑
 - **执行中干预**：用户可发送 `steer` 重做当前步骤、`answer_now` 跳过剩余步骤、`cancel` 中止执行
 - **主动追问**：模型缺少关键信息时可调用 `ask_user`，通过 SSE 向用户收集补充信息，再回填继续执行
 
@@ -65,10 +67,12 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 |---|---|
 | **三种 Agent 模式** | Fixed 单步直答、Auto 分析执行闭环、Flow DAG 编排 |
 | **数据库驱动装配** | Agent、Client、Model、Prompt、Advisor、RAG、MCP 关系由数据库配置 |
-| **统一 Agent 路由** | 一次模型调用选择 Agent，并输出可能缺失的工具能力 |
-| **动态 MCP 工具** | 工具目录中文化、意图扩写、PgVector 语义匹配、按请求临时补挂 |
+| **统一 Agent 路由** | 一次模型调用选择 Agent，并输出可能缺失的工具能力；已选 Agent 也可按配置预推断 |
+| **动态 MCP 工具** | 路由预推断与 `request_tool` 元工具并存，结合工具目录中文化、意图扩写、PgVector 语义匹配按请求临时补挂 |
 | **MCP 自愈** | 懒探活、失败重试、超时重连、dead-client 重建、冷却与熔断 |
 | **工具治理** | 非执行步禁工具、未知工具纠正、参数提示、轮次预算、跨 MCP 并行 |
+| **Flow 计划确认** | Flow 计划解析后暂停，支持用户查看、编辑、确认后继续 DAG 执行 |
+| **Run ID 步骤重做** | Redis TTL 快照保存运行步骤，支持 `/run` 查看、`/runId-stepN` 定点重做 |
 | **Agentic RAG** | SIMPLE、HyDE、FUSION、DECOMPOSE 四种查询策略 |
 | **四层记忆** | Working、Chat、Long-Term、Episodic Memory |
 | **流式干预** | Auto、Flow、Fixed 均支持立即回答、引导与取消执行 |
@@ -98,8 +102,9 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 `AgentDispatchService` 负责：
 
 - 用户未指定 Agent 时，调用 `UnifiedAgentRouter` 选择最合适的 `agent_id`
-- 用户已经指定 Agent 时，跳过 Agent 选择，但仍可推断缺失工具能力
-- 路由结果同时返回 `missing_tool_descs`，用于后续动态补工具
+- 用户已经指定 Agent 时，跳过 Agent 选择，直接使用该 Agent 的策略和装配配置；可按 `agent.dynamic-tools.infer-on-selected-agent` 决定是否继续推断缺失工具能力
+- 路由结果可携带 `missing_tool_descs`，由 `agent.dynamic-tools` 配置决定是否在本次请求中预补工具
+- 执行阶段如果模型发现当前工具不足，可在 `agent.request-tool.enabled=true` 时调用 `request_tool` 动态装载真实 MCP 工具
 - 首次使用 Agent 时通过 Armory 懒加载 ChatClient、Model、Advisor 和 MCP callback
 - 从数据库读取 Agent 的 `strategy`，分派到 Fixed、Auto 或 Flow
 
@@ -143,15 +148,31 @@ Auto 会循环执行，直到任务完成或达到 `maxStep`。Step3 判断失�
 
 DAG 中依赖已经满足的步骤可以并行，不同 MCP Server 的工具可以并行，同一个 MCP Server 复用同一连接时保持串行。
 
+Flow 还可以开启计划确认：Step2 生成计划、Step3 解析为 DAG 后先暂停，把计划以工具卡片形式展示给用户；用户可以直接确认，也可以编辑步骤标题、内容和依赖关系后再继续执行。这个能力只属于 Flow 策略，不影响 Fixed 和 Auto 的默认直跑流程。
+
+---
+
+## 🔁 Run ID 快照与步骤级重做
+
+每次 Agent 运行都会生成一个 Run ID，用来串联本次请求的 SSE、ChatMemory、event_log 和 Redis 运行快照。
+
+- **快照范围**：Fixed 记录单次回答快照；Auto 记录 Step1-Step4；Flow 记录计划阶段和 Step4 中的 DAG 执行步骤。
+- **存储方式**：运行快照保存在 Redis，并设置 TTL；过期后需要重新发起任务，而不是沿用旧计划或旧工具结果。
+- **前端入口**：输入 `/run` 展示当前会话近期运行，只展开运行摘要；选择某个 Run ID 后再展示可重做步骤。
+- **定点重做**：输入 `/runId-stepN 修正要求` 后，系统继承源运行的 Agent 和前置步骤，并从目标步骤继续生成新回答。
+- **历史记录**：ChatMemory 和 event_log 记录 Run ID，刷新页面后仍能复制 Run ID；但真正能否重做以 Redis 快照是否仍有效为准。
+
 ---
 
 ## 🛠️ 动态 MCP 工具补充
 
-固定给每个 Agent 挂大量工具，会增加上下文、工具幻觉和选错工具的概率。TAgent 将工具拆成"常驻工具"和"按请求动态补充工具"。
+固定给每个 Agent 挂大量工具，会增加上下文、工具幻觉和选错工具的概率。TAgent 将工具拆成"常驻工具"和"按请求动态补充工具"。动态补充支持两条互补路径：路由阶段根据 `missing_tool_descs` 预推断，或模型在真实执行中通过 `request_tool` 主动描述能力缺口。
 
 ```text
 UnifiedAgentRouter
-  -> missing_tool_descs
+  -> missing_tool_descs（路由预推断）
+  或 Advisor / LLM
+  -> request_tool(needs)（执行期补充）
   -> 每条能力描述生成 embedding
   -> PgVector 查询 mcp_tool_vector
   -> 每类能力取 Top-K
@@ -159,14 +180,14 @@ UnifiedAgentRouter
   -> 多类结果并集去重
   -> 懒创建或复用 MCP callback
   -> 常驻工具 + 动态工具
-  -> 注入本次请求
+  -> 注入本次请求 / run
 ```
 
 工具资产由两部分组成：
 - MySQL `ai_mcp_tool_catalog`：真实工具名、MCP、原始描述、中文描述和中文意图
 - PgVector `mcp_tool_vector`：用于语义检索的工具向量
 
-当前工具匹配采用 embedding-only，不回退 BM25 或 LLM rerank。向量服务不可用时宁可跳过动态补挂，也不盲目匹配无关工具。
+`request_tool` 属于元工具，不算业务执行工具；它可以在 Flow 的工具分析/规划阶段提前为后续 DAG 执行步补齐能力。路由预推断则适合在请求开始前补齐较明确的能力缺口。当前工具匹配采用 embedding-only，不回退 BM25 或 LLM rerank。向量服务不可用时宁可跳过动态补挂，也不盲目匹配无关工具。
 
 ---
 
@@ -498,6 +519,9 @@ agent:
     enabled: false
     max-asks: 2
     timeout-seconds: 120
+  request-tool:
+    enabled: false
+    max-calls: 3
 
   mcp:
     disable-tools-on-nonexec-steps: true
@@ -508,10 +532,20 @@ agent:
       max-serial-rounds-per-client: 3
 
   dynamic-tools:
+    # 路由阶段缺失能力预推断；与执行期 request_tool 可并存
     infer-on-selected-agent: true
     per-need-top-k: 2
     max-extra-tools-per-request: 6
     match-cache-ttl-ms: 600000
+  flow:
+    plan-review:
+      enabled: false
+      store-enabled: true
+      ttl-seconds: 7200
+  run-snapshot:
+    enabled: true
+    ttl-seconds: 21600
+    session-index-size: 30
 ```
 
 ---
