@@ -21,6 +21,8 @@ public class RunStepSnapshot {
     private Boolean inherited;
     private String preview;
     private String content;
+    /** Flow/redo 使用：执行该步骤时的原始步骤内容，随 Redis run snapshot TTL 自动过期。 */
+    private String stepContent;
     private Long createdAt;
     private Long updatedAt;
 }

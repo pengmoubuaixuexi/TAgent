@@ -26,6 +26,18 @@ public interface RunSnapshotService {
                     String content,
                     String status);
 
+    /**
+     * 记录步骤执行前的原始步骤内容（如 Flow Step4 的单个 DAG 子步骤计划）。
+     * <p>默认 no-op，Redis 实现会写入同一个 run snapshot；不涉及 DB 表结构。</p>
+     */
+    default void recordStepContent(String runId,
+                                   String stepId,
+                                   String title,
+                                   String type,
+                                   Integer stepNo,
+                                   String stepContent) {
+    }
+
     void markStatus(String runId, String status, String lastError);
 
     Optional<String> buildRedoContext(String sourceRunId, Integer redoFromStep, String sessionId);

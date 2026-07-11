@@ -1072,10 +1072,7 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
 
   function depBadgeHtml(dependsOn) {
     if (!Array.isArray(dependsOn) || dependsOn.length === 0) return '';
-    const depNames = dependsOn.map(did => {
-      const dc = stepBuffers[did];
-      return dc ? dc.displayName : did;
-    }).join(' / ');
+    const depNames = dependsOn.map(did => dependencyDisplayName(did, stepBuffers)).join(' / ');
     return `<span class="step-dep" title="此步骤依赖以下步骤完成后才能执行">依赖: ${escapeHtml(depNames)}</span>`;
   }
 
@@ -1083,10 +1080,7 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
     if (!Array.isArray(dependsOn) || dependsOn.length === 0) {
       return '<span class="text-gray-500">⏳ 等待执行中...</span>';
     }
-    const depNames = dependsOn.map(did => {
-      const dc = stepBuffers[did];
-      return dc ? dc.displayName : did;
-    }).join('、');
+    const depNames = dependsOn.map(did => dependencyDisplayName(did, stepBuffers)).join('、');
     return `<span class="text-gray-500">⏳ 依赖 ${escapeHtml(depNames)} 完成后开始执行</span>`;
   }
 
@@ -1096,17 +1090,18 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
     if (placeholder) placeholder.remove();
     const card = document.createElement('div');
     card.className = 'step-card pending collapsed fade-in';
+    const shownName = normalizeExecutionStepName(displayName, stepId) || stepId;
     card.innerHTML = `
       <div class="step-head">
         <span class="chev">▾</span>
-        <span class="step-name">${escapeHtml(displayName || stepId)}</span>
+        <span class="step-name">${escapeHtml(shownName)}</span>
         <span class="step-status">等待中</span>
       </div>
       <div class="step-body">${depPendingMessage(dependsOn)}</div>
     `;
     card.querySelector('.step-head').addEventListener('click', () => card.classList.toggle('collapsed'));
     stepsContainer.appendChild(card);
-    stepBuffers[stepId] = { card, body: card.querySelector('.step-body'), buf: '', displayName, dependsOn, status: 'pending' };
+    stepBuffers[stepId] = { card, body: card.querySelector('.step-body'), buf: '', displayName: shownName, dependsOn, status: 'pending' };
     scrollBottom();
     return stepBuffers[stepId];
   }
@@ -1114,6 +1109,7 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
   function activateStepCard(stepId, displayName, dependsOn) {
     if (!stepsContainer) return null;
     let entry = stepBuffers[stepId];
+    const shownName = normalizeExecutionStepName(displayName, stepId) || stepId;
     if (!entry) {
       const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card):not(.tool-card)');
       if (placeholder) placeholder.remove();
@@ -1122,7 +1118,7 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
       card.innerHTML = `
         <div class="step-head">
           <span class="chev">▾</span>
-          <span class="step-name">${escapeHtml(displayName || stepId)}</span>
+          <span class="step-name">${escapeHtml(shownName)}</span>
           ${depBadgeHtml(dependsOn)}
           <span class="step-status">进行中…</span>
         </div>
@@ -1130,12 +1126,14 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
       `;
       card.querySelector('.step-head').addEventListener('click', () => card.classList.toggle('collapsed'));
       stepsContainer.appendChild(card);
-      entry = { card, body: card.querySelector('.step-body'), buf: '', displayName, dependsOn, status: 'running' };
+      entry = { card, body: card.querySelector('.step-body'), buf: '', displayName: shownName, dependsOn, status: 'running' };
       stepBuffers[stepId] = entry;
     } else {
       entry.card.classList.remove('pending', 'collapsed');
       entry.card.classList.add('running');
       const head = entry.card.querySelector('.step-head');
+      const stepNameEl = head.querySelector('.step-name');
+      if (stepNameEl) stepNameEl.textContent = shownName;
       const oldBadge = head.querySelector('.step-dep');
       if (oldBadge) oldBadge.remove();
       const status = head.querySelector('.step-status');
@@ -1145,6 +1143,7 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
       entry.body.innerHTML = '';
       entry.buf = '';
       entry.dependsOn = dependsOn;
+      entry.displayName = shownName;
       entry.status = 'running';
     }
     scrollBottom();
@@ -1514,7 +1513,7 @@ function renderRunStepPalette(snapshot) {
       <div class="mt-1 text-xs text-gray-500 truncate">${escapeHtml(snapshot.originalMessage || '')}</div>
     </div>
   `);
-  steps.forEach(step => {
+  steps.filter(step => isRunStepRedoable(snapshot, step)).forEach(step => {
     const ordinal = step.ordinal || step.stepNo || 1;
     const label = runStepLabel(step);
     rows.push(`
@@ -1571,6 +1570,38 @@ function runStepLabel(step) {
   if (fixed) return fixed[1] ? `Fixed_${fixed[1]}` : 'Fixed';
   if (id === 'summary:final' || id.startsWith('summary:')) return '最终回答';
   return `Step${step.ordinal || step.stepNo || 1}`;
+}
+
+function isRunStepRedoable(snapshot, step) {
+  const agentType = String(snapshot && snapshot.agentType || '').toLowerCase();
+  if (agentType !== 'flow') return true;
+  const id = String(step && step.stepId || '');
+  const title = String(step && step.title || '');
+  return id !== 'thinking:计划解析' && !title.includes('计划解析');
+}
+
+function flowExecutionDisplayNameFromStepId(stepId) {
+  const id = String(stepId || '');
+  const m = id.match(/^flow_step4_execute_step_?(\d+)$/);
+  return m ? `执行 第${m[1]}步` : '';
+}
+
+function normalizeExecutionStepName(displayName, stepId) {
+  const fromStepId = flowExecutionDisplayNameFromStepId(stepId);
+  if (fromStepId) return fromStepId;
+  const raw = String(displayName || '').trim();
+  if (!raw) return '';
+  const cleaned = raw
+    .replace(/^Step4_execute\d+\s*[·:：\-]\s*/i, '')
+    .replace(/^Step\d+\s*[·:：\-]\s*/i, '')
+    .replace(/^Fixed(?:_\d+)?\s*[·:：\-]\s*/i, '')
+    .trim();
+  return cleaned || raw;
+}
+
+function dependencyDisplayName(depId, stepBuffers) {
+  const entry = stepBuffers && stepBuffers[depId];
+  return normalizeExecutionStepName(entry && entry.displayName ? entry.displayName : '', depId) || String(depId || '');
 }
 
 function shortRunId(runId) {
@@ -1669,10 +1700,7 @@ async function sendMessage() {
 
     function depBadgeHtml(dependsOn) {
       if (!Array.isArray(dependsOn) || dependsOn.length === 0) return '';
-      const depNames = dependsOn.map(did => {
-        const dc = stepBuffers[did];
-        return dc ? dc.displayName : did;
-      }).join(' / ');
+      const depNames = dependsOn.map(did => dependencyDisplayName(did, stepBuffers)).join(' / ');
       return `<span class="step-dep" title="此步骤依赖以下步骤完成后才能执行">依赖: ${escapeHtml(depNames)}</span>`;
     }
 
@@ -1680,10 +1708,7 @@ async function sendMessage() {
       if (!Array.isArray(dependsOn) || dependsOn.length === 0) {
         return '<span class="text-gray-500">⏳ 等待执行中...</span>';
       }
-      const depNames = dependsOn.map(did => {
-        const dc = stepBuffers[did];
-        return dc ? dc.displayName : did;
-      }).join('、');
+      const depNames = dependsOn.map(did => dependencyDisplayName(did, stepBuffers)).join('、');
       return `<span class="text-gray-500">⏳ 依赖 ${escapeHtml(depNames)} 完成后开始执行</span>`;
     }
 
@@ -1694,11 +1719,12 @@ async function sendMessage() {
       if (placeholder) placeholder.remove();
       const card = document.createElement('div');
       card.className = 'step-card pending collapsed fade-in';
+      const shownName = normalizeExecutionStepName(displayName, stepId) || stepId;
       // pending 态：head 不显示 dep badge（badge 只在 running 后才出现）
       card.innerHTML = `
         <div class="step-head">
           <span class="chev">▾</span>
-          <span class="step-name">${escapeHtml(displayName || stepId)}</span>
+          <span class="step-name">${escapeHtml(shownName)}</span>
           <span class="step-status">等待中</span>
         </div>
         <div class="step-body">${depPendingMessage(dependsOn)}</div>
@@ -1707,7 +1733,7 @@ async function sendMessage() {
         card.classList.toggle('collapsed');
       });
       stepsContainer.appendChild(card);
-      stepBuffers[stepId] = { card, body: card.querySelector('.step-body'), buf: '', displayName, dependsOn, status: 'pending' };
+      stepBuffers[stepId] = { card, body: card.querySelector('.step-body'), buf: '', displayName: shownName, dependsOn, status: 'pending' };
       scrollBottom();
       return stepBuffers[stepId];
     }
@@ -1715,6 +1741,7 @@ async function sendMessage() {
     // 一个 step 真正开始执行时调（来自 step_start 事件）：从 pending 切到 running，head 加 dep badge
     function activateStepCard(stepId, displayName, dependsOn) {
       let entry = stepBuffers[stepId];
+      const shownName = normalizeExecutionStepName(displayName, stepId) || stepId;
       if (!entry) {
         // 没收到 pending（比如 fixed / auto 的单 step 路径），临时创建一张
         const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card):not(.tool-card)');
@@ -1724,7 +1751,7 @@ async function sendMessage() {
         card.innerHTML = `
           <div class="step-head">
             <span class="chev">▾</span>
-            <span class="step-name">${escapeHtml(displayName || stepId)}</span>
+            <span class="step-name">${escapeHtml(shownName)}</span>
             ${depBadgeHtml(dependsOn)}
             <span class="step-status">进行中…</span>
           </div>
@@ -1734,7 +1761,7 @@ async function sendMessage() {
           card.classList.toggle('collapsed');
         });
         stepsContainer.appendChild(card);
-        entry = { card, body: card.querySelector('.step-body'), buf: '', displayName, dependsOn, status: 'running' };
+        entry = { card, body: card.querySelector('.step-body'), buf: '', displayName: shownName, dependsOn, status: 'running' };
         stepBuffers[stepId] = entry;
       } else {
         // 已有 pending 卡片 → 切到 running
@@ -1742,6 +1769,8 @@ async function sendMessage() {
         entry.card.classList.add('running');
         // head 注入 dep badge（dep 信息以 step_start 携带的为准，确保稳定）
         const head = entry.card.querySelector('.step-head');
+        const stepNameEl = head.querySelector('.step-name');
+        if (stepNameEl) stepNameEl.textContent = shownName;
         const oldBadge = head.querySelector('.step-dep');
         if (oldBadge) oldBadge.remove();
         const status = head.querySelector('.step-status');
@@ -1752,6 +1781,7 @@ async function sendMessage() {
         entry.body.innerHTML = '';
         entry.buf = '';
         entry.dependsOn = dependsOn;
+        entry.displayName = shownName;
         entry.status = 'running';
       }
       scrollBottom();
@@ -1767,7 +1797,7 @@ async function sendMessage() {
       const steps = payload && Array.isArray(payload.steps) ? payload.steps : [];
       steps.forEach(step => {
         const ordinal = step.ordinal || step.stepNo || 1;
-        const label = runStepLabel(step);
+        const inheritedName = normalizeExecutionStepName(step.title || '已沿用步骤', step.stepId) || '已沿用步骤';
         const stepId = `inherited_${ordinal}_${step.stepId || ''}`;
         if (stepBuffers[stepId]) return;
         const card = document.createElement('div');
@@ -1775,14 +1805,14 @@ async function sendMessage() {
         card.innerHTML = `
           <div class="step-head">
             <span class="chev">▾</span>
-            <span class="step-name">${escapeHtml(label)} · ${escapeHtml(step.title || '已沿用步骤')}</span>
+            <span class="step-name">${escapeHtml(inheritedName)}</span>
             <span class="step-status">已沿用</span>
           </div>
           <div class="step-body">${renderMarkdown(step.content || step.preview || '')}</div>
         `;
         card.querySelector('.step-head').addEventListener('click', () => card.classList.toggle('collapsed'));
         stepsContainer.appendChild(card);
-        stepBuffers[stepId] = { card, body: card.querySelector('.step-body'), buf: step.content || '', displayName: step.title || `Step${ordinal}`, status: 'done' };
+        stepBuffers[stepId] = { card, body: card.querySelector('.step-body'), buf: step.content || '', displayName: inheritedName, status: 'done' };
       });
       scrollBottom();
     }

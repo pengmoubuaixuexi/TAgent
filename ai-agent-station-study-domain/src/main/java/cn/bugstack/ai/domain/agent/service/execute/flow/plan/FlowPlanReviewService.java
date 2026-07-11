@@ -31,7 +31,7 @@ public class FlowPlanReviewService {
 
     private static final Pattern STEP_KEY_PATTERN = Pattern.compile("\\u7b2c\\s*(\\d+)\\s*\\u6b65");
     private static final Pattern DEPENDS_LINE_PATTERN = Pattern.compile("(?im)^\\s*(?:[-*+]\\s*)?(?:\\*+)?\\s*(DEPENDS_ON|\\u4f9d\\u8d56\\u6b65\\u9aa4)\\s*(?:\\*+)?\\s*[:\\uff1a].*$");
-    private static final Pattern PLAN_HEADER_PATTERN = Pattern.compile("(?is)^\\s*#{0,6}\\s*\\u7b2c\\s*\\d+\\s*\\u6b65\\s*[:\\uff1a].*(?:\\r?\\n|$)");
+    private static final Pattern PLAN_HEADER_PATTERN = Pattern.compile("(?i)^\\s*#{0,6}\\s*\\u7b2c\\s*\\d+\\s*\\u6b65\\s*[:\\uff1a][^\\r\\n]*(?:\\r?\\n|$)");
     public static final String STATUS_PENDING = "PENDING";
     public static final String STATUS_RUNNING = "RUNNING";
     public static final String STATUS_COMPLETED = "COMPLETED";

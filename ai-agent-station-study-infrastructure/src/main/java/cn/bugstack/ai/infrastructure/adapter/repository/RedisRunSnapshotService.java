@@ -35,7 +35,7 @@ public class RedisRunSnapshotService implements RunSnapshotService {
     @Value("${agent.run-snapshot.ttl-seconds:21600}")
     private long ttlSeconds;
 
-    @Value("${agent.run-snapshot.max-content-chars:16000}")
+    @Value("${agent.run-snapshot.max-content-chars:0}")
     private int maxContentChars;
 
     @Value("${agent.run-snapshot.session-index-size:30}")
@@ -175,6 +175,59 @@ public class RedisRunSnapshotService implements RunSnapshotService {
     }
 
     @Override
+    public void recordStepContent(String runId,
+                                  String stepId,
+                                  String title,
+                                  String type,
+                                  Integer stepNo,
+                                  String stepContent) {
+        if (blank(runId) || blank(stepContent)) {
+            return;
+        }
+        try {
+            RunSnapshot snapshot = find(runId).orElseGet(() -> {
+                long now = System.currentTimeMillis();
+                return RunSnapshot.builder()
+                        .runId(runId)
+                        .status(STATUS_RUNNING)
+                        .createdAt(now)
+                        .updatedAt(now)
+                        .expiresAt(now + Math.max(60, ttlSeconds) * 1000L)
+                        .steps(new ArrayList<>())
+                        .build();
+            });
+            List<RunStepSnapshot> steps = snapshot.getSteps();
+            if (steps == null) {
+                steps = new ArrayList<>();
+                snapshot.setSteps(steps);
+            }
+            String resolvedStepId = !blank(stepId) ? stepId : fallbackStepId(type, title, stepNo, steps.size() + 1);
+            RunStepSnapshot step = findStep(steps, resolvedStepId).orElse(null);
+            long now = System.currentTimeMillis();
+            if (step == null) {
+                step = RunStepSnapshot.builder()
+                        .ordinal(steps.size() + 1)
+                        .createdAt(now)
+                        .build();
+                steps.add(step);
+            }
+            step.setStepNo(stepNo);
+            step.setStepId(resolvedStepId);
+            step.setTitle(!blank(title) ? title : defaultTitle(type, stepNo));
+            step.setType(type);
+            step.setStatus(!blank(step.getStatus()) ? step.getStatus() : STATUS_RUNNING);
+            step.setStepContent(clip(stepContent, maxContentChars));
+            step.setInherited(Boolean.FALSE);
+            step.setUpdatedAt(now);
+            normalizeOrdinals(steps);
+            snapshot.setUpdatedAt(now);
+            save(snapshot);
+        } catch (Exception e) {
+            log.warn("[RunSnapshot] recordStepContent failed runId={} stepId={} err={}", runId, stepId, e.getMessage());
+        }
+    }
+
+    @Override
     public void markStatus(String runId, String status, String lastError) {
         if (blank(runId)) {
             return;
@@ -298,6 +351,7 @@ public class RedisRunSnapshotService implements RunSnapshotService {
                     .inherited(Boolean.TRUE)
                     .preview(step.getPreview())
                     .content(step.getContent())
+                    .stepContent(step.getStepContent())
                     .createdAt(step.getCreatedAt())
                     .updatedAt(step.getUpdatedAt())
                     .build();
@@ -455,6 +509,18 @@ public class RedisRunSnapshotService implements RunSnapshotService {
         }
         String stepId = step.getStepId();
         if (!blank(stepId)) {
+            if (stepId.startsWith("thinking:")) {
+                String title = step.getTitle() == null ? "" : step.getTitle();
+                if (title.contains("工具分析")) {
+                    return "Step1";
+                }
+                if (title.contains("步骤规划")) {
+                    return "Step2";
+                }
+                if (title.contains("计划解析")) {
+                    return "Step3";
+                }
+            }
             Integer flowStep4No = parseTrailingNumber(stepId, "flow_step4_execute_step_");
             if (flowStep4No != null) {
                 return "Step4_execute" + flowStep4No;
@@ -523,6 +589,9 @@ public class RedisRunSnapshotService implements RunSnapshotService {
     private String clip(String value, int maxChars) {
         if (value == null) {
             return null;
+        }
+        if (maxChars <= 0) {
+            return value;
         }
         int max = Math.max(1000, maxChars);
         if (value.length() <= max) {
