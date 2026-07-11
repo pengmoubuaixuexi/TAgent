@@ -2,7 +2,7 @@
 
 <div align="center">
 
-🚀 **A Production-Grade AI Agent Engineering Framework**
+🚀 **面向生产实践的 AI Agent 工程框架**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Java 17+](https://img.shields.io/badge/Java-17+-orange)](https://www.oracle.com/java/)
@@ -11,7 +11,7 @@
 [![CI](https://github.com/pengmoubuaixuexi/TAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/pengmoubuaixuexi/TAgent/actions/workflows/ci.yml)
 [![GitHub Stars](https://img.shields.io/github/stars/pengmoubuaixuexi/TAgent?style=social)](https://github.com/pengmoubuaixuexi/TAgent)
 
-[🇬🇧 English](./README_EN.md) | 🇨🇳 中文
+[英文版](./README_EN.md) | 中文版
 
 > 不只是简单的模型封装，而是覆盖 Agent 请求的完整生命周期：接入、路由、运行时装配、规划执行、RAG、记忆、MCP 工具治理、人工审批、执行中干预，到 SSE 流式输出和全链路观测。
 
@@ -39,14 +39,18 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 
 ![TAgent 端到端架构](docs/images/tagent-end-to-end-architecture-2026-06-v2.png)
 
+## 🎬 功能演示
+
+三种策略、动态工具补充、主动追问、计划确认、人工审批、运行编号重做与观测页面均提供了独立录屏，便于按功能查看或替换：[查看功能演示录屏](docs/demo-videos/README.md)。
+
 ### 主链路
 
 ```text
 用户请求
-  -> Filter / SSE Controller
-  -> UnifiedAgentRouter
-  -> Fixed / Auto / Flow
-  -> Advisor + LLM
+  -> 过滤器 / SSE 控制器
+  -> 统一 Agent 路由
+  -> Fixed / Auto / Flow 三种策略
+  -> Advisor 顾问链 + LLM
   -> MCP 工具执行
   -> SSE 流式响应
 ```
@@ -55,7 +59,7 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 
 - **动态工具补充**：路由可预推断缺失能力，也可由执行期 `request_tool` 主动描述能力缺口 → PgVector 匹配真实 MCP 工具 → 与 Agent 常驻工具合并
 - **Flow 计划确认**：仅 Flow 策略在生成并解析计划后可暂停，用户确认或编辑计划后再进入 DAG 执行
-- **Run ID 快照重做**：Fixed、Auto、Flow 每次运行都会生成 Run ID；前端可通过 `/run` 查看近期快照，并用 `/runId-stepN` 从指定步骤修正重跑
+- **运行编号快照重做**：Fixed、Auto、Flow 每次运行都会生成运行编号；前端可通过 `/run` 查看近期快照，并用 `/runId-stepN` 从指定步骤修正重跑
 - **执行中干预**：用户可发送 `steer` 重做当前步骤、`answer_now` 跳过剩余步骤、`cancel` 中止执行
 - **主动追问**：模型缺少关键信息时可调用 `ask_user`，通过 SSE 向用户收集补充信息，再回填继续执行
 
@@ -72,13 +76,13 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 | **MCP 自愈** | 懒探活、失败重试、超时重连、dead-client 重建、冷却与熔断 |
 | **工具治理** | 非执行步禁工具、未知工具纠正、参数提示、轮次预算、跨 MCP 并行 |
 | **Flow 计划确认** | Flow 计划解析后暂停，支持用户查看、编辑、确认后继续 DAG 执行 |
-| **Run ID 步骤重做** | Redis TTL 快照保存运行步骤，支持 `/run` 查看、`/runId-stepN` 定点重做 |
+| **运行编号步骤重做** | Redis TTL 快照保存运行步骤，支持 `/run` 查看、`/runId-stepN` 定点重做 |
 | **Agentic RAG** | SIMPLE、HyDE、FUSION、DECOMPOSE 四种查询策略 |
-| **四层记忆** | Working、Chat、Long-Term、Episodic Memory |
+| **四层记忆** | 工作记忆、对话记忆、长期记忆、情景记忆 |
 | **流式干预** | Auto、Flow、Fixed 均支持立即回答、引导与取消执行 |
 | **主动追问** | `ask_user` 通过 SSE 向用户请求补充信息，默认关闭、按 session 限次和超时 |
 | **人机协同** | 高风险工具调用通过 SSE 请求人工批准或拒绝 |
-| **可解释输出** | 工具进度、RAG evidence、Memory evidence、步骤状态 |
+| **可解释输出** | 工具进度、RAG 依据、记忆依据、步骤状态 |
 | **全链路观测** | Prometheus、ELK、Jaeger、event_log、LLM 成本与 MCP 健康页 |
 
 ---
@@ -152,15 +156,15 @@ Flow 还可以开启计划确认：Step2 生成计划、Step3 解析为 DAG 后�
 
 ---
 
-## 🔁 Run ID 快照与步骤级重做
+## 🔁 运行编号快照与步骤级重做
 
-每次 Agent 运行都会生成一个 Run ID，用来串联本次请求的 SSE、ChatMemory、event_log 和 Redis 运行快照。
+每次 Agent 运行都会生成一个运行编号，用来串联本次请求的 SSE、对话记忆、事件日志和 Redis 运行快照。
 
 - **快照范围**：Fixed 记录单次回答快照；Auto 记录 Step1-Step4；Flow 记录计划阶段和 Step4 中的 DAG 执行步骤。
 - **存储方式**：运行快照保存在 Redis，并设置 TTL；过期后需要重新发起任务，而不是沿用旧计划或旧工具结果。
-- **前端入口**：输入 `/run` 展示当前会话近期运行，只展开运行摘要；选择某个 Run ID 后再展示可重做步骤。
+- **前端入口**：输入 `/run` 展示当前会话近期运行，只展开运行摘要；选择某个运行编号后再展示可重做步骤。
 - **定点重做**：输入 `/runId-stepN 修正要求` 后，系统继承源运行的 Agent 和前置步骤，并从目标步骤继续生成新回答。
-- **历史记录**：ChatMemory 和 event_log 记录 Run ID，刷新页面后仍能复制 Run ID；但真正能否重做以 Redis 快照是否仍有效为准。
+- **历史记录**：对话记忆和事件日志记录运行编号，刷新页面后仍能复制运行编号；但真正能否重做以 Redis 快照是否仍有效为准。
 
 ---
 
@@ -220,13 +224,13 @@ Advisor 由数据库配置，并按 order 参与请求：
 | Advisor | 作用 |
 |---|---|
 | Semantic Cache | 相似问题命中后直接短路后续链路 |
-| Long-Term Memory | 注入长期画像和语义记忆，结束后异步抽取新记忆 |
-| Episodic Memory | 注入当前会话或跨会话摘要 |
+| 长期记忆 | 注入长期画像和语义记忆，结束后异步抽取新记忆 |
+| 情景记忆 | 注入当前会话或跨会话摘要 |
 | Prompt Injection | 检测潜在提示词注入 |
 | PII Mask | 对输入或输出中的敏感信息进行处理 |
 | Agentic RAG | 判断是否检索以及选择查询策略 |
 | Rag Answer | 执行混合检索、rerank、父子文档替换和引用组装 |
-| Chat Memory | 只读历史上下文，完整回答由应用层写入 |
+| 对话记忆 | 只读历史上下文，完整回答由应用层写入 |
 | CoVe | 对回答声明进行检索核验与观测 |
 
 ---
@@ -261,10 +265,10 @@ Query Planning
 
 | 记忆层 | 存储 | 用途 |
 |---|---|---|
-| Working Memory | Redis | 保存 Auto/Flow 步骤中间产物，支持步骤间读取和断线后的完成态回放 |
-| Chat Memory | MySQL + Redis Cache | 保存多轮聊天历史和滚动摘要 |
-| Long-Term Memory | MySQL Meta + PgVector | 保存用户画像、技能、偏好、计划和情况，支持语义召回 |
-| Episodic Memory | MySQL | 保存会话阶段性摘要和近期经历 |
+| 工作记忆 | Redis | 保存 Auto/Flow 步骤中间产物，支持步骤间读取和断线后的完成态回放 |
+| 对话记忆 | MySQL + Redis 缓存 | 保存多轮聊天历史和滚动摘要 |
+| 长期记忆 | MySQL 元数据 + PgVector | 保存用户画像、技能、偏好、计划和情况，支持语义召回 |
+| 情景记忆 | MySQL | 保存会话阶段性摘要和近期经历 |
 
 长期记忆包含：
 - 固定画像槽位

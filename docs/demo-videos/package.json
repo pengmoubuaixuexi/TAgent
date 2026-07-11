@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "description": "TAgent 功能演示录屏的本地依赖",
+  "devDependencies": {
+    "playwright": "^1.54.0"
+  }
+}

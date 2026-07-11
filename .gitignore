@@ -75,3 +75,10 @@ backup/
 *.zip
 *.docx
 *.pdf
+
+### Demo recording intermediates ###
+docs/demo-videos/.tmp-recordings/
+docs/demo-videos/*.failure.png
+docs/demo-videos/node_modules/
+!docs/demo-videos/scripts/
+!docs/demo-videos/scripts/**
