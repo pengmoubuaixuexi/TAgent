@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>长期记忆管理 - AI Agent Station</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    .scrollbar::-webkit-scrollbar { width: 6px; }
+    .scrollbar::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+    .memory-card { transition: border-color .15s, transform .15s; }
+    .memory-card:hover { border-color: #475569; transform: translateY(-1px); }
+    .toast { animation: toast-in .2s ease-out; }
+    @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+  <header class="sticky top-0 z-20 bg-slate-900/95 backdrop-blur border-b border-slate-800">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between gap-4">
+      <div class="flex items-center gap-3 min-w-0">
+        <a href="/" class="text-sm text-slate-400 hover:text-white transition">← 返回对话</a>
+        <span class="text-slate-700">|</span>
+        <div class="min-w-0">
+          <h1 class="font-semibold text-white truncate">长期记忆管理</h1>
+          <p class="text-xs text-slate-500">查看和纠正 Agent 跨会话记住的事实与偏好</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-2 shrink-0">
+        <div id="userAvatar" class="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center text-xs font-bold"></div>
+        <span id="userName" class="text-sm text-slate-300"></span>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-6xl mx-auto px-4 py-6">
+    <section class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-5">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <div class="text-xs text-slate-500">当前活跃记忆</div>
+        <div id="totalCount" class="text-2xl font-semibold mt-1">—</div>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <div class="text-xs text-slate-500">搜索方式</div>
+        <div class="text-sm text-blue-300 mt-2">Embedding 语义检索</div>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+        <div class="text-xs text-slate-500">浏览影响</div>
+        <div class="text-sm text-emerald-300 mt-2">不会增加访问热度</div>
+      </div>
+    </section>
+
+    <section class="bg-slate-900 border border-slate-800 rounded-xl p-4 mb-5">
+      <div class="flex flex-col gap-3">
+        <div class="flex flex-col sm:flex-row gap-2">
+          <input id="searchInput" maxlength="1000"
+                 class="flex-1 min-w-0 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
+                 placeholder="用自然语言搜索，例如：我偏好的编程语言"
+                 onkeydown="if(event.key==='Enter')runSearch()">
+          <button onclick="runSearch()" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded-lg text-sm font-medium transition">语义搜索</button>
+          <button onclick="resetSearch()" class="bg-slate-800 hover:bg-slate-700 px-3 py-2 rounded-lg text-sm text-slate-300 transition">重置</button>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <select id="topicFilter" onchange="loadMemories(1)"
+                  class="flex-1 min-w-36 sm:flex-none sm:w-48 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500">
+            <option value="">全部分类</option>
+            <option value="画像">画像</option>
+            <option value="技能">技能</option>
+            <option value="偏好">偏好</option>
+            <option value="计划">计划</option>
+            <option value="情况">情况</option>
+            <option value="other">其他</option>
+          </select>
+          <select id="sourceFilter" onchange="loadMemories(1)"
+                  class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500">
+            <option value="">全部来源</option>
+            <option value="auto">自动提取</option>
+            <option value="manual">手动维护</option>
+          </select>
+          <button onclick="openEditor()" class="bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded-lg text-sm font-medium transition whitespace-nowrap">+ 添加记忆</button>
+        </div>
+      </div>
+      <p id="searchHint" class="text-xs text-slate-500 mt-3">留空时按最近使用时间分页展示；输入内容后使用 embedding 做语义检索。</p>
+    </section>
+
+    <section id="memoryList" class="space-y-3">
+      <div class="text-center text-slate-500 py-16">正在加载长期记忆…</div>
+    </section>
+
+    <section id="pagination" class="hidden mt-6 flex items-center justify-center gap-3">
+      <button id="prevBtn" onclick="changePage(-1)" class="bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 rounded-lg text-sm">上一页</button>
+      <span id="pageInfo" class="text-sm text-slate-400"></span>
+      <button id="nextBtn" onclick="changePage(1)" class="bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 rounded-lg text-sm">下一页</button>
+    </section>
+  </main>
+
+  <div id="editorModal" class="hidden fixed inset-0 z-40 bg-black/70 p-4 flex items-center justify-center">
+    <div class="w-full max-w-2xl bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl p-6">
+      <div class="flex items-center justify-between mb-5">
+        <div>
+          <h2 id="editorTitle" class="text-lg font-semibold">添加长期记忆</h2>
+          <p class="text-xs text-slate-500 mt-1">保存时会生成新的 embedding，不调用 LLM。</p>
+        </div>
+        <button onclick="closeEditor()" class="text-slate-500 hover:text-white text-2xl">×</button>
+      </div>
+      <input id="editingMemoryId" type="hidden">
+      <label class="block text-sm text-slate-300 mb-2">主题</label>
+      <input id="editorTopic" maxlength="128"
+             class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 mb-4"
+             placeholder="例如：画像:职业、偏好:回答风格、技能:Java；不填则为 other">
+      <div class="flex items-center justify-between mb-2">
+        <label class="text-sm text-slate-300">记忆内容</label>
+        <span id="contentCounter" class="text-xs text-slate-600">0 / 4000</span>
+      </div>
+      <textarea id="editorContent" maxlength="4000" rows="8"
+                oninput="updateContentCounter()"
+                class="w-full resize-y bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm leading-6 focus:outline-none focus:border-blue-500"
+                placeholder="用明确、独立的事实句描述，例如：用户主要使用 Java 和 Spring Boot 开发后端服务。"></textarea>
+      <div id="editorError" class="hidden mt-3 text-sm text-red-300 bg-red-950/50 border border-red-900 rounded-lg px-3 py-2"></div>
+      <div class="flex justify-end gap-2 mt-5">
+        <button onclick="closeEditor()" class="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-sm">取消</button>
+        <button id="saveBtn" onclick="saveMemory()" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-sm font-medium disabled:opacity-50">保存并生成向量</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toastHost" class="fixed right-4 bottom-4 z-50 space-y-2"></div>
+
+  <script>
+    const API = '/api/v1/agent/memories';
+    const state = { userId: null, username: null, page: 1, pageSize: 20, total: 0, semantic: false, items: [] };
+
+    function init() {
+      try {
+        const login = JSON.parse(localStorage.getItem('agent_login') || 'null');
+        if (!login || !login.userId) {
+          window.location.replace('/');
+          return;
+        }
+        state.userId = login.userId;
+        state.username = login.username || login.userId;
+      } catch (e) {
+        window.location.replace('/');
+        return;
+      }
+      document.getElementById('userName').textContent = state.username;
+      document.getElementById('userAvatar').textContent = state.username.slice(0, 1).toUpperCase();
+      loadMemories(1);
+    }
+
+    function authHeaders(json = false) {
+      const headers = { 'X-User-Id': state.userId };
+      if (json) headers['Content-Type'] = 'application/json';
+      return headers;
+    }
+
+    async function request(url, options = {}) {
+      const response = await fetch(url, options);
+      const payload = await response.json();
+      if (!payload || payload.code !== '0000') throw new Error(payload && payload.info ? payload.info : '请求失败');
+      return payload.data;
+    }
+
+    async function loadMemories(page = 1) {
+      state.semantic = false;
+      state.page = Math.max(1, page);
+      const topic = document.getElementById('topicFilter').value.trim();
+      const source = document.getElementById('sourceFilter').value;
+      const params = new URLSearchParams({ page: state.page, pageSize: state.pageSize });
+      if (topic) params.set('topic', topic);
+      if (source) params.set('source', source);
+      setLoading('正在加载长期记忆…');
+      document.getElementById('searchHint').textContent = '当前为分页浏览；浏览不会更新 accessCount 或 lastAccessed。';
+      try {
+        const data = await request(`${API}?${params}`, { headers: authHeaders() });
+        state.items = Array.isArray(data.items) ? data.items : [];
+        state.total = Number(data.total || 0);
+        state.page = Number(data.page || 1);
+        renderMemories();
+        renderPagination();
+        document.getElementById('totalCount').textContent = state.total;
+      } catch (e) {
+        renderError(e.message);
+      }
+    }
+
+    async function runSearch() {
+      const query = document.getElementById('searchInput').value.trim();
+      if (!query) { loadMemories(1); return; }
+      state.semantic = true;
+      setLoading('正在进行语义搜索…');
+      document.getElementById('searchHint').textContent = '当前为 embedding 语义搜索；搜索命中不会增加记忆热度。';
+      try {
+        let items = await request(`${API}/search?query=${encodeURIComponent(query)}&limit=30`, { headers: authHeaders() });
+        const topic = document.getElementById('topicFilter').value.trim().toLowerCase();
+        const source = document.getElementById('sourceFilter').value;
+        items = Array.isArray(items) ? items : [];
+        if (topic) items = items.filter(item => matchesTopicCategory(item.topic, topic));
+        if (source) items = items.filter(item => item.source === source);
+        state.items = items;
+        renderMemories();
+        document.getElementById('pagination').classList.add('hidden');
+      } catch (e) {
+        renderError(e.message);
+      }
+    }
+
+    function resetSearch() {
+      document.getElementById('searchInput').value = '';
+      document.getElementById('topicFilter').value = '';
+      document.getElementById('sourceFilter').value = '';
+      loadMemories(1);
+    }
+
+    function setLoading(text) {
+      document.getElementById('memoryList').innerHTML = `<div class="text-center text-slate-500 py-16">${escapeHtml(text)}</div>`;
+      document.getElementById('pagination').classList.add('hidden');
+    }
+
+    function renderError(message) {
+      document.getElementById('memoryList').innerHTML = `<div class="text-center py-16"><p class="text-red-300">${escapeHtml(message)}</p><button onclick="loadMemories(state.page)" class="mt-3 text-sm text-blue-400 hover:text-blue-300">重新加载</button></div>`;
+    }
+
+    function renderMemories() {
+      const list = document.getElementById('memoryList');
+      if (!state.items.length) {
+        list.innerHTML = '<div class="text-center text-slate-500 py-16"><div class="text-3xl mb-3">◌</div><p>没有找到长期记忆</p><p class="text-xs mt-1">可以手动添加一条，或者调整搜索条件。</p></div>';
+        return;
+      }
+      list.innerHTML = state.items.map(item => {
+        const source = item.source === 'manual' ? '手动维护' : '自动提取';
+        const sourceClass = item.source === 'manual' ? 'text-emerald-300 bg-emerald-950/60 border-emerald-900' : 'text-violet-300 bg-violet-950/60 border-violet-900';
+        const similarity = item.similarity == null ? '' : `<span class="text-blue-300 bg-blue-950/60 border border-blue-900 rounded-full px-2 py-0.5">相关度 ${Math.round(Number(item.similarity) * 100)}%</span>`;
+        return `<article class="memory-card bg-slate-900 border border-slate-800 rounded-xl p-4" data-id="${escapeHtml(item.memoryId)}">
+          <div class="flex items-start justify-between gap-3">
+            <div class="min-w-0 flex flex-wrap items-center gap-2 text-xs">
+              <span class="text-blue-200 bg-blue-950/60 border border-blue-900 rounded-full px-2 py-0.5">${escapeHtml(item.topic || 'other')}</span>
+              <span class="${sourceClass} border rounded-full px-2 py-0.5">${source}</span>
+              ${similarity}
+            </div>
+            <div class="flex gap-2 shrink-0">
+              <button onclick="editMemory('${jsString(item.memoryId)}')" class="text-xs text-slate-400 hover:text-blue-300 transition">纠正</button>
+              <button onclick="archiveMemory('${jsString(item.memoryId)}')" class="text-xs text-slate-500 hover:text-red-300 transition">归档</button>
+            </div>
+          </div>
+          <p class="mt-3 text-sm text-slate-200 leading-6 whitespace-pre-wrap break-words">${escapeHtml(item.content || '')}</p>
+          <div class="mt-3 pt-3 border-t border-slate-800 flex flex-wrap gap-x-5 gap-y-1 text-xs text-slate-500">
+            <span>使用 ${Number(item.accessCount || 0)} 次</span>
+            <span>最近使用 ${formatTime(item.lastAccessed)}</span>
+            <span>创建 ${formatTime(item.createdAt)}</span>
+            ${item.sourceSession ? `<span title="${escapeHtml(item.sourceSession)}">来源会话 ${escapeHtml(shortId(item.sourceSession))}</span>` : ''}
+          </div>
+        </article>`;
+      }).join('');
+    }
+
+    function renderPagination() {
+      const pages = Math.max(1, Math.ceil(state.total / state.pageSize));
+      const pagination = document.getElementById('pagination');
+      if (state.semantic || state.total <= state.pageSize) { pagination.classList.add('hidden'); return; }
+      pagination.classList.remove('hidden');
+      document.getElementById('pageInfo').textContent = `第 ${state.page} / ${pages} 页`;
+      document.getElementById('prevBtn').disabled = state.page <= 1;
+      document.getElementById('nextBtn').disabled = state.page >= pages;
+    }
+
+    function changePage(delta) { loadMemories(state.page + delta); }
+
+    function openEditor(item = null) {
+      document.getElementById('editingMemoryId').value = item ? item.memoryId : '';
+      document.getElementById('editorTitle').textContent = item ? '纠正长期记忆' : '添加长期记忆';
+      document.getElementById('editorTopic').value = item ? (item.topic || '') : '';
+      document.getElementById('editorContent').value = item ? (item.content || '') : '';
+      document.getElementById('editorError').classList.add('hidden');
+      document.getElementById('editorModal').classList.remove('hidden');
+      updateContentCounter();
+      setTimeout(() => document.getElementById('editorContent').focus(), 50);
+    }
+
+    function closeEditor() { document.getElementById('editorModal').classList.add('hidden'); }
+
+    function editMemory(memoryId) {
+      const item = state.items.find(value => value.memoryId === memoryId);
+      if (item) openEditor(item);
+    }
+
+    function updateContentCounter() {
+      const length = document.getElementById('editorContent').value.length;
+      document.getElementById('contentCounter').textContent = `${length} / 4000`;
+    }
+
+    async function saveMemory() {
+      const memoryId = document.getElementById('editingMemoryId').value;
+      const topic = document.getElementById('editorTopic').value.trim();
+      const content = document.getElementById('editorContent').value.trim();
+      const error = document.getElementById('editorError');
+      const button = document.getElementById('saveBtn');
+      error.classList.add('hidden');
+      if (!content) {
+        error.textContent = '记忆内容不能为空';
+        error.classList.remove('hidden');
+        return;
+      }
+      button.disabled = true;
+      button.textContent = '正在生成向量…';
+      try {
+        const url = memoryId ? `${API}/${encodeURIComponent(memoryId)}` : API;
+        await request(url, {
+          method: memoryId ? 'PUT' : 'POST',
+          headers: authHeaders(true),
+          body: JSON.stringify({ content, topic })
+        });
+        closeEditor();
+        showToast(memoryId ? '记忆已纠正并重新生成向量' : '记忆已添加');
+        document.getElementById('searchInput').value = '';
+        await loadMemories(1);
+      } catch (e) {
+        error.textContent = e.message;
+        error.classList.remove('hidden');
+      } finally {
+        button.disabled = false;
+        button.textContent = '保存并生成向量';
+      }
+    }
+
+    async function archiveMemory(memoryId) {
+      const item = state.items.find(value => value.memoryId === memoryId);
+      if (!item || !confirm(`确定归档这条记忆吗？\n\n${item.content}`)) return;
+      try {
+        await request(`${API}/${encodeURIComponent(memoryId)}`, { method: 'DELETE', headers: authHeaders() });
+        showToast('记忆已归档');
+        if (state.semantic) await runSearch(); else await loadMemories(state.page);
+      } catch (e) {
+        showToast(e.message, true);
+      }
+    }
+
+    function showToast(message, error = false) {
+      const toast = document.createElement('div');
+      toast.className = `toast max-w-sm px-4 py-3 rounded-lg border shadow-xl text-sm ${error ? 'bg-red-950 border-red-800 text-red-200' : 'bg-emerald-950 border-emerald-800 text-emerald-200'}`;
+      toast.textContent = message;
+      document.getElementById('toastHost').appendChild(toast);
+      setTimeout(() => toast.remove(), 3200);
+    }
+
+    function formatTime(value) {
+      if (!value) return '从未';
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour12: false });
+    }
+
+    function shortId(value) { return value && value.length > 18 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value; }
+    function matchesTopicCategory(topic, category) {
+      const value = String(topic || '').toLowerCase();
+      const prefix = String(category || '').toLowerCase();
+      return !prefix || value === prefix || value.startsWith(`${prefix}:`) || value.startsWith(`${prefix}：`);
+    }
+    function escapeHtml(value) { return String(value == null ? '' : value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char])); }
+    function jsString(value) { return String(value == null ? '' : value).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/[\r\n]/g, ''); }
+
+    document.getElementById('editorModal').addEventListener('click', event => { if (event.target.id === 'editorModal') closeEditor(); });
+    init();
+  </script>
+</body>
+</html>

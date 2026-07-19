@@ -118,4 +118,53 @@
         LIMIT #{limit}
     </select>
 
+    <!-- 管理页普通列表只查 MySQL，浏览不会触发 embedding 或 touchAccess。 -->
+    <select id="findActivePage" resultMap="AiLongTermMemoryMap">
+        SELECT * FROM ai_long_term_memory
+        WHERE user_id = #{userId} AND archived = 0
+        <if test="topic != null and topic != ''">
+            AND (topic = #{topic}
+                 OR topic LIKE CONCAT(#{topic}, ':%')
+                 OR topic LIKE CONCAT(#{topic}, '：%'))
+        </if>
+        <if test="source != null and source != ''">
+            AND source = #{source}
+        </if>
+        <if test="keyword != null and keyword != ''">
+            AND (content LIKE CONCAT('%', #{keyword}, '%')
+                 OR topic LIKE CONCAT('%', #{keyword}, '%'))
+        </if>
+        ORDER BY COALESCE(last_accessed, created_at) DESC, id DESC
+        LIMIT #{offset}, #{limit}
+    </select>
+
+    <select id="countActive" resultType="long">
+        SELECT COUNT(1) FROM ai_long_term_memory
+        WHERE user_id = #{userId} AND archived = 0
+        <if test="topic != null and topic != ''">
+            AND (topic = #{topic}
+                 OR topic LIKE CONCAT(#{topic}, ':%')
+                 OR topic LIKE CONCAT(#{topic}, '：%'))
+        </if>
+        <if test="source != null and source != ''">
+            AND source = #{source}
+        </if>
+        <if test="keyword != null and keyword != ''">
+            AND (content LIKE CONCAT('%', #{keyword}, '%')
+                 OR topic LIKE CONCAT('%', #{keyword}, '%'))
+        </if>
+    </select>
+
+    <select id="findActiveOwned" resultMap="AiLongTermMemoryMap">
+        SELECT * FROM ai_long_term_memory
+        WHERE user_id = #{userId} AND memory_id = #{memoryId} AND archived = 0
+        LIMIT 1
+    </select>
+
+    <update id="archiveOwned">
+        UPDATE ai_long_term_memory
+        SET archived = 1, updated_at = NOW()
+        WHERE user_id = #{userId} AND memory_id = #{memoryId} AND archived = 0
+    </update>
+
 </mapper>

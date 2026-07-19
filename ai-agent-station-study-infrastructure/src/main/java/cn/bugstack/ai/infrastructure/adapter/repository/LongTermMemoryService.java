@@ -3,6 +3,8 @@ package cn.bugstack.ai.infrastructure.adapter.repository;
 import cn.bugstack.ai.domain.agent.service.memory.MemoryTopics;
 import cn.bugstack.ai.domain.agent.service.memory.conflict.IMemoryConflictResolver;
 import cn.bugstack.ai.domain.agent.service.memory.longterm.ILongTermMemoryService;
+import cn.bugstack.ai.domain.agent.service.memory.longterm.LongTermMemoryItem;
+import cn.bugstack.ai.domain.agent.service.memory.longterm.LongTermMemoryPage;
 import cn.bugstack.ai.infrastructure.dao.IAiLongTermMemoryDao;
 import cn.bugstack.ai.infrastructure.dao.po.AiLongTermMemory;
 import jakarta.annotation.Resource;
@@ -480,6 +482,143 @@ public class LongTermMemoryService implements ILongTermMemoryService {
     }
 
     @Override
+    public LongTermMemoryPage listForManagement(String userId,
+                                                int page,
+                                                int pageSize,
+                                                String topic,
+                                                String source,
+                                                String keyword) {
+        requireUserId(userId);
+        int safePage = Math.max(1, page);
+        int safePageSize = Math.max(1, Math.min(pageSize <= 0 ? 20 : pageSize, 100));
+        String safeTopic = normalizeOptionalFilter(topic);
+        String safeSource = normalizeOptionalFilter(source);
+        String safeKeyword = trimToNull(keyword);
+        int offset = (safePage - 1) * safePageSize;
+
+        List<AiLongTermMemory> rows = dao.findActivePage(
+                userId, safeTopic, safeSource, safeKeyword, offset, safePageSize);
+        long total = dao.countActive(userId, safeTopic, safeSource, safeKeyword);
+        List<LongTermMemoryItem> items = rows == null ? List.of() : rows.stream()
+                .map(row -> toManagementItem(row, null))
+                .toList();
+        return LongTermMemoryPage.builder()
+                .items(items)
+                .total(total)
+                .page(safePage)
+                .pageSize(safePageSize)
+                .build();
+    }
+
+    @Override
+    public List<LongTermMemoryItem> searchForManagement(String userId, String query, int topK) {
+        requireUserId(userId);
+        if (query == null || query.isBlank()) {
+            throw new IllegalArgumentException("搜索内容不能为空");
+        }
+        int safeTopK = Math.max(1, Math.min(topK <= 0 ? 20 : topK, 50));
+        // 管理页检索必须 touchOnHit=false：用户浏览不能虚增热度并延缓自动衰减。
+        List<Document> docs = retrieveTopKInternal(userId, query.trim(), safeTopK, false);
+        if (docs == null || docs.isEmpty()) return List.of();
+
+        List<LongTermMemoryItem> result = new ArrayList<>(docs.size());
+        for (Document doc : docs) {
+            if (doc == null || doc.getMetadata() == null) continue;
+            Object rawMemoryId = doc.getMetadata().get("memory_id");
+            if (rawMemoryId == null) continue;
+            AiLongTermMemory row = dao.findActiveOwned(userId, rawMemoryId.toString());
+            if (row == null) continue;
+            Double similarity = doc.getScore();
+            if (similarity == null) {
+                Double distance = extractDistance(doc);
+                if (distance != null) similarity = Math.max(0.0, Math.min(1.0, 1.0 - distance));
+            }
+            result.add(toManagementItem(row, similarity));
+        }
+        return result;
+    }
+
+    @Override
+    public LongTermMemoryItem createManual(String userId, String content, String topic) {
+        requireUserId(userId);
+        String safeContent = requireManagementContent(content);
+        String safeTopic = normalizeManagementTopic(topic);
+
+        // 用户明确录入时不调用 LLM 冲突判断。逐字相同直接返回已有记录；单值槽位则确定性替换。
+        List<AiLongTermMemory> sameTopic = dao.findByUserIdAndTopic(userId, safeTopic, 100);
+        if (sameTopic != null) {
+            for (AiLongTermMemory existing : sameTopic) {
+                if (existing.getContent() != null
+                        && existing.getContent().trim().equalsIgnoreCase(safeContent)) {
+                    return toManagementItem(existing, null);
+                }
+            }
+            if (MemoryTopics.isSingular(safeTopic) && !sameTopic.isEmpty()) {
+                LongTermMemoryItem corrected = correctForManagement(
+                        userId, sameTopic.get(0).getMemoryId(), safeContent, safeTopic);
+                // 防御历史重复的单值槽位：保留刚生成的新记录，其余旧重复全部归档。
+                for (int i = 1; i < sameTopic.size(); i++) {
+                    archiveForManagement(userId, sameTopic.get(i).getMemoryId());
+                }
+                return corrected;
+            }
+        }
+        AiLongTermMemory created = insertManualStrict(userId, safeContent, safeTopic, null);
+        return toManagementItem(created, null);
+    }
+
+    @Override
+    public LongTermMemoryItem correctForManagement(String userId,
+                                                   String memoryId,
+                                                   String content,
+                                                   String topic) {
+        requireUserId(userId);
+        if (memoryId == null || memoryId.isBlank()) {
+            throw new IllegalArgumentException("memoryId 不能为空");
+        }
+        AiLongTermMemory old = dao.findActiveOwned(userId, memoryId.trim());
+        if (old == null) {
+            throw new IllegalArgumentException("记忆不存在或不属于当前用户");
+        }
+
+        String safeContent = requireManagementContent(content);
+        String safeTopic = normalizeManagementTopic(topic);
+        if (safeContent.equals(old.getContent()) && safeTopic.equals(old.getTopic())) {
+            return toManagementItem(old, null);
+        }
+
+        AiLongTermMemory replacement = insertManualStrict(userId, safeContent, safeTopic, old);
+        int archived = dao.archiveOwned(userId, old.getMemoryId());
+        if (archived != 1) {
+            // 旧记录并发消失时撤销新记录，避免一次纠正意外留下两个 active 版本。
+            dao.archiveOwned(userId, replacement.getMemoryId());
+            deleteVectorQuietly(replacement.getMemoryId());
+            throw new IllegalStateException("记忆状态已经变化，请刷新后重试");
+        }
+        // MySQL 已把旧记录排除出召回；向量删除失败也不会泄漏到结果，后续可重试清理。
+        deleteVectorQuietly(old.getMemoryId());
+        return toManagementItem(replacement, null);
+    }
+
+    @Override
+    public boolean archiveForManagement(String userId, String memoryId) {
+        requireUserId(userId);
+        if (memoryId == null || memoryId.isBlank()) {
+            throw new IllegalArgumentException("memoryId 不能为空");
+        }
+        AiLongTermMemory owned = dao.findActiveOwned(userId, memoryId.trim());
+        if (owned == null) return false;
+        try {
+            getVectorStore().delete(List.of(owned.getMemoryId()));
+        } catch (Exception e) {
+            log.error("ltm.management archive vector delete FAILED memoryId={}: {}",
+                    owned.getMemoryId(), e.getMessage());
+            throw new IllegalStateException("记忆向量归档失败，请稍后重试", e);
+        }
+        return dao.archiveOwned(userId, owned.getMemoryId()) == 1;
+    }
+
+    @Override
     public int runDecay(int limit) {
         if (limit <= 0 || limit > 500) limit = 100;
         int baseDays = decayBaseDays <= 0 ? 30 : decayBaseDays;
@@ -510,6 +649,116 @@ public class LongTermMemoryService implements ILongTermMemoryService {
         log.info("ltm.decay archived baseDays={} kDurable={} kEphemeral={} kDefault={} cap={} archived={}/{}",
                 baseDays, decayKDurable, decayKEphemeral, decayKDefault, cap, ids.size(), candidates.size());
         return ids.size();
+    }
+
+    /**
+     * 管理页严格写入：先生成 embedding，成功后再写 MySQL；DB 失败则清理新向量。
+     * 与自动抽取的 save() 容错语义隔离，用户手动操作不能显示成功却留下无向量记录。
+     */
+    private AiLongTermMemory insertManualStrict(String userId,
+                                                String content,
+                                                String topic,
+                                                AiLongTermMemory inheritedFrom) {
+        String memoryId = UUID.randomUUID().toString();
+        String tenantId = inheritedFrom != null ? inheritedFrom.getTenantId() : MDC.get("tenantId");
+        if (tenantId == null || tenantId.isBlank()) tenantId = "default";
+
+        Map<String, Object> meta = new HashMap<>();
+        meta.put("type", META_TYPE);
+        meta.put("user_id", userId);
+        meta.put("memory_id", memoryId);
+        meta.put("archived", 0);
+        meta.put("topic", topic);
+        Document doc = new Document(memoryId, content, meta);
+        try {
+            getVectorStore().accept(List.of(doc));
+        } catch (Exception e) {
+            log.error("[LTM] manual embedding write FAILED memoryId={}: {}", memoryId, e.getMessage());
+            throw new IllegalStateException("记忆向量生成失败，请稍后重试", e);
+        }
+
+        AiLongTermMemory po = AiLongTermMemory.builder()
+                .memoryId(memoryId)
+                .userId(userId)
+                .tenantId(tenantId)
+                .topic(topic)
+                .content(content)
+                .source("manual")
+                .sourceSession(null)
+                .accessCount(inheritedFrom != null && inheritedFrom.getAccessCount() != null
+                        ? inheritedFrom.getAccessCount() : 0)
+                .lastAccessed(inheritedFrom != null ? inheritedFrom.getLastAccessed() : null)
+                .archived(0)
+                .build();
+        try {
+            dao.insert(po);
+        } catch (RuntimeException e) {
+            deleteVectorQuietly(memoryId);
+            throw e;
+        }
+        AiLongTermMemory inserted = dao.findActiveOwned(userId, memoryId);
+        return inserted != null ? inserted : po;
+    }
+
+    private void deleteVectorQuietly(String memoryId) {
+        if (memoryId == null || memoryId.isBlank()) return;
+        try {
+            getVectorStore().delete(List.of(memoryId));
+        } catch (Exception e) {
+            log.warn("ltm.management stale vector cleanup failed memoryId={}: {}", memoryId, e.getMessage());
+        }
+    }
+
+    private static LongTermMemoryItem toManagementItem(AiLongTermMemory row, Double similarity) {
+        return LongTermMemoryItem.builder()
+                .memoryId(row.getMemoryId())
+                .topic(row.getTopic())
+                .content(row.getContent())
+                .source(row.getSource())
+                .sourceSession(row.getSourceSession())
+                .accessCount(row.getAccessCount())
+                .lastAccessed(row.getLastAccessed())
+                .createdAt(row.getCreatedAt())
+                .updatedAt(row.getUpdatedAt())
+                .similarity(similarity)
+                .build();
+    }
+
+    private static void requireUserId(String userId) {
+        if (userId == null || userId.isBlank()) {
+            throw new IllegalArgumentException("缺少登录用户身份");
+        }
+    }
+
+    private static String requireManagementContent(String content) {
+        if (content == null || content.isBlank()) {
+            throw new IllegalArgumentException("记忆内容不能为空");
+        }
+        String value = content.trim();
+        if (value.length() > 4000) {
+            throw new IllegalArgumentException("记忆内容不能超过 4000 个字符");
+        }
+        return value;
+    }
+
+    private static String normalizeManagementTopic(String topic) {
+        String value = trimToNull(topic);
+        if (value == null) return "other";
+        if (value.length() > 128) {
+            throw new IllegalArgumentException("记忆主题不能超过 128 个字符");
+        }
+        return value.toLowerCase();
+    }
+
+    private static String normalizeOptionalFilter(String value) {
+        String normalized = trimToNull(value);
+        return normalized == null ? null : normalized.toLowerCase();
+    }
+
+    private static String trimToNull(String value) {
+        if (value == null) return null;
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? null : trimmed;
     }
 
     private static class InheritedAccessStats {

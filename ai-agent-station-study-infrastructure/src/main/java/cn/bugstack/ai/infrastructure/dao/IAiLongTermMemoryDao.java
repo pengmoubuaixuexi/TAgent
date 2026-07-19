@@ -53,4 +53,25 @@ public interface IAiLongTermMemoryDao {
 
     /** 获取用户所有活跃 memory_id 集合，用于向量检索后交叉校验过滤归档记录 */
     List<String> findActiveMemoryIds(@Param("userId") String userId);
+
+    /** 管理页分页读取；纯 MySQL 查询，不改变记忆热度。 */
+    List<AiLongTermMemory> findActivePage(@Param("userId") String userId,
+                                          @Param("topic") String topic,
+                                          @Param("source") String source,
+                                          @Param("keyword") String keyword,
+                                          @Param("offset") int offset,
+                                          @Param("limit") int limit);
+
+    long countActive(@Param("userId") String userId,
+                     @Param("topic") String topic,
+                     @Param("source") String source,
+                     @Param("keyword") String keyword);
+
+    /** 所有管理写操作都通过 userId + memoryId 做归属校验。 */
+    AiLongTermMemory findActiveOwned(@Param("userId") String userId,
+                                     @Param("memoryId") String memoryId);
+
+    /** @return 实际归档行数，0 表示不存在、不归属当前用户或已经归档。 */
+    int archiveOwned(@Param("userId") String userId,
+                     @Param("memoryId") String memoryId);
 }

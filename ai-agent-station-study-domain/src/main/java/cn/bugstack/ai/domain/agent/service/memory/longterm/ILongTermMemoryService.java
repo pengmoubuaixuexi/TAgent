@@ -72,4 +72,33 @@ public interface ILongTermMemoryService {
      * @return 实际归档条数
      */
     int runDecay(int limit);
+
+    /**
+     * 管理页按 MySQL 元数据分页读取，不执行 embedding，也不更新访问热度。
+     */
+    LongTermMemoryPage listForManagement(String userId,
+                                         int page,
+                                         int pageSize,
+                                         String topic,
+                                         String source,
+                                         String keyword);
+
+    /**
+     * 管理页语义搜索。复用 LTM embedding，但命中不会更新 access_count/last_accessed。
+     */
+    List<LongTermMemoryItem> searchForManagement(String userId, String query, int topK);
+
+    /** 用户手动新增一条长期记忆；source 由后端固定为 manual。 */
+    LongTermMemoryItem createManual(String userId, String content, String topic);
+
+    /**
+     * 用户纠正一条归属于自己的记忆。实现必须同步替换文本和 embedding，不能只改 MySQL。
+     */
+    LongTermMemoryItem correctForManagement(String userId,
+                                            String memoryId,
+                                            String content,
+                                            String topic);
+
+    /** 归档一条归属于当前用户的记忆。 */
+    boolean archiveForManagement(String userId, String memoryId);
 }
