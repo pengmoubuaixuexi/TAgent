@@ -87,6 +87,10 @@ public class McpToolCatalogService {
     @Autowired(required = false)
     private ResolvedToolLeaseStore resolvedToolLeaseStore;
 
+    /** run 终态保存动态装载的 capability need，供步骤级 redo 重新申请旧能力；可选。 */
+    @Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService runSnapshotService;
+
     /**
      * 每条 need 各取 embedding top-k（默认 2）。一次 query 可能有多条 need（多类能力），
      * 每条各自取 top-k、最后并集去重——见 {@link #resolveDynamicToolCallbacks}。
@@ -342,6 +346,22 @@ public class McpToolCatalogService {
     /** 清理 run 级 lease；供 dispatch/strategy finally 调用。 */
     public void cleanupRun(String runId) {
         if (resolvedToolLeaseStore != null && runId != null && !runId.isBlank()) {
+            // 清理前保存本 run 动态装载的 capability need，供步骤级 redo 重新申请旧能力。
+            // 这里不承诺恢复精确 tool identity；常驻工具不在 lease 里，redo 仍靠 ensureArmed 自带。
+            if (runSnapshotService != null) {
+                try {
+                    List<String> needs = resolvedToolLeaseStore.listLeases(runId).stream()
+                            .map(ResolvedToolLease::originalNeed)
+                            .filter(n -> n != null && !n.isBlank())
+                            .distinct()
+                            .collect(Collectors.toList());
+                    if (!needs.isEmpty()) {
+                        runSnapshotService.recordExtraToolNeeds(runId, needs);
+                    }
+                } catch (Exception e) {
+                    log.warn("[DynamicTools] persist extra tool needs failed runId={} err={}", runId, e.getMessage());
+                }
+            }
             resolvedToolLeaseStore.cleanupRun(runId);
         }
     }

@@ -113,7 +113,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
     @Value("${agent.token-streaming.enabled:true}")
     private boolean tokenStreamingEnabled;
 
-    /** 流式调用无 token 空闲超时（秒），与 Auto / Flow 路径保持一致，避免 Fixed 回答流挂死。 */
+    /** 流式调用无模型活动空闲超时（秒），正文、reasoning_content、工具调用响应都会续期。 */
     @Value("${agent.streaming.idle-timeout-seconds:120}")
     private int streamingIdleTimeoutSeconds;
 
@@ -239,12 +239,18 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
                         buf.setLength(0);
                         last[0] = null;
                     // v1.3.2：scopeSession 让 ReasoningContentFilter 隔离缓存；2026-06-23 改按 runId 隔离防跨题串
-                    try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(sessionId, runId)) {
+                    cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.Activity __activity =
+                            cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.start(
+                                    stepId + "#attempt-" + attempt);
+                    try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(sessionId, runId);
+                         AutoCloseable __activityScope = cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.scope(__activity)) {
                         // 立即回答 mid-stream 截断触发器：answer_now emit 它 → takeUntilOther 优雅完成 → 拿到半截
                         reactor.core.publisher.Sinks.One<Object> __trigger = reactor.core.publisher.Sinks.one();
                         if (sessionId != null) cancelTriggers.put(sessionId, __trigger);
-                        Flux<ChatClientResponse> flux = spec.stream().chatClientResponse();
-                        flux.timeout(Duration.ofSeconds(streamingIdleTimeoutSeconds))
+                        Flux<ChatClientResponse> flux = spec.stream().chatClientResponse()
+                                .doOnNext(__activity::markDecodedResponse);
+                        cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker
+                        .timeoutOnInactivity(flux, __activity, Duration.ofSeconds(streamingIdleTimeoutSeconds))
                         .map(cr -> {
                             if (cr.chatResponse() != null) last[0] = cr.chatResponse();
                             // 2026-05-07 修：getText() 在 tool_use / metadata-only 末帧会返回 null，
@@ -791,11 +797,17 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         spec = spec.toolContext(finalizeToolContext);
         StringBuilder buf = new StringBuilder();
         final ChatResponse[] last = new ChatResponse[1];
+        cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.Activity __activity =
+                cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.start(fStepId);
         // 立即回答 finalize：流式逐 token 推（与正常路径同协议）+ 真·关思考（reasoning_effort 设到 options）。
         // 思考已关、答案短，体验是"半截 → 无缝接着流出收尾"，不再是 .call() 卡几十秒后整段蹦出。
-        try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(sessionId);
-             AutoCloseable __noThink = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeNoThinking(sessionId)) {
-            spec.stream().chatClientResponse()
+        try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(sessionId, req.getRunId());
+             AutoCloseable __noThink = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeNoThinking(sessionId);
+             AutoCloseable __activityScope = cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.scope(__activity)) {
+            Flux<ChatClientResponse> flux = spec.stream().chatClientResponse()
+                    .doOnNext(__activity::markDecodedResponse);
+            cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker
+                .timeoutOnInactivity(flux, __activity, Duration.ofSeconds(streamingIdleTimeoutSeconds))
                 .map(cr -> {
                     if (cr.chatResponse() != null) last[0] = cr.chatResponse();
                     String raw = cr.chatResponse() != null && cr.chatResponse().getResult() != null
@@ -887,9 +899,15 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         spec = spec.toolContext(steerToolContext);
         StringBuilder buf = new StringBuilder();
         final ChatResponse[] last = new ChatResponse[1];
+        cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.Activity __activity =
+                cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.start(fStepId);
         // 引导重做：流式逐 token 推；思考不关（与设计一致，引导要让模型重新想）。
-        try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(sessionId)) {
-            spec.stream().chatClientResponse()
+        try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(sessionId, req.getRunId());
+             AutoCloseable __activityScope = cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.scope(__activity)) {
+            Flux<ChatClientResponse> flux = spec.stream().chatClientResponse()
+                    .doOnNext(__activity::markDecodedResponse);
+            cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker
+                .timeoutOnInactivity(flux, __activity, Duration.ofSeconds(streamingIdleTimeoutSeconds))
                 .map(cr -> {
                     if (cr.chatResponse() != null) last[0] = cr.chatResponse();
                     String raw = cr.chatResponse() != null && cr.chatResponse().getResult() != null

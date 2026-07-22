@@ -71,6 +71,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
 
     /** 2026-05-28：注入给下游步骤的依赖产出最大字符数，防 token 爆炸（现在注入的是结构化「输出数据」段，比整段散文密） */
     private static final int DEP_INJECT_MAX_CHARS = 6000;
+    /** 产物正文单独放宽；超过此值仅截断提示词展示，纯写文件工具仍机械透传完整正文。 */
 
     /**
      * step4 子步执行的系统角色：用请求级 .system() 覆盖 EXECUTOR_CLIENT 的领域人设
@@ -141,6 +142,10 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             if (stepsMap == null || stepsMap.isEmpty()) {
                 return "步骤映射为空，无法执行";
             }
+
+            // 在任何 DAG 子步骤启动前一次性保存完整计划。Redo 的后代计算必须依赖这份权威快照，
+            // 不能从并行 executeStep 过程中零散写入的 stepContent 反推（取消/并发覆盖都会丢步骤）。
+            recordFullFlowPlan(dynamicContext, stepsMap);
 
             // 2026-05-07 DAG UX：执行前先把所有步骤的占位卡片一次性广播给前端，
             // 让用户立即看到完整计划而不是一个个等出现
@@ -467,7 +472,8 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                 step4OptionsBuilder.maxTokens(step4MaxTokens);
             }
             if (!dynamicToolCallbacks.isEmpty()) {
-                step4OptionsBuilder.toolCallbacks(toRequestToolCallbacks(executorClientId, dynamicToolCallbacks));
+                ToolCallback[] requestCallbacks = toRequestToolCallbacks(executorClientId, dynamicToolCallbacks);
+                if (requestCallbacks.length > 0) step4OptionsBuilder.toolCallbacks(requestCallbacks);
             }
             ChatClient.ChatClientRequestSpec streamSpec = spec0.options(step4OptionsBuilder.build());
             // 2026-05-07 流式 UX：每个子 step 独立 step_start/end，前端折叠为"执行 步骤N 已完成"
@@ -607,12 +613,14 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                 if (depError != null && !depError.isBlank()) {
                     sb.append("（注意：第").append(depNum).append("步执行失败：").append(depError).append("）\n");
                 } else if (depResult != null && !depResult.isBlank()) {
-                    // 2026-05-28：优先注入前置步骤「输出数据」结构化段（下游真正需要的明细），
-                    // 抠不出（LLM 没按格式输出）时回退整段原文。两者都做截断防 token 爆炸。
+                    // 「输出数据」是 Flow 步骤间的正式数据契约。下游只消费该字段；若上游未按
+                    // 契约输出，则兼容旧结果，回退到完整回复，避免直接丢失全部上下文。
                     String structured = extractStepOutputData(depResult);
-                    String inject = (structured != null && !structured.isBlank()) ? structured : depResult;
-                    sb.append(inject.length() > DEP_INJECT_MAX_CHARS
-                            ? inject.substring(0, DEP_INJECT_MAX_CHARS) + "\n...(已截断)" : inject);
+                    if (structured != null && !structured.isBlank()) {
+                        sb.append(truncateDependency(structured, DEP_INJECT_MAX_CHARS));
+                    } else {
+                        sb.append(truncateDependency(depResult, DEP_INJECT_MAX_CHARS));
+                    }
                 } else {
                     sb.append("（前置步骤无产出数据可参考，但本步骤仍需基于自身能力执行）");
                 }
@@ -623,6 +631,8 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
 
         sb.append("**步骤内容:**\n").append(stepContent).append("\n\n");
         sb.append("**用户原始请求:**\n").append(userRequestForFlowPrompt(request, dynamicContext)).append("\n\n");
+
+        sb.append(FlowStepOutputContract.render(stepContent)).append("\n");
 
         // 2. 执行要求 + 反幻觉约束
         sb.append("**执行要求:**\n");
@@ -643,10 +653,10 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         sb.append("   === 执行结果 ===\n");
         sb.append("   状态: [成功/失败/无工具可用]\n");
         sb.append("   结果描述: [一句话概述本步骤做了什么、关键结论]\n");
-        sb.append("   输出数据: [本步骤产出的【完整明细数据】，结构化、可被下游步骤直接使用。\n");
-        sb.append("            必须逐条/逐项列全（如逐日数据、逐个条目、每个 URL/数值），\n");
-        sb.append("            **严禁只写\"范围/概况/趋势\"这类概括**——后续步骤只读这一段，拿不到明细就无法继续。\n");
-        sb.append("            可用 JSON 或清晰的列表/表格。若无工具可用则填\"基于通用知识的建议（非工具检索结果）\"。]\n");
+        sb.append("   输出数据: [必须直接放入【本步骤输出契约】要求的交付物本身。\n");
+        sb.append("            它不是执行摘要，也不是对交付物的描述；下游步骤只会读取这一字段。\n");
+        sb.append("            数据型任务必须逐条列全；代码/文档/配置任务必须放完整正文；\n");
+        sb.append("            文件落盘任务才输出文件路径、写入状态等结果。严禁用文件名、图表清单或摘要元数据代替正文。]\n");
         sb.append("   ```\n\n");
         sb.append("请开始执行这个步骤，并严格按照要求提供详细的执行报告和结果输出。");
         return sb.toString();
@@ -686,6 +696,11 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             data = data.substring(0, data.length() - 3).trim();
         }
         return data.isBlank() ? null : data;
+    }
+
+    private String truncateDependency(String value, int maxChars) {
+        if (value == null || value.length() <= maxChars) return value;
+        return value.substring(0, maxChars) + "\n...(已截断)";
     }
     
     /**
@@ -1058,6 +1073,29 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             runId = mdcRunId != null && !mdcRunId.isBlank() ? mdcRunId : MDC.get("agent.run_id");
         }
         runSnapshotService.recordStepContent(runId, stepId, title, type, stepNo, stepContent);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void recordFullFlowPlan(DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
+                                    Map<String, String> executionStepsMap) {
+        if (runSnapshotService == null || dynamicContext == null || executionStepsMap == null || executionStepsMap.isEmpty()) {
+            return;
+        }
+        String runId = dynamicContext.getValue("runId");
+        if (runId == null || runId.isBlank()) {
+            String mdcRunId = MDC.get("runId");
+            runId = mdcRunId != null && !mdcRunId.isBlank() ? mdcRunId : MDC.get("agent.run_id");
+        }
+        Map<String, String> snapshotSteps = dynamicContext.getValue("flowPlanSnapshotStepsMap");
+        if (snapshotSteps == null || snapshotSteps.isEmpty()) {
+            snapshotSteps = executionStepsMap;
+        }
+        Map<Integer, Set<Integer>> snapshotDependencies = dynamicContext.getValue("flowPlanSnapshotDependencies");
+        if (snapshotDependencies == null || snapshotDependencies.isEmpty()) {
+            snapshotDependencies = dynamicContext.getValue("stepDependencies");
+        }
+        runSnapshotService.recordFlowPlan(runId, snapshotSteps,
+                snapshotDependencies != null ? snapshotDependencies : Collections.emptyMap());
     }
 
     private String userRequestForFlowPrompt(ExecuteCommandEntity request,

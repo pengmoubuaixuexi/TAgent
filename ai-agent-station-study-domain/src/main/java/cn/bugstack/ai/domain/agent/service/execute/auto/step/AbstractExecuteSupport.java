@@ -838,7 +838,7 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     protected cn.bugstack.ai.domain.agent.service.execute.IEventLogService eventLogServiceForSteer;
 
-    /** 流式调用无 token 空闲超时（秒），连续 N 秒无新 token 判定为卡死 */
+    /** 流式调用无模型活动空闲超时（秒）：正文、reasoning_content、工具调用响应都会续期。 */
     @org.springframework.beans.factory.annotation.Value("${agent.streaming.idle-timeout-seconds:120}")
     protected int streamingIdleTimeoutSeconds;
 
@@ -892,8 +892,15 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
             fullResponse.setLength(0);
             lastResponse[0] = null;
             try {
-                Flux<ChatClientResponse> flux = spec.stream().chatClientResponse();
-                flux.timeout(Duration.ofSeconds(streamingIdleTimeoutSeconds))
+                cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.Activity __activity =
+                        cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.start(
+                                stepName + "#attempt-" + attempt);
+                try (AutoCloseable __activityScope =
+                             cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.scope(__activity)) {
+                Flux<ChatClientResponse> flux = spec.stream().chatClientResponse()
+                        .doOnNext(__activity::markDecodedResponse);
+                cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker
+                        .timeoutOnInactivity(flux, __activity, Duration.ofSeconds(streamingIdleTimeoutSeconds))
                 .map(cr -> {
                     if (cr.chatResponse() != null) lastResponse[0] = cr.chatResponse();
                     // 2026-05-07 修：getText() 在 tool_use / metadata-only 末帧会返回 null，
@@ -928,6 +935,7 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
                 // 立即回答/引导：trigger 一 emit → 优雅完成 Flux（取消上游 WebClient，LLM 真停）→ blockLast 返回半截
                 .takeUntilOther(__cancelTrigger.asMono())
                 .blockLast();
+                }
 
                 // mid-stream 截断时上游被取消、doOnComplete 不触发，补发 [DONE] 收尾该 step 的 token 流
                 if (dynamicContext.isFinalizeRequested() || dynamicContext.hasSteerIdea()) {

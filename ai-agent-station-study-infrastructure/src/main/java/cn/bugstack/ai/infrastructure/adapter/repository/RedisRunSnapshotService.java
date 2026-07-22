@@ -15,8 +15,12 @@ import org.springframework.stereotype.Service;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 @Slf4j
 @Service
@@ -175,6 +179,70 @@ public class RedisRunSnapshotService implements RunSnapshotService {
     }
 
     @Override
+    public void recordExtraToolNeeds(String runId, List<String> needs) {
+        if (blank(runId) || needs == null || needs.isEmpty()) {
+            return;
+        }
+        try {
+            RunSnapshot snapshot = find(runId).orElse(null);
+            if (snapshot == null) {
+                return;
+            }
+            LinkedHashSet<String> merged = new LinkedHashSet<>();
+            if (snapshot.getExtraToolNeeds() != null) {
+                merged.addAll(snapshot.getExtraToolNeeds());
+            }
+            for (String n : needs) {
+                if (n != null && !n.isBlank()) {
+                    merged.add(n.trim());
+                }
+            }
+            snapshot.setExtraToolNeeds(new ArrayList<>(merged));
+            snapshot.setUpdatedAt(System.currentTimeMillis());
+            save(snapshot);
+        } catch (Exception e) {
+            log.warn("[RunSnapshot] recordExtraToolNeeds failed runId={} err={}", runId, e.getMessage());
+        }
+    }
+
+    @Override
+    public void recordFlowPlan(String runId,
+                               Map<String, String> stepsMap,
+                               Map<Integer, Set<Integer>> stepDependencies) {
+        if (blank(runId) || stepsMap == null || stepsMap.isEmpty()) {
+            return;
+        }
+        try {
+            RunSnapshot snapshot = find(runId).orElse(null);
+            if (snapshot == null) {
+                return;
+            }
+            Map<String, String> stepsCopy = new LinkedHashMap<>();
+            stepsMap.forEach((key, value) -> {
+                if (!blank(key) && !blank(value)) {
+                    stepsCopy.put(key, value);
+                }
+            });
+            Map<Integer, Set<Integer>> depsCopy = new LinkedHashMap<>();
+            if (stepDependencies != null) {
+                stepDependencies.forEach((stepNo, deps) -> {
+                    if (stepNo != null) {
+                        depsCopy.put(stepNo, deps == null
+                                ? new LinkedHashSet<>()
+                                : new LinkedHashSet<>(deps));
+                    }
+                });
+            }
+            snapshot.setFlowPlanSteps(stepsCopy);
+            snapshot.setFlowPlanDependencies(depsCopy);
+            snapshot.setUpdatedAt(System.currentTimeMillis());
+            save(snapshot);
+        } catch (Exception e) {
+            log.warn("[RunSnapshot] recordFlowPlan failed runId={} err={}", runId, e.getMessage());
+        }
+    }
+
+    @Override
     public void recordStepContent(String runId,
                                   String stepId,
                                   String title,
@@ -267,9 +335,15 @@ public class RedisRunSnapshotService implements RunSnapshotService {
                 .filter(step -> ordinal(step) == targetOrdinal)
                 .findFirst()
                 .orElse(null);
+        Set<Integer> flowRedoSet = flowRedoSet(snapshot, targetStep);
+        List<RunStepSnapshot> inheritedSource = selectInheritedSourceSteps(steps, targetOrdinal, flowRedoSet);
         String targetLabel = targetStep != null ? displayStepLabel(targetStep) : "Step" + targetOrdinal;
         sb.append("用户要求从 ").append(targetLabel).append(" 开始修正。");
-        sb.append(targetLabel).append(" 之前的内容视为已沿用上下文；目标步骤及其后续步骤需要重新生成。\n\n");
+        if (flowRedoSet.isEmpty()) {
+            sb.append(targetLabel).append(" 之前的内容视为已沿用上下文；目标步骤及其后续步骤需要重新生成。\n\n");
+        } else {
+            sb.append("目标执行步骤及所有依赖它的传递后代需要重新生成；其余无关 DAG 分支沿用原结果。\n\n");
+        }
 
         sb.append("【重做语义】\n");
         sb.append("- 用户本次输入是对历史运行的修订指令，不是一个需要直接回答的新普通问题。\n");
@@ -278,12 +352,9 @@ public class RedisRunSnapshotService implements RunSnapshotService {
         sb.append("- 旧目标步骤只作为被重做步骤的反例/待修订材料；后续步骤只使用本轮新输出。\n");
         sb.append("- 质量检查只审查本轮新输出，不要因为旧目标步骤本身错误而判定失败；只有新输出重复了旧错误，才据此判定失败。\n\n");
 
-        if (targetOrdinal > 1) {
+        if (!inheritedSource.isEmpty()) {
             sb.append("【已沿用步骤】\n");
-            for (RunStepSnapshot step : steps) {
-                if (ordinal(step) >= targetOrdinal) {
-                    continue;
-                }
+            for (RunStepSnapshot step : inheritedSource) {
                 appendStep(sb, step);
             }
             sb.append('\n');
@@ -335,11 +406,13 @@ public class RedisRunSnapshotService implements RunSnapshotService {
             return List.of();
         }
         int targetOrdinal = normalizeTargetOrdinal(redoFromStep, steps.size());
+        RunStepSnapshot targetStep = steps.stream()
+                .filter(step -> ordinal(step) == targetOrdinal)
+                .findFirst()
+                .orElse(null);
+        Set<Integer> flowRedoSet = flowRedoSet(snapshot, targetStep);
         List<RunStepSnapshot> inherited = new ArrayList<>();
-        for (RunStepSnapshot step : steps) {
-            if (ordinal(step) >= targetOrdinal) {
-                continue;
-            }
+        for (RunStepSnapshot step : selectInheritedSourceSteps(steps, targetOrdinal, flowRedoSet)) {
             RunStepSnapshot copy = RunStepSnapshot.builder()
                     .ordinal(step.getOrdinal())
                     .stepNo(step.getStepNo())
@@ -356,6 +429,80 @@ public class RedisRunSnapshotService implements RunSnapshotService {
                     .updatedAt(step.getUpdatedAt())
                     .build();
             inherited.add(copy);
+        }
+        return inherited;
+    }
+
+    /**
+     * For a Flow execution card, redo means target + every transitive dependent.
+     * Empty means this is a legacy/non-Flow target and ordinal semantics should be retained.
+     */
+    private Set<Integer> flowRedoSet(RunSnapshot snapshot, RunStepSnapshot targetStep) {
+        if (snapshot == null || targetStep == null || blank(targetStep.getStepId())
+                || !targetStep.getStepId().startsWith("flow_step4_execute_step_")
+                || snapshot.getFlowPlanDependencies() == null
+                || snapshot.getFlowPlanDependencies().isEmpty()) {
+            return Set.of();
+        }
+        Integer targetStepNo = targetStep.getStepNo();
+        if (targetStepNo == null) {
+            targetStepNo = parseTrailingNumber(targetStep.getStepId(), "flow_step4_execute_step_");
+        }
+        if (targetStepNo == null || targetStepNo <= 0) {
+            return Set.of();
+        }
+        return collectFlowRedoTargets(targetStepNo, snapshot.getFlowPlanDependencies());
+    }
+
+    private Set<Integer> collectFlowRedoTargets(int targetStepNo,
+                                                Map<Integer, Set<Integer>> dependencies) {
+        Set<Integer> redoSet = new LinkedHashSet<>();
+        redoSet.add(targetStepNo);
+        boolean changed = true;
+        while (changed) {
+            changed = false;
+            for (Map.Entry<Integer, Set<Integer>> entry : dependencies.entrySet()) {
+                Integer stepNo = entry.getKey();
+                if (stepNo == null || redoSet.contains(stepNo)) {
+                    continue;
+                }
+                Set<Integer> stepDependencies = entry.getValue();
+                if (stepDependencies != null && stepDependencies.stream().anyMatch(redoSet::contains)) {
+                    redoSet.add(stepNo);
+                    changed = true;
+                }
+            }
+        }
+        return redoSet;
+    }
+
+    /**
+     * Flow uses dependency semantics: keep every completed execution branch outside the redo set.
+     * Planning/thinking steps before the selected card are still inherited. Old snapshots keep the ordinal rule.
+     */
+    private List<RunStepSnapshot> selectInheritedSourceSteps(List<RunStepSnapshot> steps,
+                                                            int targetOrdinal,
+                                                            Set<Integer> flowRedoSet) {
+        if (steps == null || steps.isEmpty()) {
+            return List.of();
+        }
+        List<RunStepSnapshot> inherited = new ArrayList<>();
+        for (RunStepSnapshot step : steps) {
+            if (step == null) {
+                continue;
+            }
+            boolean flowExecutionStep = !blank(step.getStepId())
+                    && step.getStepId().startsWith("flow_step4_execute_step_");
+            if (!flowRedoSet.isEmpty() && flowExecutionStep) {
+                Integer stepNo = step.getStepNo() != null
+                        ? step.getStepNo()
+                        : parseTrailingNumber(step.getStepId(), "flow_step4_execute_step_");
+                if (stepNo != null && !flowRedoSet.contains(stepNo)) {
+                    inherited.add(step);
+                }
+            } else if (ordinal(step) < targetOrdinal) {
+                inherited.add(step);
+            }
         }
         return inherited;
     }

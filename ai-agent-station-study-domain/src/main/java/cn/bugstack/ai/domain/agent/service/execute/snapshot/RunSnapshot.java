@@ -6,7 +6,10 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 @Data
 @Builder
@@ -30,4 +33,21 @@ public class RunSnapshot {
 
     @Builder.Default
     private List<RunStepSnapshot> steps = new ArrayList<>();
+
+    /**
+     * Flow 在进入 Step4 前一次性保存的完整、已确认执行计划。
+     * Redo 必须从这里读取完整 DAG；逐步骤的 stepContent 只作为执行现场兼容旧快照。
+     */
+    @Builder.Default
+    private Map<String, String> flowPlanSteps = new LinkedHashMap<>();
+
+    /** Flow 完整计划对应的依赖图（stepNo -> dependency stepNos）。 */
+    @Builder.Default
+    private Map<Integer, Set<Integer>> flowPlanDependencies = new LinkedHashMap<>();
+
+    /**
+     * 本 run 通过 request_tool 动态装载的额外工具能力需求（lease.originalNeed 去重）。
+     * Redo 据此重新申请旧能力；这不是精确 tool identity 快照，常驻工具仍由 ensureArmed 装配。
+     */
+    private List<String> extraToolNeeds;
 }

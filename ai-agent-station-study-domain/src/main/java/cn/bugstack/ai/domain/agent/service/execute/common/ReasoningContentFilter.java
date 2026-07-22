@@ -224,6 +224,9 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
         String sessionId = resolveSessionId();
         // 注入缓存按 runId 隔离（跨题/并发不串扰）；sessionId 仍用于 LATEST_REASONING / 日志。
         String reasoningKey = resolveReasoningKey(sessionId);
+        // Captured on the subscribing thread. The Activity object itself is thread-safe and is
+        // passed into the async response-body pipeline explicitly (no Reactor ThreadLocal reliance).
+        StreamingActivityTracker.Activity streamingActivity = StreamingActivityTracker.current();
         List<String> reasonings = sessionReasonings.computeIfAbsent(reasoningKey,
                 k -> Collections.synchronizedList(new ArrayList<>()));
 
@@ -244,7 +247,7 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
         }
 
         // ============ Response 侧：抓取 reasoning_content append 到 session 列表 ============
-        return next.exchange(finalRequest).map(resp -> wrapResponse(resp, reasonings, sessionId));
+        return next.exchange(finalRequest).map(resp -> wrapResponse(resp, reasonings, sessionId, streamingActivity));
     }
 
     /** 优先级：ThreadLocal > MDC.sessionId > MDC.requestId > "unknown-session" */
@@ -262,7 +265,8 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
     // Response 侧：捕获本次响应累加的 reasoning_content，按调用次序 append
     // ====================================================================
 
-    private ClientResponse wrapResponse(ClientResponse response, List<String> reasonings, String sessionId) {
+    private ClientResponse wrapResponse(ClientResponse response, List<String> reasonings, String sessionId,
+                                        StreamingActivityTracker.Activity streamingActivity) {
         Flux<DataBuffer> originalBody = response.body(BodyExtractors.toDataBuffers());
         StringBuilder sseBuffer = new StringBuilder();
         StringBuilder reasoningBuffer = new StringBuilder();
@@ -278,7 +282,7 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
                         while ((sepIndex = sseBuffer.indexOf("\n\n")) >= 0) {
                             String event = sseBuffer.substring(0, sepIndex);
                             sseBuffer.delete(0, sepIndex + 2);
-                            processSseEvent(event, reasoningBuffer);
+                            processSseEvent(event, reasoningBuffer, streamingActivity);
                         }
                     } catch (Exception e) {
                         log.debug("[ReasoningFilter] SSE parse error: {}", e.getMessage());
@@ -287,7 +291,7 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
                 })
                 .doFinally(signal -> {
                     if (sseBuffer.length() > 0) {
-                        processSseEvent(sseBuffer.toString(), reasoningBuffer);
+                        processSseEvent(sseBuffer.toString(), reasoningBuffer, streamingActivity);
                     }
                     if (reasoningBuffer.length() > 0) {
                         String captured = reasoningBuffer.toString();
@@ -313,7 +317,8 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
     }
 
     @SuppressWarnings("unchecked")
-    private void processSseEvent(String event, StringBuilder reasoningBuffer) {
+    private void processSseEvent(String event, StringBuilder reasoningBuffer,
+                                 StreamingActivityTracker.Activity streamingActivity) {
         for (String line : event.split("\n")) {
             if (!line.startsWith("data:")) continue;
             String json = line.substring(5).trim();
@@ -329,6 +334,7 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
                     Object rc = d.get("reasoning_content");
                     if (rc instanceof String s && !s.isEmpty()) {
                         reasoningBuffer.append(s);
+                        if (streamingActivity != null) streamingActivity.markReasoning();
                     }
                 }
             } catch (Exception ignored) {
