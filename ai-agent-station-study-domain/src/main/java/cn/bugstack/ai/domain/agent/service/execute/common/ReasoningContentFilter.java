@@ -1,5 +1,6 @@
 package cn.bugstack.ai.domain.agent.service.execute.common;
 
+import cn.bugstack.ai.domain.agent.service.multimodal.OpenAiMultimodalRequestNormalizer;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -355,8 +356,12 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
         if (bodyBytes == null || bodyBytes.length == 0) return null;
         try {
             Map<String, Object> requestMap = OBJECT_MAPPER.readValue(bodyBytes, MAP_TYPE);
+            // Spring AI serializes UserMessage as text -> media, while MiMo's
+            // documented and verified path uses image_url -> text. Normalize
+            // only this wire copy; ChatMemory and Message objects are unchanged.
+            boolean changed = OpenAiMultimodalRequestNormalizer.imagesBeforeText(requestMap);
             // 关思考时跳过 reasoning_content 注入：思考关了 mimo 不产 reasoning，再回填反而可能 400。
-            boolean changed = !noThink && injectReasoningInto(requestMap, reasonings, sessionId);
+            changed |= !noThink && injectReasoningInto(requestMap, reasonings, sessionId);
             if (noThink && disableThinkingFragment != null) {
                 deepMerge(requestMap, disableThinkingFragment);
                 changed = true;

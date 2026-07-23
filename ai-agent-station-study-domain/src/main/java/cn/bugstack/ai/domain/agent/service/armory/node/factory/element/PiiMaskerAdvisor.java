@@ -50,7 +50,7 @@ public class PiiMaskerAdvisor implements BaseAdvisor {
                 String text = msg.getText();
                 if (text != null && !text.isBlank()) {
                     String masked = PiiMasker.mask(text);
-                    sanitized.add(new UserMessage(masked));
+                    sanitized.add(((UserMessage) msg).mutate().text(masked).build());
                 } else {
                     sanitized.add(msg);
                 }

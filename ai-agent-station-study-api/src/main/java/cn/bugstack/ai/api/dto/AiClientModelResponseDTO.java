@@ -54,6 +54,8 @@ public class AiClientModelResponseDTO implements Serializable {
      */
     private String modelUsage;
 
+    private String capabilitiesJson;
+
     /**
      * 状态：0-禁用，1-启用
      */

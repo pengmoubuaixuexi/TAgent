@@ -90,7 +90,11 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         final ChatClient step2Client = planningChatClient;
         // 引导回复：被打断则折入新想法重做本步（思考不关、工具不变）
         String planningResult = callStepWithSteer(
-                p -> step2Client.prompt().user(p).options(step2Opts),
+                p -> step2Client.prompt().user(p)
+                        .advisors(a -> a.param(
+                                cn.bugstack.ai.domain.agent.service.multimodal.MultimodalMessageAdvisor.CURRENT_IMAGES_CONTEXT_KEY,
+                                requestParameter.getImages()))
+                        .options(step2Opts),
                 dynamicContext, "flow_step2_planning", "步骤规划",
                 cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_STEP2_PLANNING,
                 planningPromptSupplier, requestParameter.getSessionId());

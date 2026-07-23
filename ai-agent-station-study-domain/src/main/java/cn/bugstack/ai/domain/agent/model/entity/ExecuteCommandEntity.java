@@ -5,6 +5,8 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.util.List;
+
 /**
  * 执行命令实体
  *
@@ -20,6 +22,9 @@ public class ExecuteCommandEntity {
     private String aiAgentId;
 
     private String message;
+
+    /** Original images attached to this user turn. */
+    private List<ChatImageRef> images;
 
     private String sessionId;
 

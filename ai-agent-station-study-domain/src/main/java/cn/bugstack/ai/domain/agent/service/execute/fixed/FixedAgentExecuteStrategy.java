@@ -201,6 +201,8 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
                     .system(s -> s.param("current_date", ""))
                     .advisors(a -> a
                             .param(CHAT_MEMORY_CONVERSATION_ID_KEY, buildConversationId(requestParameter))
+                            .param(cn.bugstack.ai.domain.agent.service.multimodal.MultimodalMessageAdvisor.CURRENT_IMAGES_CONTEXT_KEY,
+                                    requestParameter.getImages())
                             .param("ltm_retrieval_query", buildLtmRetrievalQuery(requestParameter, "fixed"))
                             .param("memory_persist_final_turn", true)
                             .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 100));
@@ -772,6 +774,8 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         ChatClient.ChatClientRequestSpec spec = client.prompt().user(prompt)
                 .advisors(a -> a
                         .param(CHAT_MEMORY_CONVERSATION_ID_KEY, buildConversationId(req))
+                        .param(cn.bugstack.ai.domain.agent.service.multimodal.MultimodalMessageAdvisor.CURRENT_IMAGES_CONTEXT_KEY,
+                                req.getImages())
                         .param("ltm_retrieval_query", buildLtmRetrievalQuery(req, "fixed-answer-now"))
                         .param("memory_persist_final_turn", true)
                         .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 100));
@@ -881,6 +885,8 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         ChatClient.ChatClientRequestSpec spec = client.prompt().user(prompt)
                 .advisors(a -> a
                         .param(CHAT_MEMORY_CONVERSATION_ID_KEY, buildConversationId(req))
+                        .param(cn.bugstack.ai.domain.agent.service.multimodal.MultimodalMessageAdvisor.CURRENT_IMAGES_CONTEXT_KEY,
+                                req.getImages())
                         .param("ltm_retrieval_query", buildLtmRetrievalQuery(req, "fixed-steer"))
                         .param("memory_persist_final_turn", true)
                         .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 100));

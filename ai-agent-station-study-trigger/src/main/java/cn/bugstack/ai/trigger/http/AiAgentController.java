@@ -6,9 +6,12 @@ import cn.bugstack.ai.api.dto.AgentFeedbackRequestDTO;
 import cn.bugstack.ai.api.dto.ArmoryAgentRequestDTO;
 import cn.bugstack.ai.api.dto.ArmoryApiRequestDTO;
 import cn.bugstack.ai.api.dto.AutoAgentRequestDTO;
+import cn.bugstack.ai.api.dto.ChatImageInputDTO;
 import cn.bugstack.ai.api.dto.FlowPlanReviewConfirmRequestDTO;
 import cn.bugstack.ai.api.response.Response;
 import cn.bugstack.ai.domain.agent.model.entity.ExecuteCommandEntity;
+import cn.bugstack.ai.domain.agent.model.entity.ChatImageInput;
+import cn.bugstack.ai.domain.agent.model.entity.ChatImageRef;
 import cn.bugstack.ai.domain.agent.model.valobj.AiAgentVO;
 import cn.bugstack.ai.domain.agent.service.IAgentDispatchService;
 import cn.bugstack.ai.domain.agent.service.IArmoryService;
@@ -26,6 +29,9 @@ import jakarta.servlet.http.HttpServletResponse;
 import lombok.extern.slf4j.Slf4j;
 import org.slf4j.MDC;
 import org.springframework.context.ApplicationContext;
+import org.springframework.http.CacheControl;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 
 import java.util.Map;
 import org.springframework.web.bind.annotation.*;
@@ -36,6 +42,7 @@ import javax.annotation.Resource;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
  * AutoAgent 自动智能对话体
@@ -61,6 +68,9 @@ public class AiAgentController implements IAiAgentService {
     private FlowPlanReviewService flowPlanReviewService;
 
     @Resource
+    private cn.bugstack.ai.domain.agent.service.multimodal.IChatImageAttachmentService imageAttachmentService;
+
+    @Resource
     private IFlowPlanReviewResumeService flowPlanReviewResumeService;
 
     @org.springframework.beans.factory.annotation.Autowired(required = false)
@@ -78,7 +88,12 @@ public class AiAgentController implements IAiAgentService {
             if (request.getAiAgentId() != null) MDC.put("agentId", String.valueOf(request.getAiAgentId()));
             if (request.getSessionId() != null) MDC.put("sessionId", request.getSessionId());
         }
-        log.info("AutoAgent流式执行请求开始，请求信息：{}", JSON.toJSONString(request));
+        log.info("AutoAgent request started agentId={} sessionId={} runId={} textChars={} imageCount={}",
+                request == null ? null : request.getAiAgentId(),
+                request == null ? null : request.getSessionId(),
+                request == null ? null : request.getRunId(),
+                request == null || request.getMessage() == null ? 0 : request.getMessage().length(),
+                request == null || request.getImages() == null ? 0 : request.getImages().size());
 
         try {
             // 设置SSE响应头
@@ -209,10 +224,26 @@ public class AiAgentController implements IAiAgentService {
                 }
             }
 
+            List<ChatImageInput> imageInputs = request.getImages() == null
+                    ? List.of()
+                    : request.getImages().stream()
+                    .filter(java.util.Objects::nonNull)
+                    .map(this::toChatImageInput)
+                    .toList();
+            String attachmentConversationId = buildConversationId(
+                    tenantId, userId, request.getSessionId());
+            List<ChatImageRef> imageRefs = imageAttachmentService.prepareAndStore(
+                    attachmentConversationId,
+                    userId,
+                    runId,
+                    request.getMessage(),
+                    imageInputs);
+
             // 2. 构建执行命令实体
             ExecuteCommandEntity executeCommandEntity = ExecuteCommandEntity.builder()
                     .aiAgentId(effectiveAgentId)
                     .message(request.getMessage())
+                    .images(imageRefs)
                     .sessionId(request.getSessionId())
                     .runId(runId)
                     .sourceRunId(request.getSourceRunId())
@@ -591,6 +622,23 @@ public class AiAgentController implements IAiAgentService {
         }
     }
 
+    private ChatImageInput toChatImageInput(ChatImageInputDTO input) {
+        return ChatImageInput.builder()
+                .sourceType(input.getSourceType())
+                .url(input.getUrl())
+                .dataUrl(input.getDataUrl())
+                .name(input.getName())
+                .mimeType(input.getMimeType())
+                .size(input.getSize())
+                .build();
+    }
+
+    private String buildConversationId(String tenantId, String userId, String sessionId) {
+        if (userId == null || userId.isBlank()) return sessionId;
+        if (tenantId == null || tenantId.isBlank()) return userId + ":" + sessionId;
+        return tenantId + ":" + userId + ":" + sessionId;
+    }
+
     /** 取第一个非空非空白的字符串值 */
     private static String coalesce(String... values) {
         for (String v : values) {
@@ -672,6 +720,36 @@ public class AiAgentController implements IAiAgentService {
         }
     }
 
+    @RequestMapping(value = "attachments/{attachmentId}", method = RequestMethod.GET)
+    public ResponseEntity<?> getChatAttachment(
+            @PathVariable("attachmentId") String attachmentId,
+            @RequestParam("userId") String userId) {
+        ChatImageRef image = imageAttachmentService.loadOwned(attachmentId, userId);
+        if (image == null) {
+            return ResponseEntity.notFound().build();
+        }
+        if (image.getAccessUrl() != null) {
+            return ResponseEntity.status(org.springframework.http.HttpStatus.FOUND)
+                    .location(java.net.URI.create(image.getAccessUrl()))
+                    .cacheControl(CacheControl.noStore())
+                    .build();
+        }
+        if (image.getData() == null || image.getData().length == 0) {
+            return ResponseEntity.notFound().build();
+        }
+        MediaType contentType;
+        try {
+            contentType = MediaType.parseMediaType(
+                    image.getMimeType() == null ? "application/octet-stream" : image.getMimeType());
+        } catch (Exception ignored) {
+            contentType = MediaType.APPLICATION_OCTET_STREAM;
+        }
+        return ResponseEntity.ok()
+                .contentType(contentType)
+                .cacheControl(CacheControl.maxAge(1, TimeUnit.DAYS).cachePrivate())
+                .body(image.getData());
+    }
+
     /** 删除某个会话的全部历史消息（带归属校验：只能删自己的会话） */
     @RequestMapping(value = "conversation", method = RequestMethod.DELETE)
     public Response<Boolean> deleteConversation(@RequestParam("conversationId") String conversationId,
@@ -695,7 +773,10 @@ public class AiAgentController implements IAiAgentService {
                         .data(false)
                         .build();
             }
+            int deletedAttachments = imageAttachmentService.deleteOwnedByConversation(conversationId, userId);
             log.info("删除会话历史 conversationId={} userId={} rows={}", conversationId, userId, deleted);
+            log.info("删除会话图片 conversationId={} userId={} rows={}",
+                    conversationId, userId, deletedAttachments);
             return Response.<Boolean>builder()
                     .code(ResponseCode.SUCCESS.getCode())
                     .info(ResponseCode.SUCCESS.getInfo())
@@ -757,6 +838,7 @@ public class AiAgentController implements IAiAgentService {
                 m.put("runId", r.getRunId());
                 // 展示点脱敏：DB 里存的是 USER + ASSISTANT 原文
                 m.put("content", PiiMasker.mask(r.getContent()));
+                m.put("images", toHistoryImages(r.getContentParts(), r.getUserId()));
                 m.put("createdAt", r.getCreatedAt() != null ? r.getCreatedAt().toString() : null);
                 messages.add(m);
                 if (oldestId == null) oldestId = r.getId();
@@ -774,6 +856,39 @@ public class AiAgentController implements IAiAgentService {
             log.error("查询会话消息失败", e);
             return Response.<Map<String, Object>>builder()
                     .code(ResponseCode.UN_ERROR.getCode()).info(e.getMessage()).data(java.util.Map.of()).build();
+        }
+    }
+
+    private List<Map<String, Object>> toHistoryImages(String contentParts, String rowUserId) {
+        if (contentParts == null || contentParts.isBlank()) return List.of();
+        try {
+            com.alibaba.fastjson.JSONArray parts = JSON.parseArray(contentParts);
+            List<Map<String, Object>> images = new ArrayList<>();
+            for (int i = 0; i < parts.size(); i++) {
+                com.alibaba.fastjson.JSONObject part = parts.getJSONObject(i);
+                if (part == null || !"image".equals(part.getString("type"))) continue;
+                String attachmentId = part.getString("attachmentId");
+                String sourceType = part.getString("sourceType");
+                Map<String, Object> image = new LinkedHashMap<>();
+                image.put("attachmentId", attachmentId);
+                image.put("sourceType", sourceType);
+                image.put("name", part.getString("name"));
+                image.put("mimeType", part.getString("mimeType"));
+                image.put("size", part.getLong("size"));
+                if (attachmentId != null && rowUserId != null) {
+                    image.put("url", "/api/v1/agent/attachments/"
+                            + java.net.URLEncoder.encode(attachmentId, java.nio.charset.StandardCharsets.UTF_8)
+                            + "?userId="
+                            + java.net.URLEncoder.encode(rowUserId, java.nio.charset.StandardCharsets.UTF_8));
+                } else if ("URL".equalsIgnoreCase(sourceType)) {
+                    image.put("url", part.getString("sourceUrl"));
+                }
+                images.add(image);
+            }
+            return images;
+        } catch (Exception e) {
+            log.warn("parse chat content_parts failed: {}", e.getMessage());
+            return List.of();
         }
     }
 

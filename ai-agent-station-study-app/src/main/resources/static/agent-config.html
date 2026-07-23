@@ -171,6 +171,9 @@
                                 <span class="font-medium">${model.modelName}</span>
                                 <span class="tag tag-purple ml-2">${model.modelType}</span>
                                 ${model.tier ? `<span class="tag tag-orange">${model.tier}</span>` : ''}
+                                ${model.capabilitiesJson && model.capabilitiesJson.includes('"IMAGE"')
+                                    ? '<span class="tag tag-green">图片输入</span>'
+                                    : '<span class="tag">仅文本</span>'}
                                 <span class="text-gray-400 ml-2">ID: ${model.modelId}</span>
                             </div>
                         ` : '<p class="text-gray-400 text-sm">未配置</p>'}

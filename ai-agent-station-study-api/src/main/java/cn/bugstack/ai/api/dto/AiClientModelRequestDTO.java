@@ -54,6 +54,11 @@ public class AiClientModelRequestDTO implements Serializable {
     private String modelUsage;
 
     /**
+     * Example: {"inputModalities":["TEXT","IMAGE"],"imageSources":["URL","BASE64"]}.
+     */
+    private String capabilitiesJson;
+
+    /**
      * 状态：0-禁用，1-启用
      */
     private Integer status;

@@ -156,6 +156,8 @@ public class AgentRepository implements IAgentRepository {
                                 .apiId(model.getApiId())
                                 .modelName(model.getModelName())
                                 .modelType(model.getModelType())
+                                .tier(model.getTier())
+                                .capabilitiesJson(model.getCapabilitiesJson())
                                 .toolMcpIds(toolMcpIds)
                                 .build();
 
@@ -578,6 +580,7 @@ public class AgentRepository implements IAgentRepository {
                         .modelName(model.getModelName())
                         .modelType(model.getModelType())
                         .tier(model.getTier())
+                        .capabilitiesJson(model.getCapabilitiesJson())
                         .build();
 
                 // 避免重复添加相同的模型配置
@@ -604,6 +607,7 @@ public class AgentRepository implements IAgentRepository {
                     .modelName(model.getModelName())
                     .modelType(model.getModelType())
                     .tier(model.getTier())
+                    .capabilitiesJson(model.getCapabilitiesJson())
                     .build());
         }
         return result;

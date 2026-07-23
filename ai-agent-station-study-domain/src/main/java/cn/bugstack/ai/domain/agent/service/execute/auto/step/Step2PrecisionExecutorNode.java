@@ -115,6 +115,8 @@ public class Step2PrecisionExecutorNode extends AbstractExecuteSupport{
                 p -> step2Client.prompt(p)
                         .advisors(a -> a
                                 .param(CHAT_MEMORY_CONVERSATION_ID_KEY, buildConversationId(requestParameter))
+                                .param(cn.bugstack.ai.domain.agent.service.multimodal.MultimodalMessageAdvisor.CURRENT_IMAGES_CONTEXT_KEY,
+                                        requestParameter.getImages())
                                 .param(LTM_RETRIEVAL_QUERY_KEY, steerAwareRetrievalQuery(dynamicContext, requestParameter))
                                 .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 1024))
                         .options(step2Opts),

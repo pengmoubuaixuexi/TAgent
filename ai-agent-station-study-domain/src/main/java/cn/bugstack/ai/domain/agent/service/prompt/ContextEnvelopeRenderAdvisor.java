@@ -64,7 +64,8 @@ public class ContextEnvelopeRenderAdvisor implements BaseAdvisor {
         List<Message> messages = new ArrayList<>(originalMessages);
         int userIndex = lastUserMessageIndex(messages);
         if (userIndex >= 0) {
-            messages.set(userIndex, new UserMessage(rendered));
+            UserMessage originalUser = (UserMessage) messages.get(userIndex);
+            messages.set(userIndex, originalUser.mutate().text(rendered).build());
         } else {
             messages.add(new UserMessage(rendered));
         }

@@ -330,14 +330,21 @@
     <div class="max-w-4xl mx-auto relative">
       <div id="runCommandPalette" class="hidden absolute left-0 right-0 bottom-full mb-2 bg-[#111827] border border-gray-700 rounded-lg shadow-2xl overflow-hidden z-30"></div>
       <div id="runRedoHint" class="hidden mb-2 text-xs text-cyan-200 bg-cyan-950/40 border border-cyan-800/70 rounded-md px-3 py-2"></div>
+      <div id="imagePreviewStrip" class="hidden mb-2 flex gap-2 flex-wrap"></div>
       <div class="flex gap-3">
       <button onclick="newSession()" title="新会话"
         class="bg-gray-800 hover:bg-gray-700 text-gray-400 px-3 py-3 rounded-lg transition text-sm shrink-0">
         + 新会话
       </button>
-      <textarea id="msgInput" rows="1" placeholder="输入消息..."
+      <input id="chatImageInput" type="file" accept="image/*" multiple class="hidden" onchange="onChatImagesSelected(event)">
+      <button onclick="document.getElementById('chatImageInput').click()" title="添加图片（最多 4 张，每张 10MB）"
+        class="bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-3 rounded-lg transition text-sm shrink-0">
+        🖼️
+      </button>
+      <textarea id="msgInput" rows="1" placeholder="输入消息，也可粘贴图片..."
         class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition resize-none"
         onkeydown="onComposerKey(event)"
+        onpaste="onChatImagePaste(event)"
         oninput="onComposerInput(this)"></textarea>
       <button onclick="onSendBtn()" id="sendBtn"
         class="bg-blue-600 hover:bg-blue-700 active:bg-blue-800 disabled:opacity-50 disabled:cursor-not-allowed text-white px-6 py-3 rounded-lg transition font-medium">
@@ -373,7 +380,8 @@ let state = {
   approvalTimer: null,
   interventionEnabled: false,
   flowStep4Active: false,
-  selectedRunRedo: null
+  selectedRunRedo: null,
+  pendingImages: []
 };
 
 // ==================== INIT ====================
@@ -448,6 +456,8 @@ function doLogout() {
   localStorage.removeItem('agent_login');
   resetHistoryPagination(); // 第 70 轮：退出登录也要清历史分页状态，避免下次登录残留旧监听
   state.userId = null; state.username = null; state.sessionId = null;
+  state.pendingImages = [];
+  renderPendingImages();
   document.getElementById('messageArea').innerHTML = '<div class="text-center text-gray-600 text-sm py-8"><p class="text-4xl mb-3">👋</p><p>已退出登录</p></div>';
   showLogin();
 }
@@ -505,6 +515,8 @@ function newSession(options = {}) {
   state.approvalQueue = [];
   state.pendingApproval = null;
   hideApprovalModal();
+  state.pendingImages = [];
+  renderPendingImages();
   state.sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
   document.getElementById('sessionInfo').textContent = 'Session: ' + state.sessionId.substring(0, 28) + '...';
   saveActiveConversation(state.sessionId);
@@ -1352,6 +1364,7 @@ function onComposerInput(el) {
   if (!el) return;
   el.style.height = '';
   el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+  renderPendingImages();
   const parsed = parseRunRedoCommand(el.value || '');
   if (!parsed) {
     state.selectedRunRedo = null;
@@ -1627,13 +1640,152 @@ function escapeJsAttr(s) {
     .replace(/>/g, '&gt;');
 }
 
+const CHAT_IMAGE_MAX_COUNT = 4;
+const CHAT_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+
+async function onChatImagesSelected(event) {
+  const files = Array.from(event.target.files || []);
+  event.target.value = '';
+  await appendChatImageFiles(files);
+}
+
+async function onChatImagePaste(event) {
+  const items = Array.from((event.clipboardData && event.clipboardData.items) || []);
+  const files = items
+    .filter(item => item.kind === 'file' && item.type && item.type.startsWith('image/'))
+    .map(item => item.getAsFile())
+    .filter(Boolean);
+  if (!files.length) return;
+  event.preventDefault();
+  await appendChatImageFiles(files);
+}
+
+async function appendChatImageFiles(files) {
+  for (const file of files) {
+    if (state.pendingImages.length >= CHAT_IMAGE_MAX_COUNT) {
+      alert(`每条消息最多添加 ${CHAT_IMAGE_MAX_COUNT} 张图片`);
+      break;
+    }
+    if (!file.type || !file.type.startsWith('image/')) {
+      alert(`${file.name} 不是支持的图片文件`);
+      continue;
+    }
+    if (file.size > CHAT_IMAGE_MAX_BYTES) {
+      alert(`${file.name} 超过 10MB`);
+      continue;
+    }
+    const dataUrl = await readFileAsDataUrl(file);
+    state.pendingImages.push({
+      sourceType: 'BASE64',
+      dataUrl,
+      name: file.name,
+      mimeType: file.type,
+      size: file.size,
+      previewUrl: dataUrl
+    });
+  }
+  renderPendingImages();
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('读取图片失败'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function removePendingImage(index) {
+  state.pendingImages.splice(index, 1);
+  renderPendingImages();
+}
+
+function renderPendingImages() {
+  const strip = document.getElementById('imagePreviewStrip');
+  if (!strip) return;
+  const input = document.getElementById('msgInput');
+  const previewImages = mergeMessageImages(
+    state.pendingImages,
+    extractImageUrls(input ? input.value : '')
+  );
+  if (!previewImages.length) {
+    strip.classList.add('hidden');
+    strip.innerHTML = '';
+    return;
+  }
+  strip.classList.remove('hidden');
+  strip.innerHTML = previewImages.map((image, index) => `
+    <div class="relative w-20 h-20 rounded-lg overflow-hidden border border-gray-700 bg-gray-950">
+      <img src="${escapeHtml(image.previewUrl)}" alt="${escapeHtml(image.name || '图片')}"
+        class="w-full h-full object-cover" referrerpolicy="no-referrer">
+      ${image.sourceType === 'BASE64'
+        ? `<button type="button" onclick="removePendingImage(${state.pendingImages.indexOf(image)})"
+             class="absolute right-1 top-1 w-5 h-5 rounded-full bg-black/70 text-white text-xs leading-5">×</button>`
+        : '<span class="absolute left-1 bottom-1 rounded bg-black/70 px-1 text-[10px] text-gray-200">URL</span>'}
+    </div>
+  `).join('');
+}
+
+function extractImageUrls(text) {
+  const matches = String(text || '').match(/https?:\/\/[^\s)\]>"']+?\.(?:png|jpe?g|gif|webp|bmp)(?:[?#][^\s)\]>"']*)?/ig) || [];
+  const normalized = matches.map(normalizeRemoteImageUrl).filter(Boolean);
+  return [...new Set(normalized)].slice(0, CHAT_IMAGE_MAX_COUNT).map(url => ({
+    sourceType: 'URL',
+    url,
+    name: safeImageName(url),
+    mimeType: inferImageMime(url),
+    previewUrl: url
+  }));
+}
+
+function normalizeRemoteImageUrl(value) {
+  try {
+    const url = new URL(String(value || '').trim());
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
+    url.hash = '';
+    return url.toString();
+  } catch (_) {
+    return '';
+  }
+}
+
+function safeImageName(url) {
+  const raw = String(url || '').split(/[?#]/)[0].split('/').pop() || 'remote-image';
+  try { return decodeURIComponent(raw); } catch (_) { return raw; }
+}
+
+function inferImageMime(url) {
+  const value = String(url || '').toLowerCase();
+  if (value.includes('.png')) return 'image/png';
+  if (value.includes('.gif')) return 'image/gif';
+  if (value.includes('.webp')) return 'image/webp';
+  if (value.includes('.bmp')) return 'image/bmp';
+  return 'image/jpeg';
+}
+
+function mergeMessageImages(localImages, urlImages) {
+  const result = [];
+  const seen = new Set();
+  for (const image of [...(localImages || []), ...(urlImages || [])]) {
+    const key = image.sourceType === 'URL' ? `URL:${image.url}` : `BASE64:${image.name}:${image.size}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(image);
+    if (result.length >= CHAT_IMAGE_MAX_COUNT) break;
+  }
+  return result;
+}
+
 async function sendMessage() {
   if (state.sending) return;
   const input = document.getElementById('msgInput');
   const rawMessage = input.value.trim();
+  const messageImages = mergeMessageImages(state.pendingImages, extractImageUrls(rawMessage));
   const redoCommand = parseRunRedoCommand(rawMessage);
-  const message = redoCommand ? redoCommand.message : rawMessage;
-  if (!message) return;
+  const message = (redoCommand ? redoCommand.message : rawMessage)
+    || (messageImages.length ? '请查看并介绍我附带的图片。' : '');
+  if (!message && !messageImages.length) return;
   hideRunCommandPalette();
   state.selectedRunRedo = redoCommand || null;
   // aiAgentId 为空时走后端统一路由（自动模式）
@@ -1644,6 +1796,8 @@ async function sendMessage() {
   state.finalizing = false;  // 新一轮：清掉上一轮「已点立即回答」的终态，引导/立即回答恢复可用
   state.flowStep4Active = false;
   input.value = ''; input.style.height = '';
+  state.pendingImages = [];
+  renderPendingImages();
   renderRunRedoHint(null);
   const ac = new AbortController();
   state.abortController = ac;
@@ -1653,7 +1807,7 @@ async function sendMessage() {
   const userDisplayMessage = redoCommand
     ? `基于历史运行 ${shortRunId(redoCommand.sourceRunId)} 的 ${redoCommand.stepLabel || `Step${redoCommand.redoFromStep}`} 进行修正：${message}`
     : message;
-  addMessage('user', userDisplayMessage);
+  addMessage('user', userDisplayMessage, false, null, null, messageImages);
   // 添加 AI 占位
   const aiMsg = addMessage('assistant', '', true);
   // 顶部作者标题：手动选了 agent 直接显示「名称(id)」；自动模式先显示「路由中…」，收到 agent_routed 再替换
@@ -1675,6 +1829,14 @@ async function sendMessage() {
       body: JSON.stringify({
         aiAgentId: state.currentAgentId || null,
         message: message,
+        images: messageImages.map(image => ({
+          sourceType: image.sourceType,
+          url: image.url || null,
+          dataUrl: image.dataUrl || null,
+          name: image.name || null,
+          mimeType: image.mimeType || null,
+          size: image.size || null
+        })),
         sessionId: state.sessionId,
         userId: state.userId,
         maxStep: state.maxStep,
@@ -3235,7 +3397,7 @@ function flashButtonText(btn, text, restoreText) {
   }, 1400);
 }
 
-function addMessage(role, content, isPlaceholder, agentId, runId) {
+function addMessage(role, content, isPlaceholder, agentId, runId, images) {
   const area = document.getElementById('messageArea');
   // 移除空状态。第 70 轮：排除历史顶部哨兵（它也带 .text-center），否则在历史会话里继续发消息会误删哨兵
   const empty = area.querySelector('.text-center:not(#historyTopSentinel)');
@@ -3262,7 +3424,7 @@ function addMessage(role, content, isPlaceholder, agentId, runId) {
         ${role === 'assistant' ? `<button type="button" class="msg-copy-run ${runId ? '' : 'hidden'} text-[11px] text-cyan-300 hover:text-white shrink-0" onclick="copyMessageRunId(this)">复制 runId</button>` : ''}
       </div>
       <div class="msg-content text-sm leading-relaxed ${isPlaceholder ? 'typing' : ''}">
-        ${isPlaceholder ? '<span class="text-gray-500">思考中...</span>' : renderMarkdown(content)}
+        ${isPlaceholder ? '<span class="text-gray-500">思考中...</span>' : renderMessageImages(images) + renderMarkdown(content)}
       </div>
       ${role === 'assistant' ? '<div class="msg-actions mt-2 text-right"><button type="button" class="msg-copy-final hidden text-[11px] text-gray-400 hover:text-white" onclick="copyFinalAnswerFromMessage(this)">复制回复</button></div>' : ''}
     </div>
@@ -3272,6 +3434,23 @@ function addMessage(role, content, isPlaceholder, agentId, runId) {
   area.appendChild(div);
   scrollBottom(true);
   return div;
+}
+
+function renderMessageImages(images) {
+  if (!Array.isArray(images) || !images.length) return '';
+  const cards = images.map(image => {
+    const rawUrl = image.previewUrl || image.url || '';
+    const safeUrl = /^(data:image\/|https?:\/\/|\/api\/v1\/agent\/attachments\/)/i.test(rawUrl)
+      ? rawUrl
+      : '';
+    if (!safeUrl) return '';
+    return `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer"
+      class="block w-40 h-40 rounded-lg overflow-hidden border border-gray-700 bg-gray-950">
+      <img src="${escapeHtml(safeUrl)}" alt="${escapeHtml(image.name || '图片')}"
+        class="w-full h-full object-cover" loading="lazy" referrerpolicy="no-referrer">
+    </a>`;
+  }).filter(Boolean).join('');
+  return cards ? `<div class="grid grid-cols-2 gap-2 mb-3">${cards}</div>` : '';
 }
 
 // 2026-05-07：用 marked.js 渲染 Markdown，保留 KaTeX 数学公式
@@ -3541,7 +3720,7 @@ async function loadConversation(conversationId, options = {}) {
     area.innerHTML = '';
     // 先全部 append 消息（addMessage 会 scrollBottom，正常）
     messages.forEach(m => {
-      addMessage(m.messageType === 'USER' ? 'user' : 'assistant', m.content, false, m.agentId, m.runId);
+      addMessage(m.messageType === 'USER' ? 'user' : 'assistant', m.content, false, m.agentId, m.runId, m.images);
     });
     // 再插入哨兵到顶部（避免 addMessage 内部 querySelector('.text-center') 误删它）
     insertHistoryTopSentinel(area);
@@ -3632,7 +3811,7 @@ async function loadHistoryEarlier() {
     const sentinel = document.getElementById('historyTopSentinel');
     const fragment = document.createDocumentFragment();
     messages.forEach(m => {
-      const node = buildMessageNode(m.messageType === 'USER' ? 'user' : 'assistant', m.content, m.agentId, m.runId);
+      const node = buildMessageNode(m.messageType === 'USER' ? 'user' : 'assistant', m.content, m.agentId, m.runId, m.images);
       if (node) fragment.appendChild(node);
     });
     if (sentinel && sentinel.nextSibling) {
@@ -3657,7 +3836,7 @@ async function loadHistoryEarlier() {
 
 // 与 addMessage 同源的 DOM 构造，但只构造不挂载、不 scroll，供 prepend 使用。
 // 改 addMessage 时记得同步这里。
-function buildMessageNode(role, content, agentId, runId) {
+function buildMessageNode(role, content, agentId, runId, images) {
   const div = document.createElement('div');
   div.className = 'fade-in flex gap-3 ' + (role === 'user' ? 'flex-row-reverse' : '');
   div.dataset.messageRole = role;
@@ -3678,7 +3857,7 @@ function buildMessageNode(role, content, agentId, runId) {
         <div class="text-xs text-gray-500 msg-author flex-1 min-w-0 truncate">${role === 'user' ? state.username : escapeHtml(agentLabel(agentId))}</div>
         ${role === 'assistant' ? `<button type="button" class="msg-copy-run ${runId ? '' : 'hidden'} text-[11px] text-cyan-300 hover:text-white shrink-0" onclick="copyMessageRunId(this)">复制 runId</button>` : ''}
       </div>
-      <div class="msg-content text-sm leading-relaxed">${renderMarkdown(content)}</div>
+      <div class="msg-content text-sm leading-relaxed">${renderMessageImages(images)}${renderMarkdown(content)}</div>
       ${role === 'assistant' ? '<div class="msg-actions mt-2 text-right"><button type="button" class="msg-copy-final hidden text-[11px] text-gray-400 hover:text-white" onclick="copyFinalAnswerFromMessage(this)">复制回复</button></div>' : ''}
     </div>
   `;

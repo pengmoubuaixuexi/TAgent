@@ -79,6 +79,8 @@ public class ConversationTurnMemoryService implements IConversationTurnMemorySer
                         .runId(request.getRunId())
                         .messageType("USER")
                         .content(memoryUserMessage)
+                        .contentParts(ChatMessagePartsCodec.encode(memoryUserMessage, request.getImages()))
+                        .mediaCount(request.getImages() == null ? 0 : request.getImages().size())
                         .createdAt(now)
                         .build(),
                 AiChatMemory.builder()
@@ -88,6 +90,7 @@ public class ConversationTurnMemoryService implements IConversationTurnMemorySer
                         .runId(request.getRunId())
                         .messageType("ASSISTANT")
                         .content(cleanedOutput)
+                        .mediaCount(0)
                         .createdAt(now.plusNanos(1))
                         .build()
         );

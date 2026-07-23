@@ -158,6 +158,8 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
                     .prompt(summaryPrompt)
                     .advisors(a -> a
                             .param(CHAT_MEMORY_CONVERSATION_ID_KEY, buildConversationId(requestParameter))
+                            .param(cn.bugstack.ai.domain.agent.service.multimodal.MultimodalMessageAdvisor.CURRENT_IMAGES_CONTEXT_KEY,
+                                    requestParameter.getImages())
                             .param(LTM_RETRIEVAL_QUERY_KEY, buildLtmRetrievalQuery(requestParameter, "auto-step4-final-summary"))
                             .param("memory_persist_final_turn", true)
                             .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 50));

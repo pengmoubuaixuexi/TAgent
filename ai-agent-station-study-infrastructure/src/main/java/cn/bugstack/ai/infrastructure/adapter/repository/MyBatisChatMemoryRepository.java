@@ -5,6 +5,7 @@ import cn.bugstack.ai.infrastructure.dao.IAiChatMemoryDao;
 import cn.bugstack.ai.infrastructure.dao.po.AiChatMemory;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.content.Media;
 import org.springframework.ai.chat.memory.ChatMemoryRepository;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
@@ -12,7 +13,10 @@ import org.springframework.ai.chat.messages.MessageType;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.stereotype.Component;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.util.MimeType;
 
+import java.net.URI;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -46,6 +50,9 @@ public class MyBatisChatMemoryRepository implements ChatMemoryRepository {
 
     @Resource
     private MemoryCacheService memoryCache;
+
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.multimodal.IChatImageAttachmentService imageAttachmentService;
 
     /** 由调用方（FixedAgentExecuteStrategy 等）通过 {@link cn.bugstack.ai.domain.agent.service.memory.ChatMemoryContext} 设置 */
 
@@ -113,6 +120,7 @@ public class MyBatisChatMemoryRepository implements ChatMemoryRepository {
                     .runId(runId)
                     .messageType(type)
                     .content(msg.getText())
+                    .mediaCount(msg instanceof UserMessage user ? user.getMedia().size() : 0)
                     .createdAt(now)
                     .build());
         }
@@ -140,11 +148,58 @@ public class MyBatisChatMemoryRepository implements ChatMemoryRepository {
             return new UserMessage(r.getContent());
         }
         return switch (type) {
-            case USER       -> new UserMessage(r.getContent());
+            case USER       -> toUserMessage(r);
             case ASSISTANT  -> new AssistantMessage(r.getContent());
             case SYSTEM     -> new SystemMessage(r.getContent());
             case TOOL       -> null; // 见类注释
         };
+    }
+
+    private UserMessage toUserMessage(AiChatMemory row) {
+        List<String> attachmentIds = ChatMessagePartsCodec.attachmentIds(row.getContentParts());
+        if (attachmentIds.isEmpty()) return new UserMessage(row.getContent());
+        List<cn.bugstack.ai.domain.agent.model.entity.ChatImageRef> refs =
+                imageAttachmentService.loadByAttachmentIds(attachmentIds);
+        List<Media> media = new ArrayList<>();
+        for (cn.bugstack.ai.domain.agent.model.entity.ChatImageRef ref : refs) {
+            Media item = toMedia(ref);
+            if (item != null) media.add(item);
+        }
+        if (media.isEmpty()) return new UserMessage(row.getContent());
+        return UserMessage.builder()
+                .text(row.getContent())
+                .media(media)
+                .metadata(java.util.Map.of("chatImageRefs", refs))
+                .build();
+    }
+
+    private Media toMedia(cn.bugstack.ai.domain.agent.model.entity.ChatImageRef ref) {
+        if (ref == null) return null;
+        MimeType mimeType;
+        try {
+            mimeType = MimeType.valueOf(ref.getMimeType() == null ? "image/jpeg" : ref.getMimeType());
+        } catch (Exception ignored) {
+            mimeType = MimeType.valueOf("image/jpeg");
+        }
+        try {
+            if (ref.getAccessUrl() != null) {
+                return new Media(mimeType, URI.create(ref.getAccessUrl()));
+            }
+            if ("URL".equalsIgnoreCase(ref.getSourceType()) && ref.getSourceUrl() != null) {
+                return new Media(mimeType, URI.create(ref.getSourceUrl()));
+            }
+            if (ref.getData() != null && ref.getData().length > 0) {
+                return new Media(mimeType, new ByteArrayResource(ref.getData()) {
+                    @Override
+                    public String getFilename() {
+                        return ref.getName() == null ? "image" : ref.getName();
+                    }
+                });
+            }
+        } catch (Exception e) {
+            log.warn("restore chat image failed attachmentId={}: {}", ref.getAttachmentId(), e.getMessage());
+        }
+        return null;
     }
 
     /**

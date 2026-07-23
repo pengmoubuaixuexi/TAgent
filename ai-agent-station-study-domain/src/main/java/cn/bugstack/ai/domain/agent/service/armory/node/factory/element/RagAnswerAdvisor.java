@@ -171,7 +171,8 @@ public class RagAnswerAdvisor implements BaseAdvisor {
     public ChatClientRequest before(ChatClientRequest chatClientRequest, AdvisorChain advisorChain) {
         HashMap<String, Object> context = new HashMap(chatClientRequest.context());
 
-        String userText = chatClientRequest.prompt().getUserMessage().getText();
+        UserMessage originalUserMessage = chatClientRequest.prompt().getUserMessage();
+        String userText = originalUserMessage.getText();
 
         // V041：flow/auto 节点会把工具目录 + 分析模板拼进 user message，污染 RAG 路由与检索。
         // 若节点传入了干净的用户问题(ltm_retrieval_query)，就用【记忆背景 + 干净问题】做路由/检索，剥掉工具脚手架。
@@ -331,7 +332,7 @@ public class RagAnswerAdvisor implements BaseAdvisor {
                 + "如果资料不足以回答，请明确说明“当前知识库资料不足”，并列出你能确认的部分和缺失的信息。\n";
         messages.add(new SystemMessage(ragContextMsg));
         // 保持原始 UserMessage 不变
-        messages.add(new UserMessage(userText));
+        messages.add(originalUserMessage);
 
         return ChatClientRequest.builder()
                 // 透传 options，否则 per-request 动态工具回调会丢（见 LongTermMemoryAdvisor 同样修复）。

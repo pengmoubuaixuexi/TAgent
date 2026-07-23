@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="cn.bugstack.ai.infrastructure.dao.IAiChatAttachmentDao">
+
+    <resultMap id="AiChatAttachmentMap" type="cn.bugstack.ai.infrastructure.dao.po.AiChatAttachment">
+        <id column="id" property="id"/>
+        <result column="attachment_id" property="attachmentId"/>
+        <result column="conversation_id" property="conversationId"/>
+        <result column="user_id" property="userId"/>
+        <result column="run_id" property="runId"/>
+        <result column="source_type" property="sourceType"/>
+        <result column="source_url" property="sourceUrl"/>
+        <result column="image_data" property="imageData"/>
+        <result column="storage_provider" property="storageProvider"/>
+        <result column="bucket_name" property="bucketName"/>
+        <result column="object_key" property="objectKey"/>
+        <result column="etag" property="etag"/>
+        <result column="mime_type" property="mimeType"/>
+        <result column="original_name" property="originalName"/>
+        <result column="file_size" property="fileSize"/>
+        <result column="sha256" property="sha256"/>
+        <result column="created_at" property="createdAt"/>
+    </resultMap>
+
+    <insert id="insertBatch" parameterType="java.util.List">
+        INSERT INTO ai_chat_attachment (
+            attachment_id, conversation_id, user_id, run_id, source_type,
+            source_url, image_data, storage_provider, bucket_name, object_key, etag,
+            mime_type, original_name, file_size, sha256, created_at
+        ) VALUES
+        <foreach collection="list" item="a" separator=",">
+            (
+                #{a.attachmentId}, #{a.conversationId}, #{a.userId}, #{a.runId}, #{a.sourceType},
+                #{a.sourceUrl}, NULL, #{a.storageProvider}, #{a.bucketName}, #{a.objectKey}, #{a.etag},
+                #{a.mimeType}, #{a.originalName},
+                #{a.fileSize}, #{a.sha256}, #{a.createdAt}
+            )
+        </foreach>
+    </insert>
+
+    <select id="findByAttachmentIds" resultMap="AiChatAttachmentMap">
+        SELECT id, attachment_id, conversation_id, user_id, run_id, source_type,
+               source_url, image_data, storage_provider, bucket_name, object_key, etag,
+               mime_type, original_name, file_size, sha256, created_at
+        FROM ai_chat_attachment
+        WHERE attachment_id IN
+        <foreach collection="ids" item="id" open="(" separator="," close=")">
+            #{id}
+        </foreach>
+    </select>
+
+    <select id="findOwned" resultMap="AiChatAttachmentMap">
+        SELECT id, attachment_id, conversation_id, user_id, run_id, source_type,
+               source_url, image_data, storage_provider, bucket_name, object_key, etag,
+               mime_type, original_name, file_size, sha256, created_at
+        FROM ai_chat_attachment
+        WHERE attachment_id = #{attachmentId}
+          AND (
+            user_id = #{userId}
+            OR conversation_id LIKE CONCAT('%:', #{userId}, ':%')
+          )
+        LIMIT 1
+    </select>
+
+    <select id="findOwnedByConversation" resultMap="AiChatAttachmentMap">
+        SELECT id, attachment_id, conversation_id, user_id, run_id, source_type,
+               source_url, image_data, storage_provider, bucket_name, object_key, etag,
+               mime_type, original_name, file_size, sha256, created_at
+        FROM ai_chat_attachment
+        WHERE conversation_id = #{conversationId}
+          AND (
+            user_id = #{userId}
+            OR conversation_id LIKE CONCAT('%:', #{userId}, ':%')
+          )
+    </select>
+
+    <select id="findLegacyWithoutObjectKey" resultMap="AiChatAttachmentMap">
+        SELECT id, attachment_id, conversation_id, user_id, run_id, source_type,
+               source_url, image_data, storage_provider, bucket_name, object_key, etag,
+               mime_type, original_name, file_size, sha256, created_at
+        FROM ai_chat_attachment
+        WHERE object_key IS NULL OR object_key = ''
+        ORDER BY id
+    </select>
+
+    <update id="markStoredInOss">
+        UPDATE ai_chat_attachment
+        SET storage_provider = #{storageProvider},
+            bucket_name = #{bucketName},
+            object_key = #{objectKey},
+            etag = #{etag},
+            image_data = NULL
+        WHERE attachment_id = #{attachmentId}
+    </update>
+
+    <delete id="deleteOwnedByConversation">
+        DELETE FROM ai_chat_attachment
+        WHERE conversation_id = #{conversationId}
+          AND (
+            user_id = #{userId}
+            OR conversation_id LIKE CONCAT('%:', #{userId}, ':%')
+          )
+    </delete>
+
+</mapper>

@@ -43,6 +43,22 @@ public class AiClientModelVO {
      */
     private String tier;
 
+    /** JSON capability descriptor, for example TEXT+IMAGE input support. */
+    private String capabilitiesJson;
+
+    public boolean supportsImageInput() {
+        if (capabilitiesJson == null || capabilitiesJson.isBlank()) return false;
+        try {
+            com.alibaba.fastjson.JSONObject value = com.alibaba.fastjson.JSON.parseObject(capabilitiesJson);
+            java.util.List<String> modalities = value.getJSONArray("inputModalities") == null
+                    ? java.util.List.of()
+                    : value.getJSONArray("inputModalities").toJavaList(String.class);
+            return modalities.stream().anyMatch("IMAGE"::equalsIgnoreCase);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
     /**
      * 工具 mcp ids
      */

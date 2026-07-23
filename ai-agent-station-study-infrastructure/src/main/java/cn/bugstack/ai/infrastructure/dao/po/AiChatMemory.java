@@ -33,5 +33,10 @@ public class AiChatMemory {
 
     private String content;
 
+    /** Provider-neutral text/image part references; never contains Base64. */
+    private String contentParts;
+
+    private Integer mediaCount;
+
     private LocalDateTime createdAt;
 }

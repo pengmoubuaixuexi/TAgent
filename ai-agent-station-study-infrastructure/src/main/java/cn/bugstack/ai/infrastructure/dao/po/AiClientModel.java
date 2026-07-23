@@ -56,6 +56,9 @@ public class AiClientModel {
      */
     private String tier;
 
+    /** Provider/model input capabilities in JSON format. */
+    private String capabilitiesJson;
+
     /**
      * 状态：0-禁用，1-启用
      */

@@ -1,6 +1,19 @@
 server:
   port: 8091
 
+agent:
+  multimodal:
+    max-images: 4
+    max-image-bytes: 10485760
+    oss:
+      enabled: ${TAGENT_OSS_ENABLED:false}
+      region: ${TAGENT_OSS_REGION:cn-beijing}
+      endpoint: ${TAGENT_OSS_ENDPOINT:https://oss-cn-beijing.aliyuncs.com}
+      bucket: ${TAGENT_OSS_BUCKET:}
+      object-prefix: ${TAGENT_OSS_OBJECT_PREFIX:chat-images}
+      signed-url-ttl-seconds: ${TAGENT_OSS_SIGNED_URL_TTL_SECONDS:1800}
+      migrate-legacy-on-startup: ${TAGENT_OSS_MIGRATE_LEGACY_ON_STARTUP:false}
+
 # 线程池配置
 thread:
   pool:

@@ -462,7 +462,10 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             ChatClient.ChatClientRequestSpec spec0 = executorChatClient.prompt()
                     // P2-B-1：A2 请求级 .system() 替换 defaultSystem，故公共信任边界须在此另行 prepend（否则 DAG 子步丢失）。
                     .system(cn.bugstack.ai.domain.agent.service.prompt.SystemPolicyComposer.prepend(SUB_STEP_EXECUTOR_SYSTEM))
-                    .user(stepExecPrompt);
+                    .user(stepExecPrompt)
+                    .advisors(a -> a.param(
+                            cn.bugstack.ai.domain.agent.service.multimodal.MultimodalMessageAdvisor.CURRENT_IMAGES_CONTEXT_KEY,
+                            request.getImages()));
             // 必须 OpenAiChatOptions：DefaultChatClientUtils 需 instanceof ToolCallingChatOptions 才注入 toolContext，
             // 且 OpenAiChatModel.buildRequestPrompt 的 toolContext merge 把 runtime 强转 OpenAiChatOptions，
             // 非 OpenAiChatOptions 会丢掉 toolContext(sessionId/stepLabel) → 工具线程拿不到 → 审批门失效（Step4 是 flow 工具执行步骤）。
@@ -955,6 +958,8 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                     .user(prompt)
                     .advisors(a -> a
                             .param(CHAT_MEMORY_CONVERSATION_ID_KEY, buildConversationId(request))
+                            .param(cn.bugstack.ai.domain.agent.service.multimodal.MultimodalMessageAdvisor.CURRENT_IMAGES_CONTEXT_KEY,
+                                    request.getImages())
                             .param(LTM_RETRIEVAL_QUERY_KEY, buildLtmRetrievalQuery(request, "flow-answer-now"))
                             .param("memory_persist_final_turn", true)
                             .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 50));
@@ -1120,6 +1125,8 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                 .user(prompt)
                 .advisors(a -> a
                         .param(CHAT_MEMORY_CONVERSATION_ID_KEY, buildConversationId(request))
+                        .param(cn.bugstack.ai.domain.agent.service.multimodal.MultimodalMessageAdvisor.CURRENT_IMAGES_CONTEXT_KEY,
+                                request.getImages())
                         .param(LTM_RETRIEVAL_QUERY_KEY, buildLtmRetrievalQuery(request, "flow-final-synthesis"))
                         .param("memory_persist_final_turn", true)
                         .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 50));

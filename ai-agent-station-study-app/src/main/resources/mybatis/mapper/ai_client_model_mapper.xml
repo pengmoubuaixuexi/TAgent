@@ -10,6 +10,7 @@
         <result column="model_type" property="modelType"/>
         <result column="model_usage" property="modelUsage"/>
         <result column="tier" property="tier"/>
+        <result column="capabilities_json" property="capabilitiesJson"/>
         <result column="status" property="status"/>
         <result column="create_time" property="createTime"/>
         <result column="update_time" property="updateTime"/>
@@ -17,9 +18,9 @@
 
     <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientModel" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO ai_client_model (
-            model_id, api_id, model_name, model_type, model_usage, tier, status, create_time, update_time
+            model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
         ) VALUES (
-            #{modelId}, #{apiId}, #{modelName}, #{modelType}, #{modelUsage}, #{tier}, #{status}, #{createTime}, #{updateTime}
+            #{modelId}, #{apiId}, #{modelName}, #{modelType}, #{modelUsage}, #{tier}, #{capabilitiesJson}, #{status}, #{createTime}, #{updateTime}
         )
     </insert>
 
@@ -31,6 +32,7 @@
             model_type = #{modelType},
             model_usage = #{modelUsage},
             tier = #{tier},
+            capabilities_json = #{capabilitiesJson},
             status = #{status},
             update_time = #{updateTime}
         WHERE id = #{id}
@@ -43,6 +45,7 @@
             model_type = #{modelType},
             model_usage = #{modelUsage},
             tier = #{tier},
+            capabilities_json = #{capabilitiesJson},
             status = #{status},
             update_time = #{updateTime}
         WHERE model_id = #{modelId}
@@ -57,40 +60,40 @@
     </delete>
 
     <select id="queryById" parameterType="java.lang.Long" resultMap="AiClientModelMap">
-        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, status, create_time, update_time
+        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
         FROM ai_client_model
         WHERE id = #{id}
     </select>
 
     <select id="queryByModelId" parameterType="java.lang.String" resultMap="AiClientModelMap">
-        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, status, create_time, update_time
+        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
         FROM ai_client_model
         WHERE model_id = #{modelId}
     </select>
 
     <select id="queryByApiId" parameterType="java.lang.String" resultMap="AiClientModelMap">
-        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, status, create_time, update_time
+        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
         FROM ai_client_model
         WHERE api_id = #{apiId}
         ORDER BY create_time DESC
     </select>
 
     <select id="queryByModelType" parameterType="java.lang.String" resultMap="AiClientModelMap">
-        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, status, create_time, update_time
+        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
         FROM ai_client_model
         WHERE model_type = #{modelType}
         ORDER BY create_time DESC
     </select>
 
     <select id="queryEnabledModels" resultMap="AiClientModelMap">
-        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, status, create_time, update_time
+        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
         FROM ai_client_model
         WHERE status = 1
         ORDER BY create_time DESC
     </select>
 
     <select id="queryAll" resultMap="AiClientModelMap">
-        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, status, create_time, update_time
+        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
         FROM ai_client_model
         ORDER BY create_time DESC
     </select>

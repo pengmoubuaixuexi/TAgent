@@ -63,6 +63,11 @@ public class WireTraceRecorder implements ExchangeFilterFunction {
     /** Single-line body cap; tuned so a single Logstash JSON doc stays under ES default mapping limits. */
     private static final int MAX_BODY_CHARS = 32_000;
 
+    private static final java.util.regex.Pattern IMAGE_DATA_URL =
+            java.util.regex.Pattern.compile(
+                    "data:image/[a-zA-Z0-9.+-]+;base64,[a-zA-Z0-9+/=\\\\r\\\\n]+",
+                    java.util.regex.Pattern.CASE_INSENSITIVE);
+
     /** Process-wide hop counter; lets Kibana sort multiple HTTP round-trips of one Spring AI .call(). */
     private static final AtomicLong HOP_SEQ = new AtomicLong();
 
@@ -228,7 +233,8 @@ public class WireTraceRecorder implements ExchangeFilterFunction {
 
     private String normalizeForSingleLine(String body) {
         if (body == null || body.isEmpty()) return "";
-        String s = body;
+        // Redact before truncation so neither the head nor tail can leak image bytes.
+        String s = IMAGE_DATA_URL.matcher(body).replaceAll("[IMAGE_BASE64_REDACTED]");
         if (s.length() > MAX_BODY_CHARS) {
             String marker = "...(truncated middle, full=" + body.length() + ")...";
             int headChars = MAX_BODY_CHARS / 2;

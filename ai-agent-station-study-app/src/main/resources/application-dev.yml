@@ -155,6 +155,17 @@ agent:
     max-messages: 20
     summarize-trigger: 30
     summarize-keep-recent: 10
+  multimodal:
+    max-images: 4
+    max-image-bytes: 10485760
+    oss:
+      enabled: ${TAGENT_OSS_ENABLED:false}
+      region: ${TAGENT_OSS_REGION:cn-beijing}
+      endpoint: ${TAGENT_OSS_ENDPOINT:https://oss-cn-beijing.aliyuncs.com}
+      bucket: ${TAGENT_OSS_BUCKET:}
+      object-prefix: ${TAGENT_OSS_OBJECT_PREFIX:chat-images}
+      signed-url-ttl-seconds: ${TAGENT_OSS_SIGNED_URL_TTL_SECONDS:1800}
+      migrate-legacy-on-startup: ${TAGENT_OSS_MIGRATE_LEGACY_ON_STARTUP:false}
   # US-008：长期记忆 profile 检索上限（原硬编码 16）
   memory:
     profile-max: 64

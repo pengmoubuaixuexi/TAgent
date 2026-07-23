@@ -11,6 +11,7 @@ import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.definition.ToolDefinition;
 import org.springframework.ai.tool.metadata.ToolMetadata;
 
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Set;
 import java.io.IOException;
@@ -201,8 +202,31 @@ public class MeteredToolCallback implements ToolCallback {
         // 且需拿到 buildToolContext 注入的 agent.run_id（按 runId 隔离）。Fixed/Flow 不注入开关 → 不记 → 不会"只记不清"。
         boolean ledgerOn = "true".equals(readContext(toolContext, ToolCallLedger.CTX_ENABLED_KEY));
         String ledgerRunId = ledgerOn ? readContext(toolContext, "agent.run_id") : null;
+        ToolContext mcpSafeContext = withoutToolCallHistory(toolContext);
         return invoke(name, toolInput, effectiveInput, resolveSessionId(toolContext), resolveStepLabel(toolContext),
-                ledgerRunId, () -> delegate.get().call(effectiveInput, toolContext));
+                ledgerRunId, () -> delegate.get().call(effectiveInput, mcpSafeContext));
+    }
+
+    /**
+     * Spring AI 1.1.x appends the complete conversation to
+     * {@link ToolContext#TOOL_CALL_HISTORY}. The MCP converter copies that map
+     * into JSON-RPC {@code _meta}. URL-backed Media stores a URI rather than a
+     * byte array, so Jackson fails on Media#getDataAsByteArray before the MCP
+     * server sees the request. Binary media would also make every call huge.
+     *
+     * Remove only framework-generated history from the MCP-bound copy.
+     * Session, step, approval and ledger context stay intact; the original
+     * prompt and ChatMemory are not changed.
+     */
+    private ToolContext withoutToolCallHistory(ToolContext toolContext) {
+        if (toolContext == null || toolContext.getContext() == null
+                || !toolContext.getContext().containsKey(ToolContext.TOOL_CALL_HISTORY)) {
+            return toolContext;
+        }
+        LinkedHashMap<String, Object> safe = new LinkedHashMap<>(toolContext.getContext());
+        safe.remove(ToolContext.TOOL_CALL_HISTORY);
+        log.debug("[MeteredToolCallback] stripped TOOL_CALL_HISTORY from MCP metadata tool={}", safeName());
+        return new ToolContext(safe);
     }
 
     /**

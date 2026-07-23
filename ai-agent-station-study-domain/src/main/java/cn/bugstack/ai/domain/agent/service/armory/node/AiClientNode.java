@@ -3,6 +3,7 @@ package cn.bugstack.ai.domain.agent.service.armory.node;
 import cn.bugstack.ai.domain.agent.model.entity.ArmoryCommandEntity;
 import cn.bugstack.ai.domain.agent.model.valobj.enums.AiAgentEnumVO;
 import cn.bugstack.ai.domain.agent.model.valobj.AiClientSystemPromptVO;
+import cn.bugstack.ai.domain.agent.model.valobj.AiClientModelVO;
 import cn.bugstack.ai.domain.agent.model.valobj.AiClientVO;
 import cn.bugstack.ai.domain.agent.service.armory.node.factory.DefaultArmoryStrategyFactory;
 
@@ -100,6 +101,15 @@ public class AiClientNode extends AbstractArmorySupport {
         }
 
         Map<String, AiClientSystemPromptVO> systemPromptMap = dynamicContext.getValue(AiAgentEnumVO.AI_CLIENT_SYSTEM_PROMPT.getDataName());
+        List<AiClientModelVO> modelConfigs = dynamicContext.getValue(AiAgentEnumVO.AI_CLIENT_MODEL.getDataName());
+        Map<String, AiClientModelVO> modelByBeanName = new java.util.HashMap<>();
+        if (modelConfigs != null) {
+            for (AiClientModelVO model : modelConfigs) {
+                modelByBeanName.put(
+                        AiAgentEnumVO.AI_CLIENT_MODEL.getBeanName(model.getModelId()),
+                        model);
+            }
+        }
         List<String> agentMemoryAdvisorBeanNames = collectAgentMemoryAdvisorBeanNames(aiClientList);
         if (!agentMemoryAdvisorBeanNames.isEmpty()) {
             log.info("[AiClientNode] agent memory advisors propagated to all clients: {}", agentMemoryAdvisorBeanNames);
@@ -154,6 +164,14 @@ public class AiClientNode extends AbstractArmorySupport {
             // P2-B-2：LTM/Episodic 只采集 section 到 request.context，统一由 render advisor 渲染单个 envelope。
             // 无 ctx.envelope.* 时 no-op；不需要改 DB advisor 配置。
             advisors.add(new ContextEnvelopeRenderAdvisor());
+            AiClientModelVO configuredModel = modelByBeanName.get(aiClientVO.getModelBeanName());
+            boolean imageInputSupported = configuredModel != null && configuredModel.supportsImageInput();
+            advisors.add(new cn.bugstack.ai.domain.agent.service.multimodal.MultimodalMessageAdvisor(
+                    imageInputSupported));
+            log.info("[AiClientNode] clientId={} model={} imageInputSupported={}",
+                    aiClientVO.getClientId(),
+                    configuredModel == null ? aiClientVO.getModelBeanName() : configuredModel.getModelName(),
+                    imageInputSupported);
 
             Advisor[] advisorArray = advisors.toArray(new Advisor[]{});
 

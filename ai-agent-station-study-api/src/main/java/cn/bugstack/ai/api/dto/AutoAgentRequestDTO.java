@@ -7,6 +7,7 @@ import lombok.NoArgsConstructor;
 
 import java.io.Serial;
 import java.io.Serializable;
+import java.util.List;
 
 /**
  * AutoAgent 请求 DTO
@@ -32,6 +33,12 @@ public class AutoAgentRequestDTO implements Serializable {
      * 用户消息
      */
     private String message;
+
+    /**
+     * Optional images that belong to this user message. The message remains a
+     * single provider-neutral text + image turn in ChatMemory.
+     */
+    private List<ChatImageInputDTO> images;
 
     /**
      * 会话ID
