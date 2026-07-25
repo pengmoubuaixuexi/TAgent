@@ -37,7 +37,7 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 
 ## 🎯 系统总览
 
-![TAgent 端到端架构](docs/images/tagent-end-to-end-architecture-2026-07-v14.png)
+![TAgent 端到端架构](docs/images/tagent-end-to-end-architecture-2026-07-v15.png)
 
 ## 🎬 功能演示
 

@@ -37,7 +37,7 @@ It is not another one-call model wrapper. TAgent makes the complete Agent-reques
 
 ## 🎯 System Overview
 
-![TAgent End-to-End Architecture](docs/images/tagent-end-to-end-architecture-2026-07-v14.png)
+![TAgent End-to-End Architecture](docs/images/tagent-end-to-end-architecture-2026-07-v15.png)
 
 ## 🎬 Feature Demos
 
