@@ -1,6 +1,8 @@
 # TAgent
 
-🚀 **A Production-Grade AI Agent Engineering Framework**
+<div align="center">
+
+🚀 **A production-oriented AI Agent engineering reference for Java developers**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Java 17+](https://img.shields.io/badge/Java-17+-orange)](https://www.oracle.com/java/)
@@ -11,9 +13,17 @@
 
 [中文文档](./README.md) | **English**
 
-TAgent is an enterprise-level AI Agent implementation project built on **Java 17**, **Spring Boot**, **Spring AI**, and **Domain-Driven Design (DDD)** layered architecture.
+[![Watch the Dynamic MCP Demo](https://img.shields.io/badge/Watch-Dynamic%20MCP%20demo-0ea5e9?style=for-the-badge&logo=github)](./docs/demo-videos/03-%E6%89%A7%E8%A1%8C%E6%9C%9F%E5%8A%A8%E6%80%81%E8%A1%A5%E6%8C%82%E5%B7%A5%E5%85%B7.webm)
 
-Unlike simple model wrapper, TAgent covers the **complete end-to-end lifecycle** of an Agent request: from ingestion, routing, runtime assembly, planning & execution, RAG, memory management, MCP tool governance, human approval, in-execution intervention, to SSE streaming output and full-chain observability.
+</div>
+
+TAgent is an enterprise-level AI Agent implementation project built with **Java 17**, **Spring Boot**, **Spring AI**, and a **Domain-Driven Design (DDD)** layered architecture.
+
+It is not another one-call model wrapper. TAgent makes the complete Agent-request lifecycle concrete and inspectable: ingestion, routing, runtime assembly, planning and execution, RAG, memory, MCP tool governance, human approval, in-execution intervention, SSE streaming, recovery, and end-to-end observability.
+
+[![TAgent architecture preview — click to watch the Dynamic MCP demo](docs/images/social-preview.jpg)](./docs/demo-videos/03-%E6%89%A7%E8%A1%8C%E6%9C%9F%E5%8A%A8%E6%80%81%E8%A1%A5%E6%8C%82%E5%B7%A5%E5%85%B7.webm)
+
+**What you can verify in the demo:** the model detects a missing capability during execution, calls `request_tool`, matches a real MCP tool through PgVector, and continues the same run with the newly attached tool. See the [full demo catalogue](./docs/demo-videos/README.md) for planning review, human approval, step-level redo, resilient runs, multimodal input, and background tasks.
 
 *This repository is a sanitized public version without real API keys, runtime logs, chat histories, temporary reports, database backups, or personal data.*
 
@@ -27,7 +37,20 @@ Unlike simple model wrapper, TAgent covers the **complete end-to-end lifecycle**
 
 ## 🎯 System Overview
 
-![TAgent End-to-End Architecture](docs/images/tagent-end-to-end-architecture-2026-06-v2.png)
+![TAgent End-to-End Architecture](docs/images/tagent-end-to-end-architecture-2026-07-v14.png)
+
+## 🎬 Feature Demos
+
+The repository includes focused recordings for the features below, so a visitor can verify a behavior instead of only reading about it:
+
+- [Fixed / Auto / Flow execution modes](./docs/demo-videos/01-%E4%B8%89%E7%A7%8D%E7%AD%96%E7%95%A5%E5%9F%BA%E7%A1%80%E9%97%AE%E7%AD%94.mp4)
+- [Dynamic MCP tool attachment during execution](./docs/demo-videos/03-%E6%89%A7%E8%A1%8C%E6%9C%9F%E5%8A%A8%E6%80%81%E8%A1%A5%E6%8C%82%E5%B7%A5%E5%85%B7.webm)
+- [Flow plan review and editing](./docs/demo-videos/05-%E6%B5%81%E7%A8%8B%E8%AE%A1%E5%88%92%E7%A1%AE%E8%AE%A4%E7%BC%96%E8%BE%91.webm)
+- [Human approval for high-risk tools](./docs/demo-videos/08-%E9%AB%98%E5%8D%B1%E5%B7%A5%E5%85%B7%E4%BA%BA%E5%B7%A5%E5%AE%A1%E6%89%B9.mp4)
+- [Step-level redo by run ID](./docs/demo-videos/09-%E8%BF%90%E8%A1%8C%E7%BC%96%E5%8F%B7%E6%AD%A5%E9%AA%A4%E9%87%8D%E5%81%9A.mp4)
+- [Disconnect, reconnect, and continue in the background](./docs/demo-videos/12-%E6%96%AD%E7%BA%BF%E9%87%8D%E8%BF%9E%E5%90%8E%E5%8F%B0%E7%BB%A7%E4%BD%9C.mp4)
+- [Multimodal image understanding](./docs/demo-videos/13-%E5%9B%BE%E7%89%87%E7%90%86%E8%A7%A3%E8%83%BD%E5%8A%9B.mp4)
+- [Scheduled tasks and file-change monitoring](./docs/demo-videos/14-%E5%AE%9A%E6%97%B6%E4%BB%BB%E5%8A%A1%E5%92%8C%E5%AF%B9%E8%B1%A1%E7%9B%91%E8%A7%86%E5%99%A8%E5%8A%9F%E8%83%BD.mp4)
 
 ### Main Request Flow
 
@@ -44,6 +67,10 @@ User Request
 ### Key Control Flows Beyond Main Chain
 
 - **Dynamic Tool Supplement**: Router detects missing capabilities → PgVector matches real MCP tools from catalog → merge with Agent's resident tools
+- **Flow Plan Review**: Pause after a plan has been parsed into a DAG; the user can inspect, edit, and confirm it before execution
+- **Run Snapshots and Redo**: Save run steps in Redis and resume from `/runId-stepN` with a correction
+- **Resilient Runs**: Refreshing the browser or reconnecting SSE does not cancel backend work; the timeline is recovered on reconnect
+- **Background Tasks**: Draft, confirm, schedule, pause, resume, or run one-time, Cron, and stable-file-change tasks
 - **In-Execution Intervention**: Users can send `steer` to redo current step, `answer_now` to skip remaining steps, or `cancel` to abort
 - **Proactive Clarification**: Model can invoke `ask_user` to collect missing information via SSE, then continue execution with user input
 
@@ -59,6 +86,11 @@ User Request
 | **Dynamic MCP Tools** | Tool catalog localization, intent expansion, PgVector semantic matching, on-demand attachment |
 | **MCP Self-Healing** | Lazy probing, failure retry, timeout reconnect, dead-client rebuild, cooldown & circuit breaker |
 | **Tool Governance** | Disable tools in non-execution steps, correct unknown tools, parameter hints, round budget, parallel execution |
+| **Flow Plan Review** | Pause after DAG parsing; users can inspect, edit, and confirm the plan before it runs |
+| **Run Snapshots & Step-level Redo** | Redis TTL snapshots, `/run` history, and `/runId-stepN` targeted redo |
+| **Resilient Runs & Timeline Reconnect** | Snapshot-first recovery, Redis Stream catch-up, then live SSE subscription |
+| **Background Task Center** | One-time schedules, Spring Cron, stable-file-change monitoring, confirmation, lifecycle controls, and run history |
+| **Multimodal Image Messages** | URLs, uploads, and clipboard images are normalized to OSS and preserved as `text + image` chat memory |
 | **Agentic RAG** | Four query strategies: SIMPLE, HyDE, FUSION, DECOMPOSE |
 | **Four-Layer Memory** | Working, Chat, Long-Term, Episodic Memory |
 | **Streaming Intervention** | Auto/Flow/Fixed support immediate answer, steering, or cancellation |
@@ -87,9 +119,10 @@ The `ack` includes intervention capability flags for frontend UI rendering.
 
 `AgentDispatchService` handles:
 
-- Select best `agent_id` via `UnifiedAgentRouter` (if user doesn't specify)
-- Infer missing tool capabilities even if Agent is pre-selected
-- Return `missing_tool_descs` for dynamic tool attachment
+- When no Agent is specified, select the best `agent_id` through `UnifiedAgentRouter`
+- When an Agent is pre-selected, optionally continue inferring missing capabilities via `agent.dynamic-tools.infer-on-selected-agent`
+- Return `missing_tool_descs` for router-stage dynamic attachment
+- Let the model call `request_tool` during execution when its current tools are insufficient
 - Lazy-load ChatClient, Model, Advisor, MCP callback on first use via Armory
 - Dispatch to Fixed, Auto, or Flow strategy based on `agent.strategy`
 
@@ -135,15 +168,50 @@ Parallel boundaries:
 - Tools from different MCP servers can parallelize
 - Same MCP server reuses connection → serial execution to avoid transport layer concurrency issues
 
+Flow can enable **plan review**: Step2 produces a plan and Step3 parses it into a DAG, then execution pauses. The user can confirm the plan as-is or edit a step's title, content, and dependencies before Step4 runs. This is a Flow-only control and does not change the default direct execution of Fixed or Auto.
+
+---
+
+## 🔁 Run Snapshots and Step-level Redo
+
+Every Agent run has a `runId` that connects its SSE events, chat memory, event log, and Redis snapshot.
+
+- **Snapshot scope:** Fixed saves the response; Auto saves Step1–Step4; Flow saves planning and Step4 DAG execution steps.
+- **History entry point:** `/run` lists recent run summaries for the current session.
+- **Targeted redo:** `/runId-stepN correction` reuses the source Agent and prior steps, then regenerates from the requested step.
+- **Retention boundary:** snapshots are Redis records with TTL. After expiry, start a new run instead of reusing old plans or tool results.
+
+---
+
+## 🔌 Resilient Runs and Timeline Reconnect
+
+A run belongs to a session, not to one browser's SSE connection. Refreshing the page, transient network failure, or switching conversations does not cancel backend execution; only an explicit cancel ends the target run.
+
+Reconnect restores the UI in three stages: load the aggregated Timeline Snapshot, read Redis Stream events after the snapshot cursor, then subscribe to live events. Completed runs can still restore step text, tool cards, RAG and memory evidence, approvals, and clarification cards.
+
+---
+
+## ⏰ Background Tasks and Object Monitoring
+
+`BackgroundTaskCommandRouter` recognizes task commands before normal Agent intent routing, without changing Fixed, Auto, or Flow responsibilities. Supported task types are:
+
+- `SCHEDULE_ONCE`: trigger once at a specified time.
+- `CRON`: trigger on a six-field Spring Cron expression in the selected time zone.
+- `FILE_CHANGE_STABLE`: trigger only when a file's content changes and then remains unchanged for the specified quiet window.
+
+New tasks are saved as drafts and require user confirmation before activation. The task center supports editing, pausing, resuming, running now, cancelling, viewing trigger history, and opening the target conversation. A trigger reuses the ordinary Agent-run path; only one run may execute per session at a time.
+
 ---
 
 ## 🛠️ Dynamic MCP Tool Supplement
 
-Instead of loading all tools upfront (increases context, tool hallucination, wrong tool selection), TAgent separates "resident tools" and "on-demand dynamic tools".
+Instead of loading all tools upfront (which increases context size, tool hallucination, and wrong-tool selection), TAgent separates "resident tools" from "on-demand dynamic tools". It supports two complementary paths: the router can infer missing capabilities before execution, or the model can call the `request_tool` meta-tool while executing.
 
 ```text
 UnifiedAgentRouter
-  -> missing_tool_descs
+  -> missing_tool_descs (router-stage inference)
+  or Advisor / LLM
+  -> request_tool(needs) (execution-stage attachment)
   -> Generate embedding per capability
   -> PgVector query mcp_tool_vector
   -> Top-K per capability
@@ -159,6 +227,8 @@ Tool assets:
 - PgVector `mcp_tool_vector`: Embedding for semantic retrieval
 
 Current matching uses embedding-only (no BM25 or LLM rerank fallback). When vector service is unavailable, skip dynamic attachment rather than force bad matches.
+
+`request_tool` is a meta-tool, not a business tool. In Flow it can be called during tool analysis or planning to prepare capabilities for later DAG execution. Router inference is better suited to clear capability gaps that can be identified before the run starts.
 
 ---
 
@@ -265,7 +335,7 @@ Dynamic tool matching and RAG document retrieval are separate pipelines:
 
 | Memory Layer | Storage | Purpose |
 |---|---|---|
-| Working Memory | Redis | Save Auto/Flow step intermediates; support inter-step reads & post-disconnect completion replay |
+| Working Memory | Redis | Save Auto/Flow step intermediates; support inter-step reads, snapshots, and post-disconnect replay |
 | Chat Memory | MySQL + Redis Cache | Multi-turn chat history & rolling summarization |
 | Long-Term Memory | MySQL Meta + PgVector | User profile, skills, preferences, plans, context; semantic recall |
 | Episodic Memory | MySQL | Session-phase summaries and recent experiences |
@@ -280,6 +350,10 @@ Long-Term Memory includes:
 - Single-round multi-step recall snapshot sharing
 
 When RAG or memory truly retrieves content, frontend gets `rag_evidence` or `memory_evidence` SSE event.
+
+## 🖼️ Multimodal Image Messages
+
+Image URLs, selected files, and clipboard images follow one normalization path: TAgent persists the image to OSS, stores it in ChatMemory as `text + image`, and only sends image content to models that support it. This keeps later history replay and model capability checks consistent.
 
 ---
 
@@ -486,6 +560,13 @@ EMBEDDING_BASE_URL=https://your-embedding-endpoint
 EMBEDDING_API_KEY=your-embedding-key
 EMBEDDING_MODEL=BAAI/bge-m3
 
+# Optional: proxy for remote image downloads
+TAGENT_IMAGE_PROXY_URL=http://127.0.0.1:7897
+
+# Optional: private OSS storage for images
+TAGENT_OSS_ENABLED=false
+TAGENT_OSS_BUCKET=your-private-bucket
+
 # Database Credentials
 MYSQL_USERNAME=root
 MYSQL_PASSWORD=your-mysql-password
@@ -510,7 +591,7 @@ Incremental scripts located in:
 docs/dev-ops/sql-migrations
 ```
 
-Execute in version order for new environment. Dynamic tool features require at least `V041`, `V046`, `V047`.
+Execute in version order for a new environment. Dynamic tool features require at least `V041`, `V046`, and `V047`; the background task center requires `V058__create_background_task_center.sql`.
 
 ### Build
 
@@ -569,6 +650,9 @@ agent:
     enabled: false
     max-asks: 2
     timeout-seconds: 120
+  request-tool:
+    enabled: false
+    max-calls: 3
 
   mcp:
     disable-tools-on-nonexec-steps: true
@@ -583,6 +667,15 @@ agent:
     per-need-top-k: 2
     max-extra-tools-per-request: 6
     match-cache-ttl-ms: 600000
+  flow:
+    plan-review:
+      enabled: false
+      store-enabled: true
+      ttl-seconds: 7200
+  run-snapshot:
+    enabled: true
+    ttl-seconds: 21600
+    session-index-size: 30
 ```
 
 ---
@@ -611,4 +704,16 @@ This project is licensed under the [MIT License](LICENSE).
 
 ---
 
-**Questions or Ideas?** Open an issue or discussion! We welcome contributions and feedback. 🙌
+## 🤝 Contributing
+
+Focused contributions are welcome: documentation and setup improvements, reproducible smoke tests for Agent/MCP/RAG/SSE flows, small MCP governance cases, and observability improvements. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+
+**Questions or ideas?** [Open an issue](https://github.com/pengmoubuaixuexi/TAgent/issues) or [start a discussion](https://github.com/pengmoubuaixuexi/TAgent/discussions). 🙌
+
+---
+
+<div align="center">
+
+Made with ❤️ by pengmoubuaixuexi
+
+</div>
