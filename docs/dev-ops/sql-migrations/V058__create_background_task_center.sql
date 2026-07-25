@@ -1,0 +1,53 @@
+CREATE TABLE IF NOT EXISTS `ai_background_task` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `task_id` VARCHAR(64) NOT NULL COMMENT 'Public task UUID',
+  `user_id` VARCHAR(128) NOT NULL,
+  `tenant_id` VARCHAR(128) NOT NULL DEFAULT 'default',
+  `session_id` VARCHAR(128) NOT NULL COMMENT 'Session receiving the triggered run',
+  `name` VARCHAR(255) NOT NULL,
+  `task_type` VARCHAR(32) NOT NULL COMMENT 'FILE_CHANGE_STABLE/SCHEDULE_ONCE/CRON',
+  `status` VARCHAR(32) NOT NULL COMMENT 'DRAFT/ACTIVE/PAUSED/WAITING_SESSION/RUNNING/COMPLETED/FAILED/CANCELLED',
+  `trigger_config_json` TEXT NOT NULL,
+  `action_prompt` MEDIUMTEXT NOT NULL,
+  `action_agent_id` VARCHAR(64) DEFAULT NULL,
+  `max_step` INT NOT NULL DEFAULT 5,
+  `run_once` TINYINT(1) NOT NULL DEFAULT 1,
+  `baseline_hash` VARCHAR(64) DEFAULT NULL,
+  `last_observed_hash` VARCHAR(64) DEFAULT NULL,
+  `observed_changed_at` DATETIME(3) DEFAULT NULL,
+  `next_trigger_at` DATETIME(3) DEFAULT NULL,
+  `last_checked_at` DATETIME(3) DEFAULT NULL,
+  `last_triggered_at` DATETIME(3) DEFAULT NULL,
+  `last_run_id` VARCHAR(64) DEFAULT NULL,
+  `draft_expires_at` DATETIME(3) DEFAULT NULL,
+  `last_error` TEXT DEFAULT NULL,
+  `version` INT NOT NULL DEFAULT 0,
+  `created_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  `updated_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_background_task_id` (`task_id`),
+  KEY `idx_background_task_owner` (`user_id`, `updated_at`),
+  KEY `idx_background_task_session` (`session_id`, `updated_at`),
+  KEY `idx_background_task_runnable` (`status`, `next_trigger_at`, `last_checked_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Platform background tasks';
+
+CREATE TABLE IF NOT EXISTS `ai_background_task_execution` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `execution_id` VARCHAR(64) NOT NULL,
+  `task_id` VARCHAR(64) NOT NULL,
+  `run_id` VARCHAR(64) DEFAULT NULL,
+  `trigger_reason` VARCHAR(255) DEFAULT NULL,
+  `status` VARCHAR(32) NOT NULL COMMENT 'STARTING/RUNNING/COMPLETED/SKIPPED/FAILED/CANCELLED',
+  `started_at` DATETIME(3) DEFAULT NULL,
+  `finished_at` DATETIME(3) DEFAULT NULL,
+  `error_message` TEXT DEFAULT NULL,
+  `created_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  `updated_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_background_execution_id` (`execution_id`),
+  UNIQUE KEY `uk_background_execution_run` (`run_id`),
+  KEY `idx_background_execution_task` (`task_id`, `created_at`),
+  CONSTRAINT `fk_background_execution_task`
+    FOREIGN KEY (`task_id`) REFERENCES `ai_background_task` (`task_id`)
+    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Background task trigger history';

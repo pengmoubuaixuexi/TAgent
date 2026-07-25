@@ -301,23 +301,36 @@ public class ChatImageAttachmentService implements IChatImageAttachmentService {
             if (uri.getHost() == null || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))) {
                 throw new IllegalArgumentException("图片 URL 仅支持 http/https");
             }
-            // URI fragments are browser-side anchors and are never part of the
-            // HTTP resource. Some OpenAI-compatible vision gateways reject or
-            // silently ignore image_url values that retain "#pic_center".
-            return new URI(
+            URI normalized = new URI(
                     uri.getScheme(),
                     uri.getUserInfo(),
                     uri.getHost(),
                     uri.getPort(),
                     uri.getPath(),
                     uri.getQuery(),
-                    null)
-                    .toASCIIString();
+                    null);
+            String githubRawUrl = githubBlobToRawUrl(normalized);
+            return githubRawUrl == null ? normalized.toASCIIString() : githubRawUrl;
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException("图片 URL 无效: " + value, e);
         } catch (Exception e) {
             throw new IllegalArgumentException("图片 URL 无效: " + value, e);
         }
+    }
+
+    private static String githubBlobToRawUrl(URI uri) {
+        if (!"github.com".equalsIgnoreCase(uri.getHost())) return null;
+        String[] segments = uri.getRawPath().split("/");
+        if (segments.length < 6 || !"blob".equals(segments[3])) return null;
+        if (segments[1].isBlank() || segments[2].isBlank() || segments[4].isBlank()) return null;
+        StringBuilder raw = new StringBuilder("https://raw.githubusercontent.com");
+        raw.append('/').append(segments[1]);
+        raw.append('/').append(segments[2]);
+        raw.append('/').append(segments[4]);
+        for (int i = 5; i < segments.length; i++) {
+            raw.append('/').append(segments[i]);
+        }
+        return raw.toString();
     }
 
     private ChatImageRef toRef(AiChatAttachment row) {

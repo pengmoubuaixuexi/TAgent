@@ -1,5 +1,6 @@
 package cn.bugstack.ai.domain.agent.service.security;
 
+import cn.bugstack.ai.domain.agent.service.execute.event.RunEventPublisher;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.Resource;
@@ -54,6 +55,9 @@ public class HumanApprovalGate {
     private ApprovalChannelRegistry approvalChannelRegistry;
 
     @Resource
+    private RunEventPublisher runEventPublisher;
+
+    @Resource
     private HighRiskToolRegistry highRiskToolRegistry;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -98,13 +102,12 @@ public class HumanApprovalGate {
         if (!enabled) return Decision.APPROVED;
         if (!highRiskToolRegistry.isHighRisk(toolName)) return Decision.APPROVED;
 
-        ResponseBodyEmitter emitter = approvalChannelRegistry.get(sessionId);
-        if (emitter == null) {
-            log.warn("[HumanApproval] approval channel missing sessionId={} toolName={}, returning APPROVAL_UNAVAILABLE",
+        if (runEventPublisher.currentRunId(sessionId) == null) {
+            log.warn("[HumanApproval] active run missing sessionId={} toolName={}, returning APPROVAL_UNAVAILABLE",
                     sessionId, toolName);
             return Decision.APPROVAL_UNAVAILABLE;
         }
-        return doRequestApproval(sessionId, toolName, toolInput, stepLabel, emitter);
+        return doRequestApproval(sessionId, toolName, toolInput, stepLabel, null);
     }
 
     /**
@@ -132,14 +135,21 @@ public class HumanApprovalGate {
         pendingApprovals.put(approvalId, future);
 
         try {
-            emitter.send("event: human_approval_required\ndata: " + buildPayload(approvalId, toolName, toolInput, stepLabel) + "\n\n");
+            if (emitter != null) {
+                emitter.send("event: human_approval_required\ndata: " + buildPayload(approvalId, toolName, toolInput, stepLabel) + "\n\n");
+            } else {
+                runEventPublisher.publishCurrent(sessionId, "human_approval_required",
+                        buildPayload(approvalId, toolName, toolInput, stepLabel));
+            }
             log.info("[HumanApproval] requested approvalId={} toolName={} step={}", approvalId, toolName, stepLabel);
 
             Boolean approved = future.get(timeoutSeconds, TimeUnit.SECONDS);
             log.info("[HumanApproval] result approvalId={} approved={}", approvalId, approved);
+            publishResult(sessionId, approvalId, approved != null && approved ? "APPROVED" : "REJECTED");
             return (approved != null && approved) ? Decision.APPROVED : Decision.REJECTED;
         } catch (TimeoutException e) {
             log.warn("[HumanApproval] timeout approvalId={} toolName={}", approvalId, toolName);
+            publishResult(sessionId, approvalId, "TIMEOUT");
             return Decision.TIMEOUT;
         } catch (IOException e) {
             log.warn("[HumanApproval] emit failed approvalId={}: {}", approvalId, e.toString());
@@ -150,6 +160,13 @@ public class HumanApprovalGate {
         } finally {
             pendingApprovals.remove(approvalId);
         }
+    }
+
+    private void publishResult(String sessionId, String approvalId, String status) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("approvalId", approvalId);
+        payload.put("status", status);
+        runEventPublisher.publishCurrent(sessionId, "human_approval_result", payload);
     }
 
     /**
@@ -170,6 +187,7 @@ public class HumanApprovalGate {
             map.put("step", stepLabel);
         }
         map.put("timeoutSeconds", timeoutSeconds);
+        map.put("expiresAt", System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(timeoutSeconds));
         try {
             return MAPPER.writeValueAsString(map);
         } catch (JsonProcessingException e) {

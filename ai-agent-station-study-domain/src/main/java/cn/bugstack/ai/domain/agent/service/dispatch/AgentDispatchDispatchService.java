@@ -7,6 +7,7 @@ import cn.bugstack.ai.domain.agent.service.IAgentDispatchService;
 import cn.bugstack.ai.domain.agent.service.IExecuteStrategy;
 import cn.bugstack.ai.domain.agent.service.armory.ArmoryService;
 import cn.bugstack.ai.domain.agent.service.execute.common.SessionRefCounter;
+import cn.bugstack.ai.domain.agent.service.execute.event.RunEventPublisher;
 import cn.bugstack.ai.domain.agent.service.router.RouteDecision;
 import cn.bugstack.ai.domain.agent.service.router.UnifiedAgentRouter;
 import cn.bugstack.ai.types.exception.BizException;
@@ -19,6 +20,7 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyEmitter
 import javax.annotation.Resource;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 
@@ -53,6 +55,12 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
     @Autowired(required = false)
     private cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService runSnapshotService;
 
+    @Autowired
+    private RunEventPublisher runEventPublisher;
+
+    /** A browser connection is only a subscriber; the session owns the run. */
+    private final ConcurrentHashMap<String, String> activeRunBySession = new ConcurrentHashMap<>();
+
     /** 动态补工具能力描述(need)的统一存储入口；按 sessionId 写入，执行层读取。 */
     @Autowired(required = false)
     private cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService mcpToolCatalogService;
@@ -78,12 +86,36 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
         // 策略 finally 不会跑、clearNeeds 漏掉）。本轮 need 写在这之后；若本轮也没成功交出去，由方法末尾 finally 兜底清。
         final String __needSid = requestParameter.getSessionId();
         final String __runId = requestParameter.getRunId();
-        if (mcpToolCatalogService != null && __needSid != null && !__needSid.isBlank()) {
-            mcpToolCatalogService.clearNeeds(__needSid);
+        if (__needSid == null || __needSid.isBlank()) {
+            throw new BizException("sessionId不能为空");
+        }
+        String existingRunId = activeRunBySession.putIfAbsent(__needSid, __runId);
+        if (existingRunId != null) {
+            if (existingRunId.equals(__runId)) {
+                // Idempotent retry/double-submit: the controller-side emitter
+                // is already attached to this run, so it can observe/replay the
+                // existing execution. Never start the strategy a second time.
+                log.info("[Dispatch] duplicate active run request joined existing execution sessionId={} runId={}",
+                        __needSid, __runId);
+                return;
+            }
+            throw RunDispatchConflictException.sessionBusy(__needSid, __runId, existingRunId);
+        }
+        if (runSnapshotService != null && runSnapshotService.find(__runId).isPresent()) {
+            activeRunBySession.remove(__needSid, __runId);
+            throw RunDispatchConflictException.duplicateRunId(__needSid, __runId);
+        }
+        runEventPublisher.registerRun(__runId, __needSid);
+        if (runSnapshotService != null) {
+            // Create the RUNNING anchor before routing/arming so a refresh can
+            // reconnect even while the first model/router call is still busy.
+            runSnapshotService.startRun(requestParameter, "ROUTING", null);
         }
         boolean __handedOff = false;
         try {
-
+        if (mcpToolCatalogService != null && __needSid != null && !__needSid.isBlank()) {
+            mcpToolCatalogService.clearNeeds(__needSid);
+        }
         // 1. 如果前端没选 agent（aiAgentId 为空），走统一路由
         if (agentId == null || agentId.isBlank()) {
             if (unifiedAgentRouter != null) {
@@ -132,13 +164,11 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
 
         // 路由命中后第一时间把 agent 透传给前端（TTFT：前端先显示"路由中…"，收到本事件后替换成 名称(id)）。
         // 发送失败（客户端断开等）不影响主流程。
-        try {
-            String safeName = aiAgentVO.getAgentName() == null ? ""
-                    : aiAgentVO.getAgentName().replace("\\", "\\\\").replace("\"", "\\\"");
-            emitter.send("event: agent_routed\ndata: {\"agentId\":\"" + agentId + "\",\"agentName\":\"" + safeName
-                    + "\",\"runId\":\"" + requestParameter.getRunId() + "\"}\n\n");
-        } catch (Exception ignore) {
-        }
+        java.util.Map<String, Object> routedPayload = new java.util.LinkedHashMap<>();
+        routedPayload.put("agentId", agentId);
+        routedPayload.put("agentName", aiAgentVO.getAgentName() == null ? "" : aiAgentVO.getAgentName());
+        routedPayload.put("runId", requestParameter.getRunId());
+        runEventPublisher.publish(__runId, __needSid, "agent_routed", routedPayload);
 
         String strategy = aiAgentVO.getStrategy();
 
@@ -194,19 +224,17 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
                                     e.getMessage());
                         }
                         log.error("Agent执行异常：agentId={} strategy={} error={}", finalAgentId, finalStrategy, e.getMessage(), e);
-                        try {
-                            emitter.send("执行异常：" + e.getMessage());
-                        } catch (Exception ex) {
-                            log.error("发送异常信息失败：{}", ex.getMessage(), ex);
-                        }
+                        runEventPublisher.publish(__runId, __needSid, "message",
+                                java.util.Map.of(
+                                        "type", "error",
+                                        "content", "执行异常：" + (e.getMessage() == null
+                                                ? e.getClass().getSimpleName() : e.getMessage()),
+                                        "sessionId", __needSid));
                     }
                 } finally {
                     if (sessionRefCounter != null) sessionRefCounter.clear(sessionId);
-                    try {
-                        emitter.complete();
-                    } catch (Exception e) {
-                        log.error("完成流式输出失败：{}", e.getMessage(), e);
-                    }
+                    activeRunBySession.remove(sessionId, __runId);
+                    runEventPublisher.finishRun(__runId);
                     restoreMdc("runId", oldRunId);
                     restoreMdc("agent.run_id", oldAgentRunId);
                     restoreMdc("agentId", oldAgentId);
@@ -223,8 +251,11 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
                         cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_FAILED,
                         e.getMessage());
             }
-            emitter.send("{\"error\":\"service_unavailable\",\"message\":\"Server too busy, please retry later\",\"status\":503}");
-            emitter.complete();
+            runEventPublisher.publish(__runId, __needSid, "message",
+                    java.util.Map.of("type", "error",
+                            "content", "Server too busy, please retry later",
+                            "error", "service_unavailable", "status", 503,
+                            "sessionId", __needSid));
         }
         } finally {
             // 同步路径异常（armory/查 agent/策略查找抛 BizException）或线程池拒绝 → 没交给异步策略 → 策略 finally 不跑，
@@ -234,6 +265,19 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
             }
             if (!__handedOff && mcpToolCatalogService != null && __runId != null && !__runId.isBlank()) {
                 mcpToolCatalogService.cleanupRun(__runId);
+            }
+            if (!__handedOff) {
+                if (runSnapshotService != null) {
+                    runSnapshotService.find(__runId)
+                            .filter(snapshot -> cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_RUNNING
+                                    .equals(snapshot.getStatus()))
+                            .ifPresent(snapshot -> runSnapshotService.markStatus(
+                                    __runId,
+                                    cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_FAILED,
+                                    "dispatch failed before execution started"));
+                }
+                activeRunBySession.remove(__needSid, __runId);
+                runEventPublisher.finishRun(__runId);
             }
         }
     }
@@ -275,6 +319,26 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
                 log.debug("[Dispatch] cancelExecute on {} failed: {}", s.getClass().getSimpleName(), e.getMessage());
             }
         }
+    }
+
+    @Override
+    public boolean cancelExecute(String sessionId, String runId) {
+        if (sessionId == null || sessionId.isBlank() || runId == null || runId.isBlank()) return false;
+        String activeRunId = activeRunBySession.get(sessionId);
+        if (activeRunId == null) activeRunId = runEventPublisher.currentRunId(sessionId);
+        if (!runId.equals(activeRunId)) {
+            log.info("[Dispatch] ignore stale cancel sessionId={} requestedRunId={} activeRunId={}",
+                    sessionId, runId, activeRunId);
+            return false;
+        }
+        cancelExecute(sessionId);
+        return true;
+    }
+
+    @Override
+    public String activeRunId(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) return null;
+        return activeRunBySession.get(sessionId);
     }
 
     private static void putMdc(String key, String value) {

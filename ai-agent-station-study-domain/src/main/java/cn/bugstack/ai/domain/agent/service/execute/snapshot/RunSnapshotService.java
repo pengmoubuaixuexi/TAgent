@@ -1,6 +1,7 @@
 package cn.bugstack.ai.domain.agent.service.execute.snapshot;
 
 import cn.bugstack.ai.domain.agent.model.entity.ExecuteCommandEntity;
+import cn.bugstack.ai.domain.agent.service.execute.event.RunEventRecord;
 
 import java.util.List;
 import java.util.Map;
@@ -19,6 +20,14 @@ public interface RunSnapshotService {
     Optional<RunSnapshot> find(String runId);
 
     List<RunSnapshot> listRecent(String sessionId, int limit);
+
+    /**
+     * List recent Redis runs owned by a user. This keeps a brand-new running
+     * session discoverable before its final turn is written to ChatMemory.
+     */
+    default List<RunSnapshot> listRecentByUser(String userId, int limit) {
+        return List.of();
+    }
 
     void recordStep(String runId,
                     String stepId,
@@ -54,6 +63,10 @@ public interface RunSnapshotService {
      * <p>默认 no-op，Redis 实现写入同一 run snapshot。常驻工具不在此列——redo 时 ensureArmed 自带。</p>
      */
     default void recordExtraToolNeeds(String runId, List<String> needs) {
+    }
+
+    /** Persist the user-visible UI projection in the same Redis snapshot. */
+    default void recordTimeline(String runId, List<RunEventRecord> events, String lastEventId) {
     }
 
     void markStatus(String runId, String status, String lastError);

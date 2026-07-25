@@ -1,5 +1,6 @@
 package cn.bugstack.ai.domain.agent.service.execute.common;
 
+import cn.bugstack.ai.domain.agent.service.execute.event.RunEventPublisher;
 import cn.bugstack.ai.domain.agent.service.security.ApprovalChannelRegistry;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -45,6 +46,9 @@ public class ToolCallProgressEmitter {
     @Resource
     private ApprovalChannelRegistry approvalChannelRegistry;
 
+    @Resource
+    private RunEventPublisher runEventPublisher;
+
     /**
      * 2026-06-22 评估采集开关：开后 {@code tool_call_end} 携带工具真实返回(截断 {@value #DEFAULT_RESULT_PREVIEW_MAX_CHARS} 字，可配 agent.tool-progress.result-preview.max-chars)。
      * <p><b>默认 false —— 生产环境必须保持关闭</b>：SSE 出口是 PII 脱敏边界，把原始工具返回推到前端会越过该边界
@@ -71,7 +75,7 @@ public class ToolCallProgressEmitter {
 
     public void emitStart(String sessionId, String toolName, String input, String step, String callId) {
         ResponseBodyEmitter emitter = lookupEmitter(sessionId);
-        if (emitter == null) return;
+        if (emitter == null && !hasRun(sessionId)) return;
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("sessionId", sessionId);
         data.put("toolName", toolName);
@@ -101,7 +105,7 @@ public class ToolCallProgressEmitter {
     public void emitEnd(String sessionId, String toolName, String status, long latencyMs, int resultChars,
                         String step, String callId, String resultPreview) {
         ResponseBodyEmitter emitter = lookupEmitter(sessionId);
-        if (emitter == null) return;
+        if (emitter == null && !hasRun(sessionId)) return;
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("sessionId", sessionId);
         data.put("toolName", toolName);
@@ -127,7 +131,7 @@ public class ToolCallProgressEmitter {
 
     public void emitError(String sessionId, String toolName, String errorSummary, long latencyMs, String step, String callId) {
         ResponseBodyEmitter emitter = lookupEmitter(sessionId);
-        if (emitter == null) return;
+        if (emitter == null && !hasRun(sessionId)) return;
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("sessionId", sessionId);
         data.put("toolName", toolName);
@@ -148,7 +152,7 @@ public class ToolCallProgressEmitter {
      */
     public void emitMetaStart(String sessionId, String toolName, String preview, String step) {
         ResponseBodyEmitter emitter = lookupEmitter(sessionId);
-        if (emitter == null) return;
+        if (emitter == null && !hasRun(sessionId)) return;
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("sessionId", sessionId);
         data.put("toolName", toolName);
@@ -165,7 +169,7 @@ public class ToolCallProgressEmitter {
      */
     public void emitMetaEnd(String sessionId, String toolName, String status, String detail, String step) {
         ResponseBodyEmitter emitter = lookupEmitter(sessionId);
-        if (emitter == null) return;
+        if (emitter == null && !hasRun(sessionId)) return;
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("sessionId", sessionId);
         data.put("toolName", toolName);
@@ -189,6 +193,10 @@ public class ToolCallProgressEmitter {
         return approvalChannelRegistry.get(sessionId);
     }
 
+    private boolean hasRun(String sessionId) {
+        return runEventPublisher != null && runEventPublisher.currentRunId(sessionId) != null;
+    }
+
     private void sendEvent(ResponseBodyEmitter emitter, String event, Map<String, Object> data,
                            String sessionId, String toolName) {
         String payload;
@@ -196,6 +204,10 @@ public class ToolCallProgressEmitter {
             payload = MAPPER.writeValueAsString(data);
         } catch (JsonProcessingException e) {
             log.debug("[ToolCallProgress] json serialize failed event={} tool={} err={}", event, toolName, e.toString());
+            return;
+        }
+        if (hasRun(sessionId)) {
+            runEventPublisher.publishCurrent(sessionId, event, data);
             return;
         }
         try {

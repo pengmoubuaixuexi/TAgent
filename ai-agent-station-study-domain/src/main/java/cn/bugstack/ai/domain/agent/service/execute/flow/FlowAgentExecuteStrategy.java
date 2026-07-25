@@ -107,10 +107,6 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
         }
 
         // P2.2.4 Step 取消：SSE 客户端断开 / 超时 → 设 cancelled 标记
-        emitter.onCompletion(dynamicContext::cancel);
-        emitter.onTimeout(dynamicContext::cancel);
-        emitter.onError(e -> dynamicContext.cancel());
-
         try {
             String apply = executeHandler.apply(executeCommandEntity, dynamicContext);
             log.info("流程执行结果:{}", apply);
@@ -192,10 +188,6 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
             if (sessionRefCounter != null && sessionId != null && !sessionId.isBlank()) {
                 sessionRefCounter.clear(sessionId);
             }
-            emitter.onCompletion(dynamicContext::cancel);
-            emitter.onTimeout(dynamicContext::cancel);
-            emitter.onError(e -> dynamicContext.cancel());
-
             boolean[] completed = {false};
             boolean[] cancelled = {false};
             String[] failureMessage = {null};

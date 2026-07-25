@@ -174,6 +174,7 @@
       </div>
       <button onclick="showRagModal()" class="text-xs bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-1.5 rounded-lg transition">RAG 上传</button>
       <button onclick="window.location.href='/memory.html'" class="text-xs bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-1.5 rounded-lg transition">记忆管理</button>
+      <button onclick="showBackgroundTaskModal()" class="text-xs bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-1.5 rounded-lg transition">后台任务</button>
       <button onclick="toggleHistory()" class="text-xs bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-1.5 rounded-lg transition">历史</button>
       <button onclick="doLogout()" class="text-xs text-gray-500 hover:text-red-400 transition">退出</button>
     </div>
@@ -222,6 +223,28 @@
         </div>
         <div id="ragStatus" class="hidden text-sm"></div>
         <button onclick="uploadRag()" id="ragUploadBtn" class="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white py-2.5 rounded-lg transition text-sm font-medium">开始上传</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="backgroundTaskModal" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+    <div class="bg-[#0b1120] rounded-2xl p-6 border border-gray-700 w-full max-w-4xl max-h-[86vh] overflow-hidden shadow-2xl flex flex-col">
+      <div class="flex items-start justify-between gap-4 mb-4">
+        <div>
+          <h3 class="text-lg font-bold text-white">后台任务</h3>
+          <p class="text-xs text-gray-400 mt-1">监视、定时和周期任务；触发时会在原会话创建一个普通 run。</p>
+        </div>
+        <button onclick="hideBackgroundTaskModal()" class="text-gray-500 hover:text-white text-xl">&times;</button>
+      </div>
+      <div class="flex items-center justify-between gap-3 mb-3">
+        <label class="text-xs text-gray-400 flex items-center gap-2">
+          <input id="backgroundTaskCurrentSessionOnly" type="checkbox" class="accent-cyan-500" onchange="loadBackgroundTasks()">
+          只看当前会话
+        </label>
+        <button onclick="loadBackgroundTasks()" class="text-xs border border-gray-700 bg-gray-800 text-gray-200 rounded-md px-3 py-1.5 hover:bg-gray-700">刷新</button>
+      </div>
+      <div id="backgroundTaskList" class="flex-1 overflow-y-auto pr-1 space-y-3 scrollbar">
+        <div class="text-sm text-gray-500 text-center py-8">加载中...</div>
       </div>
     </div>
   </div>
@@ -381,7 +404,13 @@ let state = {
   interventionEnabled: false,
   flowStep4Active: false,
   selectedRunRedo: null,
-  pendingImages: []
+  pendingImages: [],
+  activeRunId: null,
+  lastRunEventId: null,
+  userCancelling: false,
+  finalizing: false,
+  runUiGeneration: 0,
+  backgroundTasks: []
 };
 
 // ==================== INIT ====================
@@ -451,6 +480,7 @@ function showLoginError(msg) {
 }
 
 function doLogout() {
+  detachObservedRunUi();
   try { localStorage.removeItem(pendingFlowPlanStorageKey()); } catch (e) {}
   try { localStorage.removeItem(activeConversationStorageKey()); } catch (e) {}
   localStorage.removeItem('agent_login');
@@ -506,6 +536,7 @@ function onAgentChange() {
 }
 
 function newSession(options = {}) {
+  detachObservedRunUi();
   if (!options.preservePendingPlan) {
     clearPendingFlowPlan();
   }
@@ -522,6 +553,33 @@ function newSession(options = {}) {
   saveActiveConversation(state.sessionId);
   document.getElementById('messageArea').innerHTML =
     '<div class="text-center text-gray-600 text-sm py-8"><p class="text-4xl mb-3">🆕</p><p>新会话已开始</p></div>';
+}
+
+/**
+ * Stop observing the previous session without cancelling its backend Run.
+ * Every async reader captures runUiGeneration, so an old reader/finally cannot
+ * overwrite the controls after the user has switched to another session.
+ */
+function detachObservedRunUi() {
+  state.runUiGeneration++;
+  const oldController = state.abortController;
+  state.abortController = null;
+  if (oldController) {
+    try { oldController.abort(); } catch (e) {}
+  }
+  state.sending = false;
+  state.activeRunId = null;
+  state.lastRunEventId = null;
+  state.userCancelling = false;
+  state.interventionEnabled = false;
+  state.flowStep4Active = false;
+  state.finalizing = false;
+  state.approvalQueue = [];
+  state.pendingApproval = null;
+  hideApprovalModal();
+  clearApprovalTimer();
+  setSendBtn(false);
+  showAnswerNow(false);
 }
 
 function activeConversationStorageKey() {
@@ -1741,9 +1799,15 @@ function extractImageUrls(text) {
 
 function normalizeRemoteImageUrl(value) {
   try {
-    const url = new URL(String(value || '').trim());
+    let url = new URL(String(value || '').trim());
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
     url.hash = '';
+    if (url.hostname.toLowerCase() === 'github.com') {
+      const parts = url.pathname.split('/').filter(Boolean);
+      if (parts.length >= 5 && parts[2] === 'blob') {
+        url = new URL(`https://raw.githubusercontent.com/${parts[0]}/${parts[1]}/${parts.slice(3).join('/')}`);
+      }
+    }
     return url.toString();
   } catch (_) {
     return '';
@@ -1777,6 +1841,311 @@ function mergeMessageImages(localImages, urlImages) {
   return result;
 }
 
+function looksLikeBackgroundTaskCommand(message) {
+  const text = (message || '').toLowerCase();
+  return /监视|监听|监控|定时|提醒|每天|每周|每隔|cron|后台任务|对象监视|background task/.test(text)
+    || (/(暂停|恢复|取消|列出|查看)/.test(text) && /(任务|监视器|提醒)/.test(text));
+}
+
+async function tryHandleBackgroundTaskCommand(message, images) {
+  if (!message || (images && images.length)) return false;
+  try {
+    const res = await fetch(API + '/background-tasks/interpret', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        message,
+        sessionId: state.sessionId,
+        userId: state.userId,
+        aiAgentId: state.currentAgentId || null,
+        maxStep: state.maxStep
+      })
+    });
+    const envelope = await res.json();
+    if (envelope.code !== '0000') {
+      if (!looksLikeBackgroundTaskCommand(message)) return false;
+      consumeBackgroundTaskComposer(message);
+      addMessage('user', message, false);
+      addMessage('assistant', `后台任务命令解析失败：${envelope.info || '未知错误'}`, false);
+      return true;
+    }
+    const result = envelope.data || {};
+    if (!result.matched) return false;
+
+    consumeBackgroundTaskComposer(message);
+    addMessage('user', message, false);
+    if (result.needsClarification) {
+      const questions = Array.isArray(result.clarifyingQuestions) ? result.clarifyingQuestions : [];
+      addMessage('assistant', questions.length
+        ? `创建后台任务前还需要确认：\n\n${questions.map(x => `- ${x}`).join('\n')}`
+        : '我识别到这是后台任务命令，但还缺少触发条件或触发后的操作。', false);
+      return true;
+    }
+    if (result.task) {
+      if (result.operation === 'CREATE' && result.task.status === 'DRAFT') {
+        renderBackgroundTaskDraftMessage(result.task);
+      } else {
+        addMessage('assistant', result.message || `后台任务“${result.task.name}”已更新为 ${result.task.status}。`, false);
+      }
+      return true;
+    }
+    if (Array.isArray(result.tasks)) {
+      addMessage('assistant', `当前共有 ${result.tasks.length} 个后台任务，已为你打开任务中心。`, false);
+      showBackgroundTaskModal();
+      return true;
+    }
+    addMessage('assistant', result.message || '后台任务命令已处理。', false);
+    return true;
+  } catch (e) {
+    console.warn('background task preflight failed, continue normal agent routing', e);
+    return false;
+  }
+}
+
+function consumeBackgroundTaskComposer() {
+  const input = document.getElementById('msgInput');
+  if (input) {
+    input.value = '';
+    input.style.height = '';
+  }
+  state.pendingImages = [];
+  renderPendingImages();
+  hideRunCommandPalette();
+}
+
+function backgroundTaskTypeLabel(type) {
+  return ({
+    FILE_CHANGE_STABLE: '文件变化后稳定触发',
+    SCHEDULE_ONCE: '一次性定时',
+    CRON: '周期任务'
+  })[type] || type || '未知类型';
+}
+
+function backgroundTaskStatusLabel(status) {
+  return ({
+    DRAFT: '待确认',
+    ACTIVE: '运行中',
+    PAUSED: '已暂停',
+    WAITING_SESSION: '等待会话空闲',
+    RUNNING: 'Agent 正在执行',
+    COMPLETED: '已完成',
+    FAILED: '失败',
+    CANCELLED: '已取消'
+  })[status] || status || '未知';
+}
+
+function backgroundTaskTriggerText(task) {
+  const trigger = task && task.trigger ? task.trigger : {};
+  if (task.taskType === 'FILE_CHANGE_STABLE') {
+    return `${trigger.path || '-'} · 变化后 ${trigger.quiet_seconds || 120} 秒无修改`;
+  }
+  if (task.taskType === 'SCHEDULE_ONCE') return trigger.trigger_at || task.nextTriggerAt || '-';
+  if (task.taskType === 'CRON') return `${trigger.cron_expression || '-'} · ${trigger.zone_id || 'Asia/Shanghai'}`;
+  return JSON.stringify(trigger);
+}
+
+function renderBackgroundTaskDraftMessage(task) {
+  const message = addMessage('assistant', '', false);
+  const content = message.querySelector('.msg-content');
+  content.innerHTML = `
+    <div class="border border-cyan-700/70 bg-cyan-950/20 rounded-xl p-4" data-task-card="${escapeHtml(task.taskId)}">
+      <div class="flex items-center justify-between gap-3 mb-3">
+        <div class="font-semibold text-cyan-100">后台任务草稿</div>
+        <span class="text-xs text-amber-300 bg-amber-950/50 border border-amber-800 rounded-full px-2 py-0.5">确认后才会启用</span>
+      </div>
+      <div class="space-y-2 text-xs">
+        <div><span class="text-gray-500">名称：</span><span class="text-gray-100">${escapeHtml(task.name)}</span></div>
+        <div><span class="text-gray-500">类型：</span><span class="text-gray-200">${escapeHtml(backgroundTaskTypeLabel(task.taskType))}</span></div>
+        <div><span class="text-gray-500">触发：</span><span class="text-gray-200 break-all">${escapeHtml(backgroundTaskTriggerText(task))}</span></div>
+        <div><span class="text-gray-500">触发后：</span><div class="mt-1 p-2 bg-gray-950 border border-gray-800 rounded text-gray-300 whitespace-pre-wrap">${escapeHtml(task.actionPrompt)}</div></div>
+        <div><span class="text-gray-500">目标会话：</span><span class="text-gray-300 break-all">${escapeHtml(task.sessionId)}</span></div>
+      </div>
+      <div class="flex justify-end gap-2 mt-4">
+        <button onclick="runBackgroundTaskAction('${escapeHtml(task.taskId)}','cancel',this)" class="text-xs border border-gray-700 bg-gray-800 hover:bg-gray-700 text-gray-200 px-3 py-1.5 rounded-md">取消草稿</button>
+        <button onclick="runBackgroundTaskAction('${escapeHtml(task.taskId)}','activate',this)" class="text-xs bg-cyan-600 hover:bg-cyan-700 text-white px-3 py-1.5 rounded-md">确认并启用</button>
+      </div>
+    </div>`;
+  scrollBottom(true);
+}
+
+async function showBackgroundTaskModal() {
+  document.getElementById('backgroundTaskModal').classList.remove('hidden');
+  await loadBackgroundTasks();
+}
+
+function hideBackgroundTaskModal() {
+  document.getElementById('backgroundTaskModal').classList.add('hidden');
+}
+
+async function loadBackgroundTasks() {
+  const list = document.getElementById('backgroundTaskList');
+  if (!list || !state.userId) return;
+  list.innerHTML = '<div class="text-sm text-gray-500 text-center py-8">加载中...</div>';
+  const currentOnly = !!document.getElementById('backgroundTaskCurrentSessionOnly')?.checked;
+  const params = new URLSearchParams({userId: state.userId, limit: '100'});
+  if (currentOnly && state.sessionId) params.set('sessionId', state.sessionId);
+  try {
+    const res = await fetch(`${API}/background-tasks?${params}`);
+    const envelope = await res.json();
+    if (envelope.code !== '0000') throw new Error(envelope.info || '加载失败');
+    const tasks = envelope.data || [];
+    state.backgroundTasks = tasks;
+    if (!tasks.length) {
+      list.innerHTML = '<div class="text-sm text-gray-500 text-center py-8">还没有后台任务。你可以直接在聊天中说“监视 v6.md，变化后 2 分钟无修改就检查 Claude 回复”。</div>';
+      return;
+    }
+    list.innerHTML = tasks.map(renderBackgroundTaskListItem).join('');
+  } catch (e) {
+    list.innerHTML = `<div class="text-sm text-red-400 text-center py-8">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderBackgroundTaskListItem(task) {
+  const status = task.status;
+  const buttons = [];
+  if (status === 'DRAFT') buttons.push(taskActionButton(task.taskId, 'activate', '确认启用', 'cyan'));
+  if (['ACTIVE', 'WAITING_SESSION'].includes(status)) buttons.push(taskActionButton(task.taskId, 'pause', '暂停'));
+  if (['PAUSED', 'FAILED'].includes(status)) buttons.push(taskActionButton(task.taskId, 'resume', '恢复'));
+  if (!['RUNNING', 'COMPLETED', 'CANCELLED'].includes(status)) {
+    buttons.push(`<button onclick="editBackgroundTask('${escapeHtml(task.taskId)}')" class="text-xs border border-gray-700 bg-gray-800 hover:bg-gray-700 text-gray-200 px-2.5 py-1.5 rounded-md">编辑</button>`);
+  }
+  if (['ACTIVE', 'PAUSED', 'WAITING_SESSION', 'FAILED'].includes(status)) buttons.push(taskActionButton(task.taskId, 'run-now', '立即运行', 'indigo'));
+  if (!['COMPLETED', 'CANCELLED'].includes(status)) buttons.push(taskActionButton(task.taskId, 'cancel', status === 'RUNNING' ? '取消后续任务' : '取消', 'red'));
+  buttons.push(`<button onclick="toggleBackgroundTaskHistory('${escapeHtml(task.taskId)}',this)" class="text-xs border border-gray-700 bg-gray-800 hover:bg-gray-700 text-gray-200 px-2.5 py-1.5 rounded-md">触发记录</button>`);
+  buttons.push(`<button onclick="jumpToBackgroundTaskSession('${escapeHtml(task.sessionId)}')" class="text-xs border border-gray-700 bg-gray-800 hover:bg-gray-700 text-gray-200 px-2.5 py-1.5 rounded-md">进入会话</button>`);
+  return `
+    <div class="border border-gray-700 bg-gray-900/80 rounded-xl p-4" data-task-card="${escapeHtml(task.taskId)}">
+      <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0">
+          <div class="text-sm font-semibold text-gray-100 break-all">${escapeHtml(task.name)}</div>
+          <div class="text-xs text-gray-500 mt-1">${escapeHtml(backgroundTaskTypeLabel(task.taskType))} · ${escapeHtml(task.taskId.substring(0, 8))}</div>
+        </div>
+        <span class="text-xs px-2 py-1 rounded-full border border-gray-700 text-cyan-200 whitespace-nowrap">${escapeHtml(backgroundTaskStatusLabel(status))}</span>
+      </div>
+      <div class="mt-3 text-xs text-gray-300 break-all">${escapeHtml(backgroundTaskTriggerText(task))}</div>
+      <div class="mt-2 text-xs text-gray-500 line-clamp-2">${escapeHtml(task.actionPrompt || '')}</div>
+      ${task.lastError ? `<div class="mt-2 text-xs text-red-300">${escapeHtml(task.lastError)}</div>` : ''}
+      ${task.lastRunId ? `<div class="mt-2 text-xs text-gray-500">最近 run：${escapeHtml(task.lastRunId)}</div>` : ''}
+      <div class="flex flex-wrap justify-end gap-2 mt-3">${buttons.join('')}</div>
+      <div class="hidden mt-3 border-t border-gray-800 pt-3 space-y-2" data-task-history="${escapeHtml(task.taskId)}"></div>
+    </div>`;
+}
+
+function taskActionButton(taskId, action, label, tone) {
+  const style = tone === 'cyan' ? 'bg-cyan-600 hover:bg-cyan-700 text-white'
+    : tone === 'indigo' ? 'bg-indigo-600 hover:bg-indigo-700 text-white'
+    : tone === 'red' ? 'border border-red-900 bg-red-950/40 hover:bg-red-900/60 text-red-300'
+    : 'border border-gray-700 bg-gray-800 hover:bg-gray-700 text-gray-200';
+  return `<button onclick="runBackgroundTaskAction('${escapeHtml(taskId)}','${escapeHtml(action)}',this)" class="text-xs ${style} px-2.5 py-1.5 rounded-md">${escapeHtml(label)}</button>`;
+}
+
+async function runBackgroundTaskAction(taskId, action, button) {
+  if (!taskId || !action) return;
+  if (button) button.disabled = true;
+  try {
+    const endpoint = action === 'activate'
+      ? `${API}/background-tasks/${encodeURIComponent(taskId)}/activate`
+      : action === 'run-now'
+        ? `${API}/background-tasks/${encodeURIComponent(taskId)}/run-now`
+        : `${API}/background-tasks/${encodeURIComponent(taskId)}/${action}`;
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({userId: state.userId})
+    });
+    const envelope = await res.json();
+    if (envelope.code !== '0000') throw new Error(envelope.info || '操作失败');
+    const card = button ? button.closest('[data-task-card]') : null;
+    if (card && action === 'activate') {
+      card.innerHTML = `<div class="text-sm text-emerald-300">✓ 后台任务已启用。你可以在顶部“后台任务”中暂停、立即运行或取消。</div>`;
+    } else if (card && action === 'cancel' && card.closest('.msg-content')) {
+      card.innerHTML = '<div class="text-sm text-gray-400">任务草稿已取消。</div>';
+    }
+    if (!document.getElementById('backgroundTaskModal').classList.contains('hidden')) await loadBackgroundTasks();
+  } catch (e) {
+    alert('后台任务操作失败：' + e.message);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function editBackgroundTask(taskId) {
+  const task = (state.backgroundTasks || []).find(item => item.taskId === taskId);
+  if (!task) return;
+  const name = prompt('任务名称', task.name || '');
+  if (name === null) return;
+  const triggerText = prompt('触发配置 JSON', JSON.stringify(task.trigger || {}, null, 2));
+  if (triggerText === null) return;
+  let trigger;
+  try {
+    trigger = JSON.parse(triggerText);
+  } catch (e) {
+    alert('触发配置不是有效 JSON：' + e.message);
+    return;
+  }
+  const actionPrompt = prompt('触发后交给 Agent 的完整指令', task.actionPrompt || '');
+  if (actionPrompt === null) return;
+  const maxStepText = prompt('最大执行步数（1-30）', String(task.maxStep || 5));
+  if (maxStepText === null) return;
+  try {
+    const res = await fetch(`${API}/background-tasks/${encodeURIComponent(taskId)}/edit`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        userId: state.userId,
+        name,
+        trigger,
+        actionPrompt,
+        actionAgentId: task.actionAgentId || null,
+        maxStep: parseInt(maxStepText, 10) || 5,
+        runOnce: task.runOnce
+      })
+    });
+    const envelope = await res.json();
+    if (envelope.code !== '0000') throw new Error(envelope.info || '编辑失败');
+    alert('修改已保存为待确认草稿。请检查后点击“确认启用”。');
+    await loadBackgroundTasks();
+  } catch (e) {
+    alert('编辑后台任务失败：' + e.message);
+  }
+}
+
+async function toggleBackgroundTaskHistory(taskId, button) {
+  const card = button && button.closest('[data-task-card]');
+  const history = card && card.querySelector(`[data-task-history="${taskId}"]`);
+  if (!history) return;
+  if (!history.classList.contains('hidden')) {
+    history.classList.add('hidden');
+    return;
+  }
+  history.classList.remove('hidden');
+  history.innerHTML = '<div class="text-xs text-gray-500">加载触发记录...</div>';
+  try {
+    const res = await fetch(`${API}/background-tasks/${encodeURIComponent(taskId)}/history?userId=${encodeURIComponent(state.userId)}&limit=30`);
+    const envelope = await res.json();
+    if (envelope.code !== '0000') throw new Error(envelope.info || '加载失败');
+    const records = envelope.data || [];
+    history.innerHTML = records.length ? records.map(record => `
+      <div class="text-xs border border-gray-800 bg-gray-950/60 rounded-md p-2">
+        <div class="flex justify-between gap-3">
+          <span class="text-gray-300">${escapeHtml(backgroundTaskStatusLabel(record.status))}</span>
+          <span class="text-gray-600">${escapeHtml(record.startedAt || '')}</span>
+        </div>
+        <div class="text-gray-500 mt-1 break-all">runId: ${escapeHtml(record.runId || '-')}</div>
+        <div class="text-gray-500 mt-1">${escapeHtml(record.triggerReason || '')}</div>
+        ${record.errorMessage ? `<div class="text-red-300 mt-1">${escapeHtml(record.errorMessage)}</div>` : ''}
+      </div>`).join('') : '<div class="text-xs text-gray-500">尚未触发过。</div>';
+  } catch (e) {
+    history.innerHTML = `<div class="text-xs text-red-300">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function jumpToBackgroundTaskSession(sessionId) {
+  if (!sessionId) return;
+  hideBackgroundTaskModal();
+  await loadConversation(conversationIdForSession(sessionId));
+}
+
 async function sendMessage() {
   if (state.sending) return;
   const input = document.getElementById('msgInput');
@@ -1791,8 +2160,18 @@ async function sendMessage() {
   // aiAgentId 为空时走后端统一路由（自动模式）
   if (!state.sessionId) newSession();
   saveActiveConversation(state.sessionId);
+  if (!redoCommand && await tryHandleBackgroundTaskCommand(message, messageImages)) {
+    return;
+  }
+  const runId = (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const runUiGeneration = ++state.runUiGeneration;
 
   state.sending = true;
+  state.activeRunId = runId;
+  state.lastRunEventId = null;
+  state.userCancelling = false;
   state.finalizing = false;  // 新一轮：清掉上一轮「已点立即回答」的终态，引导/立即回答恢复可用
   state.flowStep4Active = false;
   input.value = ''; input.style.height = '';
@@ -1809,7 +2188,7 @@ async function sendMessage() {
     : message;
   addMessage('user', userDisplayMessage, false, null, null, messageImages);
   // 添加 AI 占位
-  const aiMsg = addMessage('assistant', '', true);
+  const aiMsg = addMessage('assistant', '', true, null, runId);
   // 顶部作者标题：手动选了 agent 直接显示「名称(id)」；自动模式先显示「路由中…」，收到 agent_routed 再替换
   const aiAuthorEl = aiMsg.querySelector('.msg-author');
   if (aiAuthorEl) {
@@ -1821,6 +2200,7 @@ async function sendMessage() {
     }
   }
 
+  let reconnectCurrentRun = null;
   try {
     const res = await fetch(API + '/auto_agent', {
       method: 'POST',
@@ -1838,6 +2218,7 @@ async function sendMessage() {
           size: image.size || null
         })),
         sessionId: state.sessionId,
+        runId: runId,
         userId: state.userId,
         maxStep: state.maxStep,
         planReviewEnabled: !!state.planReviewEnabled,
@@ -2696,12 +3077,14 @@ async function sendMessage() {
 
     let curEvent = 'message';
     let curData = '';
+    let curEventId = '';
 
     function dispatchEvent() {
-      if (!curData) { curEvent = 'message'; return; }
+      if (!curData) { curEvent = 'message'; curEventId = ''; return; }
       let payload = null;
       try { payload = JSON.parse(curData); } catch (e) { /* skip */ }
-      if (!payload) { curEvent = 'message'; curData = ''; return; }
+      if (!payload) { curEvent = 'message'; curData = ''; curEventId = ''; return; }
+      if (curEventId) state.lastRunEventId = curEventId;
 
       if (curEvent === 'run_replay_context') {
         renderInheritedRunSteps(payload);
@@ -2824,6 +3207,7 @@ async function sendMessage() {
       }
       curEvent = 'message';
       curData = '';
+      curEventId = '';
     }
 
     async function consumeSseResponse(response) {
@@ -2832,6 +3216,7 @@ async function sendMessage() {
       let buffer = '';
       curEvent = 'message';
       curData = '';
+      curEventId = '';
       while (true) {
       const {done, value} = await reader.read();
       if (done) { dispatchEvent(); break; }
@@ -2849,30 +3234,68 @@ async function sendMessage() {
         } else if (line.startsWith('data: ')) {
           // 同 event 多个 data 行拼接
           curData += (curData ? '\n' : '') + line.substring(6);
+        } else if (line.startsWith('id: ')) {
+          curEventId = line.substring(4).trim();
         }
         // 其他行（id:/retry:）忽略
       }
     }
     }
 
+    reconnectCurrentRun = async function() {
+      while (state.sending && state.activeRunId === runId && !state.userCancelling) {
+        try {
+          const snapshotRes = await fetch(
+            `${API}/run-snapshots/${encodeURIComponent(runId)}?sessionId=${encodeURIComponent(state.sessionId)}`
+          );
+          const snapshotBody = await snapshotRes.json();
+          const snapshot = snapshotBody && snapshotBody.data;
+          if (!snapshot || snapshot.status !== 'RUNNING') return;
+
+          const reconnectController = new AbortController();
+          state.abortController = reconnectController;
+          const after = state.lastRunEventId
+            ? `&afterEventId=${encodeURIComponent(state.lastRunEventId)}`
+            : '';
+          const streamRes = await fetch(
+            `${API}/runs/${encodeURIComponent(runId)}/stream?sessionId=${encodeURIComponent(state.sessionId)}${after}`,
+            { signal: reconnectController.signal }
+          );
+          if (!streamRes.ok) throw new Error(`SSE 重连失败: HTTP ${streamRes.status}`);
+          await consumeSseResponse(streamRes);
+        } catch (reconnectError) {
+          if (state.userCancelling || state.activeRunId !== runId) throw reconnectError;
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
+    };
+
     await consumeSseResponse(res);
     scrollBottom();
   } catch(e) {
-    if (e && e.name === 'AbortError') {
+    if (state.userCancelling) {
       // 用户点了「取消」：保留已生成的内容，仅追加一条停止标记，不当作错误
       appendCancelledMarker();
     } else {
-      aiMsg.querySelector('.msg-content').innerHTML = `<span class="text-red-400">❌ 请求失败: ${escapeHtml(e.message)}</span>`;
-      aiMsg.classList.remove('typing');
+      if (reconnectCurrentRun) {
+        await reconnectCurrentRun();
+      } else {
+        await recoverRunAfterInitialDisconnect(runId, state.sessionId, aiMsg);
+      }
     }
   } finally {
-    state.sending = false;
-    state.abortController = null;
-    state.flowStep4Active = false;
-    setSendBtn(false);  // 恢复「发送」
-    showAnswerNow(false);
-    clearApprovalTimer();
-    scrollBottom(true);
+    if (state.runUiGeneration === runUiGeneration && state.activeRunId === runId) {
+      state.sending = false;
+      state.abortController = null;
+      state.activeRunId = null;
+      state.lastRunEventId = null;
+      state.userCancelling = false;
+      state.flowStep4Active = false;
+      setSendBtn(false);  // 恢复「发送」
+      showAnswerNow(false);
+      clearApprovalTimer();
+      scrollBottom(true);
+    }
   }
 }
 
@@ -2937,12 +3360,13 @@ function onSendBtn() {
 async function cancelSend() {
   const b = document.getElementById('sendBtn');
   if (b) { b.disabled = true; b.textContent = '取消中…'; }
-  if (state.sessionId) {
+  state.userCancelling = true;
+  if (state.sessionId && state.activeRunId) {
     try {
       await fetch(API + '/cancel', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ sessionId: state.sessionId })
+        body: JSON.stringify({ sessionId: state.sessionId, runId: state.activeRunId })
       });
     } catch (e) { /* 后端取消请求失败也继续 abort 本地 */ }
   }
@@ -3067,7 +3491,7 @@ function showApprovalModal(payload) {
   clearApprovalTimer();
   const timeoutSeconds = Number(payload.timeoutSeconds || 0);
   if (timeoutSeconds > 0) {
-    const deadline = Date.now() + timeoutSeconds * 1000;
+    const deadline = Number(payload.expiresAt || 0) || (Date.now() + timeoutSeconds * 1000);
     updateApprovalCountdown(deadline);
     state.approvalTimer = setInterval(() => updateApprovalCountdown(deadline), 1000);
   } else {
@@ -3204,7 +3628,7 @@ function showUserInput(payload) {
   clearUserInputTimer();
   const timeoutSeconds = Number(payload.timeoutSeconds || 0);
   if (timeoutSeconds > 0) {
-    const deadline = Date.now() + timeoutSeconds * 1000;
+    const deadline = Number(payload.expiresAt || 0) || (Date.now() + timeoutSeconds * 1000);
     updateUserInputCountdown(deadline);
     state.userInputTimer = setInterval(() => updateUserInputCountdown(deadline), 1000);
   } else {
@@ -3436,6 +3860,559 @@ function addMessage(role, content, isPlaceholder, agentId, runId, images) {
   return div;
 }
 
+function createRunTimelineView(aiMsg, finalContent) {
+  const content = aiMsg && aiMsg.querySelector('.msg-content');
+  if (!content) return null;
+  content.classList.remove('typing');
+  content.innerHTML = `
+    <div class="steps-container"></div>
+    <div class="final-answer mt-2">${renderMarkdown(finalContent || '')}</div>
+    <div class="memory-evidence-container mt-2"></div>
+    <div class="rag-evidence-container mt-2"></div>`;
+  if (finalContent) setFinalAnswerCopy(aiMsg, finalContent);
+  return {
+    aiMsg,
+    steps: content.querySelector('.steps-container'),
+    finalAnswer: content.querySelector('.final-answer'),
+    memoryEvidence: content.querySelector('.memory-evidence-container'),
+    ragEvidence: content.querySelector('.rag-evidence-container'),
+    stepById: {},
+    runningTools: {},
+    interactionById: {},
+    evidenceFingerprints: {
+      memory: new Set(),
+      rag: new Set()
+    },
+    interventionEnabled: false,
+    flowStep4Active: false,
+    finalContent: finalContent || '',
+    lastEventId: null
+  };
+}
+
+function timelinePayload(record) {
+  if (!record) return null;
+  const raw = record.payloadJson != null ? record.payloadJson : record.data;
+  if (raw == null) return null;
+  if (typeof raw === 'object') return raw;
+  try { return JSON.parse(raw); } catch (e) { return raw; }
+}
+
+function timelineStep(view, payload, status) {
+  const stepId = String((payload && payload.stepId) || 'step');
+  let entry = view.stepById[stepId];
+  if (!entry) {
+    const card = document.createElement('div');
+    card.className = `step-card ${status === 'pending' ? 'pending' : 'running'} collapsed fade-in`;
+    card.innerHTML = `
+      <div class="step-head">
+        <span class="chev">▶</span>
+        <span class="step-name">${escapeHtml(normalizeExecutionStepName(payload && payload.displayName, stepId) || stepId)}</span>
+        <span class="step-status">${status === 'pending' ? '等待中' : '执行中'}</span>
+      </div>
+      <div class="step-body"></div>`;
+    card.querySelector('.step-head').addEventListener('click', () => card.classList.toggle('collapsed'));
+    view.steps.appendChild(card);
+    entry = { card, body: card.querySelector('.step-body'), buf: '' };
+    view.stepById[stepId] = entry;
+  }
+  if (status === 'running') {
+    entry.card.classList.remove('pending', 'done');
+    entry.card.classList.add('running');
+    entry.card.querySelector('.step-status').textContent = '执行中';
+  } else if (status === 'done') {
+    entry.card.classList.remove('pending', 'running');
+    entry.card.classList.add('done', 'collapsed');
+    entry.card.querySelector('.step-status').textContent =
+      (payload && payload.summary) || '已完成';
+  }
+  return entry;
+}
+
+// Timeline replay uses the same compact tool-card language as the live stream.
+// Keep these helpers outside sendMessage so refresh/history restoration does
+// not fall back to a raw input/output <pre> layout.
+function timelineToolStatusClass(status) {
+  return ['success', 'blocked', 'approval_denied', 'approval_timeout',
+    'approval_unavailable', 'error'].includes(status) ? status : 'running';
+}
+
+function timelineToolStatusText(status) {
+  const map = {
+    running: '调用中',
+    success: '已完成',
+    blocked: '已拦截',
+    approval_denied: '已拒绝',
+    approval_timeout: '审批超时',
+    approval_unavailable: '无审批通道',
+    error: '调用失败'
+  };
+  return map[status] || status || '未知';
+}
+
+function timelineShortToolName(toolName) {
+  return String(toolName || 'unknown_tool')
+    .replace(/^JavaSDKMCPClient_/, '')
+    .replace(/^spring_ai_mcp_client_/i, '');
+}
+
+function timelineIsMetaTool(toolName) {
+  const name = String(toolName || '').toLowerCase();
+  return name === 'ask_user' || name === 'request_tool';
+}
+
+function timelineToolActionText(toolName) {
+  const shortName = timelineShortToolName(toolName).toLowerCase();
+  if (shortName === 'ask_user') return '询问用户';
+  if (shortName === 'request_tool') return '装配工具';
+  if (shortName.includes('search_repositories')) return '搜仓库';
+  if (shortName.includes('get_file_contents')) return '读文件';
+  if (shortName.includes('search_code')) return '搜代码';
+  if (shortName.includes('search_papers')) return '搜论文';
+  if (shortName.includes('aisearch') || shortName.includes('search')) return '检索资料';
+  if (shortName.includes('amap') || shortName.includes('route') || shortName.includes('geo')) return '查地图';
+  if (shortName.includes('weather')) return '查天气';
+  if (shortName.includes('calculate')) return '计算';
+  if (shortName.includes('create') || shortName.includes('publish')
+      || shortName.includes('update') || shortName.includes('delete')) return '写入操作';
+  return '调用工具';
+}
+
+function timelineTryParseToolInput(inputPreview) {
+  if (!inputPreview || typeof inputPreview !== 'string') return null;
+  const clean = inputPreview.replace(/\.\.\.\(truncated, full=\d+\)$/, '').trim();
+  if (!clean.startsWith('{') && !clean.startsWith('[')) return null;
+  try { return JSON.parse(clean); } catch (e) { return null; }
+}
+
+function timelineToolInputFocus(inputPreview) {
+  const parsed = timelineTryParseToolInput(inputPreview);
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const keys = ['query', 'q', 'keyword', 'keywords', 'search', 'repository',
+      'repo', 'owner', 'path', 'url', 'address', 'origin', 'destination'];
+    for (const key of keys) {
+      const value = parsed[key];
+      if (value !== undefined && value !== null && String(value).trim()) {
+        return `${key}: ${String(value).trim()}`;
+      }
+    }
+    const first = Object.entries(parsed)
+      .find(([, value]) => value !== undefined && value !== null && String(value).trim());
+    if (first) return `${first[0]}: ${String(first[1]).trim()}`;
+  }
+  const oneLine = String(inputPreview || '').replace(/\s+/g, ' ').trim();
+  return oneLine.length > 120 ? oneLine.slice(0, 120) + '...' : oneLine;
+}
+
+function timelineToolPurposeText(toolName) {
+  const shortName = timelineShortToolName(toolName).toLowerCase();
+  if (shortName.includes('search_repositories')) return '搜索 GitHub 仓库，给回答提供真实项目候选、仓库信息或示例参考。';
+  if (shortName.includes('search_code')) return '搜索代码片段，用来验证 API、配置或实现细节。';
+  if (shortName.includes('search_papers')) return '搜索论文资料，用来补充技术背景、方法依据或参考文献。';
+  if (shortName.includes('aisearch') || shortName.includes('search')) return '检索外部资料或知识库，补充回答所需的事实依据。';
+  if (shortName.includes('amap') || shortName.includes('route') || shortName.includes('geo')) return '查询地图、路线或地点信息，用来生成可执行的出行建议。';
+  if (shortName.includes('weather')) return '查询天气信息，用来校准时间、地点和出行/运动建议。';
+  if (shortName.includes('calculate')) return '执行计算，避免手算误差并给出可复核结果。';
+  if (shortName.includes('create') || shortName.includes('publish') || shortName.includes('csdn')) {
+    return '创建、发布或写入外部平台，属于会改变外部状态的高风险操作。';
+  }
+  return '调用外部工具补充模型自身没有的实时数据、系统能力或可验证结果。';
+}
+
+function timelineToolResultHint(payload, status, detail) {
+  if (detail) return detail;
+  if (status === 'error') return payload.error || '工具调用失败，Agent 应尝试换路或解释失败原因。';
+  if (status === 'blocked') return '已被安全策略拦截：这类工具需要显式授权或不允许自动执行。';
+  if (status === 'approval_denied') return '用户已拒绝执行，Agent 应改用不改变外部状态的方案。';
+  if (status === 'approval_timeout') return '审批超时，本次工具调用已拒绝。';
+  if (status === 'approval_unavailable') return '没有可用审批通道，本次高风险工具未执行。';
+  if (typeof payload.resultChars === 'number') {
+    if (payload.resultChars <= 120) return `返回 ${payload.resultChars} 字符，结果很短，可能为空结果、拒绝信息或精简摘要。`;
+    if (payload.resultChars >= 8000) return `返回 ${payload.resultChars} 字符，结果很长，后续回答应只提炼关键命中。`;
+    return `返回 ${payload.resultChars} 字符，可作为本轮回答的工具依据。`;
+  }
+  return '';
+}
+
+function timelineMetaToolBody(payload, status, detail) {
+  const name = String(payload.toolName || '').toLowerCase();
+  const lines = String(payload.inputPreview || '').split('\n').map(x => x.trim()).filter(Boolean);
+  const list = lines.length
+    ? `<div class="tool-detail">${lines.map(line => escapeHtml(line)).join('<br>')}</div>`
+    : '';
+  const finalDetail = detail || payload.detail || '';
+  if (name === 'ask_user') {
+    return `<div class="tool-purpose"><strong>具体问题：</strong></div>${list}
+      ${finalDetail ? `<div class="tool-detail"><strong>用户回答：</strong> ${escapeHtml(finalDetail)}</div>` : ''}
+      <div class="tool-meta"><span class="tool-pill">工具：ask_user</span></div>`;
+  }
+  return `<div class="tool-purpose"><strong>缺失能力：</strong></div>${list}
+    <div class="tool-detail">${status === 'running' ? '正在匹配并装配工具…' : escapeHtml(finalDetail || '未装配工具')}</div>
+    <div class="tool-meta"><span class="tool-pill">工具：request_tool</span></div>`;
+}
+
+function timelineToolBody(payload, status, detail) {
+  if (timelineIsMetaTool(payload.toolName)) return timelineMetaToolBody(payload, status, detail);
+  const shortName = timelineShortToolName(payload.toolName);
+  const inputFocus = timelineToolInputFocus(payload.inputPreview || '');
+  const pills = [];
+  if (payload.step) pills.push(`<span class="tool-pill">步骤：${escapeHtml(payload.step)}</span>`);
+  pills.push(`<span class="tool-pill">工具：${escapeHtml(shortName)}</span>`);
+  if (typeof payload.latencyMs === 'number') pills.push(`<span class="tool-pill">耗时 ${payload.latencyMs}ms</span>`);
+  if (typeof payload.resultChars === 'number') pills.push(`<span class="tool-pill">返回 ${payload.resultChars} 字符</span>`);
+  const hint = timelineToolResultHint(payload, status, detail);
+  return `
+    <div class="tool-purpose"><strong>为什么用：</strong>${escapeHtml(timelineToolPurposeText(payload.toolName))}</div>
+    <div class="tool-meta">${pills.join('')}</div>
+    ${inputFocus ? `<div class="tool-input">本次参数：<code>${escapeHtml(inputFocus)}</code></div>` : ''}
+    ${hint ? `<div class="tool-detail">${escapeHtml(hint)}</div>` : ''}`;
+}
+
+function timelineToolSummary(payload) {
+  const parts = [];
+  if (payload.step) parts.push(`阶段：${payload.step}`);
+  const inputFocus = timelineToolInputFocus(payload.inputPreview || '');
+  if (inputFocus) parts.push(`参数：${inputFocus}`);
+  if (typeof payload.latencyMs === 'number') parts.push(`${payload.latencyMs}ms`);
+  if (typeof payload.resultChars === 'number') parts.push(`${payload.resultChars}字`);
+  return parts.join(' · ');
+}
+
+function timelineToolCard(view, payload, status, detail) {
+  const toolName = String((payload && payload.toolName) || 'unknown_tool');
+  let entry = status === 'running'
+    ? null
+    : ((view.runningTools[toolName] || []).find(item => item.status === 'running') || null);
+  if (!entry) {
+    const card = document.createElement('div');
+    card.className = 'tool-card running fade-in';
+    card.innerHTML = `
+      <div class="tool-head">
+        <span class="tool-chev">▶</span>
+        <span class="tool-action">${escapeHtml(timelineToolActionText(toolName))}</span>
+        <span class="tool-name" title="${escapeHtml(toolName)}">${escapeHtml(timelineShortToolName(toolName))}</span>
+        <span class="tool-summary"></span>
+        <span class="tool-status">${timelineToolStatusText('running')}</span>
+      </div>
+      <div class="tool-body">${timelineToolBody(payload || {}, 'running', '')}</div>`;
+    card.querySelector('.tool-head').addEventListener('click', () => card.classList.toggle('collapsed'));
+    view.steps.appendChild(card);
+    entry = {card, status: 'running', payload: {...(payload || {})}};
+    (view.runningTools[toolName] ||= []).push(entry);
+  }
+  entry.payload = {...entry.payload, ...(payload || {})};
+  entry.status = status;
+  const normalized = timelineToolStatusClass(status);
+  entry.card.className = `tool-card ${normalized} ${normalized === 'running' ? '' : 'collapsed'} fade-in`;
+  entry.card.querySelector('.tool-status').textContent = timelineToolStatusText(normalized);
+  entry.card.querySelector('.tool-summary').textContent = timelineToolSummary(entry.payload);
+  entry.card.querySelector('.tool-body').innerHTML =
+    timelineToolBody(entry.payload, normalized, detail);
+}
+
+function timelineEvidence(view, payload, memory) {
+  const items = Array.isArray(payload && payload.items) ? payload.items : [];
+  if (!items.length) return;
+  const fingerprints = memory
+    ? view.evidenceFingerprints.memory
+    : view.evidenceFingerprints.rag;
+  const container = memory ? view.memoryEvidence : view.ragEvidence;
+  let card = container.querySelector('.evidence-card');
+  if (!card) {
+    card = document.createElement('div');
+    card.className = `evidence-card ${memory ? 'memory-card' : ''} collapsed fade-in`;
+    card.innerHTML = `
+      <div class="evidence-head"><span class="evidence-chev">v</span>
+        <span class="evidence-title">${memory ? '记忆依据' : '引用依据'}</span>
+        <span class="evidence-count">0 条</span></div>
+      <div class="evidence-body"></div>`;
+    card.querySelector('.evidence-head').addEventListener('click', () => card.classList.toggle('collapsed'));
+    container.appendChild(card);
+  }
+  const body = card.querySelector('.evidence-body');
+  for (const item of items) {
+    const title = memory ? (item.topic || item.kind || payload.memoryType || '记忆') : (item.source || '来源');
+    const text = item.content || item.snippet || '';
+    const fingerprint = memory
+      ? `${payload.memoryType || 'memory'}|${item.topic || ''}|${item.kind || ''}|${text}`
+      : `${item.ref == null ? '' : item.ref}|${title}|${text}`;
+    if (fingerprints.has(fingerprint)) continue;
+    fingerprints.add(fingerprint);
+    body.insertAdjacentHTML('beforeend', `
+      <div class="evidence-item">
+        <div class="evidence-meta"><span class="evidence-source">${escapeHtml(String(title))}</span></div>
+        <div class="evidence-snippet">${escapeHtml(String(text))}</div>
+      </div>`);
+  }
+  card.querySelector('.evidence-count').textContent = `${body.querySelectorAll('.evidence-item').length} 条`;
+}
+
+function timelineInteraction(view, eventType, payload) {
+  const id = payload && (payload.approvalId || payload.inputId);
+  if (!id) return;
+  if (eventType.endsWith('_result')) {
+    const existing = view.interactionById[id];
+    if (existing) {
+      existing.resolved = true;
+      existing.card.querySelector('.tool-status').textContent =
+        payload.status === 'TIMEOUT' ? '已超时' : (payload.status === 'APPROVED' || payload.status === 'ANSWERED' ? '已处理' : '已拒绝');
+      existing.card.classList.remove('running');
+      existing.card.classList.add(payload.status === 'TIMEOUT' ? 'error' : 'success', 'collapsed');
+    }
+    return;
+  }
+  const card = document.createElement('div');
+  card.className = 'tool-card running fade-in';
+  const isApproval = eventType === 'human_approval_required';
+  card.innerHTML = `
+    <div class="tool-head"><span class="tool-chev">▶</span>
+      <span class="tool-action">${isApproval ? '等待审批' : '等待用户补充'}</span>
+      <span class="tool-name">${escapeHtml(payload.toolName || payload.step || '')}</span>
+      <span class="tool-summary"></span><span class="tool-status">等待中</span></div>
+    <div class="tool-body"><pre class="text-xs whitespace-pre-wrap">${escapeHtml(
+      String(isApproval ? (payload.toolInput || '') : ((payload.questions || []).join('\n') || payload.context || payload.raw || ''))
+    )}</pre></div>`;
+  card.querySelector('.tool-head').addEventListener('click', () => card.classList.toggle('collapsed'));
+  view.steps.appendChild(card);
+  view.interactionById[id] = {card, payload, eventType, resolved: false};
+}
+
+function applyRunTimelineEvent(view, eventType, payload, eventId, interactive) {
+  if (!view || !eventType) return;
+  if (eventId) {
+    view.lastEventId = eventId;
+    state.lastRunEventId = eventId;
+  }
+  if (eventType === 'ack') {
+    view.interventionEnabled = !!(payload && payload.intervention);
+    if (interactive && state.activeRunId && state.sessionId) {
+      state.interventionEnabled = view.interventionEnabled;
+      showAnswerNow(true);
+    }
+  } else if (eventType === 'step_pending') timelineStep(view, payload, 'pending');
+  else if (eventType === 'step_start') {
+    if (String((payload && payload.stepId) || '').startsWith('flow_step4')) {
+      view.flowStep4Active = true;
+      if (interactive) {
+        state.flowStep4Active = true;
+        showAnswerNow(true);
+      }
+    }
+    timelineStep(view, payload, 'running');
+  }
+  else if (eventType === 'token') {
+    const step = timelineStep(view, payload, 'running');
+    if (payload && payload.token !== '[DONE]') step.buf += payload.token || '';
+    step.body.innerHTML = renderMarkdown(step.buf);
+  } else if (eventType === 'step_end') timelineStep(view, payload, 'done');
+  else if (eventType === 'tool_call_start') timelineToolCard(view, payload, 'running', '');
+  else if (eventType === 'tool_call_end') timelineToolCard(view, payload, payload.status || 'success', '');
+  else if (eventType === 'tool_call_error') timelineToolCard(view, payload, 'error', payload.error || '');
+  else if (eventType === 'rag_evidence') timelineEvidence(view, payload, false);
+  else if (eventType === 'memory_evidence') timelineEvidence(view, payload, true);
+  else if (eventType === 'human_approval_required' || eventType === 'user_input_required'
+      || eventType === 'human_approval_result' || eventType === 'user_input_result') {
+    timelineInteraction(view, eventType, payload || {});
+    if (interactive && eventType === 'human_approval_required') enqueueApproval(payload);
+    if (interactive && eventType === 'user_input_required') showUserInput(payload);
+  } else if (eventType === 'agent_routed' && payload) {
+    const author = view.aiMsg.querySelector('.msg-author');
+    if (author) author.textContent = payload.agentName ? `${payload.agentName}(${payload.agentId})` : `Agent ${payload.agentId}`;
+  } else if ((eventType === 'message' || !eventType) && payload && payload.type === 'summary') {
+    view.finalContent = payload.content || '';
+    view.finalAnswer.innerHTML = renderMarkdown(view.finalContent);
+    setFinalAnswerCopy(view.aiMsg, view.finalContent);
+  } else if ((eventType === 'message' || !eventType) && payload && payload.type === 'error') {
+    view.finalAnswer.innerHTML = `<span class="text-red-400">❌ ${escapeHtml(payload.content || '')}</span>`;
+  }
+}
+
+function restoreTimelineSnapshot(aiMsg, snapshot, finalContent) {
+  const view = createRunTimelineView(aiMsg, finalContent);
+  if (!view) return null;
+  for (const record of (snapshot.timelineEvents || [])) {
+    applyRunTimelineEvent(view, record.eventType, timelinePayload(record), record.eventId, false);
+  }
+  view.lastEventId = snapshot.lastEventId || view.lastEventId;
+  return view;
+}
+
+function activatePendingTimelineInteractions(view) {
+  Object.values((view && view.interactionById) || {}).forEach(entry => {
+    if (!entry || entry.resolved) return;
+    if (entry.eventType === 'human_approval_required') enqueueApproval(entry.payload);
+    if (entry.eventType === 'user_input_required') showUserInput(entry.payload);
+  });
+}
+
+async function attachRestoredRunStream(snapshot, view, sessionId) {
+  const runId = snapshot.runId;
+  const runUiGeneration = state.runUiGeneration;
+  state.sending = true;
+  state.activeRunId = runId;
+  state.lastRunEventId = view.lastEventId || snapshot.lastEventId || null;
+  state.userCancelling = false;
+  state.interventionEnabled = !!view.interventionEnabled;
+  state.flowStep4Active = !!view.flowStep4Active;
+  state.finalizing = false;
+  setSendBtn(true);
+  showAnswerNow(true);
+  while (state.runUiGeneration === runUiGeneration && state.sending
+      && state.sessionId === sessionId && state.activeRunId === runId && !state.userCancelling) {
+    try {
+      const ac = new AbortController();
+      state.abortController = ac;
+      const after = state.lastRunEventId ? `&afterEventId=${encodeURIComponent(state.lastRunEventId)}` : '';
+      const response = await fetch(
+        `${API}/runs/${encodeURIComponent(runId)}/stream?sessionId=${encodeURIComponent(sessionId)}${after}`,
+        {signal: ac.signal}
+      );
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '', eventType = 'message', data = '', eventId = '';
+      const dispatch = () => {
+        if (!data) return;
+        let payload;
+        try { payload = JSON.parse(data); } catch (e) { payload = data; }
+        applyRunTimelineEvent(view, eventType, payload, eventId, true);
+        eventType = 'message'; data = ''; eventId = '';
+      };
+      while (true) {
+        const {done, value} = await reader.read();
+        if (done) { dispatch(); break; }
+        buffer += decoder.decode(value, {stream: true});
+        let idx;
+        while ((idx = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, idx).replace(/\r$/, '');
+          buffer = buffer.slice(idx + 1);
+          if (!line) dispatch();
+          else if (line.startsWith('event:')) eventType = line.slice(6).trim();
+          else if (line.startsWith('data:')) data += (data ? '\n' : '') + line.slice(5).trimStart();
+          else if (line.startsWith('id:')) eventId = line.slice(3).trim();
+        }
+      }
+      const statusRes = await fetch(`${API}/run-snapshots/${encodeURIComponent(runId)}?sessionId=${encodeURIComponent(sessionId)}`);
+      const statusBody = await statusRes.json();
+      if (!statusBody.data || statusBody.data.status !== 'RUNNING') break;
+    } catch (e) {
+      if (state.runUiGeneration !== runUiGeneration || state.userCancelling
+          || state.sessionId !== sessionId || state.activeRunId !== runId) break;
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  if (state.runUiGeneration === runUiGeneration && state.sessionId === sessionId
+      && state.activeRunId === runId) {
+    state.sending = false;
+    state.activeRunId = null;
+    state.lastRunEventId = null;
+    state.abortController = null;
+    setSendBtn(false);
+    showAnswerNow(false);
+  }
+}
+
+async function recoverRunAfterInitialDisconnect(runId, sessionId, aiMsg) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 10 && !state.userCancelling; attempt++) {
+    try {
+      const response = await fetch(
+        `${API}/run-snapshots/${encodeURIComponent(runId)}?sessionId=${encodeURIComponent(sessionId)}`
+      );
+      const body = await response.json();
+      const snapshot = body && body.data;
+      if (snapshot) {
+        const view = restoreTimelineSnapshot(aiMsg, snapshot, '');
+        if (snapshot.status === 'RUNNING' && view) {
+          activatePendingTimelineInteractions(view);
+          await attachRestoredRunStream(snapshot, view, sessionId);
+        }
+        return;
+      }
+    } catch (e) {
+      lastError = e;
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  const content = aiMsg && aiMsg.querySelector('.msg-content');
+  if (content) {
+    content.innerHTML = `<span class="text-red-400">❌ 无法确认任务是否已提交${lastError ? `：${escapeHtml(lastError.message || '')}` : ''}</span>`;
+    content.classList.remove('typing');
+  }
+}
+
+async function restoreRunTimelines(messages, renderedMessages, sessionId) {
+  try {
+    const response = await fetch(`${API}/run-snapshots?sessionId=${encodeURIComponent(sessionId)}&limit=50`);
+    const body = await response.json();
+    const snapshots = Array.isArray(body && body.data) ? body.data : [];
+    const byRunId = new Map(snapshots.map(snapshot => [String(snapshot.runId), snapshot]));
+    const assistantByRunId = new Map();
+    const userRunIds = new Set();
+    messages.forEach((message, index) => {
+      if (!message.runId) return;
+      if (message.messageType === 'ASSISTANT') assistantByRunId.set(String(message.runId), {node: renderedMessages[index], message});
+      if (message.messageType === 'USER') userRunIds.add(String(message.runId));
+    });
+    const detailRunIds = new Set(
+      [...assistantByRunId.keys()].filter(runId => {
+        const snapshot = byRunId.get(runId);
+        return !snapshot || !Array.isArray(snapshot.timelineEvents) || !snapshot.timelineEvents.length;
+      })
+    );
+    snapshots.filter(snapshot => snapshot.status === 'RUNNING' && snapshot.runId)
+      .forEach(snapshot => detailRunIds.add(String(snapshot.runId)));
+    await Promise.all([...detailRunIds].map(async runId => {
+      try {
+        const snapshotRes = await fetch(
+          `${API}/run-snapshots/${encodeURIComponent(runId)}?sessionId=${encodeURIComponent(sessionId)}`
+        );
+        const snapshotBody = await snapshotRes.json();
+        if (snapshotBody && snapshotBody.data) byRunId.set(runId, snapshotBody.data);
+      } catch (e) {
+        // Snapshot 已过期时保留 ChatMemory 的纯文本展示。
+      }
+    }));
+    for (const [runId, pair] of assistantByRunId.entries()) {
+      const snapshot = byRunId.get(runId);
+      if (snapshot && Array.isArray(snapshot.timelineEvents) && snapshot.timelineEvents.length) {
+        restoreTimelineSnapshot(pair.node, snapshot, pair.message.content || '');
+      }
+    }
+    for (const snapshot of byRunId.values()) {
+      const runId = String(snapshot.runId || '');
+      if (!runId || snapshot.status === 'RUNNING' || assistantByRunId.has(runId)
+          || !userRunIds.has(runId) || !Array.isArray(snapshot.timelineEvents)
+          || !snapshot.timelineEvents.length) continue;
+      const node = addMessage('assistant', '', true, snapshot.agentId, snapshot.runId);
+      assistantByRunId.set(runId, {node, message: {content: ''}});
+      restoreTimelineSnapshot(node, snapshot, '');
+    }
+    const active = [...byRunId.values()].find(snapshot => snapshot.status === 'RUNNING');
+    if (!active || state.sessionId !== sessionId) return;
+    let pair = assistantByRunId.get(String(active.runId));
+    if (!userRunIds.has(String(active.runId))) {
+      const activeImages = (active.images || []).map(image => ({
+        ...image,
+        url: image.attachmentId
+          ? `${API}/attachments/${encodeURIComponent(image.attachmentId)}?userId=${encodeURIComponent(state.userId || '')}`
+          : image.sourceUrl
+      }));
+      addMessage('user', active.originalMessage || '运行中的任务', false, active.agentId, active.runId, activeImages);
+    }
+    if (!pair) {
+      pair = {node: addMessage('assistant', '', true, active.agentId, active.runId), message: {content: ''}};
+    }
+    const view = restoreTimelineSnapshot(pair.node, active, pair.message.content || '');
+    if (view) {
+      activatePendingTimelineInteractions(view);
+      void attachRestoredRunStream(active, view, sessionId);
+    }
+  } catch (e) {
+    console.warn('restore run timeline failed', e);
+  }
+}
+
 function renderMessageImages(images) {
   if (!Array.isArray(images) || !images.length) return '';
   const cards = images.map(image => {
@@ -3602,26 +4579,59 @@ async function loadHistory() {
   if (!state.userId) return;
   const list = document.getElementById('historyList');
   try {
-    const res = await fetch(`/api/v1/agent/conversations?userId=${encodeURIComponent(state.userId)}`);
-    const data = await res.json();
-    if (data.code !== '0000' || !data.data || !data.data.length) {
+    const [conversationRes, activeRunRes] = await Promise.all([
+      fetch(`/api/v1/agent/conversations?userId=${encodeURIComponent(state.userId)}`),
+      fetch(`${API}/active-runs?userId=${encodeURIComponent(state.userId)}`)
+    ]);
+    const [data, activeRunData] = await Promise.all([conversationRes.json(), activeRunRes.json()]);
+    const conversations = data.code === '0000' && Array.isArray(data.data) ? data.data : [];
+    const activeRuns = activeRunData.code === '0000' && Array.isArray(activeRunData.data)
+      ? activeRunData.data
+      : [];
+    const activeBySession = new Map(activeRuns
+      .filter(run => run && run.sessionId)
+      .map(run => [String(run.sessionId), run]));
+    const existingSessions = new Set(conversations.map(c =>
+      (c.conversationId || '').split(':').pop() || c.conversationId
+    ));
+    const runningOnly = activeRuns
+      .filter(run => run && run.sessionId && !existingSessions.has(String(run.sessionId)))
+      .map(run => ({
+        conversationId: conversationIdForSession(run.sessionId),
+        firstMessage: run.originalMessage || '运行中的任务',
+        lastTime: run.updatedAt || run.createdAt,
+        messageCount: 0,
+        activeRun: run
+      }));
+    const merged = [
+      ...runningOnly,
+      ...conversations.map(c => ({
+        ...c,
+        activeRun: activeBySession.get(String(
+          (c.conversationId || '').split(':').pop() || c.conversationId
+        )) || null
+      }))
+    ];
+    if (!merged.length) {
       list.innerHTML = '<div class="text-xs text-gray-600 text-center py-4">暂无历史会话</div>';
       return;
     }
-    list.innerHTML = data.data.map(c => {
+    list.innerHTML = merged.map(c => {
       const preview = (c.firstMessage || '').substring(0, 30) + (c.firstMessage && c.firstMessage.length > 30 ? '...' : '');
       const time = c.lastTime ? new Date(c.lastTime).toLocaleString('zh-CN', {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
       const sid = (c.conversationId || '').split(':').pop() || c.conversationId;
       const active = state.sessionId && c.conversationId && c.conversationId.endsWith(state.sessionId) ? 'border-blue-500 bg-blue-900/20' : 'border-gray-700 hover:border-gray-500';
+      const running = !!c.activeRun;
       return `<div class="${active} border rounded-lg p-2 transition text-xs relative group">
         <div onclick="loadConversation('${escapeHtml(c.conversationId)}')" class="cursor-pointer">
-          <div class="text-gray-300 truncate pr-5">${escapeHtml(preview || '(空)')}</div>
+          <div class="text-gray-300 truncate pr-5">${running ? '<span class="text-emerald-400 mr-1">● 运行中</span>' : ''}${escapeHtml(preview || '(空)')}</div>
           <div class="text-gray-500 mt-1 flex justify-between">
-            <span>${c.messageCount} 条消息</span><span>${time}</span>
+            <span>${running && !c.messageCount ? '正在生成首轮回答' : `${c.messageCount} 条消息`}</span><span>${time}</span>
           </div>
         </div>
-        <button onclick="event.stopPropagation();deleteConversation('${escapeHtml(c.conversationId)}')" title="删除此会话"
+        ${running ? '' : `<button onclick="event.stopPropagation();deleteConversation('${escapeHtml(c.conversationId)}')" title="删除此会话"
           class="absolute top-1 right-1.5 text-gray-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition text-base leading-none px-1">&times;</button>
+        `}
       </div>`;
     }).join('');
   } catch(e) {
@@ -3681,7 +4691,9 @@ function resetHistoryPagination() {
 async function loadConversation(conversationId, options = {}) {
   // 从 conversationId 提取 sessionId
   const parts = conversationId.split(':');
-  state.sessionId = parts[parts.length - 1];
+  const targetSessionId = parts[parts.length - 1];
+  detachObservedRunUi();
+  state.sessionId = targetSessionId;
   document.getElementById('sessionInfo').textContent = 'Session: ' + state.sessionId.substring(0, 28) + '...';
   if (options.keepHistoryPanelHidden !== false) {
     document.getElementById('historyPanel').classList.add('hidden');
@@ -3719,13 +4731,14 @@ async function loadConversation(conversationId, options = {}) {
 
     area.innerHTML = '';
     // 先全部 append 消息（addMessage 会 scrollBottom，正常）
-    messages.forEach(m => {
-      addMessage(m.messageType === 'USER' ? 'user' : 'assistant', m.content, false, m.agentId, m.runId, m.images);
-    });
+    const renderedMessages = messages.map(m =>
+      addMessage(m.messageType === 'USER' ? 'user' : 'assistant', m.content, false, m.agentId, m.runId, m.images)
+    );
     // 再插入哨兵到顶部（避免 addMessage 内部 querySelector('.text-center') 误删它）
     insertHistoryTopSentinel(area);
     updateHistoryTopSentinel();
     setupHistoryScrollWatcher();
+    await restoreRunTimelines(messages, renderedMessages, state.sessionId);
   } catch(e) {
     area.innerHTML = '<div class="text-center text-red-400 py-4">加载失败</div>';
     return false;

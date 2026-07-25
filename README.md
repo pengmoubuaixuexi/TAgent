@@ -41,7 +41,7 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 
 ## 🎬 功能演示
 
-三种策略、动态工具补充、主动追问、计划确认、人工审批、运行编号重做、长期记忆管理与观测页面均提供了独立录屏，便于按功能查看或替换：[查看功能演示录屏](docs/demo-videos/README.md)。
+三种策略、动态工具补充、主动追问、计划确认、人工审批、运行编号重做、长期记忆管理、断线续作、图片理解、后台任务与观测页面均提供了独立录屏，便于按功能查看或替换：[查看功能演示录屏](docs/demo-videos/README.md)。
 
 ### 主链路
 
@@ -60,6 +60,8 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 - **动态工具补充**：路由可预推断缺失能力，也可由执行期 `request_tool` 主动描述能力缺口 → PgVector 匹配真实 MCP 工具 → 与 Agent 常驻工具合并
 - **Flow 计划确认**：仅 Flow 策略在生成并解析计划后可暂停，用户确认或编辑计划后再进入 DAG 执行
 - **运行编号快照重做**：Fixed、Auto、Flow 每次运行都会生成运行编号；前端可通过 `/run` 查看近期快照，并用 `/runId-stepN` 从指定步骤修正重跑
+- **断线续作与重连**：浏览器连接只是 run 的订阅者；刷新、网络抖动或切换会话不取消后端执行，重连后恢复完整 Timeline 并继续接收实时事件
+- **后台任务中心**：独立命令路由识别定时、Cron 和文件变化稳定监视任务，确认后由调度器在目标会话触发普通 Agent run
 - **执行中干预**：用户可发送 `steer` 重做当前步骤、`answer_now` 跳过剩余步骤、`cancel` 中止执行
 - **主动追问**：模型缺少关键信息时可调用 `ask_user`，通过 SSE 向用户收集补充信息，再回填继续执行
 
@@ -77,6 +79,9 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 | **工具治理** | 非执行步禁工具、未知工具纠正、参数提示、轮次预算、跨 MCP 并行 |
 | **Flow 计划确认** | Flow 计划解析后暂停，支持用户查看、编辑、确认后继续 DAG 执行 |
 | **运行编号步骤重做** | Redis TTL 快照保存运行步骤，支持 `/run` 查看、`/runId-stepN` 定点重做 |
+| **断线续作与 Timeline 重连** | Snapshot 首屏恢复、Redis Stream 补增量、SSE 接实时流，完成态仍可恢复步骤与工具卡片 |
+| **后台任务中心** | 一次性定时、Spring Cron、文件变化稳定监视，支持确认、编辑、暂停、恢复、立即执行与触发记录 |
+| **多模态图片消息** | URL、文件选择和剪贴板图片统一转存 OSS，以 `text + image` 保存到 ChatMemory 并按模型能力发送 |
 | **Agentic RAG** | SIMPLE、HyDE、FUSION、DECOMPOSE 四种查询策略 |
 | **四层记忆** | 工作记忆、对话记忆、长期记忆、情景记忆 |
 | **流式干预** | Auto、Flow、Fixed 均支持立即回答、引导与取消执行 |
@@ -165,6 +170,26 @@ Flow 还可以开启计划确认：Step2 生成计划、Step3 解析为 DAG 后�
 - **前端入口**：输入 `/run` 展示当前会话近期运行，只展开运行摘要；选择某个运行编号后再展示可重做步骤。
 - **定点重做**：输入 `/runId-stepN 修正要求` 后，系统继承源运行的 Agent 和前置步骤，并从目标步骤继续生成新回答。
 - **历史记录**：对话记忆和事件日志记录运行编号，刷新页面后仍能复制运行编号；但真正能否重做以 Redis 快照是否仍有效为准。
+
+---
+
+## 🔌 断线续作与 Timeline 重连
+
+Agent run 的生命周期归 session 管理，不再绑定某一个浏览器 SSE 连接。刷新、网络抖动或离开当前会话时，后端继续运行；只有显式取消才会按 `sessionId + runId` 终止目标 run。
+
+重连按三段恢复：先加载已聚合的 Timeline Snapshot，再读取 Redis Stream 中快照游标之后的事件，最后订阅实时流。运行完成后仍可从最终快照恢复步骤文本、工具调用、记忆/RAG 依据、审批与主动追问卡片。
+
+---
+
+## ⏰ 后台任务与对象监视器
+
+聊天入口会先由独立的 `BackgroundTaskCommandRouter` 判断是否属于后台任务命令，不改变 Fixed、Auto、Flow 的普通意图路由职责。当前支持：
+
+- `SCHEDULE_ONCE`：指定时间触发一次。
+- `CRON`：使用六段 Spring Cron 和时区周期触发。
+- `FILE_CHANGE_STABLE`：文件内容变化后，持续指定时间未再修改时触发。
+
+创建结果先保存为草稿，由用户确认后启用。任务中心支持编辑、暂停、恢复、立即执行、取消、查看触发记录和进入目标会话；触发时复用普通 Agent run，同一 session 同时只允许一个 run，繁忙时任务会等待会话空闲。
 
 ---
 
@@ -440,6 +465,13 @@ EMBEDDING_BASE_URL=https://your-embedding-endpoint
 EMBEDDING_API_KEY=your-embedding-key
 EMBEDDING_MODEL=BAAI/bge-m3
 
+# 可选：远程图片下载代理
+TAGENT_IMAGE_PROXY_URL=http://127.0.0.1:7897
+
+# 可选：私有 OSS 图片存储
+TAGENT_OSS_ENABLED=false
+TAGENT_OSS_BUCKET=your-private-bucket
+
 # 数据库凭据
 MYSQL_USERNAME=root
 MYSQL_PASSWORD=your-mysql-password
@@ -464,7 +496,7 @@ WEIXIN_API_APP_SECRET=your-weixin-secret
 docs/dev-ops/sql-migrations
 ```
 
-新环境应按版本顺序执行。动态工具功能至少需要 `V041`、`V046`、`V047`。
+新环境应按版本顺序执行。动态工具功能至少需要 `V041`、`V046`、`V047`；后台任务中心需要执行 `V058__create_background_task_center.sql`。
 
 ### 构建
 

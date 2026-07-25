@@ -1,5 +1,6 @@
 package cn.bugstack.ai.domain.agent.service.execute.common;
 
+import cn.bugstack.ai.domain.agent.service.execute.event.RunEventPublisher;
 import cn.bugstack.ai.domain.agent.service.security.ApprovalChannelRegistry;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -71,6 +72,9 @@ public class RagEvidenceEmitter {
     @Resource
     private ApprovalChannelRegistry approvalChannelRegistry;
 
+    @Resource
+    private RunEventPublisher runEventPublisher;
+
     /** Spring 注入路径；测试可用此构造手动装配。 */
     public RagEvidenceEmitter() {}
 
@@ -98,7 +102,7 @@ public class RagEvidenceEmitter {
             if (sessionId == null || sessionId.isBlank()) return;
             if (documents == null || documents.isEmpty()) return;
             ResponseBodyEmitter emitter = lookupEmitter(sessionId);
-            if (emitter == null) return;
+            if (emitter == null && !hasRun(sessionId)) return;
 
             List<Map<String, Object>> items = buildEvidenceSnippets(documents, startRef);
             if (items.isEmpty()) return;
@@ -197,12 +201,20 @@ public class RagEvidenceEmitter {
         return approvalChannelRegistry.get(sessionId);
     }
 
+    private boolean hasRun(String sessionId) {
+        return runEventPublisher != null && runEventPublisher.currentRunId(sessionId) != null;
+    }
+
     private void sendEvent(ResponseBodyEmitter emitter, Map<String, Object> data, String sessionId) {
         String payload;
         try {
             payload = MAPPER.writeValueAsString(data);
         } catch (JsonProcessingException e) {
             log.debug("[RagEvidence] json serialize failed sessionId={} err={}", sessionId, e.toString());
+            return;
+        }
+        if (hasRun(sessionId)) {
+            runEventPublisher.publishCurrent(sessionId, "rag_evidence", data);
             return;
         }
         try {

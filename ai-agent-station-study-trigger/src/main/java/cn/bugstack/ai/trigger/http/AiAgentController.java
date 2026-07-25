@@ -16,6 +16,7 @@ import cn.bugstack.ai.domain.agent.model.valobj.AiAgentVO;
 import cn.bugstack.ai.domain.agent.service.IAgentDispatchService;
 import cn.bugstack.ai.domain.agent.service.IArmoryService;
 import cn.bugstack.ai.domain.agent.service.armory.node.factory.DefaultArmoryStrategyFactory;
+import cn.bugstack.ai.domain.agent.service.execute.event.RunEventPublisher;
 import cn.bugstack.ai.domain.agent.service.execute.flow.plan.FlowPlanReviewPreparedPlan;
 import cn.bugstack.ai.domain.agent.service.execute.flow.plan.FlowPlanReviewService;
 import cn.bugstack.ai.domain.agent.service.execute.flow.plan.FlowPlanReviewStep;
@@ -76,6 +77,9 @@ public class AiAgentController implements IAiAgentService {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService runSnapshotService;
 
+    @Resource
+    private RunEventPublisher runEventPublisher;
+
     /** 执行干预（立即回答/引导）总开关；false 时端点拒绝、ack 不带 intervention=true，前端据此不渲染按钮。 */
     @org.springframework.beans.factory.annotation.Value("${agent.intervention.enabled:true}")
     private boolean interventionEnabled;
@@ -96,6 +100,44 @@ public class AiAgentController implements IAiAgentService {
                 request == null || request.getImages() == null ? 0 : request.getImages().size());
 
         try {
+            // A client retry/double-click may submit an already used runId.
+            // Treat it as an observation of the existing run instead of
+            // executing the same logical run and its tools a second time.
+            if (request != null && request.getRunId() != null && !request.getRunId().isBlank()
+                    && runSnapshotService != null) {
+                cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot existing =
+                        runSnapshotService.find(request.getRunId()).orElse(null);
+                if (existing != null) {
+                    if (request.getSessionId() == null
+                            || !request.getSessionId().equals(existing.getSessionId())) {
+                        ResponseBodyEmitter rejected = new ResponseBodyEmitter();
+                        try {
+                            rejected.send("runId has already been used by another session");
+                            rejected.complete();
+                        } catch (Exception sendError) {
+                            rejected.completeWithError(sendError);
+                        }
+                        return rejected;
+                    }
+                    existing = reconcileRunLiveness(existing);
+                    response.setContentType("text/event-stream");
+                    response.setCharacterEncoding("UTF-8");
+                    response.setHeader("Cache-Control", "no-cache");
+                    response.setHeader("Connection", "keep-alive");
+                    response.setHeader("X-Accel-Buffering", "no");
+                    ResponseBodyEmitter existingEmitter = new ResponseBodyEmitter(Long.MAX_VALUE);
+                    runEventPublisher.attach(
+                            existing.getRunId(), existing.getSessionId(), existingEmitter, null);
+                    if (!cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_RUNNING
+                            .equals(existing.getStatus())) {
+                        runEventPublisher.finishRun(existing.getRunId());
+                    }
+                    log.info("[Dispatch] idempotent POST reused existing run sessionId={} runId={} status={}",
+                            existing.getSessionId(), existing.getRunId(), existing.getStatus());
+                    return existingEmitter;
+                }
+            }
+
             // 设置SSE响应头
             response.setContentType("text/event-stream");
             response.setCharacterEncoding("UTF-8");
@@ -107,15 +149,18 @@ public class AiAgentController implements IAiAgentService {
             response.setBufferSize(0);  // 关 servlet 容器的输出缓冲
 
             // 1. 创建流式输出对象
-            ResponseBodyEmitter emitter = new ResponseBodyEmitter(Long.MAX_VALUE);
             String sessionId = request != null ? request.getSessionId() : null;
             String runId = request != null ? coalesce(request.getRunId(), java.util.UUID.randomUUID().toString())
                     : java.util.UUID.randomUUID().toString();
+            ResponseBodyEmitter emitter =
+                    new cn.bugstack.ai.domain.agent.service.execute.event.RunAwareResponseBodyEmitter(
+                            Long.MAX_VALUE, runId, sessionId, runEventPublisher);
             if (request != null) {
                 request.setRunId(runId);
             }
             MDC.put("runId", runId);
             MDC.put("agent.run_id", runId);
+            runEventPublisher.attach(runId, sessionId, emitter, null);
             if (sessionId != null && !sessionId.isBlank()) {
                 approvalChannelRegistry.register(sessionId, emitter);
                 emitter.onCompletion(() -> approvalChannelRegistry.unregister(sessionId, emitter));
@@ -134,7 +179,7 @@ public class AiAgentController implements IAiAgentService {
                 ack.put("runId", runId);
                 ack.put("intervention", interventionEnabled);
                 ack.put("timestamp", System.currentTimeMillis());
-                sendSseObject(emitter, "ack", ack);
+                runEventPublisher.publish(runId, sessionId, "ack", ack);
             } catch (Exception ackEx) {
                 log.debug("ack 发送失败（不影响主流程）: {}", ackEx.getMessage());
             }
@@ -263,6 +308,13 @@ public class AiAgentController implements IAiAgentService {
 
         } catch (Exception e) {
             log.error("AutoAgent请求处理异常：{}", e.getMessage(), e);
+            boolean protectsExistingRun =
+                    e instanceof cn.bugstack.ai.domain.agent.service.dispatch.RunDispatchConflictException conflict
+                            && cn.bugstack.ai.domain.agent.service.dispatch.RunDispatchConflictException.Reason.DUPLICATE_RUN_ID
+                            .equals(conflict.getReason());
+            if (!protectsExistingRun && request != null && request.getRunId() != null) {
+                runEventPublisher.finishRun(request.getRunId());
+            }
             ResponseBodyEmitter errorEmitter = new ResponseBodyEmitter();
             try {
                 errorEmitter.send("请求处理异常：" + e.getMessage());
@@ -285,12 +337,15 @@ public class AiAgentController implements IAiAgentService {
             response.setHeader("X-Accel-Buffering", "no");
             response.setBufferSize(0);
 
-            ResponseBodyEmitter emitter = new ResponseBodyEmitter(Long.MAX_VALUE);
             String sessionId = request != null ? request.getSessionId() : null;
             String runId = request != null ? request.getRunId() : null;
+            ResponseBodyEmitter emitter =
+                    new cn.bugstack.ai.domain.agent.service.execute.event.RunAwareResponseBodyEmitter(
+                            Long.MAX_VALUE, runId, sessionId, runEventPublisher);
             if (runId != null && !runId.isBlank()) {
                 MDC.put("runId", runId);
                 MDC.put("agent.run_id", runId);
+                runEventPublisher.attach(runId, sessionId, emitter, null);
             }
             if (sessionId != null && !sessionId.isBlank()) {
                 approvalChannelRegistry.register(sessionId, emitter);
@@ -306,7 +361,7 @@ public class AiAgentController implements IAiAgentService {
             ack.put("planReviewResume", true);
             ack.put("intervention", interventionEnabled);
             ack.put("timestamp", System.currentTimeMillis());
-            sendSseObject(emitter, "ack", ack);
+            runEventPublisher.publish(runId, sessionId, "ack", ack);
 
             List<FlowPlanReviewStep> steps = toPlanReviewSteps(request != null ? request.getSteps() : null);
             FlowPlanReviewPreparedPlan preparedPlan = flowPlanReviewService.prepareApprovedPlan(
@@ -337,6 +392,9 @@ public class AiAgentController implements IAiAgentService {
             return emitter;
         } catch (Exception e) {
             log.error("Flow plan review confirm failed", e);
+            if (request != null && request.getRunId() != null) {
+                runEventPublisher.finishRun(request.getRunId());
+            }
             ResponseBodyEmitter errorEmitter = new ResponseBodyEmitter();
             try {
                 sendSseObject(errorEmitter, "message",
@@ -580,12 +638,17 @@ public class AiAgentController implements IAiAgentService {
     @RequestMapping(value = "cancel", method = RequestMethod.POST)
     public Response<Boolean> cancel(@RequestBody Map<String, Object> request) {
         String sessionId = request != null ? (String) request.get("sessionId") : null;
-        if (sessionId == null || sessionId.isBlank()) {
-            return Response.<Boolean>builder().code(ResponseCode.UN_ERROR.getCode()).info("缺少 sessionId").data(false).build();
+        String runId = request != null ? (String) request.get("runId") : null;
+        if (sessionId == null || sessionId.isBlank() || runId == null || runId.isBlank()) {
+            return Response.<Boolean>builder().code(ResponseCode.UN_ERROR.getCode()).info("缺少 sessionId 或 runId").data(false).build();
         }
-        agentDispatchService.cancelExecute(sessionId);
-        log.info("[Cancel] sessionId={}", sessionId);
-        return Response.<Boolean>builder().code(ResponseCode.SUCCESS.getCode()).info("已取消").data(true).build();
+        boolean cancelled = agentDispatchService.cancelExecute(sessionId, runId);
+        log.info("[Cancel] sessionId={} runId={} accepted={}", sessionId, runId, cancelled);
+        return Response.<Boolean>builder()
+                .code(cancelled ? ResponseCode.SUCCESS.getCode() : ResponseCode.UN_ERROR.getCode())
+                .info(cancelled ? "已取消" : "运行已结束或 runId 已变化，未执行取消")
+                .data(cancelled)
+                .build();
     }
 
     private List<FlowPlanReviewStep> toPlanReviewSteps(List<FlowPlanReviewConfirmRequestDTO.Step> requestSteps) {
@@ -647,6 +710,37 @@ public class AiAgentController implements IAiAgentService {
         return null;
     }
 
+    /**
+     * A browser disconnect is recoverable, but an application restart is not:
+     * the Redis snapshot survives while the JVM-owned execution lease does not.
+     * Reconcile that stale RUNNING marker whenever a snapshot is exposed.
+     */
+    private cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot reconcileRunLiveness(
+            cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot snapshot) {
+        if (snapshot == null
+                || !cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_RUNNING
+                .equals(snapshot.getStatus())) {
+            return snapshot;
+        }
+        String activeRunId = agentDispatchService.activeRunId(snapshot.getSessionId());
+        if (snapshot.getRunId() != null && snapshot.getRunId().equals(activeRunId)) {
+            return snapshot;
+        }
+        String error = "Application restarted or execution context was lost; the original run cannot continue";
+        if (runSnapshotService != null) {
+            runSnapshotService.markStatus(
+                    snapshot.getRunId(),
+                    cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_FAILED,
+                    error);
+        }
+        snapshot.setStatus(cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_FAILED);
+        snapshot.setLastError(error);
+        snapshot.setUpdatedAt(System.currentTimeMillis());
+        log.warn("[RunSnapshot] reconciled orphan RUNNING snapshot runId={} sessionId={}",
+                snapshot.getRunId(), snapshot.getSessionId());
+        return snapshot;
+    }
+
     /** 查用户的会话历史列表 */
     @RequestMapping(value = "run-snapshots", method = RequestMethod.GET)
     public Response<List<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot>> listRunSnapshots(
@@ -659,10 +753,17 @@ public class AiAgentController implements IAiAgentService {
                     .data(List.of())
                     .build();
         }
+        List<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot> snapshots =
+                runSnapshotService.listRecent(sessionId, limit != null ? limit : 10).stream()
+                        .map(this::reconcileRunLiveness)
+                        .toList();
+        // The list endpoint is metadata-only. Full timelines can be large and
+        // are fetched per visible run through /run-snapshots/{runId}.
+        snapshots.forEach(snapshot -> snapshot.setTimelineEvents(List.of()));
         return Response.<List<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot>>builder()
                 .code(ResponseCode.SUCCESS.getCode())
                 .info(ResponseCode.SUCCESS.getInfo())
-                .data(runSnapshotService.listRecent(sessionId, limit != null ? limit : 10))
+                .data(snapshots)
                 .build();
     }
 
@@ -677,7 +778,8 @@ public class AiAgentController implements IAiAgentService {
                     .data(null)
                     .build();
         }
-        java.util.Optional<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot> snapshot = runSnapshotService.find(runId);
+        java.util.Optional<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot> snapshot =
+                runSnapshotService.find(runId);
         if (snapshot.isEmpty() || (sessionId != null && !sessionId.isBlank() && !sessionId.equals(snapshot.get().getSessionId()))) {
             return Response.<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot>builder()
                     .code(ResponseCode.UN_ERROR.getCode())
@@ -685,11 +787,96 @@ public class AiAgentController implements IAiAgentService {
                     .data(null)
                     .build();
         }
+        cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot reconciled =
+                reconcileRunLiveness(snapshot.get());
         return Response.<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot>builder()
                 .code(ResponseCode.SUCCESS.getCode())
                 .info(ResponseCode.SUCCESS.getInfo())
-                .data(snapshot.get())
+                .data(reconciled)
                 .build();
+    }
+
+    /** Return the single active run for a session, if one still exists in Redis. */
+    @RequestMapping(value = "active-run", method = RequestMethod.GET)
+    public Response<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot> getActiveRun(
+            @RequestParam("sessionId") String sessionId) {
+        cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot active = null;
+        if (runSnapshotService != null && sessionId != null && !sessionId.isBlank()) {
+            active = runSnapshotService.listRecent(sessionId, 20).stream()
+                    .map(this::reconcileRunLiveness)
+                    .filter(snapshot -> cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_RUNNING
+                            .equals(snapshot.getStatus()))
+                    .findFirst()
+                    .orElse(null);
+        }
+        return Response.<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot>builder()
+                .code(ResponseCode.SUCCESS.getCode())
+                .info(ResponseCode.SUCCESS.getInfo())
+                .data(active)
+                .build();
+    }
+
+    /** Running Redis runs visible in the history panel before ChatMemory has a final turn. */
+    @RequestMapping(value = "active-runs", method = RequestMethod.GET)
+    public Response<List<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot>> getActiveRunsByUser(
+            @RequestParam("userId") String userId) {
+        List<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot> active =
+                runSnapshotService == null || userId == null || userId.isBlank()
+                        ? List.of()
+                        : runSnapshotService.listRecentByUser(userId, 50).stream()
+                        .map(this::reconcileRunLiveness)
+                        .filter(snapshot -> cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_RUNNING
+                                .equals(snapshot.getStatus()))
+                        .peek(snapshot -> snapshot.setTimelineEvents(List.of()))
+                        .toList();
+        return Response.<List<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot>>builder()
+                .code(ResponseCode.SUCCESS.getCode())
+                .info(ResponseCode.SUCCESS.getInfo())
+                .data(active)
+                .build();
+    }
+
+    /**
+     * Replay Redis Stream events after afterEventId, then stay attached for live
+     * events. Disconnecting this HTTP response never owns or cancels the run.
+     */
+    @RequestMapping(value = "runs/{runId}/stream", method = RequestMethod.GET,
+            produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public ResponseBodyEmitter reconnectRunStream(
+            @PathVariable("runId") String runId,
+            @RequestParam("sessionId") String sessionId,
+            @RequestParam(value = "afterEventId", required = false) String afterEventId,
+            HttpServletResponse response) {
+        if (runSnapshotService == null) {
+            throw new org.springframework.web.server.ResponseStatusException(
+                    org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE, "Run snapshot service is not available");
+        }
+        cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot snapshot =
+                runSnapshotService.find(runId).orElseThrow(() ->
+                        new org.springframework.web.server.ResponseStatusException(
+                                org.springframework.http.HttpStatus.NOT_FOUND, "run snapshot not found"));
+        if (sessionId == null || !sessionId.equals(snapshot.getSessionId())) {
+            throw new org.springframework.web.server.ResponseStatusException(
+                    org.springframework.http.HttpStatus.FORBIDDEN, "run does not belong to session");
+        }
+        snapshot = reconcileRunLiveness(snapshot);
+        response.setCharacterEncoding("UTF-8");
+        response.setHeader("Cache-Control", "no-cache");
+        response.setHeader("Connection", "keep-alive");
+        response.setHeader("X-Accel-Buffering", "no");
+        ResponseBodyEmitter emitter = new ResponseBodyEmitter(Long.MAX_VALUE);
+        runEventPublisher.attach(runId, sessionId, emitter, afterEventId);
+        // The run may finish after the first find() but before attach(). Read
+        // once more after attaching so a late subscriber cannot miss the only
+        // terminal completion signal and remain open forever.
+        java.util.Optional<cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot> latest =
+                runSnapshotService.find(runId).map(this::reconcileRunLiveness);
+        if (latest.isEmpty()
+                || !cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_RUNNING
+                .equals(latest.get().getStatus())) {
+            runEventPublisher.finishRun(runId);
+        }
+        return emitter;
     }
 
     @RequestMapping(value = "conversations", method = RequestMethod.GET)

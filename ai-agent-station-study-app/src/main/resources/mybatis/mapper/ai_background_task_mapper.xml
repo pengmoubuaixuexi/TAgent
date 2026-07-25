@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="cn.bugstack.ai.infrastructure.dao.IAiBackgroundTaskDao">
+
+    <resultMap id="TaskMap" type="cn.bugstack.ai.infrastructure.dao.po.AiBackgroundTask">
+        <id column="id" property="id"/>
+        <result column="task_id" property="taskId"/>
+        <result column="user_id" property="userId"/>
+        <result column="tenant_id" property="tenantId"/>
+        <result column="session_id" property="sessionId"/>
+        <result column="name" property="name"/>
+        <result column="task_type" property="taskType"/>
+        <result column="status" property="status"/>
+        <result column="trigger_config_json" property="triggerConfigJson"/>
+        <result column="action_prompt" property="actionPrompt"/>
+        <result column="action_agent_id" property="actionAgentId"/>
+        <result column="max_step" property="maxStep"/>
+        <result column="run_once" property="runOnce"/>
+        <result column="baseline_hash" property="baselineHash"/>
+        <result column="last_observed_hash" property="lastObservedHash"/>
+        <result column="observed_changed_at" property="observedChangedAt"/>
+        <result column="next_trigger_at" property="nextTriggerAt"/>
+        <result column="last_checked_at" property="lastCheckedAt"/>
+        <result column="last_triggered_at" property="lastTriggeredAt"/>
+        <result column="last_run_id" property="lastRunId"/>
+        <result column="draft_expires_at" property="draftExpiresAt"/>
+        <result column="last_error" property="lastError"/>
+        <result column="version" property="version"/>
+        <result column="created_at" property="createdAt"/>
+        <result column="updated_at" property="updatedAt"/>
+    </resultMap>
+
+    <resultMap id="ExecutionMap" type="cn.bugstack.ai.infrastructure.dao.po.AiBackgroundTaskExecution">
+        <id column="id" property="id"/>
+        <result column="execution_id" property="executionId"/>
+        <result column="task_id" property="taskId"/>
+        <result column="run_id" property="runId"/>
+        <result column="trigger_reason" property="triggerReason"/>
+        <result column="status" property="status"/>
+        <result column="started_at" property="startedAt"/>
+        <result column="finished_at" property="finishedAt"/>
+        <result column="error_message" property="errorMessage"/>
+        <result column="created_at" property="createdAt"/>
+        <result column="updated_at" property="updatedAt"/>
+    </resultMap>
+
+    <sql id="TaskColumns">
+        id, task_id, user_id, tenant_id, session_id, name, task_type, status,
+        trigger_config_json, action_prompt, action_agent_id, max_step, run_once,
+        baseline_hash, last_observed_hash, observed_changed_at, next_trigger_at,
+        last_checked_at, last_triggered_at, last_run_id, draft_expires_at,
+        last_error, version, created_at, updated_at
+    </sql>
+
+    <insert id="insertTask" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_background_task (
+            task_id, user_id, tenant_id, session_id, name, task_type, status,
+            trigger_config_json, action_prompt, action_agent_id, max_step, run_once,
+            next_trigger_at, draft_expires_at, created_at, updated_at
+        ) VALUES (
+            #{taskId}, #{userId}, #{tenantId}, #{sessionId}, #{name}, #{taskType}, #{status},
+            #{triggerConfigJson}, #{actionPrompt}, #{actionAgentId}, #{maxStep}, #{runOnce},
+            #{nextTriggerAt}, #{draftExpiresAt}, #{createdAt}, #{updatedAt}
+        )
+    </insert>
+
+    <select id="findOwned" resultMap="TaskMap">
+        SELECT <include refid="TaskColumns"/> FROM ai_background_task
+        WHERE task_id = #{taskId} AND user_id = #{userId} LIMIT 1
+    </select>
+
+    <select id="findByTaskId" resultMap="TaskMap">
+        SELECT <include refid="TaskColumns"/> FROM ai_background_task
+        WHERE task_id = #{taskId} LIMIT 1
+    </select>
+
+    <select id="findOwnedByReference" resultMap="TaskMap">
+        SELECT <include refid="TaskColumns"/> FROM ai_background_task
+        WHERE user_id = #{userId}
+          AND (
+            task_id = #{taskReference}
+            OR task_id LIKE CONCAT(#{taskReference}, '%')
+            OR name = #{taskReference}
+          )
+        ORDER BY updated_at DESC
+        LIMIT 1
+    </select>
+
+    <select id="listOwned" resultMap="TaskMap">
+        SELECT <include refid="TaskColumns"/> FROM ai_background_task
+        WHERE user_id = #{userId}
+        <if test="sessionId != null and sessionId != ''">AND session_id = #{sessionId}</if>
+        ORDER BY updated_at DESC
+        LIMIT #{limit}
+    </select>
+
+    <select id="findRunnable" resultMap="TaskMap">
+        SELECT <include refid="TaskColumns"/> FROM ai_background_task
+        WHERE status IN ('ACTIVE', 'WAITING_SESSION', 'RUNNING')
+        ORDER BY COALESCE(next_trigger_at, last_checked_at, created_at)
+        LIMIT #{limit}
+    </select>
+
+    <update id="activateDraft">
+        UPDATE ai_background_task
+        SET status = 'ACTIVE', baseline_hash = #{baselineHash}, last_observed_hash = NULL,
+            observed_changed_at = NULL, next_trigger_at = #{nextTriggerAt},
+            last_error = NULL, version = version + 1
+        WHERE task_id = #{taskId} AND user_id = #{userId} AND status = 'DRAFT'
+          AND draft_expires_at > CURRENT_TIMESTAMP(3)
+    </update>
+
+    <update id="updateStatusOwned">
+        UPDATE ai_background_task SET status = #{status}, last_error = #{lastError}, version = version + 1
+        WHERE task_id = #{taskId} AND user_id = #{userId}
+    </update>
+
+    <update id="updateStatus">
+        UPDATE ai_background_task SET status = #{status}, last_error = #{lastError}, version = version + 1
+        WHERE task_id = #{taskId}
+    </update>
+
+    <update id="updateDraftOwned">
+        UPDATE ai_background_task
+        SET name = #{name}, trigger_config_json = #{triggerConfigJson},
+            action_prompt = #{actionPrompt}, action_agent_id = #{actionAgentId},
+            max_step = #{maxStep}, run_once = #{runOnce}, status = 'DRAFT',
+            baseline_hash = NULL, last_observed_hash = NULL, observed_changed_at = NULL,
+            next_trigger_at = #{nextTriggerAt}, draft_expires_at = #{draftExpiresAt},
+            last_error = NULL, version = version + 1
+        WHERE task_id = #{taskId} AND user_id = #{userId}
+          AND status NOT IN ('RUNNING', 'COMPLETED', 'CANCELLED')
+    </update>
+
+    <update id="updateObservation">
+        UPDATE ai_background_task
+        SET last_observed_hash = #{lastObservedHash}, observed_changed_at = #{observedChangedAt},
+            last_checked_at = #{lastCheckedAt}, last_error = #{lastError}, version = version + 1
+        WHERE task_id = #{taskId} AND status IN ('ACTIVE', 'WAITING_SESSION')
+    </update>
+
+    <update id="markTriggered">
+        UPDATE ai_background_task
+        SET status = #{status}, last_run_id = #{runId}, last_triggered_at = #{lastTriggeredAt},
+            next_trigger_at = #{nextTriggerAt}, last_error = NULL, version = version + 1
+        WHERE task_id = #{taskId} AND status IN ('ACTIVE', 'WAITING_SESSION')
+    </update>
+
+    <update id="deferTriggered">
+        UPDATE ai_background_task
+        SET status = 'WAITING_SESSION', next_trigger_at = #{nextTriggerAt},
+            last_error = #{lastError}, version = version + 1
+        WHERE task_id = #{taskId} AND status = 'RUNNING' AND last_run_id = #{runId}
+    </update>
+
+    <update id="resetRecurringFileTask">
+        UPDATE ai_background_task
+        SET status = 'ACTIVE', baseline_hash = #{baselineHash}, last_observed_hash = NULL,
+            observed_changed_at = NULL, last_error = NULL, version = version + 1
+        WHERE task_id = #{taskId}
+    </update>
+
+    <insert id="insertExecution" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_background_task_execution (
+            execution_id, task_id, run_id, trigger_reason, status, started_at, created_at, updated_at
+        ) VALUES (
+            #{executionId}, #{taskId}, #{runId}, #{triggerReason}, #{status},
+            #{startedAt}, #{createdAt}, #{updatedAt}
+        )
+    </insert>
+
+    <update id="updateExecution">
+        UPDATE ai_background_task_execution
+        SET status = #{status}, finished_at = #{finishedAt},
+            error_message = #{errorMessage}, updated_at = CURRENT_TIMESTAMP(3)
+        WHERE run_id = #{runId}
+    </update>
+
+    <update id="markExecutionRunning">
+        UPDATE ai_background_task_execution
+        SET status = 'RUNNING', updated_at = CURRENT_TIMESTAMP(3)
+        WHERE run_id = #{runId} AND status = 'STARTING'
+    </update>
+
+    <select id="listExecutions" resultMap="ExecutionMap">
+        SELECT id, execution_id, task_id, run_id, trigger_reason, status,
+               started_at, finished_at, error_message, created_at, updated_at
+        FROM ai_background_task_execution
+        WHERE task_id = #{taskId}
+        ORDER BY created_at DESC
+        LIMIT #{limit}
+    </select>
+
+    <select id="findInFlightExecutions" resultMap="ExecutionMap">
+        SELECT id, execution_id, task_id, run_id, trigger_reason, status,
+               started_at, finished_at, error_message, created_at, updated_at
+        FROM ai_background_task_execution
+        WHERE status IN ('STARTING', 'RUNNING')
+        ORDER BY started_at
+        LIMIT #{limit}
+    </select>
+</mapper>

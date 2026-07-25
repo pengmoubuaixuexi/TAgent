@@ -1,25 +1,96 @@
 package cn.bugstack.ai.infrastructure.adapter.repository;
 
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.ProxySelector;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.Locale;
+import java.util.Map;
 
 @Component
 class RemoteImageDownloader {
 
     private static final int MAX_REDIRECTS = 3;
-    private final HttpClient client = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(10))
-            .followRedirects(HttpClient.Redirect.NEVER)
-            .build();
+    private final HttpClient client;
+
+    RemoteImageDownloader() {
+        this("", System.getenv());
+    }
+
+    RemoteImageDownloader(Map<String, String> environment) {
+        this("", environment);
+    }
+
+    @Autowired
+    RemoteImageDownloader(
+            @Value("${agent.multimodal.remote-image-proxy-url:}") String configuredProxyUrl) {
+        this(configuredProxyUrl, System.getenv());
+    }
+
+    RemoteImageDownloader(String configuredProxyUrl, Map<String, String> environment) {
+        this.client = buildClient(configuredProxyUrl, environment);
+    }
+
+    static HttpClient buildClient(Map<String, String> environment) {
+        return buildClient("", environment);
+    }
+
+    static HttpClient buildClient(String configuredProxyUrl, Map<String, String> environment) {
+        HttpClient.Builder builder = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .followRedirects(HttpClient.Redirect.NEVER);
+        ProxySelector proxySelector = proxySelector(configuredProxyUrl, environment);
+        if (proxySelector != null) {
+            builder.proxy(proxySelector);
+        }
+        return builder.build();
+    }
+
+    private static ProxySelector proxySelector(
+            String configuredProxyUrl,
+            Map<String, String> environment) {
+        String value = configuredProxyUrl == null || configuredProxyUrl.isBlank()
+                ? firstNonBlank(
+                        environment,
+                        "HTTPS_PROXY", "https_proxy",
+                        "HTTP_PROXY", "http_proxy")
+                : configuredProxyUrl;
+        if (value == null) return null;
+        try {
+            URI uri = URI.create(value.trim());
+            String scheme = uri.getScheme();
+            if (uri.getHost() == null
+                    || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))) {
+                return null;
+            }
+            int port = uri.getPort();
+            if (port < 0) {
+                port = "https".equalsIgnoreCase(scheme) ? 443 : 80;
+            }
+            return ProxySelector.of(new InetSocketAddress(uri.getHost(), port));
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static String firstNonBlank(Map<String, String> environment, String... names) {
+        if (environment == null) return null;
+        for (String name : names) {
+            String value = environment.get(name);
+            if (value != null && !value.isBlank()) return value;
+        }
+        return null;
+    }
 
     DownloadedImage download(String value, long maxBytes) {
         URI current = requirePublicHttpUri(value);

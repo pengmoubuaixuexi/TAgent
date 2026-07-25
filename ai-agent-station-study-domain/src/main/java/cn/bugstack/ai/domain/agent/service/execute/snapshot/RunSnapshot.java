@@ -1,5 +1,7 @@
 package cn.bugstack.ai.domain.agent.service.execute.snapshot;
 
+import cn.bugstack.ai.domain.agent.model.entity.ChatImageRef;
+import cn.bugstack.ai.domain.agent.service.execute.event.RunEventRecord;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -19,10 +21,14 @@ public class RunSnapshot {
 
     private String runId;
     private String sessionId;
+    /** Owner used only for listing this user's still-live Redis runs. */
+    private String userId;
     private String agentId;
     private String agentName;
     private String agentType;
     private String originalMessage;
+    /** Stable metadata only; never contains BASE64 bytes or expiring access URLs. */
+    private List<ChatImageRef> images;
     private String sourceRunId;
     private Integer redoFromStep;
     private String status;
@@ -50,4 +56,11 @@ public class RunSnapshot {
      * Redo 据此重新申请旧能力；这不是精确 tool identity 快照，常驻工具仍由 ensureArmed 装配。
      */
     private List<String> extraToolNeeds;
+
+    /** Compact projection of all events that were visible in the run UI. */
+    @Builder.Default
+    private List<RunEventRecord> timelineEvents = new ArrayList<>();
+
+    /** Redis Stream cursor already covered by {@link #timelineEvents}. */
+    private String lastEventId;
 }

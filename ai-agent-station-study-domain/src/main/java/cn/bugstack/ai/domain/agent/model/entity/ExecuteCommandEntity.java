@@ -24,7 +24,8 @@ public class ExecuteCommandEntity {
     private String message;
 
     /** Original images attached to this user turn. */
-    private List<ChatImageRef> images;
+    @Builder.Default
+    private List<ChatImageRef> images = List.of();
 
     private String sessionId;
 

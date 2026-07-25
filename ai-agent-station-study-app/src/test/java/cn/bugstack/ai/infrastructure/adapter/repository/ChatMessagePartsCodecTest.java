@@ -92,6 +92,14 @@ public class ChatMessagePartsCodecTest {
                         "https://i-blog.csdnimg.cn/direct/example.png#pic_center"));
     }
 
+    @Test
+    public void convertsGithubBlobImageToRawUrl() {
+        assertEquals(
+                "https://raw.githubusercontent.com/pengmoubuaixuexi/TAgent/main/docs/images/architecture.png",
+                ChatImageAttachmentService.normalizeHttpImageUrl(
+                        "https://github.com/pengmoubuaixuexi/TAgent/blob/main/docs/images/architecture.png"));
+    }
+
     private static final class StubAttachmentService implements IChatImageAttachmentService {
 
         private final ChatImageRef image;

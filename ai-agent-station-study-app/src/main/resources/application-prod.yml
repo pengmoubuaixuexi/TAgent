@@ -5,6 +5,7 @@ agent:
   multimodal:
     max-images: 4
     max-image-bytes: 10485760
+    remote-image-proxy-url: ${TAGENT_IMAGE_PROXY_URL:}
     oss:
       enabled: ${TAGENT_OSS_ENABLED:false}
       region: ${TAGENT_OSS_REGION:cn-beijing}

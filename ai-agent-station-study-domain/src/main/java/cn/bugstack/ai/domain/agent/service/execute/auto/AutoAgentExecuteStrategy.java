@@ -81,10 +81,6 @@ public class AutoAgentExecuteStrategy implements IExecuteStrategy {
         }
 
         // P2.2.4 Step 取消：SSE 客户端断开 / 超时 → 设 cancelled 标记，后续 step 跳过 LLM 调用省 token
-        emitter.onCompletion(dynamicContext::cancel);
-        emitter.onTimeout(dynamicContext::cancel);
-        emitter.onError(e -> dynamicContext.cancel());
-
         try {
             String apply = executeHandler.apply(executeCommandEntity, dynamicContext);
             log.info("测试结果:{}", apply);

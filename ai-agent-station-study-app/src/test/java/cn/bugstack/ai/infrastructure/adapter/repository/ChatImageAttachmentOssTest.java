@@ -7,13 +7,19 @@ import cn.bugstack.ai.infrastructure.dao.po.AiChatAttachment;
 import org.junit.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.net.InetSocketAddress;
+import java.net.Proxy;
+import java.net.URI;
+import java.net.http.HttpClient;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 public class ChatImageAttachmentOssTest {
 
@@ -53,6 +59,38 @@ public class ChatImageAttachmentOssTest {
     @Test(expected = IllegalArgumentException.class)
     public void remoteDownloaderRejectsLoopbackBeforeConnecting() {
         new RemoteImageDownloader().download("http://127.0.0.1/private.png", 1024);
+    }
+
+    @Test
+    public void remoteDownloaderUsesHttpsProxyFromEnvironment() {
+        HttpClient client = RemoteImageDownloader.buildClient(Map.of(
+                "HTTPS_PROXY", "http://127.0.0.1:7897",
+                "HTTP_PROXY", "http://127.0.0.1:7898"));
+
+        List<Proxy> proxies = client.proxy().orElseThrow()
+                .select(URI.create("https://raw.githubusercontent.com/example/image.png"));
+
+        assertEquals(1, proxies.size());
+        assertEquals(Proxy.Type.HTTP, proxies.get(0).type());
+        assertTrue(proxies.get(0).address() instanceof InetSocketAddress);
+        InetSocketAddress address = (InetSocketAddress) proxies.get(0).address();
+        assertEquals("127.0.0.1", address.getHostString());
+        assertEquals(7897, address.getPort());
+    }
+
+    @Test
+    public void configuredImageProxyOverridesEnvironment() {
+        HttpClient client = RemoteImageDownloader.buildClient(
+                "http://127.0.0.1:7896",
+                Map.of("HTTPS_PROXY", "http://127.0.0.1:7897"));
+
+        InetSocketAddress address = (InetSocketAddress) client.proxy().orElseThrow()
+                .select(URI.create("https://raw.githubusercontent.com/example/image.png"))
+                .get(0)
+                .address();
+
+        assertEquals("127.0.0.1", address.getHostString());
+        assertEquals(7896, address.getPort());
     }
 
     private ChatImageAttachmentService service(CapturingDao dao, FakeStorage storage) {

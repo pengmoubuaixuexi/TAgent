@@ -1,5 +1,6 @@
 package cn.bugstack.ai.domain.agent.service.execute.common;
 
+import cn.bugstack.ai.domain.agent.service.execute.event.RunEventPublisher;
 import cn.bugstack.ai.domain.agent.service.security.ApprovalChannelRegistry;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -50,6 +51,9 @@ public class MemoryEvidenceEmitter {
     @Resource
     private ApprovalChannelRegistry approvalChannelRegistry;
 
+    @Resource
+    private RunEventPublisher runEventPublisher;
+
     public MemoryEvidenceEmitter() {}
 
     public MemoryEvidenceEmitter(ApprovalChannelRegistry registry, boolean explainEnabled) {
@@ -69,7 +73,7 @@ public class MemoryEvidenceEmitter {
             if (sessionId == null || sessionId.isBlank()) return;
             if (profileLines == null || profileLines.isEmpty()) return;
             ResponseBodyEmitter emitter = lookupEmitter(sessionId);
-            if (emitter == null) return;
+            if (emitter == null && !hasRun(sessionId)) return;
 
             List<Map<String, Object>> items = new ArrayList<>(profileLines.size());
             for (String line : profileLines) {
@@ -95,7 +99,7 @@ public class MemoryEvidenceEmitter {
         try {
             if (sessionId == null || sessionId.isBlank()) return;
             ResponseBodyEmitter emitter = lookupEmitter(sessionId);
-            if (emitter == null) return;
+            if (emitter == null && !hasRun(sessionId)) return;
 
             List<Map<String, Object>> items = new ArrayList<>();
             if (currentSummary != null && !currentSummary.isBlank()) {
@@ -142,6 +146,10 @@ public class MemoryEvidenceEmitter {
         return approvalChannelRegistry.get(sessionId);
     }
 
+    private boolean hasRun(String sessionId) {
+        return runEventPublisher != null && runEventPublisher.currentRunId(sessionId) != null;
+    }
+
     private void sendEvent(String sessionId, String memoryType, List<Map<String, Object>> items, ResponseBodyEmitter emitter) {
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("sessionId", sessionId);
@@ -153,6 +161,10 @@ public class MemoryEvidenceEmitter {
             payload = MAPPER.writeValueAsString(data);
         } catch (JsonProcessingException e) {
             log.debug("[MemoryEvidence] json serialize failed sessionId={} err={}", sessionId, e.toString());
+            return;
+        }
+        if (hasRun(sessionId)) {
+            runEventPublisher.publishCurrent(sessionId, "memory_evidence", data);
             return;
         }
         try {

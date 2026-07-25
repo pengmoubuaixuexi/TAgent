@@ -1,5 +1,6 @@
 package cn.bugstack.ai.domain.agent.service.security;
 
+import cn.bugstack.ai.domain.agent.service.execute.event.RunEventPublisher;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -66,11 +67,14 @@ public class UserInputGate {
     @Value("${agent.user-input.max-asks:2}")
     private int maxAsks;
 
-    @Value("${agent.user-input.timeout-seconds:120}")
+    @Value("${agent.user-input.timeout-seconds:60}")
     private int timeoutSeconds;
 
     @Resource
     private ApprovalChannelRegistry approvalChannelRegistry;
+
+    @Resource
+    private RunEventPublisher runEventPublisher;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -120,9 +124,8 @@ public class UserInputGate {
     public Result requestUserInput(String sessionId, String argsJson, String stepLabel) {
         if (!enabled) return new Result(Status.UNAVAILABLE, null);
 
-        ResponseBodyEmitter emitter = approvalChannelRegistry.get(sessionId);
-        if (emitter == null) {
-            log.warn("[UserInput] channel missing sessionId={}, returning UNAVAILABLE", sessionId);
+        if (runEventPublisher.currentRunId(sessionId) == null) {
+            log.warn("[UserInput] active run missing sessionId={}, returning UNAVAILABLE", sessionId);
             return new Result(Status.UNAVAILABLE, null);
         }
 
@@ -139,13 +142,16 @@ public class UserInputGate {
         pendingInputs.put(inputId, future);
 
         try {
-            emitter.send("event: user_input_required\ndata: " + buildPayload(inputId, argsJson, stepLabel) + "\n\n");
+            runEventPublisher.publishCurrent(sessionId, "user_input_required",
+                    buildPayload(inputId, argsJson, stepLabel));
             log.info("[UserInput] requested inputId={} step={}", inputId, stepLabel);
             String answer = future.get(timeoutSeconds, TimeUnit.SECONDS);
             log.info("[UserInput] answered inputId={} len={}", inputId, answer != null ? answer.length() : 0);
+            publishResult(sessionId, inputId, "ANSWERED");
             return new Result(Status.ANSWERED, answer);
         } catch (TimeoutException e) {
             log.warn("[UserInput] timeout inputId={}", inputId);
+            publishResult(sessionId, inputId, "TIMEOUT");
             return new Result(Status.TIMEOUT, null);
         } catch (Exception e) {
             log.warn("[UserInput] failed inputId={}: {}", inputId, e.toString());
@@ -153,6 +159,13 @@ public class UserInputGate {
         } finally {
             pendingInputs.remove(inputId);
         }
+    }
+
+    private void publishResult(String sessionId, String inputId, String status) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("inputId", inputId);
+        payload.put("status", status);
+        runEventPublisher.publishCurrent(sessionId, "user_input_result", payload);
     }
 
     /** 前端回填入口（由 Controller 调用）。 */
@@ -187,6 +200,7 @@ public class UserInputGate {
             map.put("step", stepLabel);
         }
         map.put("timeoutSeconds", timeoutSeconds);
+        map.put("expiresAt", System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(timeoutSeconds));
         try {
             return MAPPER.writeValueAsString(map);
         } catch (JsonProcessingException e) {

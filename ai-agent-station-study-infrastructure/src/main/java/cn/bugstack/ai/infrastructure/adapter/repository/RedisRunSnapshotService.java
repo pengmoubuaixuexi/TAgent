@@ -1,6 +1,7 @@
 package cn.bugstack.ai.infrastructure.adapter.repository;
 
 import cn.bugstack.ai.domain.agent.model.entity.ExecuteCommandEntity;
+import cn.bugstack.ai.domain.agent.service.execute.event.RunEventRecord;
 import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot;
 import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService;
 import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunStepSnapshot;
@@ -36,6 +37,9 @@ public class RedisRunSnapshotService implements RunSnapshotService {
     @Value("${agent.run-snapshot.session-index-prefix:agent:run:snapshot:session:}")
     private String sessionIndexPrefix;
 
+    @Value("${agent.run-snapshot.user-index-prefix:agent:run:snapshot:user:}")
+    private String userIndexPrefix;
+
     @Value("${agent.run-snapshot.ttl-seconds:21600}")
     private long ttlSeconds;
 
@@ -45,6 +49,9 @@ public class RedisRunSnapshotService implements RunSnapshotService {
     @Value("${agent.run-snapshot.session-index-size:30}")
     private int sessionIndexSize;
 
+    @Value("${agent.run-snapshot.user-index-size:50}")
+    private int userIndexSize;
+
     @Override
     public void startRun(ExecuteCommandEntity request, String agentType, String agentName) {
         if (request == null || blank(request.getRunId())) {
@@ -52,17 +59,30 @@ public class RedisRunSnapshotService implements RunSnapshotService {
         }
         try {
             long now = System.currentTimeMillis();
-            RunSnapshot existing = find(request.getRunId()).orElse(null);
+            RunSnapshot existing = findMetadata(request.getRunId()).orElse(null);
             RunSnapshot snapshot = existing != null ? existing : RunSnapshot.builder()
                     .runId(request.getRunId())
                     .createdAt(now)
                     .steps(new ArrayList<>())
                     .build();
             snapshot.setSessionId(request.getSessionId());
+            snapshot.setUserId(request.getUserId());
             snapshot.setAgentId(request.getAiAgentId());
             snapshot.setAgentName(agentName);
             snapshot.setAgentType(agentType);
             snapshot.setOriginalMessage(request.getMessage());
+            snapshot.setImages(request.getImages() == null ? List.of() : request.getImages().stream()
+                    .filter(java.util.Objects::nonNull)
+                    .map(image -> cn.bugstack.ai.domain.agent.model.entity.ChatImageRef.builder()
+                            .attachmentId(image.getAttachmentId())
+                            .sourceType(image.getSourceType())
+                            .sourceUrl(image.getSourceUrl())
+                            .mimeType(image.getMimeType())
+                            .name(image.getName())
+                            .size(image.getSize())
+                            .sha256(image.getSha256())
+                            .build())
+                    .toList());
             snapshot.setSourceRunId(request.getSourceRunId());
             snapshot.setRedoFromStep(request.getRedoFromStep());
             snapshot.setStatus(STATUS_RUNNING);
@@ -71,6 +91,7 @@ public class RedisRunSnapshotService implements RunSnapshotService {
             snapshot.setExpiresAt(now + Math.max(60, ttlSeconds) * 1000L);
             save(snapshot);
             indexBySession(snapshot);
+            indexByUser(snapshot);
         } catch (Exception e) {
             log.warn("[RunSnapshot] startRun failed runId={} err={}", request.getRunId(), e.getMessage());
         }
@@ -78,6 +99,26 @@ public class RedisRunSnapshotService implements RunSnapshotService {
 
     @Override
     public Optional<RunSnapshot> find(String runId) {
+        Optional<RunSnapshot> metadata = findMetadata(runId);
+        if (metadata.isEmpty()) return metadata;
+        try {
+            RunSnapshot snapshot = metadata.get();
+            String timelineJson = stringRedisTemplate.opsForValue().get(timelineKey(runId));
+            if (!blank(timelineJson)) {
+                com.alibaba.fastjson.JSONObject timeline = JSON.parseObject(timelineJson);
+                snapshot.setTimelineEvents(timeline.getJSONArray("events") == null
+                        ? new ArrayList<>()
+                        : timeline.getJSONArray("events").toJavaList(RunEventRecord.class));
+                snapshot.setLastEventId(timeline.getString("lastEventId"));
+            }
+            return Optional.of(snapshot);
+        } catch (Exception e) {
+            log.warn("[RunSnapshot] timeline find failed runId={} err={}", runId, e.getMessage());
+            return metadata;
+        }
+    }
+
+    private Optional<RunSnapshot> findMetadata(String runId) {
         if (blank(runId)) {
             return Optional.empty();
         }
@@ -106,7 +147,7 @@ public class RedisRunSnapshotService implements RunSnapshotService {
             }
             List<RunSnapshot> result = new ArrayList<>();
             for (String runId : runIds) {
-                find(runId).ifPresent(snapshot -> {
+                findMetadata(runId).ifPresent(snapshot -> {
                     if (sessionId.equals(snapshot.getSessionId()) && result.size() < effectiveLimit) {
                         result.add(snapshot);
                     }
@@ -123,6 +164,36 @@ public class RedisRunSnapshotService implements RunSnapshotService {
     }
 
     @Override
+    public List<RunSnapshot> listRecentByUser(String userId, int limit) {
+        if (blank(userId)) {
+            return List.of();
+        }
+        int effectiveLimit = Math.max(1, Math.min(limit <= 0 ? 20 : limit, 50));
+        try {
+            List<String> runIds = stringRedisTemplate.opsForList()
+                    .range(userIndexKey(userId), 0, Math.max(0, userIndexSize - 1));
+            if (runIds == null || runIds.isEmpty()) {
+                return List.of();
+            }
+            List<RunSnapshot> result = new ArrayList<>();
+            for (String runId : runIds) {
+                findMetadata(runId).ifPresent(snapshot -> {
+                    if (userId.equals(snapshot.getUserId()) && result.size() < effectiveLimit) {
+                        result.add(snapshot);
+                    }
+                });
+                if (result.size() >= effectiveLimit) {
+                    break;
+                }
+            }
+            return result;
+        } catch (Exception e) {
+            log.warn("[RunSnapshot] listRecentByUser failed userId={} err={}", userId, e.getMessage());
+            return List.of();
+        }
+    }
+
+    @Override
     public void recordStep(String runId,
                            String stepId,
                            String title,
@@ -134,7 +205,7 @@ public class RedisRunSnapshotService implements RunSnapshotService {
             return;
         }
         try {
-            RunSnapshot snapshot = find(runId).orElseGet(() -> {
+            RunSnapshot snapshot = findMetadata(runId).orElseGet(() -> {
                 long now = System.currentTimeMillis();
                 return RunSnapshot.builder()
                         .runId(runId)
@@ -184,7 +255,7 @@ public class RedisRunSnapshotService implements RunSnapshotService {
             return;
         }
         try {
-            RunSnapshot snapshot = find(runId).orElse(null);
+            RunSnapshot snapshot = findMetadata(runId).orElse(null);
             if (snapshot == null) {
                 return;
             }
@@ -206,6 +277,28 @@ public class RedisRunSnapshotService implements RunSnapshotService {
     }
 
     @Override
+    public void recordTimeline(String runId, List<RunEventRecord> events, String lastEventId) {
+        if (blank(runId)) return;
+        try {
+            RunSnapshot snapshot = findMetadata(runId).orElse(null);
+            if (snapshot == null) return;
+            Map<String, Object> timeline = new LinkedHashMap<>();
+            timeline.put("events", events == null ? new ArrayList<>() : new ArrayList<>(events));
+            timeline.put("lastEventId", lastEventId);
+            timeline.put("updatedAt", System.currentTimeMillis());
+            long now = System.currentTimeMillis();
+            Long expiresAt = snapshot.getExpiresAt();
+            long ttlMillis = expiresAt != null ? expiresAt - now : Math.max(60, ttlSeconds) * 1000L;
+            if (ttlMillis > 0) {
+                stringRedisTemplate.opsForValue().set(
+                        timelineKey(runId), JSON.toJSONString(timeline), Duration.ofMillis(ttlMillis));
+            }
+        } catch (Exception error) {
+            log.warn("[RunSnapshot] recordTimeline failed runId={} err={}", runId, error.getMessage());
+        }
+    }
+
+    @Override
     public void recordFlowPlan(String runId,
                                Map<String, String> stepsMap,
                                Map<Integer, Set<Integer>> stepDependencies) {
@@ -213,7 +306,7 @@ public class RedisRunSnapshotService implements RunSnapshotService {
             return;
         }
         try {
-            RunSnapshot snapshot = find(runId).orElse(null);
+            RunSnapshot snapshot = findMetadata(runId).orElse(null);
             if (snapshot == null) {
                 return;
             }
@@ -253,7 +346,7 @@ public class RedisRunSnapshotService implements RunSnapshotService {
             return;
         }
         try {
-            RunSnapshot snapshot = find(runId).orElseGet(() -> {
+            RunSnapshot snapshot = findMetadata(runId).orElseGet(() -> {
                 long now = System.currentTimeMillis();
                 return RunSnapshot.builder()
                         .runId(runId)
@@ -301,7 +394,7 @@ public class RedisRunSnapshotService implements RunSnapshotService {
             return;
         }
         try {
-            RunSnapshot snapshot = find(runId).orElse(null);
+            RunSnapshot snapshot = findMetadata(runId).orElse(null);
             if (snapshot == null) {
                 return;
             }
@@ -316,7 +409,7 @@ public class RedisRunSnapshotService implements RunSnapshotService {
 
     @Override
     public Optional<String> buildRedoContext(String sourceRunId, Integer redoFromStep, String sessionId) {
-        RunSnapshot snapshot = find(sourceRunId).orElse(null);
+        RunSnapshot snapshot = findMetadata(sourceRunId).orElse(null);
         if (snapshot == null || !sameSession(snapshot, sessionId)) {
             return Optional.empty();
         }
@@ -365,7 +458,7 @@ public class RedisRunSnapshotService implements RunSnapshotService {
 
     @Override
     public Optional<String> buildRedoTargetStepContext(String sourceRunId, Integer redoFromStep, String sessionId) {
-        RunSnapshot snapshot = find(sourceRunId).orElse(null);
+        RunSnapshot snapshot = findMetadata(sourceRunId).orElse(null);
         if (snapshot == null || !sameSession(snapshot, sessionId)) {
             return Optional.empty();
         }
@@ -397,7 +490,7 @@ public class RedisRunSnapshotService implements RunSnapshotService {
 
     @Override
     public List<RunStepSnapshot> inheritedSteps(String sourceRunId, Integer redoFromStep, String sessionId) {
-        RunSnapshot snapshot = find(sourceRunId).orElse(null);
+        RunSnapshot snapshot = findMetadata(sourceRunId).orElse(null);
         if (snapshot == null || !sameSession(snapshot, sessionId)) {
             return List.of();
         }
@@ -518,7 +611,14 @@ public class RedisRunSnapshotService implements RunSnapshotService {
             stringRedisTemplate.delete(key(snapshot.getRunId()));
             return;
         }
-        stringRedisTemplate.opsForValue().set(key(snapshot.getRunId()), JSON.toJSONString(snapshot), Duration.ofMillis(ttlMillis));
+        com.alibaba.fastjson.JSONObject stored = (com.alibaba.fastjson.JSONObject) JSON.toJSON(snapshot);
+        // Timeline is updated far more frequently than execution metadata. Keep
+        // it in a sibling Redis value so token checkpoints cannot overwrite a
+        // concurrent status/step update (or vice versa).
+        stored.remove("timelineEvents");
+        stored.remove("lastEventId");
+        stringRedisTemplate.opsForValue().set(
+                key(snapshot.getRunId()), stored.toJSONString(), Duration.ofMillis(ttlMillis));
     }
 
     private void indexBySession(RunSnapshot snapshot) {
@@ -529,6 +629,17 @@ public class RedisRunSnapshotService implements RunSnapshotService {
         stringRedisTemplate.opsForList().remove(key, 0, snapshot.getRunId());
         stringRedisTemplate.opsForList().leftPush(key, snapshot.getRunId());
         stringRedisTemplate.opsForList().trim(key, 0, Math.max(0, sessionIndexSize - 1));
+        stringRedisTemplate.expire(key, Duration.ofSeconds(Math.max(60, ttlSeconds)));
+    }
+
+    private void indexByUser(RunSnapshot snapshot) {
+        if (snapshot == null || blank(snapshot.getUserId()) || blank(snapshot.getRunId())) {
+            return;
+        }
+        String key = userIndexKey(snapshot.getUserId());
+        stringRedisTemplate.opsForList().remove(key, 0, snapshot.getRunId());
+        stringRedisTemplate.opsForList().leftPush(key, snapshot.getRunId());
+        stringRedisTemplate.opsForList().trim(key, 0, Math.max(0, userIndexSize - 1));
         stringRedisTemplate.expire(key, Duration.ofSeconds(Math.max(60, ttlSeconds)));
     }
 
@@ -751,8 +862,16 @@ public class RedisRunSnapshotService implements RunSnapshotService {
         return keyPrefix + runId;
     }
 
+    private String timelineKey(String runId) {
+        return keyPrefix + "timeline:" + runId;
+    }
+
     private String sessionIndexKey(String sessionId) {
         return sessionIndexPrefix + sessionId;
+    }
+
+    private String userIndexKey(String userId) {
+        return userIndexPrefix + userId;
     }
 
     private boolean blank(String value) {
