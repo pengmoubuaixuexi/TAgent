@@ -199,7 +199,10 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             }
             log.error("第四步执行失败", e);
             recordTransition("flow_step4_execute_steps_failed", dynamicContext);
-            return "执行步骤失败: " + e.getMessage();
+            if (e instanceof RuntimeException) {
+                throw (RuntimeException) e;
+            }
+            throw new IllegalStateException("Flow Step4 execution failed: " + errorMessage(e), e);
         }
     }
 
@@ -243,26 +246,59 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             executeStepsAsDag(executorChatClient, stepsMap, stepNumbers,
                     deps != null ? deps : Collections.emptyMap(), dynamicContext, request);
         } else {
-            // 按顺序执行每个步骤
-            for (Integer stepNumber : stepNumbers) {
-                if (dynamicContext.isCancelled() || Thread.currentThread().isInterrupted()) {
-                    throw new CancellationException("execution cancelled before step " + stepNumber);
-                }
-                // 立即回答：停止调度剩余子步，已完成的产出交给 finalizeNow 整合
-                if (dynamicContext.isFinalizeRequested()) {
-                    log.info("[AnswerNow][flow] 串行执行中收到立即回答，停止调度第{}步及之后", stepNumber);
-                    break;
-                }
-                String stepKey = "第" + stepNumber + "步";
-                String stepContent = resolveStepContent(stepsMap, stepKey);
-                if (stepContent != null) {
-                    executeStep(executorChatClient, stepNumber, stepKey, stepContent, dynamicContext, request,
-                            deps != null ? deps.getOrDefault(stepNumber, Collections.emptySet())
-                                         : Collections.emptySet());
-                } else {
-                    log.warn("未找到步骤内容: {}", stepKey);
-                }
+            executeStepsSequentially(executorChatClient, stepsMap, stepNumbers,
+                    deps != null ? deps : Collections.emptyMap(), dynamicContext, request);
+        }
+    }
+
+    private void executeStepsSequentially(ChatClient executorChatClient,
+                                          Map<String, String> stepsMap,
+                                          List<Integer> stepNumbers,
+                                          Map<Integer, Set<Integer>> deps,
+                                          DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
+                                          ExecuteCommandEntity request) {
+        List<Integer> executionOrder = validateAndTopologicallySort(stepNumbers, deps);
+        Map<Integer, DagStepOutcome> outcomes = new LinkedHashMap<>();
+        for (Integer stepNumber : executionOrder) {
+            if (dynamicContext.isCancelled() || Thread.currentThread().isInterrupted()) {
+                throw new CancellationException("execution cancelled before step " + stepNumber);
             }
+            if (dynamicContext.isFinalizeRequested()) {
+                log.info("[AnswerNow][flow] 串行执行中收到立即回答，停止调度第{}步及之后", stepNumber);
+                break;
+            }
+            String stepKey = "第" + stepNumber + "步";
+            String stepContent = resolveStepContent(stepsMap, stepKey);
+            Set<Integer> blockers = deps.getOrDefault(stepNumber, Collections.emptySet()).stream()
+                    .filter(dependency -> {
+                        DagStepOutcome outcome = outcomes.get(dependency);
+                        return outcome != null && !outcome.isSuccessful();
+                    })
+                    .collect(java.util.stream.Collectors.toCollection(TreeSet::new));
+            if (!blockers.isEmpty()) {
+                outcomes.put(stepNumber, recordBlockedStep(
+                        stepNumber, stepKey, stepContent, blockers, dynamicContext));
+                continue;
+            }
+            if (stepContent == null) {
+                String message = "未找到步骤内容: " + stepKey;
+                recordFailedStep(stepNumber, stepKey, null, message, dynamicContext);
+                outcomes.put(stepNumber, DagStepOutcome.failed(stepNumber, message));
+                continue;
+            }
+            try {
+                executeStep(executorChatClient, stepNumber, stepKey, stepContent, dynamicContext, request,
+                        deps.getOrDefault(stepNumber, Collections.emptySet()));
+                outcomes.put(stepNumber, DagStepOutcome.succeeded(stepNumber));
+            } catch (FlowStepExecutionException e) {
+                outcomes.put(stepNumber, DagStepOutcome.failed(stepNumber, errorMessage(e)));
+            }
+        }
+        List<DagStepOutcome> unsuccessful = outcomes.values().stream()
+                .filter(outcome -> !outcome.isSuccessful())
+                .toList();
+        if (!dynamicContext.isFinalizeRequested() && !unsuccessful.isEmpty()) {
+            throw new FlowDagExecutionException("Flow sequential execution failed: " + unsuccessful);
         }
     }
 
@@ -282,60 +318,55 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                                     ExecuteCommandEntity request) {
         // 2026-05-29 依赖驱动调度（取代旧的"整层屏障"）：每个步骤"自己的依赖一完成就启动"，
         // 不再等同层最慢的步骤。例：1、3 同为起始层，1 先完成 → 依赖 1 的 2 立刻开跑，不必等 3。
-        // 用 Kahn 拓扑序保证构建 future 时其依赖的 future 已存在；有环的节点排不进拓扑序 → 末尾串行兜底，绝不卡死。
+        // 用 Kahn 拓扑序保证构建 future 时其依赖的 future 已存在；非法依赖/环必须在任何子步骤启动前失败。
         // 上下文接力由 dagExecutor 内部统一处理（DagExecutorConfig.wrap）。
-        java.util.Map<Integer, CompletableFuture<Void>> futures = new java.util.HashMap<>();
+        java.util.Map<Integer, CompletableFuture<DagStepOutcome>> futures = new java.util.HashMap<>();
 
-        // 1. Kahn 拓扑排序（仅统计落在 stepNumbers 内的依赖）
-        java.util.Map<Integer, Integer> indegree = new java.util.HashMap<>();
-        for (Integer n : stepNumbers) {
-            int cnt = 0;
-            for (Integer d : deps.getOrDefault(n, Collections.emptySet())) {
-                if (stepNumbers.contains(d)) cnt++;
-            }
-            indegree.put(n, cnt);
-        }
-        java.util.Deque<Integer> queue = new java.util.ArrayDeque<>();
-        for (Integer n : stepNumbers) if (indegree.get(n) == 0) queue.add(n);
-        List<Integer> topoOrder = new ArrayList<>();
-        while (!queue.isEmpty()) {
-            Integer n = queue.poll();
-            topoOrder.add(n);
-            for (Integer m : stepNumbers) {
-                if (deps.getOrDefault(m, Collections.emptySet()).contains(n)) {
-                    int left = indegree.get(m) - 1;
-                    indegree.put(m, left);
-                    if (left == 0) queue.add(m);
-                }
-            }
-        }
+        // 1. 先完成整图校验。不能执行一半后才发现环，也不能把非法 DAG 静默改成串行语义。
+        List<Integer> topoOrder = validateAndTopologicallySort(stepNumbers, deps);
 
-        // 2. 按拓扑序为每步建 future：allOf(依赖的 future).thenRunAsync(执行该步)。
+        // 2. 按拓扑序为每步建 future：依赖 Future 结束后还要检查业务结果，不能把 FAILED 当成成功完成。
         //    依赖一旦全部完成就立即在 dagExecutor 上启动，无整层屏障。
         for (Integer n : topoOrder) {
             final Integer stepNumber = n;
             final Set<Integer> d = deps.getOrDefault(n, Collections.emptySet());
-            CompletableFuture<?>[] depFutures = d.stream()
-                    .map(futures::get).filter(java.util.Objects::nonNull)
-                    .toArray(CompletableFuture[]::new);
+            final Map<Integer, CompletableFuture<DagStepOutcome>> dependencyFutures = new LinkedHashMap<>();
+            for (Integer dependency : d) {
+                dependencyFutures.put(dependency, futures.get(dependency));
+            }
+            CompletableFuture<?>[] depFutures = dependencyFutures.values().toArray(new CompletableFuture[0]);
             final String stepKey = "第" + n + "步";
             final String stepContent = resolveStepContent(stepsMap, stepKey);
-            CompletableFuture<Void> f = CompletableFuture.allOf(depFutures).thenRunAsync(() -> {
+            CompletableFuture<DagStepOutcome> f = CompletableFuture.allOf(depFutures).thenApplyAsync(ignored -> {
                 MDC.put("step", "flow_step4_dag_" + stepNumber);
                 try {
                     if (dynamicContext.isCancelled() || Thread.currentThread().isInterrupted()) {
                         throw new CancellationException("execution cancelled before step " + stepNumber);
                     }
+                    if (dynamicContext.isFinalizeRequested()) {
+                        return DagStepOutcome.skipped(stepNumber);
+                    }
+                    Set<Integer> blockers = dependencyFutures.entrySet().stream()
+                            .filter(entry -> !entry.getValue().join().isSuccessful())
+                            .map(Map.Entry::getKey)
+                            .collect(java.util.stream.Collectors.toCollection(TreeSet::new));
+                    if (!blockers.isEmpty()) {
+                        return recordBlockedStep(stepNumber, stepKey, stepContent, blockers, dynamicContext);
+                    }
                     // 立即回答：已触发则未启动的子步直接跳过，让 future 快速完成，控制权尽快回到 finalizeNow
                     if (stepContent != null && !dynamicContext.isFinalizeRequested()) {
                         executeStep(executorChatClient, stepNumber, stepKey, stepContent, dynamicContext, request, d);
+                        return DagStepOutcome.succeeded(stepNumber);
                     }
+                    String message = "未找到步骤内容: " + stepKey;
+                    recordFailedStep(stepNumber, stepKey, stepContent, message, dynamicContext);
+                    return DagStepOutcome.failed(stepNumber, message);
                 } catch (CancellationException e) {
                     log.info("[Cancel] DAG step {} skipped/cancelled: {}", stepNumber, e.getMessage());
                     throw e;
-                } catch (Exception e) {
-                    // 单步失败不阻断依赖它的后续步骤（与旧行为一致：失败也视为"完成"）
+                } catch (FlowStepExecutionException e) {
                     log.error("[DAG] 第{}步 执行异常: {}", stepNumber, e.toString());
+                    return DagStepOutcome.failed(stepNumber, errorMessage(e));
                 } finally {
                     MDC.remove("step");
                 }
@@ -344,28 +375,178 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             log.info("[DAG] 调度 第{}步 依赖={}（依赖完成即启动，无整层屏障）", n, d.isEmpty() ? "无" : d);
         }
 
-        // 3. 环/无法拓扑排序的节点 → 等已调度的跑完后串行兜底，不卡死
-        List<Integer> unscheduled = new ArrayList<>();
-        for (Integer n : stepNumbers) if (!futures.containsKey(n)) unscheduled.add(n);
-        if (!unscheduled.isEmpty()) {
-            log.warn("[DAG] 检测到环/无法满足的依赖，剩余步骤 {} 退化为串行执行", unscheduled);
-            CompletableFuture.allOf(futures.values().toArray(new CompletableFuture[0])).join();
-            for (Integer n : unscheduled) {
-                if (dynamicContext.isCancelled() || Thread.currentThread().isInterrupted()) {
-                    throw new CancellationException("execution cancelled before fallback step " + n);
+        // 3. 等全部分支到达终态；独立分支可以完成，但只要存在 FAILED/BLOCKED，整个 Flow 必须向上抛失败。
+        CompletableFuture.allOf(futures.values().toArray(new CompletableFuture[0])).join();
+        List<DagStepOutcome> unsuccessful = futures.values().stream()
+                .map(CompletableFuture::join)
+                .filter(outcome -> !outcome.isSuccessful() && outcome.status != DagStepStatus.SKIPPED)
+                .sorted(Comparator.comparingInt(outcome -> outcome.stepNumber))
+                .toList();
+        if (!dynamicContext.isFinalizeRequested() && !unsuccessful.isEmpty()) {
+            throw new FlowDagExecutionException("Flow DAG execution failed: " + unsuccessful);
+        }
+    }
+
+    private static List<Integer> validateAndTopologicallySort(List<Integer> stepNumbers,
+                                                               Map<Integer, Set<Integer>> deps) {
+        LinkedHashSet<Integer> nodes = new LinkedHashSet<>(stepNumbers != null ? stepNumbers : List.of());
+        if (nodes.size() != (stepNumbers != null ? stepNumbers.size() : 0)) {
+            throw new InvalidFlowDagException("Flow plan contains duplicate step numbers");
+        }
+        Map<Integer, Integer> indegree = new LinkedHashMap<>();
+        Map<Integer, List<Integer>> outgoing = new LinkedHashMap<>();
+        for (Integer node : nodes) {
+            indegree.put(node, 0);
+            outgoing.put(node, new ArrayList<>());
+        }
+        for (Integer node : nodes) {
+            for (Integer dependency : deps.getOrDefault(node, Collections.emptySet())) {
+                if (!nodes.contains(dependency)) {
+                    throw new InvalidFlowDagException(
+                            "Flow step " + node + " depends on missing step " + dependency);
                 }
-                String stepKey = "第" + n + "步";
-                String stepContent = resolveStepContent(stepsMap, stepKey);
-                if (stepContent != null) {
-                    executeStep(executorChatClient, n, stepKey, stepContent, dynamicContext, request,
-                            deps.getOrDefault(n, Collections.emptySet()));
-                }
+                indegree.put(node, indegree.get(node) + 1);
+                outgoing.get(dependency).add(node);
             }
-            return;
+        }
+        Deque<Integer> ready = new ArrayDeque<>();
+        for (Integer node : nodes) {
+            if (indegree.get(node) == 0) ready.addLast(node);
+        }
+        List<Integer> order = new ArrayList<>();
+        while (!ready.isEmpty()) {
+            Integer node = ready.removeFirst();
+            order.add(node);
+            for (Integer next : outgoing.getOrDefault(node, List.of())) {
+                int remaining = indegree.get(next) - 1;
+                indegree.put(next, remaining);
+                if (remaining == 0) ready.addLast(next);
+            }
+        }
+        if (order.size() != nodes.size()) {
+            List<Integer> cyclicSteps = nodes.stream()
+                    .filter(node -> indegree.getOrDefault(node, 0) > 0)
+                    .sorted()
+                    .toList();
+            throw new InvalidFlowDagException(
+                    "Flow plan dependencies contain a cycle: " + cyclicSteps);
+        }
+        return order;
+    }
+
+    private DagStepOutcome recordBlockedStep(Integer stepNumber,
+                                             String stepKey,
+                                             String stepContent,
+                                             Set<Integer> blockers,
+                                             DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext) {
+        String message = stepKey + " 已阻断：依赖步骤 " + blockers + " 未成功";
+        dynamicContext.setValue("step" + stepNumber + "Status", "BLOCKED");
+        dynamicContext.setValue("step" + stepNumber + "BlockedBy", new TreeSet<>(blockers));
+        recordRunStep(dynamicContext,
+                "flow_step4_execute_step_" + stepNumber,
+                displayNameForStep(dynamicContext, stepNumber, stepKey),
+                "flow_step4_execution",
+                stepNumber,
+                message + (stepContent == null || stepContent.isBlank() ? "" : "\n" + stepContent),
+                cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_BLOCKED);
+        sendStepEnd(dynamicContext,
+                "flow_step4_execute_step_" + stepNumber,
+                message,
+                "blocked",
+                dynamicContext.getValue("sessionId"));
+        log.warn("[DAG] 第{}步 BLOCKED blockers={}", stepNumber, blockers);
+        return DagStepOutcome.blocked(stepNumber, blockers);
+    }
+
+    private void recordFailedStep(Integer stepNumber,
+                                  String stepKey,
+                                  String stepContent,
+                                  String error,
+                                  DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext) {
+        String message = stepKey + " 执行失败: " + error;
+        recordRunStep(dynamicContext,
+                "flow_step4_execute_step_" + stepNumber,
+                displayNameForStep(dynamicContext, stepNumber, stepKey),
+                "flow_step4_execution",
+                stepNumber,
+                message + (stepContent == null || stepContent.isBlank() ? "" : "\n" + stepContent),
+                cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_FAILED);
+        sendStepEnd(dynamicContext,
+                "flow_step4_execute_step_" + stepNumber,
+                message,
+                "failed",
+                dynamicContext.getValue("sessionId"));
+    }
+
+    private static String errorMessage(Throwable error) {
+        if (error == null) return "unknown error";
+        if (error.getMessage() != null && !error.getMessage().isBlank()) return error.getMessage();
+        if (error.getCause() != null && error.getCause().getMessage() != null
+                && !error.getCause().getMessage().isBlank()) return error.getCause().getMessage();
+        return error.getClass().getSimpleName();
+    }
+
+    private enum DagStepStatus {
+        SUCCEEDED, FAILED, BLOCKED, SKIPPED
+    }
+
+    private static final class DagStepOutcome {
+        private final int stepNumber;
+        private final DagStepStatus status;
+        private final Set<Integer> blockers;
+        private final String error;
+
+        private DagStepOutcome(int stepNumber, DagStepStatus status, Set<Integer> blockers, String error) {
+            this.stepNumber = stepNumber;
+            this.status = status;
+            this.blockers = blockers == null ? Set.of() : Set.copyOf(blockers);
+            this.error = error;
         }
 
-        // 4. 等全部步骤完成（final synthesis 在 doApply 中 DAG 之后才执行）
-        CompletableFuture.allOf(futures.values().toArray(new CompletableFuture[0])).join();
+        private static DagStepOutcome succeeded(int stepNumber) {
+            return new DagStepOutcome(stepNumber, DagStepStatus.SUCCEEDED, Set.of(), null);
+        }
+
+        private static DagStepOutcome failed(int stepNumber, String error) {
+            return new DagStepOutcome(stepNumber, DagStepStatus.FAILED, Set.of(), error);
+        }
+
+        private static DagStepOutcome blocked(int stepNumber, Set<Integer> blockers) {
+            return new DagStepOutcome(stepNumber, DagStepStatus.BLOCKED, blockers, null);
+        }
+
+        private static DagStepOutcome skipped(int stepNumber) {
+            return new DagStepOutcome(stepNumber, DagStepStatus.SKIPPED, Set.of(), null);
+        }
+
+        private boolean isSuccessful() {
+            return status == DagStepStatus.SUCCEEDED;
+        }
+
+        @Override
+        public String toString() {
+            return "step=" + stepNumber + ", status=" + status
+                    + (blockers.isEmpty() ? "" : ", blockers=" + blockers)
+                    + (error == null || error.isBlank() ? "" : ", error=" + error);
+        }
+    }
+
+    private static final class InvalidFlowDagException extends RuntimeException {
+        private InvalidFlowDagException(String message) {
+            super(message);
+        }
+    }
+
+    private static final class FlowDagExecutionException extends RuntimeException {
+        private FlowDagExecutionException(String message) {
+            super(message);
+        }
+    }
+
+    private static final class FlowStepExecutionException extends RuntimeException {
+        private FlowStepExecutionException(int stepNumber, String message, Throwable cause) {
+            super("Flow step " + stepNumber + " failed: " + message, cause);
+        }
     }
 
     // 旧的 executeStepsInParallel 已被 executeStepsAsDag 替代（2026-05-07）
@@ -531,11 +712,14 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             if (dynamicContext.isCancelled() || Thread.currentThread().isInterrupted()) {
                 throw new CancellationException("execution cancelled during step " + stepNumber);
             }
-            log.error("执行步骤 {} 时发生错误: {}", stepNumber, e.getMessage());
-            dynamicContext.setValue("step" + stepNumber + "Error", e.getMessage());
+            String message = errorMessage(e);
+            log.error("执行步骤 {} 时发生错误: {}", stepNumber, message);
+            dynamicContext.setValue("step" + stepNumber + "Error", message);
 
-            // 记录错误但继续执行下一步
+            // SSE 错误结果可能被投影成普通 execution，故最后必须显式以 FAILED 覆盖持久步骤终态。
             handleStepExecutionError(stepNumber, stepKey, e, dynamicContext);
+            recordFailedStep(stepNumber, stepKey, stepContent, message, dynamicContext);
+            throw new FlowStepExecutionException(stepNumber, message, e);
         }
 
         log.info("--- 完成执行 {} ---", stepKey);

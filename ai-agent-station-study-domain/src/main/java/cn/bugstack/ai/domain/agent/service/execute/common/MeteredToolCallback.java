@@ -293,15 +293,19 @@ public class MeteredToolCallback implements ToolCallback {
         // H3-A：sessionId 已在 call() 入口经 resolveSessionId(toolContext) 解析（ToolContext 优先、MDC 兜底），
         // 不再直接读 MDC——流式/DAG 线程上 MDC 为空会让进度事件和审批门一起失效。null/blank → emitter 内部跳过。
         ToolCallProgressEmitter progress = this.toolCallProgressEmitter;
-        if (progress != null) {
-            progress.emitStart(sessionId, name, effectiveInput, stepLabel);
-        }
+        boolean progressStarted = false;
+        long progressStartedAt = start;
         // H3-A：finally 阶段用此字段决定 emit end 的 status；catch 改写为 error。
         String progressStatus = STATUS_SUCCESS;
         // 2026-05-20：把 rawResult 提到 finally 之外，让 ES trace 拿到未经 normalize/truncate 的真实响应
         String rawResultForTrace = null;
         try {
             if (isBlockedGithubWriteTool(name)) {
+                if (progress != null) {
+                    progressStartedAt = System.currentTimeMillis();
+                    progress.emitStart(sessionId, name, effectiveInput, stepLabel);
+                    progressStarted = true;
+                }
                 String result = toolBlockedResult(name);
                 rawResultChars = result.length();
                 returnedResultChars = result.length();
@@ -330,6 +334,14 @@ public class MeteredToolCallback implements ToolCallback {
                     progressStatus = approvalDecisionToStatus(decision);
                     return result;
                 }
+            }
+
+            // 审批只是执行前的人机交互，不属于工具调用。只有审批通过（或本工具无需审批）后，
+            // 才开始发布工具进度；拒绝/超时/通道不可用都不会产生 tool_call 卡片。
+            if (progress != null) {
+                progressStartedAt = System.currentTimeMillis();
+                progress.emitStart(sessionId, name, effectiveInput, stepLabel);
+                progressStarted = true;
             }
 
             // 方案A：同 mcpId 串行，防并行 step 并发写同一条 MCP 连接（高德 400 "Sending message failed"）
@@ -365,6 +377,9 @@ public class MeteredToolCallback implements ToolCallback {
             throw e;
         } finally {
             long latency = System.currentTimeMillis() - start;
+            long progressLatency = progressStarted
+                    ? Math.max(0L, System.currentTimeMillis() - progressStartedAt)
+                    : latency;
             metrics.recordCall(name, latency, success);
             if (rawResultChars >= 0) {
                 metrics.recordResultSize(name, rawResultChars, resultLimited);
@@ -403,13 +418,13 @@ public class MeteredToolCallback implements ToolCallback {
             }
             // H3-A：emit 进度终态事件。放在 MDC 清理之后避免 emit 失败影响 MDC；
             // emitter 内部对 null sessionId / null emitter / 序列化异常都吞掉，不影响调用方。
-            if (progress != null) {
+            if (progress != null && progressStarted) {
                 if (STATUS_ERROR.equals(progressStatus)) {
-                    progress.emitError(sessionId, name, summarizeFailure(failure), latency, stepLabel);
+                    progress.emitError(sessionId, name, summarizeFailure(failure), progressLatency, stepLabel);
                 } else {
                     // 2026-06-22 评估采集：把工具真实返回(rawResultForTrace=未 normalize/截断 的原始响应)透给 emitter；
                     // emitter 端按 agent.tool-progress.result-preview.enabled 决定是否落进 SSE(默认关,生产不推)。
-                    progress.emitEnd(sessionId, name, progressStatus, latency,
+                    progress.emitEnd(sessionId, name, progressStatus, progressLatency,
                             returnedResultChars >= 0 ? returnedResultChars : 0, stepLabel, null, rawResultForTrace);
                 }
             }

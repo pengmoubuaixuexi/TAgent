@@ -47,7 +47,7 @@ public final class RuntimeToolPromptComposer {
         StringBuilder sb = new StringBuilder("\n\n## 本阶段可用的元工具（例外）\n");
         sb.append("本阶段不执行用户的实际任务，但下列元工具属于例外、可按需调用（调用它们不算执行用户任务）：\n");
         if (askUserAvailable) {
-            sb.append("- ask_user：关键信息缺失、或对用户意图有多种合理理解需用户拍板时，向用户提问澄清（一次把问题问全）。\n");
+            sb.append("- ask_user：关键信息缺失、或对用户意图有多种合理理解需用户拍板时，向用户提问澄清（一次把问题问全）；存在明确互斥答案时给出 2-4 个快捷选项并允许自由文本，无法可靠枚举时不必提供选项。\n");
         }
         if (requestToolAvailable) {
             sb.append("- request_tool：发现完成任务需要当前工具列表里没有的能力时，在 needs 里逐条用一句话描述所缺能力，预先装载真实工具供后续步骤使用。\n");

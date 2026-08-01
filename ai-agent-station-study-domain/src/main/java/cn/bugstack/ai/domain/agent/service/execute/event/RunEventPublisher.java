@@ -2,6 +2,7 @@ package cn.bugstack.ai.domain.agent.service.execute.event;
 
 import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot;
 import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService;
+import cn.bugstack.ai.domain.agent.service.notification.RunNotificationProjector;
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONObject;
 import lombok.extern.slf4j.Slf4j;
@@ -31,6 +32,9 @@ public class RunEventPublisher {
 
     @Autowired(required = false)
     private RunSnapshotService runSnapshotService;
+
+    @Autowired(required = false)
+    private RunNotificationProjector notificationProjector;
 
     private final ConcurrentHashMap<String, CopyOnWriteArrayList<Subscriber>> subscribers = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, TimelineAccumulator> timelines = new ConcurrentHashMap<>();
@@ -86,6 +90,10 @@ public class RunEventPublisher {
                     .payloadJson(payloadJson)
                     .createdAt(System.currentTimeMillis())
                     .build();
+        }
+
+        if (notificationProjector != null) {
+            notificationProjector.project(runId, sessionId, eventType, payloadJson);
         }
 
         timeline(runId).append(record);

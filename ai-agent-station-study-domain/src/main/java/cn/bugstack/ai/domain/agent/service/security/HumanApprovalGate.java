@@ -204,10 +204,8 @@ public class HumanApprovalGate {
      * @param approvalId 审批 ID
      * @param approved true=批准
      */
-    public void resolveApproval(String approvalId, boolean approved) {
+    public boolean resolveApproval(String approvalId, boolean approved) {
         CompletableFuture<Boolean> future = pendingApprovals.get(approvalId);
-        if (future != null) {
-            future.complete(approved);
-        }
+        return future != null && future.complete(approved);
     }
 }

@@ -36,6 +36,10 @@
   .step-card.pending .step-head .step-status::before { content:'⌛ '; }
   .step-card.running .step-head .step-status::before { content:'⏳ '; }
   .step-card.done .step-head .step-status::before { content:'✓ '; color:#10b981; }
+  .step-card.failed { border-color:#7f1d1d; }
+  .step-card.failed .step-head .step-status::before { content:'✕ '; color:#ef4444; }
+  .step-card.blocked { border-color:#78350f; }
+  .step-card.blocked .step-head .step-status::before { content:'⊘ '; color:#f59e0b; }
   .step-body { padding:8px 12px; background:#0f172a; font-size:13px; color:#cbd5e1; max-height:300px; overflow-y:auto; word-break:break-word; }
   .tool-card { border:1px solid #374151; border-radius:8px; margin:6px 0; overflow:hidden; background:#0b1120; }
   .tool-card .tool-head { display:flex; align-items:center; gap:8px; padding:6px 10px; background:#111827; font-size:12px; color:#9ca3af; cursor:pointer; user-select:none; }
@@ -145,10 +149,36 @@
 <!-- ==================== CHAT SCREEN ==================== -->
 <div id="chatScreen" class="hidden h-screen flex flex-col">
   <!-- Header -->
-  <header class="bg-gray-900 border-b border-gray-800 px-4 py-3 flex items-center justify-between shrink-0">
+  <header class="relative bg-gray-900 border-b border-gray-800 px-4 py-3 flex items-center justify-between shrink-0">
     <div class="flex items-center gap-3">
       <span class="text-blue-400 font-bold text-lg">AI Agent Station</span>
       <span class="text-xs bg-gray-800 text-gray-400 px-2 py-1 rounded">v2.0</span>
+      <div class="relative">
+        <button id="notificationBell" type="button" onclick="toggleNotificationCenter(event)" title="通知中心"
+          class="relative w-8 h-8 rounded-lg border border-gray-800 bg-gray-950/60 text-gray-400 hover:text-white hover:border-gray-700 flex items-center justify-center transition">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"></path>
+            <path d="M10 21h4"></path>
+          </svg>
+          <span id="notificationBadge" class="hidden absolute -right-1 -top-1 min-w-4 h-4 px-1 rounded-full bg-blue-500 text-[10px] leading-4 text-white font-semibold text-center"></span>
+        </button>
+        <div id="notificationPanel" class="hidden absolute left-0 top-10 z-[70] w-[390px] max-w-[calc(100vw-2rem)] bg-[#0b1120] border border-gray-700 rounded-xl shadow-2xl overflow-hidden" onclick="event.stopPropagation()">
+          <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
+            <div>
+              <div class="text-sm font-semibold text-gray-100">通知中心</div>
+              <div id="notificationPanelSummary" class="text-[11px] text-gray-500 mt-0.5">正在加载...</div>
+            </div>
+            <button type="button" onclick="refreshNotifications()" class="text-xs text-gray-500 hover:text-blue-300">刷新</button>
+          </div>
+          <div class="px-3 pt-2 flex gap-2 text-xs">
+            <button id="notificationPendingTab" type="button" onclick="setNotificationFilter('pending')" class="px-2.5 py-1.5 rounded-md bg-blue-600/20 text-blue-200 border border-blue-700/60">待处理</button>
+            <button id="notificationAllTab" type="button" onclick="setNotificationFilter('all')" class="px-2.5 py-1.5 rounded-md text-gray-400 border border-transparent hover:border-gray-700">全部</button>
+          </div>
+          <div id="notificationList" class="max-h-[65vh] overflow-y-auto p-3 space-y-2 scrollbar">
+            <div class="text-xs text-gray-500 text-center py-8">正在加载...</div>
+          </div>
+        </div>
+      </div>
     </div>
     <div class="flex items-center gap-3">
       <!-- Agent Selector -->
@@ -324,6 +354,10 @@
           <div class="text-xs text-gray-500 mb-1">AI 想了解</div>
           <ul id="userInputQuestions" class="text-sm text-gray-100 bg-gray-950 border border-gray-800 rounded-lg p-3 space-y-1.5 max-h-56 overflow-auto list-disc list-inside"></ul>
         </div>
+        <div id="userInputOptionsWrap" class="hidden space-y-2">
+          <div class="text-xs text-gray-500">快捷选择（选择后仍可修改文本）</div>
+          <div id="userInputOptions" class="space-y-3"></div>
+        </div>
         <div>
           <div class="text-xs text-gray-500 mb-1">你的回答（可回答问题，也可补充信息或调整需求）</div>
           <textarea id="userInputAnswer" rows="4" class="w-full text-sm text-gray-100 bg-gray-950 border border-gray-800 rounded-lg p-3 focus:outline-none focus:border-indigo-600 resize-none" placeholder="自由输入..."></textarea>
@@ -410,7 +444,11 @@ let state = {
   userCancelling: false,
   finalizing: false,
   runUiGeneration: 0,
-  backgroundTasks: []
+  backgroundTasks: [],
+  notifications: [],
+  notificationFilter: 'all',
+  notificationTimer: null,
+  userInputSelections: {}
 };
 
 // ==================== INIT ====================
@@ -481,6 +519,7 @@ function showLoginError(msg) {
 
 function doLogout() {
   detachObservedRunUi();
+  stopNotificationPolling();
   try { localStorage.removeItem(pendingFlowPlanStorageKey()); } catch (e) {}
   try { localStorage.removeItem(activeConversationStorageKey()); } catch (e) {}
   localStorage.removeItem('agent_login');
@@ -499,6 +538,8 @@ async function showChat() {
   document.getElementById('userDisplay').textContent = state.username;
   document.getElementById('userAvatar').textContent = (state.username || 'U')[0].toUpperCase();
   await loadAgents();
+  await refreshNotifications();
+  startNotificationPolling();
   const pendingPlan = loadPendingFlowPlan();
   if (pendingPlan) {
     await restorePendingFlowPlanAfterRefresh(pendingPlan);
@@ -511,6 +552,296 @@ async function showChat() {
   }
   newSession({ preservePendingPlan: true });
 }
+
+// ==================== NOTIFICATION CENTER ====================
+function notificationHeaders(extra = {}) {
+  return { 'X-User-Id': String(state.userId || ''), ...extra };
+}
+
+function startNotificationPolling() {
+  stopNotificationPolling();
+  state.notificationTimer = setInterval(() => refreshNotifications(true), 15000);
+}
+
+function stopNotificationPolling() {
+  if (state.notificationTimer) {
+    clearInterval(state.notificationTimer);
+    state.notificationTimer = null;
+  }
+}
+
+function toggleNotificationCenter(event) {
+  if (event) event.stopPropagation();
+  const panel = document.getElementById('notificationPanel');
+  if (!panel) return;
+  panel.classList.toggle('hidden');
+  if (!panel.classList.contains('hidden')) refreshNotifications(true);
+}
+
+function setNotificationFilter(filter) {
+  state.notificationFilter = filter === 'all' ? 'all' : 'pending';
+  renderNotifications();
+}
+
+async function refreshNotifications(silent = false) {
+  if (!state.userId) return;
+  const list = document.getElementById('notificationList');
+  if (!silent && list && !state.notifications.length) {
+    list.innerHTML = '<div class="text-xs text-gray-500 text-center py-8">正在加载...</div>';
+  }
+  try {
+    const res = await fetch(`${API}/notifications?limit=100&includeArchived=false`, {
+      headers: notificationHeaders()
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.code !== '0000') throw new Error(body.info || `HTTP ${res.status}`);
+    state.notifications = Array.isArray(body.data) ? body.data : [];
+    renderNotifications();
+  } catch (e) {
+    if (!silent && list) {
+      list.innerHTML = `<div class="text-xs text-red-300 text-center py-8">通知加载失败：${escapeHtml(e.message || '')}</div>`;
+    }
+  }
+}
+
+function notificationEffectiveStatus(item) {
+  const raw = String((item && item.status) || '').toUpperCase();
+  const waiting = raw === 'WAITING' || raw === 'PLAN_REVIEW' || raw === 'PENDING';
+  if (waiting && item && item.expiresAt && Number(item.expiresAt) <= Date.now()) return 'EXPIRED';
+  return raw || 'WAITING';
+}
+
+function notificationIsPending(item) {
+  const status = notificationEffectiveStatus(item);
+  return status === 'WAITING' || status === 'PLAN_REVIEW' || status === 'PENDING';
+}
+
+function notificationIsCurrentSessionInteraction(item) {
+  if (!item || !notificationIsPending(item)) return false;
+  const type = String(item.type || '').toUpperCase();
+  if (!['ASK_USER', 'TOOL_APPROVAL', 'PLAN_REVIEW'].includes(type)) return false;
+  const notificationSessionId = String(item.sessionId || '').trim();
+  const currentSessionId = String(state.sessionId || '').trim();
+  return !!notificationSessionId && !!currentSessionId && notificationSessionId === currentSessionId;
+}
+
+function notificationVisibleInInbox(item) {
+  // 交互仍由后端持久化；当前会话已经有原位弹窗/计划卡片时，铃铛暂不重复提醒。
+  // 切换会话后 state.sessionId 改变，未处理通知会自然重新进入收件箱。
+  return !notificationIsCurrentSessionInteraction(item);
+}
+
+function notificationVisual(item) {
+  const status = notificationEffectiveStatus(item);
+  const type = String((item && item.type) || '').toUpperCase();
+  if (status === 'EXPIRED') return { color:'#d97706', label:'已过期', icon:'⌛' };
+  if (status === 'TASK_FAILED' || type === 'TASK_FAILED' || status === 'FAILED') return { color:'#dc2626', label:'执行失败', icon:'✕' };
+  if (status === 'TASK_COMPLETED' || type === 'TASK_COMPLETED' || status === 'RESOLVED' || status === 'COMPLETED') {
+    return { color:'#059669', label:type === 'TASK_COMPLETED' ? '已完成' : '已处理', icon:'✓' };
+  }
+  if (type === 'PLAN_REVIEW') return { color:'#2563eb', label:'待确认', icon:'▣' };
+  if (type === 'TOOL_APPROVAL') return { color:'#2563eb', label:'待审批', icon:'🛡' };
+  return { color:'#2563eb', label:'待回答', icon:'?' };
+}
+
+function notificationTimeText(item) {
+  const status = notificationEffectiveStatus(item);
+  if (notificationIsPending(item) && item.expiresAt) {
+    const left = Math.max(0, Math.ceil((Number(item.expiresAt) - Date.now()) / 1000));
+    if (left < 60) return `还剩 ${left} 秒`;
+    if (left < 3600) return `还剩 ${Math.ceil(left / 60)} 分钟`;
+    return `有效至 ${new Date(Number(item.expiresAt)).toLocaleString()}`;
+  }
+  if (status === 'EXPIRED') return '原交互已失效';
+  const time = Number(item.updatedAt || item.createdAt || 0);
+  return time ? new Date(time).toLocaleString() : '';
+}
+
+function renderNotifications() {
+  const all = Array.isArray(state.notifications) ? state.notifications : [];
+  const inbox = all.filter(notificationVisibleInInbox);
+  const unread = inbox.filter(item => String(item.readStatus || 'UNREAD').toUpperCase() === 'UNREAD').length;
+  const pending = inbox.filter(notificationIsPending).length;
+  const badge = document.getElementById('notificationBadge');
+  if (badge) {
+    badge.textContent = unread > 99 ? '99+' : String(unread);
+    badge.classList.toggle('hidden', unread <= 0);
+  }
+  const summary = document.getElementById('notificationPanelSummary');
+  if (summary) summary.textContent = `${pending} 条待处理 · ${unread} 条未确认`;
+  const pendingTab = document.getElementById('notificationPendingTab');
+  const allTab = document.getElementById('notificationAllTab');
+  if (pendingTab) {
+    pendingTab.textContent = `待处理 ${pending}`;
+    pendingTab.className = state.notificationFilter === 'pending'
+      ? 'px-2.5 py-1.5 rounded-md bg-blue-600/20 text-blue-200 border border-blue-700/60'
+      : 'px-2.5 py-1.5 rounded-md text-gray-400 border border-transparent hover:border-gray-700';
+  }
+  if (allTab) {
+    allTab.className = state.notificationFilter === 'all'
+      ? 'px-2.5 py-1.5 rounded-md bg-blue-600/20 text-blue-200 border border-blue-700/60'
+      : 'px-2.5 py-1.5 rounded-md text-gray-400 border border-transparent hover:border-gray-700';
+  }
+
+  const visible = (state.notificationFilter === 'pending' ? inbox.filter(notificationIsPending) : inbox)
+    .slice().sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+  const list = document.getElementById('notificationList');
+  if (!list) return;
+  if (!visible.length) {
+    list.innerHTML = `<div class="text-xs text-gray-500 text-center py-8">${state.notificationFilter === 'pending' ? '暂时没有待处理事项' : '暂时没有通知'}</div>`;
+    return;
+  }
+  list.innerHTML = visible.map(item => {
+    const visual = notificationVisual(item);
+    const unreadItem = String(item.readStatus || 'UNREAD').toUpperCase() === 'UNREAD';
+    const acknowledged = String(item.readStatus || '').toUpperCase() === 'ACKNOWLEDGED';
+    return `<div data-notification-id="${escapeHtml(item.notificationId || '')}" onclick="openNotification('${escapeHtml(item.notificationId || '')}')"
+      class="group relative cursor-pointer rounded-lg border bg-gray-950/70 px-3 py-2.5 hover:bg-gray-900 transition" style="border-color:${visual.color}">
+      <div class="flex items-start gap-2.5">
+        <div class="mt-0.5 w-5 h-5 rounded-full flex items-center justify-center text-xs" style="color:${visual.color};border:1px solid ${visual.color}">${visual.icon}</div>
+        <div class="min-w-0 flex-1 pr-7">
+          <div class="text-sm ${unreadItem ? 'text-gray-100 font-medium' : 'text-gray-300'} leading-5">${escapeHtml(item.title || 'Agent 通知')}</div>
+          <div class="text-xs text-gray-500 mt-0.5 truncate">${escapeHtml(item.summary || '')}</div>
+          <div class="mt-1.5 flex items-center gap-2 text-[11px]">
+            <span style="color:${visual.color}">${visual.label}</span>
+            <span class="text-gray-600">${escapeHtml(notificationTimeText(item))}</span>
+            ${acknowledged ? '<span class="text-emerald-400">✓ 已收到</span>' : ''}
+          </div>
+        </div>
+        <button type="button" onclick="ackNotification(event, '${escapeHtml(item.notificationId || '')}')" title="收到，但不跳转"
+          class="absolute right-2 top-2 w-6 h-6 rounded-md text-gray-600 hover:text-emerald-300 hover:bg-emerald-900/30 ${unreadItem ? 'opacity-0 group-hover:opacity-100' : 'opacity-100'} transition">✓</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function ackNotification(event, notificationId) {
+  if (event) event.stopPropagation();
+  const item = state.notifications.find(value => String(value.notificationId) === String(notificationId));
+  if (!item || String(item.readStatus).toUpperCase() === 'ACKNOWLEDGED') return;
+  try {
+    const res = await fetch(`${API}/notifications/${encodeURIComponent(notificationId)}/ack`, {
+      method: 'POST', headers: notificationHeaders()
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.code !== '0000') throw new Error(body.info || `HTTP ${res.status}`);
+    item.readStatus = 'ACKNOWLEDGED';
+    item.acknowledgedAt = Date.now();
+    renderNotifications();
+  } catch (e) {
+    showNotificationToast(`确认通知失败：${e.message || ''}`, true);
+  }
+}
+
+async function openNotification(notificationId) {
+  const item = state.notifications.find(value => String(value.notificationId) === String(notificationId));
+  if (!item) return;
+  await ackNotification(null, notificationId);
+  const panel = document.getElementById('notificationPanel');
+  if (panel) panel.classList.add('hidden');
+  if (!item.sessionId) {
+    showNotificationToast('这条通知没有关联会话，无法跳转。', true);
+    return;
+  }
+  const loaded = await loadConversation(conversationIdForSession(item.sessionId));
+  if (!loaded) {
+    showNotificationToast('关联会话加载失败。', true);
+    return;
+  }
+  setTimeout(() => focusNotificationTarget(item), 80);
+}
+
+function focusNotificationTarget(item) {
+  const area = document.getElementById('messageArea');
+  if (!area || !item) return;
+  const runId = String(item.runId || '');
+  const refId = String(item.referenceId || '');
+  const type = String(item.type || '').toUpperCase();
+  const metadata = notificationMetadata(item);
+  let target = null;
+  if (type === 'PLAN_REVIEW') {
+    target = [...area.querySelectorAll('[data-plan-review-card="true"]')]
+      .find(card => !runId || String(card.dataset.runId || '') === runId) || null;
+    if (!target && runId && Array.isArray(metadata.steps)) {
+      const payload = {
+        runId,
+        sessionId:item.sessionId,
+        agentId:metadata.agentId,
+        steps:metadata.steps,
+        expiresAt:item.expiresAt,
+        status:notificationEffectiveStatus(item) === 'EXPIRED' ? 'EXPIRED' : 'PENDING'
+      };
+      const aiMsg = addMessage('assistant', '', false, metadata.agentId, runId);
+      const msgContent = aiMsg.querySelector('.msg-content');
+      msgContent.innerHTML = '<div class="steps-container"></div><div class="final-answer mt-3"></div>';
+      createRestoredPlanReviewRow(payload, aiMsg, msgContent.querySelector('.steps-container'));
+      target = msgContent.querySelector('[data-plan-review-card="true"]');
+    }
+    if (target && notificationEffectiveStatus(item) !== 'EXPIRED') {
+      const head = target.querySelector('.tool-head');
+      if (head) head.click();
+    }
+  }
+  if (!target && refId) {
+    target = [...area.querySelectorAll('[data-interaction-id]')]
+      .find(card => String(card.dataset.interactionId || '') === refId) || null;
+  }
+  if (!target && runId) {
+    target = [...area.querySelectorAll('[data-run-id]')]
+      .find(node => String(node.dataset.runId || '') === runId) || null;
+  }
+  if (type === 'ASK_USER' && notificationIsPending(item) && refId) {
+    showUserInput({
+      inputId:refId,
+      step:item.stepId,
+      expiresAt:item.expiresAt,
+      context:metadata.context,
+      questions:Array.isArray(metadata.questions) ? metadata.questions : [],
+      questionDetails:Array.isArray(metadata.questionDetails) ? metadata.questionDetails : []
+    });
+  } else if (type === 'TOOL_APPROVAL' && notificationIsPending(item) && refId) {
+    enqueueApproval({
+      approvalId:refId,
+      step:item.stepId,
+      expiresAt:item.expiresAt,
+      toolName:metadata.toolName,
+      toolInput:metadata.toolInput
+    });
+  }
+  if (target) {
+    target.scrollIntoView({ behavior:'smooth', block:'center' });
+    target.animate([{boxShadow:'0 0 0 0 rgba(59,130,246,0)'}, {boxShadow:'0 0 0 3px rgba(59,130,246,.65)'}, {boxShadow:'0 0 0 0 rgba(59,130,246,0)'}], {duration:1300});
+  }
+  if (notificationEffectiveStatus(item) === 'EXPIRED') {
+    showNotificationToast('该人工交互已经过期，原 Run 已继续或结束；这里只定位历史位置，不能再提交原请求。');
+  }
+}
+
+function notificationMetadata(item) {
+  if (!item || !item.metadata) return {};
+  if (typeof item.metadata === 'object') return item.metadata;
+  try { return JSON.parse(item.metadata); } catch (e) { return {}; }
+}
+
+function showNotificationToast(message, error = false) {
+  let toast = document.getElementById('notificationToast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'notificationToast';
+    toast.className = 'fixed top-20 left-1/2 -translate-x-1/2 z-[90] max-w-xl rounded-lg border px-4 py-2.5 text-sm shadow-2xl';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = message;
+  toast.className = `fixed top-20 left-1/2 -translate-x-1/2 z-[90] max-w-xl rounded-lg border px-4 py-2.5 text-sm shadow-2xl ${error ? 'bg-red-950 border-red-700 text-red-200' : 'bg-gray-900 border-blue-700 text-gray-200'}`;
+  toast.classList.remove('hidden');
+  clearTimeout(toast._hideTimer);
+  toast._hideTimer = setTimeout(() => toast.classList.add('hidden'), 4200);
+}
+
+document.addEventListener('click', () => {
+  const panel = document.getElementById('notificationPanel');
+  if (panel) panel.classList.add('hidden');
+});
 
 async function loadAgents() {
   try {
@@ -551,6 +882,7 @@ function newSession(options = {}) {
   state.sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
   document.getElementById('sessionInfo').textContent = 'Session: ' + state.sessionId.substring(0, 28) + '...';
   saveActiveConversation(state.sessionId);
+  renderNotifications();
   document.getElementById('messageArea').innerHTML =
     '<div class="text-center text-gray-600 text-sm py-8"><p class="text-4xl mb-3">🆕</p><p>新会话已开始</p></div>';
 }
@@ -683,6 +1015,7 @@ async function restorePendingFlowPlanAfterRefresh(payload = null) {
     state.sessionId = sessionId;
     document.getElementById('sessionInfo').textContent = 'Session: ' + state.sessionId.substring(0, 28) + '...';
     saveActiveConversation(sessionId, conversationId);
+    renderNotifications();
     document.getElementById('messageArea').innerHTML = '';
   }
 
@@ -1336,8 +1669,10 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
     } else if (curEvent === 'step_end') {
       const card = stepBuffers[payload.stepId];
       if (card) {
-        card.card.classList.remove('running');
-        card.card.classList.add('done', 'collapsed');
+        const terminalClass = payload.status === 'failed' ? 'failed'
+          : (payload.status === 'blocked' ? 'blocked' : 'done');
+        card.card.classList.remove('pending', 'running', 'done', 'failed', 'blocked');
+        card.card.classList.add(terminalClass, 'collapsed');
         const status = card.card.querySelector('.step-status');
         if (status) status.textContent = payload.summary || ((card.displayName || payload.stepId) + ' 已完成');
       }
@@ -3118,8 +3453,10 @@ async function sendMessage() {
         const sid = payload.stepId;
         const card = stepBuffers[sid];
         if (card) {
-          card.card.classList.remove('running');
-          card.card.classList.add('done', 'collapsed');
+          const terminalClass = payload.status === 'failed' ? 'failed'
+            : (payload.status === 'blocked' ? 'blocked' : 'done');
+          card.card.classList.remove('pending', 'running', 'done', 'failed', 'blocked');
+          card.card.classList.add(terminalClass, 'collapsed');
           card.card.querySelector('.step-status').textContent = payload.summary || (card.displayName + ' 已完成');
         }
       } else if (curEvent === 'ack') {
@@ -3593,6 +3930,7 @@ async function submitApproval(approved) {
 function showUserInput(payload) {
   if (!payload || !payload.inputId) return;
   state.pendingUserInput = payload;
+  state.userInputSelections = {};
 
   const stepWrap = document.getElementById('userInputStepWrap');
   const stepEl = document.getElementById('userInputStep');
@@ -3618,6 +3956,8 @@ function showUserInput(payload) {
     qWrap.classList.add('hidden');
   }
 
+  renderUserInputOptions(payload);
+
   const ta = document.getElementById('userInputAnswer');
   ta.value = '';
   setUserInputStatus('', '');
@@ -3634,6 +3974,71 @@ function showUserInput(payload) {
   } else {
     document.getElementById('userInputCountdown').textContent = '';
   }
+}
+
+function renderUserInputOptions(payload) {
+  const wrap = document.getElementById('userInputOptionsWrap');
+  const root = document.getElementById('userInputOptions');
+  if (!wrap || !root) return;
+  root.innerHTML = '';
+  const details = Array.isArray(payload && payload.questionDetails) ? payload.questionDetails : [];
+  const groups = details.filter(detail => detail && Array.isArray(detail.options) && detail.options.length > 0);
+  if (!groups.length) {
+    wrap.classList.add('hidden');
+    return;
+  }
+  groups.forEach((detail, index) => {
+    const key = String(detail.id || index);
+    const group = document.createElement('div');
+    group.className = 'rounded-lg border border-indigo-900/70 bg-indigo-950/20 p-2.5';
+    const title = document.createElement('div');
+    title.className = 'text-xs text-indigo-200 mb-2';
+    title.textContent = detail.question || detail.prompt || `问题 ${index + 1}`;
+    group.appendChild(title);
+    const buttons = document.createElement('div');
+    buttons.className = 'flex flex-wrap gap-2';
+    detail.options.forEach(rawOption => {
+      const option = typeof rawOption === 'string' ? { label:rawOption, value:rawOption } : (rawOption || {});
+      const label = String(option.label || option.value || '').trim();
+      if (!label) return;
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.dataset.questionKey = key;
+      button.className = 'text-xs text-indigo-100 border border-indigo-700/70 bg-indigo-950/50 hover:bg-indigo-900/70 rounded-full px-3 py-1.5 transition';
+      button.textContent = label;
+      if (option.description) button.title = String(option.description);
+      button.addEventListener('click', () => selectUserInputOption(detail, option, key, button));
+      buttons.appendChild(button);
+    });
+    group.appendChild(buttons);
+    if (detail.allowFreeText !== false) {
+      const hint = document.createElement('div');
+      hint.className = 'text-[11px] text-gray-500 mt-2';
+      hint.textContent = '也可以在下方自由输入或修改选择内容';
+      group.appendChild(hint);
+    }
+    root.appendChild(group);
+  });
+  wrap.classList.remove('hidden');
+}
+
+function selectUserInputOption(detail, option, key, button) {
+  const label = String((option && (option.value || option.label)) || '').trim();
+  if (!label) return;
+  const question = String((detail && (detail.question || detail.prompt)) || '').trim();
+  state.userInputSelections[key] = { question, answer:label };
+  document.querySelectorAll(`#userInputOptions [data-question-key="${CSS.escape(String(key))}"]`).forEach(node => {
+    node.classList.remove('bg-indigo-600', 'border-indigo-400', 'text-white');
+  });
+  button.classList.add('bg-indigo-600', 'border-indigo-400', 'text-white');
+  const selections = Object.values(state.userInputSelections);
+  const answer = selections.length === 1
+    ? selections[0].answer
+    : selections.map(value => value.question ? `${value.question}：${value.answer}` : value.answer).join('\n');
+  const textarea = document.getElementById('userInputAnswer');
+  textarea.value = answer;
+  textarea.focus();
+  textarea.setSelectionRange(textarea.value.length, textarea.value.length);
 }
 
 function updateUserInputCountdown(deadline) {
@@ -3917,14 +4322,19 @@ function timelineStep(view, payload, status) {
     view.stepById[stepId] = entry;
   }
   if (status === 'running') {
-    entry.card.classList.remove('pending', 'done');
+    entry.card.classList.remove('pending', 'done', 'failed', 'blocked');
     entry.card.classList.add('running');
     entry.card.querySelector('.step-status').textContent = '执行中';
   } else if (status === 'done') {
-    entry.card.classList.remove('pending', 'running');
+    entry.card.classList.remove('pending', 'running', 'failed', 'blocked');
     entry.card.classList.add('done', 'collapsed');
     entry.card.querySelector('.step-status').textContent =
       (payload && payload.summary) || '已完成';
+  } else if (status === 'failed' || status === 'blocked') {
+    entry.card.classList.remove('pending', 'running', 'done', 'failed', 'blocked');
+    entry.card.classList.add(status, 'collapsed');
+    entry.card.querySelector('.step-status').textContent =
+      (payload && payload.summary) || (status === 'failed' ? '执行失败' : '依赖阻断');
   }
   return entry;
 }
@@ -4154,27 +4564,18 @@ function timelineInteraction(view, eventType, payload) {
     const existing = view.interactionById[id];
     if (existing) {
       existing.resolved = true;
-      existing.card.querySelector('.tool-status').textContent =
-        payload.status === 'TIMEOUT' ? '已超时' : (payload.status === 'APPROVED' || payload.status === 'ANSWERED' ? '已处理' : '已拒绝');
-      existing.card.classList.remove('running');
-      existing.card.classList.add(payload.status === 'TIMEOUT' ? 'error' : 'success', 'collapsed');
+      if (existing.card) {
+        existing.card.querySelector('.tool-status').textContent =
+          payload.status === 'TIMEOUT' ? '已超时' : (payload.status === 'ANSWERED' ? '已处理' : '已拒绝');
+        existing.card.classList.remove('running');
+        existing.card.classList.add(payload.status === 'TIMEOUT' ? 'error' : 'success', 'collapsed');
+      }
     }
     return;
   }
-  const card = document.createElement('div');
-  card.className = 'tool-card running fade-in';
-  const isApproval = eventType === 'human_approval_required';
-  card.innerHTML = `
-    <div class="tool-head"><span class="tool-chev">▶</span>
-      <span class="tool-action">${isApproval ? '等待审批' : '等待用户补充'}</span>
-      <span class="tool-name">${escapeHtml(payload.toolName || payload.step || '')}</span>
-      <span class="tool-summary"></span><span class="tool-status">等待中</span></div>
-    <div class="tool-body"><pre class="text-xs whitespace-pre-wrap">${escapeHtml(
-      String(isApproval ? (payload.toolInput || '') : ((payload.questions || []).join('\n') || payload.context || payload.raw || ''))
-    )}</pre></div>`;
-  card.querySelector('.tool-head').addEventListener('click', () => card.classList.toggle('collapsed'));
-  view.steps.appendChild(card);
-  view.interactionById[id] = {card, payload, eventType, resolved: false};
+  // 审批与 ask_user 都属于人工交互，只由弹窗和通知中心承载。保留 pending 状态
+  // 供刷新后恢复，但绝不能伪装成工具调用卡片。
+  view.interactionById[id] = {card: null, payload, eventType, resolved: false};
 }
 
 function applyRunTimelineEvent(view, eventType, payload, eventId, interactive) {
@@ -4204,7 +4605,11 @@ function applyRunTimelineEvent(view, eventType, payload, eventId, interactive) {
     const step = timelineStep(view, payload, 'running');
     if (payload && payload.token !== '[DONE]') step.buf += payload.token || '';
     step.body.innerHTML = renderMarkdown(step.buf);
-  } else if (eventType === 'step_end') timelineStep(view, payload, 'done');
+  } else if (eventType === 'step_end') {
+    const terminalStatus = payload && payload.status === 'failed' ? 'failed'
+      : (payload && payload.status === 'blocked' ? 'blocked' : 'done');
+    timelineStep(view, payload, terminalStatus);
+  }
   else if (eventType === 'tool_call_start') timelineToolCard(view, payload, 'running', '');
   else if (eventType === 'tool_call_end') timelineToolCard(view, payload, payload.status || 'success', '');
   else if (eventType === 'tool_call_error') timelineToolCard(view, payload, 'error', payload.error || '');
@@ -4695,6 +5100,7 @@ async function loadConversation(conversationId, options = {}) {
   detachObservedRunUi();
   state.sessionId = targetSessionId;
   document.getElementById('sessionInfo').textContent = 'Session: ' + state.sessionId.substring(0, 28) + '...';
+  renderNotifications();
   if (options.keepHistoryPanelHidden !== false) {
     document.getElementById('historyPanel').classList.add('hidden');
   }

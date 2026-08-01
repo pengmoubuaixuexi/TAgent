@@ -88,11 +88,24 @@ public class RobustToolCallingManager implements ToolCallingManager {
     private static final ToolDefinition ASK_USER_DEFINITION = ToolDefinition.builder()
             .name(ASK_USER_TOOL_NAME)
             .description("当你缺少完成任务所必需的关键信息，或对用户意图存在多种合理理解、需要用户拍板时，调用本工具向用户提问。"
-                    + "请把所有需要澄清的问题一次性放进 questions 数组问全，不要逐条反复追问；questions 里每条必须是一个具体、可直接回答的问题，不要写笼统含糊的话。"
+                    + "请把所有需要澄清的问题一次性放进 questions 数组问全，不要逐条反复追问；每条必须是一个具体、可直接回答的问题，不要写笼统含糊的话。"
+                    + "当问题存在明确且互斥的常见答案时，优先给出 2-4 个具体 options 作为快捷选择，并保持 allowFreeText=true，让用户仍可输入选项之外的答案；"
+                    + "若信息不足以可靠枚举选项，则不要猜测，可省略 options。选项只是帮助用户快速作答，不能代替用户最终以文本形式提交的回答。"
                     + "用户会以自由文本回答（可能直接回答、也可能补充信息或调整需求），其回答会作为本工具的结果返回给你，请据此继续完成任务。")
             .inputSchema("{\"type\":\"object\",\"properties\":{"
                     + "\"context\":{\"type\":\"string\",\"description\":\"可选。向用户说明你为什么需要这些信息，或你目前的理解，便于用户作答\"},"
-                    + "\"questions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"要问用户的问题列表，每条是一个具体、可直接回答的问题，尽量一次问全\"}"
+                    + "\"questions\":{\"type\":\"array\",\"description\":\"要问用户的问题列表，优先使用结构化问题；兼容直接传字符串的旧格式\",\"items\":{\"oneOf\":["
+                    + "{\"type\":\"string\",\"description\":\"兼容旧格式：一个具体、可直接回答的问题\"},"
+                    + "{\"type\":\"object\",\"properties\":{"
+                    + "\"question\":{\"type\":\"string\",\"description\":\"一个具体、可直接回答的问题\"},"
+                    + "\"options\":{\"type\":\"array\",\"minItems\":2,\"maxItems\":4,\"description\":\"可选。仅在存在明确且互斥的常见答案时提供 2-4 个快捷选项\",\"items\":{\"type\":\"object\",\"properties\":{"
+                    + "\"label\":{\"type\":\"string\",\"description\":\"展示给用户的简短选项名\"},"
+                    + "\"value\":{\"type\":\"string\",\"description\":\"用户选择后写入最终文本回答的值；省略时等于 label\"},"
+                    + "\"description\":{\"type\":\"string\",\"description\":\"可选。用一句话解释该选项的影响或区别\"}"
+                    + "},\"required\":[\"label\"]}},"
+                    + "\"allowFreeText\":{\"type\":\"boolean\",\"description\":\"是否允许用户输入选项之外的文本；默认并优先设为 true\",\"default\":true}"
+                    + "},\"required\":[\"question\"]}"
+                    + "]}}"
                     + "},\"required\":[\"questions\"]}")
             .build();
 
@@ -614,10 +627,9 @@ public class RobustToolCallingManager implements ToolCallingManager {
         return argsJson.trim();
     }
 
-    /** 调 gate 阻塞提问，把状态翻译成给 LLM 的工具结果文本；同时发观察卡片（开始=问题列表，结束=用户回复/超时）。 */
+    /** 调 gate 阻塞提问，把状态翻译成给 LLM 的工具结果文本；同时发 ask_user 元工具观察卡片。 */
     private String runAskUser(String sessionId, AssistantMessage.ToolCall tc, String stepLabel) {
         ToolCallProgressEmitter p = this.toolCallProgressEmitter;
-        // 卡片开始：在阻塞等待之前发，让时间线先出现"正在向你提问（问题列表）"，模态框关掉后仍可回看问了什么
         if (p != null) {
             p.emitMetaStart(sessionId, ASK_USER_TOOL_NAME, askUserPreview(tc.arguments()), stepLabel);
         }
@@ -661,7 +673,7 @@ public class RobustToolCallingManager implements ToolCallingManager {
         return modelText;
     }
 
-    /** 解析 ask_user 入参里的 context + questions，拼成给卡片看的预览（编号列表）；解析失败退原始串。 */
+    /** 解析 ask_user 入参里的 context + questions，兼容旧字符串问题和结构化问题，拼成卡片预览。 */
     private String askUserPreview(String argsJson) {
         try {
             com.alibaba.fastjson.JSONObject o = com.alibaba.fastjson.JSON.parseObject(argsJson);
@@ -672,8 +684,31 @@ public class RobustToolCallingManager implements ToolCallingManager {
                 com.alibaba.fastjson.JSONArray qs = o.getJSONArray("questions");
                 if (qs != null) {
                     for (int i = 0; i < qs.size(); i++) {
-                        String q = qs.getString(i);
-                        if (q != null && !q.isBlank()) sb.append(i + 1).append(". ").append(q.trim()).append("\n");
+                        Object rawQuestion = qs.get(i);
+                        String question = null;
+                        com.alibaba.fastjson.JSONArray options = null;
+                        if (rawQuestion instanceof String text) {
+                            question = text;
+                        } else if (rawQuestion instanceof com.alibaba.fastjson.JSONObject detail) {
+                            question = detail.getString("question");
+                            options = detail.getJSONArray("options");
+                        }
+                        if (question == null || question.isBlank()) continue;
+                        sb.append(i + 1).append(". ").append(question.trim());
+                        if (options != null && !options.isEmpty()) {
+                            List<String> labels = new ArrayList<>();
+                            for (int optionIndex = 0; optionIndex < options.size(); optionIndex++) {
+                                Object rawOption = options.get(optionIndex);
+                                if (rawOption instanceof String text && !text.isBlank()) {
+                                    labels.add(text.trim());
+                                } else if (rawOption instanceof com.alibaba.fastjson.JSONObject option) {
+                                    String label = option.getString("label");
+                                    if (label != null && !label.isBlank()) labels.add(label.trim());
+                                }
+                            }
+                            if (!labels.isEmpty()) sb.append(" [").append(String.join(" / ", labels)).append("]");
+                        }
+                        sb.append("\n");
                     }
                 }
                 if (sb.length() > 0) return sb.toString().trim();

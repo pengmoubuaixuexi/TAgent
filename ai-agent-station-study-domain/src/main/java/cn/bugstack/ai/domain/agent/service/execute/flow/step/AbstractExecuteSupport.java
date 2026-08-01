@@ -592,12 +592,18 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
      */
     protected void sendStepEnd(DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
                                String stepId, String summary, String sessionId) {
+        sendStepEnd(dynamicContext, stepId, summary, "completed", sessionId);
+    }
+
+    protected void sendStepEnd(DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
+                               String stepId, String summary, String status, String sessionId) {
         try {
             ResponseBodyEmitter emitter = dynamicContext.getValue("emitter");
             if (emitter == null) return;
             Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("stepId", stepId);
             payload.put("summary", summary);
+            payload.put("status", status);
             payload.put("sessionId", sessionId);
             payload.put("timestamp", System.currentTimeMillis());
             synchronized (emitter) { emitter.send("event: step_end\ndata: " + JSON.toJSONString(payload) + "\n\n"); }
@@ -678,14 +684,19 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         java.util.Map<String, Object> toolContext = buildToolContext(sessionId, displayName, profile, runId);
         final ChatClient.ChatClientRequestSpec callSpec = toolContext.isEmpty() ? spec : spec.toolContext(toolContext);
         String result;
+        boolean completed = false;
         try {
             if (tokenStreamingEnabled) {
                 result = callChatClientWithTokenStreaming(callSpec, dynamicContext, stepId, promptText);
             } else {
                 result = callChatClientWithLogging(callSpec::call, stepId, promptText);
             }
+            completed = true;
         } finally {
-            sendStepEnd(dynamicContext, stepId, displayName + " 已完成", sessionId);
+            sendStepEnd(dynamicContext, stepId,
+                    displayName + (completed ? " 已完成" : " 执行失败"),
+                    completed ? "completed" : "failed",
+                    sessionId);
         }
         return result;
     }

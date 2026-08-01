@@ -562,7 +562,14 @@ public class AiAgentController implements IAiAgentService {
                     .data(false)
                     .build();
         }
-        humanApprovalGate.resolveApproval(approvalId, approved);
+        boolean accepted = humanApprovalGate.resolveApproval(approvalId, approved);
+        if (!accepted) {
+            return Response.<Boolean>builder()
+                    .code(ResponseCode.ILLEGAL_PARAMETER.getCode())
+                    .info("该审批已过期、已处理或不存在")
+                    .data(false)
+                    .build();
+        }
         return Response.<Boolean>builder()
                 .code(ResponseCode.SUCCESS.getCode())
                 .info(approved ? "已批准" : "已拒绝")
@@ -587,7 +594,14 @@ public class AiAgentController implements IAiAgentService {
                     .data(false)
                     .build();
         }
-        userInputGate.resolveUserInput(inputId, answer);
+        boolean accepted = userInputGate.resolveUserInput(inputId, answer);
+        if (!accepted) {
+            return Response.<Boolean>builder()
+                    .code(ResponseCode.ILLEGAL_PARAMETER.getCode())
+                    .info("该问题已过期、已回答或不存在")
+                    .data(false)
+                    .build();
+        }
         return Response.<Boolean>builder()
                 .code(ResponseCode.SUCCESS.getCode())
                 .info("已提交")

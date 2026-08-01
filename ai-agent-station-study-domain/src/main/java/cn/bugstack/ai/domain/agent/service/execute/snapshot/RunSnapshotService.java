@@ -13,6 +13,7 @@ public interface RunSnapshotService {
     String STATUS_RUNNING = "RUNNING";
     String STATUS_COMPLETED = "COMPLETED";
     String STATUS_FAILED = "FAILED";
+    String STATUS_BLOCKED = "BLOCKED";
     String STATUS_CANCELLED = "CANCELLED";
 
     void startRun(ExecuteCommandEntity request, String agentType, String agentName);

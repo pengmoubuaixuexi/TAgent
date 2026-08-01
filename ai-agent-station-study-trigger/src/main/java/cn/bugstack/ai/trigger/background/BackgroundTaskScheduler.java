@@ -7,6 +7,9 @@ import cn.bugstack.ai.domain.agent.service.execute.event.RunAwareResponseBodyEmi
 import cn.bugstack.ai.domain.agent.service.execute.event.RunEventPublisher;
 import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot;
 import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService;
+import cn.bugstack.ai.domain.agent.service.notification.AgentNotification;
+import cn.bugstack.ai.domain.agent.service.notification.NotificationCommand;
+import cn.bugstack.ai.domain.agent.service.notification.NotificationService;
 import cn.bugstack.ai.infrastructure.dao.IAiBackgroundTaskDao;
 import cn.bugstack.ai.infrastructure.dao.po.AiBackgroundTask;
 import cn.bugstack.ai.infrastructure.dao.po.AiBackgroundTaskExecution;
@@ -41,6 +44,9 @@ public class BackgroundTaskScheduler {
     @Autowired(required = false)
     private RunSnapshotService runSnapshotService;
 
+    @Autowired(required = false)
+    private NotificationService notificationService;
+
     @org.springframework.beans.factory.annotation.Value(
             "${agent.background-task.starting-grace-seconds:30}")
     private long startingGraceSeconds;
@@ -55,7 +61,12 @@ public class BackgroundTaskScheduler {
                     if (!"RUNNING".equals(task.getStatus())) evaluate(task);
                 } catch (Exception e) {
                     log.warn("[BackgroundTask] evaluate failed taskId={}: {}", task.getTaskId(), e.getMessage());
-                    dao.updateStatus(task.getTaskId(), "FAILED", abbreviate(e.getMessage(), 1000));
+                    AiBackgroundTask latest = dao.findByTaskId(task.getTaskId());
+                    // trigger() 已经落过带 runId 的失败通知时，不要再生成一条无 runId 的重复消息。
+                    if (latest == null || !"FAILED".equals(latest.getStatus())) {
+                        dao.updateStatus(task.getTaskId(), "FAILED", abbreviate(e.getMessage(), 1000));
+                        publishTaskNotification(task, null, "FAILED", e.getMessage());
+                    }
                 } finally {
                     evaluating.remove(task.getTaskId());
                 }
@@ -85,7 +96,11 @@ public class BackgroundTaskScheduler {
         switch (task.getTaskType()) {
             case "FILE_CHANGE_STABLE" -> evaluateFile(task);
             case "SCHEDULE_ONCE", "CRON" -> evaluateTime(task);
-            default -> dao.updateStatus(task.getTaskId(), "FAILED", "Unsupported task type: " + task.getTaskType());
+            default -> {
+                String error = "Unsupported task type: " + task.getTaskType();
+                dao.updateStatus(task.getTaskId(), "FAILED", error);
+                publishTaskNotification(task, null, "FAILED", error);
+            }
         }
     }
 
@@ -93,7 +108,9 @@ public class BackgroundTaskScheduler {
         Map<String, Object> trigger = taskService.trigger(task);
         Path path = Path.of(String.valueOf(trigger.get("path")));
         if (!Files.isRegularFile(path)) {
-            dao.updateStatus(task.getTaskId(), "FAILED", "监视文件不存在：" + path);
+            String error = "监视文件不存在：" + path;
+            dao.updateStatus(task.getTaskId(), "FAILED", error);
+            publishTaskNotification(task, null, "FAILED", error);
             return;
         }
         String currentHash = BackgroundTaskService.sha256(path);
@@ -190,10 +207,12 @@ public class BackgroundTaskScheduler {
             }
             dao.updateExecution(runId, "FAILED", LocalDateTime.now(), abbreviate(e.getMessage(), 1000));
             dao.updateStatus(task.getTaskId(), "FAILED", abbreviate(e.getMessage(), 1000));
+            publishTaskNotification(task, runId, "FAILED", e.getMessage());
             throw e;
         } catch (Exception e) {
             dao.updateExecution(runId, "FAILED", LocalDateTime.now(), abbreviate(e.getMessage(), 1000));
             dao.updateStatus(task.getTaskId(), "FAILED", abbreviate(e.getMessage(), 1000));
+            publishTaskNotification(task, runId, "FAILED", e.getMessage());
             throw new IllegalStateException("后台任务触发 run 失败：" + e.getMessage(), e);
         }
     }
@@ -237,18 +256,20 @@ public class BackgroundTaskScheduler {
                 }
             }
             dao.updateExecution(runId, executionStatus, LocalDateTime.now(), error);
-            finishTask(task, executionStatus, error);
+            finishTask(task, runId, executionStatus, error);
         }
     }
 
-    private void finishTask(AiBackgroundTask task, String executionStatus, String error) {
+    private void finishTask(AiBackgroundTask task, String runId, String executionStatus, String error) {
         if ("CANCELLED".equals(task.getStatus()) || "PAUSED".equals(task.getStatus())) return;
         if (!"COMPLETED".equals(executionStatus)) {
             dao.updateStatus(task.getTaskId(), "FAILED", error);
+            publishTaskNotification(task, runId, executionStatus, error);
             return;
         }
         if (Boolean.TRUE.equals(task.getRunOnce())) {
             dao.updateStatus(task.getTaskId(), "COMPLETED", null);
+            publishTaskNotification(task, runId, "COMPLETED", null);
             return;
         }
         if ("FILE_CHANGE_STABLE".equals(task.getTaskType())) {
@@ -258,6 +279,36 @@ public class BackgroundTaskScheduler {
             dao.resetRecurringFileTask(task.getTaskId(), baseline);
         } else {
             dao.updateStatus(task.getTaskId(), "ACTIVE", null);
+        }
+        publishTaskNotification(task, runId, "COMPLETED", null);
+    }
+
+    private void publishTaskNotification(AiBackgroundTask task, String runId, String executionStatus, String error) {
+        if (notificationService == null || task == null || task.getUserId() == null || task.getUserId().isBlank()) return;
+        try {
+            boolean completed = "COMPLETED".equals(executionStatus);
+            String referenceId = runId != null && !runId.isBlank()
+                    ? runId
+                    : task.getTaskId() + ":" + executionStatus;
+            Map<String, Object> metadata = new java.util.LinkedHashMap<>();
+            metadata.put("taskId", task.getTaskId());
+            metadata.put("taskName", task.getName());
+            metadata.put("executionStatus", executionStatus);
+            notificationService.publish(NotificationCommand.builder()
+                    .userId(task.getUserId())
+                    .tenantId(task.getTenantId())
+                    .sessionId(task.getSessionId())
+                    .runId(runId)
+                    .type(completed ? AgentNotification.Type.TASK_COMPLETED : AgentNotification.Type.TASK_FAILED)
+                    .referenceId(referenceId)
+                    .status(completed ? AgentNotification.Status.TASK_COMPLETED : AgentNotification.Status.TASK_FAILED)
+                    .title("后台任务「" + task.getName() + "」" + (completed ? "已完成" : "执行失败"))
+                    .summary(completed ? "点击进入会话查看结果" : abbreviate(error, 240))
+                    .metadata(metadata)
+                    .build());
+        } catch (Exception e) {
+            log.warn("[BackgroundTask] notification failed taskId={} runId={}: {}",
+                    task.getTaskId(), runId, e.getMessage());
         }
     }
 

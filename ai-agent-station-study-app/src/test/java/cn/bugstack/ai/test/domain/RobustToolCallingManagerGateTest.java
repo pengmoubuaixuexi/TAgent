@@ -1,6 +1,7 @@
 package cn.bugstack.ai.test.domain;
 
 import cn.bugstack.ai.domain.agent.service.execute.common.RobustToolCallingManager;
+import cn.bugstack.ai.domain.agent.service.execute.common.ToolCallProgressEmitter;
 import cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilities;
 import cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityProfile;
 import cn.bugstack.ai.domain.agent.service.security.UserInputGate;
@@ -28,7 +29,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -159,6 +162,33 @@ public class RobustToolCallingManagerGateTest {
                 .stream().map(ToolDefinition::name).toList());
         assertEquals(List.of("toolA", "toolB", "ask_user", "request_tool"), mgr.resolveToolDefinitions(optsWithProfile(ToolCapabilityProfile.ALL))
                 .stream().map(ToolDefinition::name).toList());
+    }
+
+    @Test
+    public void askUserEmitsItsMetaToolProgressCard() {
+        RobustToolCallingManager mgr = new RobustToolCallingManager(new StaticDelegate());
+        UserInputGate gate = mock(UserInputGate.class);
+        when(gate.isEnabled()).thenReturn(true);
+        when(gate.requestUserInput(anyString(), anyString(),
+                org.mockito.ArgumentMatchers.nullable(String.class)))
+                .thenReturn(new UserInputGate.Result(UserInputGate.Status.ANSWERED, "user-selected"));
+        ToolCallProgressEmitter progress = mock(ToolCallProgressEmitter.class);
+        mgr.setUserInputGate(gate);
+        mgr.setToolCallProgressEmitter(progress);
+        MDC.put("sessionId", "s1");
+
+        ToolExecutionResult result = mgr.executeToolCalls(
+                promptWithProfile(ToolCapabilityProfile.INTERACTIVE_META),
+                responseWithToolCall("ask_user", "{\"questions\":[\"where\"]}"));
+
+        verify(progress).emitMetaStart(eq("s1"), eq("ask_user"), anyString(),
+                org.mockito.ArgumentMatchers.nullable(String.class));
+        verify(progress).emitMetaEnd(eq("s1"), eq("ask_user"), eq("success"), anyString(),
+                org.mockito.ArgumentMatchers.nullable(String.class));
+        org.springframework.ai.chat.messages.ToolResponseMessage response =
+                (org.springframework.ai.chat.messages.ToolResponseMessage) result.conversationHistory()
+                        .get(result.conversationHistory().size() - 1);
+        assertTrue(response.getResponses().get(0).responseData().contains("user-selected"));
     }
 
     @Test

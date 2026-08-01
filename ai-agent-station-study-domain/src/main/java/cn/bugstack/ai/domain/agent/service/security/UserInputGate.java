@@ -118,7 +118,8 @@ public class UserInputGate {
     /**
      * 阻塞式向用户提问。
      * @param sessionId 当前会话；用于反查 emitter + 预算计数
-     * @param argsJson  ask_user 工具入参原文（{@code {"context":..,"questions":[..]}}），透传前端展示
+     * @param argsJson  ask_user 工具入参原文。questions 兼容字符串和
+     *                  {@code {question, options, allowFreeText}} 两种元素格式
      * @param stepLabel 当前步骤标签（可空），仅供前端标注「哪个步骤要问的」
      */
     public Result requestUserInput(String sessionId, String argsJson, String stepLabel) {
@@ -169,15 +170,16 @@ public class UserInputGate {
     }
 
     /** 前端回填入口（由 Controller 调用）。 */
-    public void resolveUserInput(String inputId, String answer) {
+    public boolean resolveUserInput(String inputId, String answer) {
         CompletableFuture<String> future = pendingInputs.get(inputId);
-        if (future != null) {
-            future.complete(answer == null ? "" : answer);
-        }
+        return future != null && future.complete(answer == null ? "" : answer);
     }
 
     /**
-     * 把工具入参解析摊平成前端易用的 payload：{@code {inputId, context?, questions?, step?, timeoutSeconds}}。
+     * 把工具入参解析摊平成前端易用的 payload。
+     * <p>兼容约定：{@code questions} 始终输出字符串列表，保证旧前端和历史事件可继续读取；
+     * 结构化问题另以 {@code questionDetails} 输出，快捷选项只负责填充最终文本回答，不改变
+     * {@code POST /user-input} 的 {@code answer: String} 协议。
      * 解析失败时退回 {@code raw} 原文，保证前端永远能拿到 inputId。
      */
     private String buildPayload(String inputId, String argsJson, String stepLabel) {
@@ -190,8 +192,27 @@ public class UserInputGate {
             }
             if (node.has("questions") && node.get("questions").isArray()) {
                 List<String> qs = new ArrayList<>();
-                node.get("questions").forEach(q -> qs.add(q.asText()));
-                map.put("questions", qs);
+                List<Map<String, Object>> questionDetails = new ArrayList<>();
+                node.get("questions").forEach(q -> {
+                    if (q.isTextual()) {
+                        if (!q.asText().isBlank()) qs.add(q.asText());
+                        return;
+                    }
+                    if (!q.isObject()) return;
+
+                    String question = textValue(q, "question");
+                    if (question == null || question.isBlank()) return;
+                    qs.add(question);
+
+                    Map<String, Object> detail = new LinkedHashMap<>();
+                    detail.put("question", question);
+                    List<Map<String, String>> options = normalizeOptions(q.get("options"));
+                    if (!options.isEmpty()) detail.put("options", options);
+                    detail.put("allowFreeText", !q.has("allowFreeText") || q.get("allowFreeText").asBoolean(true));
+                    questionDetails.add(detail);
+                });
+                if (!qs.isEmpty()) map.put("questions", qs);
+                if (!questionDetails.isEmpty()) map.put("questionDetails", questionDetails);
             }
         } catch (Exception e) {
             map.put("raw", argsJson != null ? argsJson : "");
@@ -207,5 +228,40 @@ public class UserInputGate {
             log.warn("[UserInput] json serialize fallback inputId={}: {}", inputId, e.toString());
             return "{\"inputId\":\"" + inputId.replace("\"", "") + "\",\"timeoutSeconds\":" + timeoutSeconds + "}";
         }
+    }
+
+    /** 把字符串/对象选项统一成前端可直接渲染的 label/value/description。 */
+    private List<Map<String, String>> normalizeOptions(JsonNode optionsNode) {
+        List<Map<String, String>> options = new ArrayList<>();
+        if (optionsNode == null || !optionsNode.isArray()) return options;
+        optionsNode.forEach(option -> {
+            String label;
+            String value;
+            String description = null;
+            if (option.isTextual()) {
+                label = option.asText();
+                value = label;
+            } else if (option.isObject()) {
+                label = textValue(option, "label");
+                value = textValue(option, "value");
+                description = textValue(option, "description");
+                if (label == null || label.isBlank()) label = value;
+                if (value == null || value.isBlank()) value = label;
+            } else {
+                return;
+            }
+            if (label == null || label.isBlank()) return;
+            Map<String, String> normalized = new LinkedHashMap<>();
+            normalized.put("label", label);
+            normalized.put("value", value);
+            if (description != null && !description.isBlank()) normalized.put("description", description);
+            options.add(normalized);
+        });
+        return options;
+    }
+
+    private String textValue(JsonNode node, String field) {
+        JsonNode value = node == null ? null : node.get(field);
+        return value != null && value.isTextual() ? value.asText() : null;
     }
 }

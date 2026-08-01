@@ -3,6 +3,9 @@ package cn.bugstack.ai.domain.agent.service.execute.flow.plan;
 import cn.bugstack.ai.domain.agent.model.entity.ExecuteCommandEntity;
 import cn.bugstack.ai.domain.agent.service.execute.flow.step.factory.DefaultFlowAgentExecuteStrategyFactory;
 import cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService;
+import cn.bugstack.ai.domain.agent.service.notification.AgentNotification;
+import cn.bugstack.ai.domain.agent.service.notification.NotificationCommand;
+import cn.bugstack.ai.domain.agent.service.notification.NotificationService;
 import com.alibaba.fastjson.JSON;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -46,6 +49,9 @@ public class FlowPlanReviewService {
 
     @Autowired(required = false)
     private McpToolCatalogService mcpToolCatalogService;
+
+    @Autowired(required = false)
+    private NotificationService notificationService;
 
     @Value("${agent.flow.plan-review.enabled:false}")
     private boolean enabled;
@@ -107,6 +113,7 @@ public class FlowPlanReviewService {
             log.warn("[FlowPlanReview] Redis save failed, continue without review runId={} err={}", runId, e.getMessage());
             return false;
         }
+        publishPlanReviewNotification(state);
         dynamicContext.setValue("planReviewPaused", Boolean.TRUE);
         sendPlanReviewRequired(emitter, state, validation, effectiveTtlSeconds);
         log.info("[FlowPlanReview] paused runId={} sessionId={} steps={} ttl={}s",
@@ -132,6 +139,7 @@ public class FlowPlanReviewService {
                 state.setStatus(STATUS_EXPIRED);
                 state.setUpdatedAt(now);
                 stateStore.update(state);
+                resolvePlanReviewNotification(state, AgentNotification.Status.EXPIRED);
                 return FlowPlanReviewPreparedPlan.failed("plan_expired", List.of("The pending plan has expired; please generate a fresh plan"));
             }
             if (sessionId != null && !sessionId.isBlank()
@@ -162,6 +170,7 @@ public class FlowPlanReviewService {
             state.setLastError(null);
             state.setUpdatedAt(now);
             stateStore.update(state);
+            resolvePlanReviewNotification(state, AgentNotification.Status.RESOLVED);
 
             return FlowPlanReviewPreparedPlan.builder()
                     .ready(true)
@@ -305,6 +314,47 @@ public class FlowPlanReviewService {
         } catch (Exception e) {
             log.warn("[FlowPlanReview] failed to emit review event runId={} err={}", state.getRunId(), e.getMessage());
         }
+    }
+
+    private void publishPlanReviewNotification(FlowPlanReviewState state) {
+        if (notificationService == null || state == null || state.getUserId() == null || state.getUserId().isBlank()) return;
+        try {
+            Map<String, Object> metadata = new LinkedHashMap<>();
+            metadata.put("agentId", state.getAgentId());
+            metadata.put("steps", state.getSteps());
+            metadata.put("status", normalizeStatus(state.getStatus()));
+            notificationService.publish(NotificationCommand.builder()
+                    .userId(state.getUserId())
+                    .tenantId(state.getTenantId())
+                    .sessionId(state.getSessionId())
+                    .runId(state.getRunId())
+                    .type(AgentNotification.Type.PLAN_REVIEW)
+                    .referenceId(state.getRunId())
+                    .status(AgentNotification.Status.PLAN_REVIEW)
+                    .title(planNotificationTitle(state.getOriginalMessage()))
+                    .summary((state.getSteps() == null ? 0 : state.getSteps().size()) + " 个步骤，等待确认")
+                    .expiresAt(state.getExpiresAt())
+                    .metadata(metadata)
+                    .build());
+        } catch (Exception e) {
+            log.warn("[FlowPlanReview] notification publish failed runId={}: {}", state.getRunId(), e.getMessage());
+        }
+    }
+
+    private void resolvePlanReviewNotification(FlowPlanReviewState state, AgentNotification.Status status) {
+        if (notificationService == null || state == null || state.getUserId() == null || state.getUserId().isBlank()) return;
+        try {
+            notificationService.resolve(state.getUserId(), state.getRunId(), status);
+        } catch (Exception e) {
+            log.debug("[FlowPlanReview] notification resolve failed runId={}: {}", state.getRunId(), e.getMessage());
+        }
+    }
+
+    private String planNotificationTitle(String originalMessage) {
+        if (originalMessage == null || originalMessage.isBlank()) return "执行计划已生成";
+        String oneLine = originalMessage.replaceAll("\\s+", " ").trim();
+        if (oneLine.length() > 18) oneLine = oneLine.substring(0, 18) + "…";
+        return "「" + oneLine + "」计划已生成";
     }
 
     private List<FlowPlanReviewStep> toReviewSteps(Map<String, String> stepsMap, Map<Integer, Set<Integer>> stepDependencies) {

@@ -205,7 +205,7 @@ public class AiClientModelNode extends AbstractArmorySupport {
             robustMgr.setMcpToolCatalogService(mcpToolCatalogService);
             robustMgr.setRequestToolEnabled(requestToolEnabled);
             robustMgr.setRequestToolMaxCalls(requestToolMaxCalls);
-            // 元工具(ask_user / request_tool)观察卡片：它们不走 MeteredToolCallback，进度事件得由 manager 直接发
+            // 元工具(ask_user / request_tool)观察卡片：它们不走 MeteredToolCallback，进度事件由 manager 直接发
             robustMgr.setToolCallProgressEmitter(toolCallProgressEmitter);
 
             OpenAiChatModel chatModel = OpenAiChatModel.builder()

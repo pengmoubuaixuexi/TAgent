@@ -147,8 +147,6 @@ public class ToolCallProgressEmitter {
      * 元工具(ask_user / request_tool)观察卡片：复用 {@code tool_call_start}/{@code tool_call_end} 事件，
      * 走前端同一套卡片生命周期(running→done、按 toolName 配对、完成折叠)，但带 {@code meta:true} 标记，
      * 前端按 toolName 专用渲染(ask_user=问题列表、request_tool=needs+装载结果)。
-     * <p>这俩元工具不走 {@link MeteredToolCallback}(它们不是注册 callback，由 RobustToolCallingManager 自消化)，
-     * 故进度事件必须从 manager 侧单独发；否则前端"静默"看不到提问/装载。
      */
     public void emitMetaStart(String sessionId, String toolName, String preview, String step) {
         ResponseBodyEmitter emitter = lookupEmitter(sessionId);
