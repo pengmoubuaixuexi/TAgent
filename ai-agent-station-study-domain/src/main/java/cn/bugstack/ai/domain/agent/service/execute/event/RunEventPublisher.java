@@ -17,6 +17,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -226,21 +227,28 @@ public class RunEventPublisher {
         private final String runId;
         private final ResponseBodyEmitter emitter;
         private final ConcurrentLinkedQueue<RunEventRecord> buffered = new ConcurrentLinkedQueue<>();
+        private final AtomicBoolean draining = new AtomicBoolean();
         private boolean replaying = true;
-        private boolean active = true;
+        private volatile boolean active = true;
 
         private Subscriber(String runId, ResponseBodyEmitter emitter) {
             this.runId = runId;
             this.emitter = emitter;
         }
 
-        private synchronized boolean accept(RunEventRecord record) {
-            if (!active) return false;
-            if (replaying) {
+        private boolean accept(RunEventRecord record) {
+            boolean shouldDrain;
+            synchronized (this) {
+                if (!active) return false;
                 buffered.add(record);
-                return true;
+                shouldDrain = !replaying;
             }
-            return send(record);
+            // Never perform emitter I/O while holding the Subscriber monitor.
+            // Legacy RunAwareResponseBodyEmitter.send() captures an event while callers may already
+            // hold the emitter monitor; the inverse Subscriber -> emitter order used to deadlock
+            // with that path. The queue + single drainer preserves serialization without nested locks.
+            if (shouldDrain) drain(Set.of());
+            return active;
         }
 
         private void finishReplay(List<RunEventRecord> replay) {
@@ -252,14 +260,41 @@ public class RunEventPublisher {
                     if (!send(record)) break;
                 }
             }
+            if (!active) return;
+
+            // Claim the drain before exposing live mode. An accept racing with this transition can
+            // enqueue, but cannot overtake the replay tail or send a replayed event twice.
+            if (!draining.compareAndSet(false, true)) {
+                throw new IllegalStateException("subscriber drain unexpectedly active during replay");
+            }
             synchronized (this) {
-                RunEventRecord queued;
-                while (active && (queued = buffered.poll()) != null) {
-                    if (queued.getEventId() != null && replayedIds.contains(queued.getEventId())) continue;
-                    if (!send(queued)) break;
-                }
                 replaying = false;
             }
+            drainOwned(replayedIds);
+        }
+
+        private void drain(Set<String> skipEventIds) {
+            if (!active || !draining.compareAndSet(false, true)) return;
+            drainOwned(skipEventIds);
+        }
+
+        private void drainOwned(Set<String> skipEventIds) {
+            try {
+                RunEventRecord queued;
+                while (active && (queued = buffered.poll()) != null) {
+                    if (queued.getEventId() != null && skipEventIds.contains(queued.getEventId())) continue;
+                    if (!send(queued)) break;
+                }
+            } finally {
+                draining.set(false);
+            }
+            // An event may be enqueued between the last poll and releasing the drain flag.
+            // Re-acquire once necessary; CAS still guarantees a single emitter writer.
+            boolean live;
+            synchronized (this) {
+                live = active && !replaying;
+            }
+            if (live && !buffered.isEmpty()) drain(Set.of());
         }
 
         private boolean send(RunEventRecord record) {
@@ -284,9 +319,13 @@ public class RunEventPublisher {
             }
         }
 
-        private synchronized void complete() {
-            if (!active) return;
-            active = false;
+        private void complete() {
+            synchronized (this) {
+                if (!active) return;
+                active = false;
+            }
+            // Completion may enter ResponseBodyEmitter internals; do not nest it under the
+            // Subscriber monitor for the same reason as normal sends.
             try {
                 if (emitter instanceof RunAwareResponseBodyEmitter runEmitter) {
                     runEmitter.completeRaw();

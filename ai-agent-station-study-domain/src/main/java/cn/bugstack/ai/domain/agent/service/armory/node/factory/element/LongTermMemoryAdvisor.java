@@ -2,6 +2,7 @@ package cn.bugstack.ai.domain.agent.service.armory.node.factory.element;
 
 import cn.bugstack.ai.domain.agent.service.execute.common.LongTermMemoryTurnSnapshot;
 import cn.bugstack.ai.domain.agent.service.memory.longterm.ILongTermMemoryService;
+import cn.bugstack.ai.domain.agent.service.memory.longterm.LongTermMemoryRecall;
 import lombok.extern.slf4j.Slf4j;
 import org.slf4j.MDC;
 import org.springframework.ai.chat.client.ChatClient;
@@ -173,14 +174,15 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
 
         // 混合检索：核心记忆（高频+近期）+ 语义相关记忆（向量相似度）
         String evidenceSessionId = resolveSessionIdForEvidence(ctx);
-        List<String> profileLines = loadTurnMemorySnapshot(evidenceSessionId, userId, retrievalQuery);
+        List<LongTermMemoryRecall> recalls = loadTurnMemorySnapshot(evidenceSessionId, userId, retrievalQuery);
+        List<String> profileLines = recalls.stream().map(LongTermMemoryRecall::toPromptLine).toList();
         if (profileLines == null || profileLines.isEmpty()) return request;
 
         // H2-A：emit memory_evidence SSE 给前端展示"本轮用了哪些长期记忆"。
         // emitter 内部已 explain 开关 + try/catch 兜底；此处再外层 try 保险，advisor 失败 ≠ 主回答失败
         try {
             if (memoryEvidenceEmitter != null) {
-                memoryEvidenceEmitter.emitLongTermEvidence(evidenceSessionId, profileLines);
+                memoryEvidenceEmitter.emitLongTermEvidenceDetailed(evidenceSessionId, recalls);
             }
         } catch (Exception emitEx) {
             log.debug("[LTM] memory evidence emit skipped: {}", emitEx.toString());
@@ -219,22 +221,25 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
                 .build();
     }
 
-    private List<String> loadTurnMemorySnapshot(String sessionId, String userId, String retrievalQuery) {
+    private List<LongTermMemoryRecall> loadTurnMemorySnapshot(String sessionId, String userId, String retrievalQuery) {
         LongTermMemoryTurnSnapshot snapshot = this.turnSnapshot;
         if (snapshot == null || sessionId == null || sessionId.isBlank()) {
             return retrieveProfileLines(userId, retrievalQuery);
         }
-        return snapshot.getOrLoad(sessionId, userId, () -> retrieveProfileLines(userId, retrievalQuery));
+        return snapshot.getOrLoadDetailed(sessionId, userId, () -> retrieveProfileLines(userId, retrievalQuery));
     }
 
-    private List<String> retrieveProfileLines(String userId, String retrievalQuery) {
+    private List<LongTermMemoryRecall> retrieveProfileLines(String userId, String retrievalQuery) {
         try {
             // 核心记忆=全部画像槽位(封闭约13个)，给足上限确保全取；语义相关记忆 5 条
-            return ltm.retrieveForInjection(userId, retrievalQuery, 30, 5);
+            return ltm.retrieveForInjectionDetailed(userId, retrievalQuery, 30, 5);
         } catch (Exception e) {
             log.warn("ltm.retrieveForInjection failed, fallback to retrieveProfile: {}", e.getMessage());
             try {
-                return ltm.retrieveProfile(userId);
+                return ltm.retrieveProfile(userId).stream()
+                        .map(content -> LongTermMemoryRecall.builder().topic("other").content(content)
+                                .kind(LongTermMemoryRecall.KIND_CORE).build())
+                        .toList();
             } catch (Exception e2) {
                 log.warn("ltm.retrieveProfile also failed: {}", e2.getMessage());
                 return List.of();

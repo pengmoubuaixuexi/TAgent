@@ -101,6 +101,64 @@ public class RunEventPublisherTest {
         assertTrue(reconnect.frames.get(2).contains("\"token\":\"好\""));
     }
 
+    @Test
+    public void concurrentLegacyCaptureAndDirectPublishMustNotDeadlock() throws Exception {
+        MemoryStore store = new MemoryStore();
+        RunEventPublisher publisher = new RunEventPublisher();
+        ReflectionTestUtils.setField(publisher, "eventStore", store);
+
+        RunAwareResponseBodyEmitter emitter =
+                new RunAwareResponseBodyEmitter(Long.MAX_VALUE, "run-deadlock", "session-deadlock", publisher);
+        publisher.attach("run-deadlock", "session-deadlock", emitter, null);
+
+        CountDownLatch emitterLocked = new CountDownLatch(1);
+        CountDownLatch allowLegacyCapture = new CountDownLatch(1);
+        AtomicReference<Throwable> legacyFailure = new AtomicReference<>();
+        AtomicReference<Throwable> directFailure = new AtomicReference<>();
+
+        Thread legacy = new Thread(() -> {
+            try {
+                synchronized (emitter) {
+                    emitterLocked.countDown();
+                    assertTrue(allowLegacyCapture.await(2, TimeUnit.SECONDS));
+                    emitter.send("event: step_start\ndata: {\"stepId\":\"legacy\"}\n\n");
+                }
+            } catch (Throwable error) {
+                legacyFailure.set(error);
+            }
+        }, "legacy-emitter-capture");
+        legacy.setDaemon(true);
+
+        Thread direct = new Thread(() -> {
+            try {
+                assertTrue(emitterLocked.await(2, TimeUnit.SECONDS));
+                publisher.publish("run-deadlock", "session-deadlock", "memory_evidence",
+                        java.util.Map.of("type", "long_term"));
+            } catch (Throwable error) {
+                directFailure.set(error);
+            }
+        }, "direct-run-event-publish");
+        direct.setDaemon(true);
+
+        legacy.start();
+        direct.start();
+        assertTrue(emitterLocked.await(2, TimeUnit.SECONDS));
+        long waitUntil = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+        while (direct.getState() != Thread.State.BLOCKED && System.nanoTime() < waitUntil) {
+            Thread.onSpinWait();
+        }
+        allowLegacyCapture.countDown();
+
+        legacy.join(2_000);
+        direct.join(2_000);
+        assertFalse("legacy capture deadlocked", legacy.isAlive());
+        assertFalse("direct publish deadlocked", direct.isAlive());
+        assertNull(legacyFailure.get());
+        assertNull(directFailure.get());
+        assertEquals(2, store.records.size());
+        emitter.complete();
+    }
+
     private static class CapturingEmitter extends ResponseBodyEmitter {
         protected final List<String> frames = new ArrayList<>();
 

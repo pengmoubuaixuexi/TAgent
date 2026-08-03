@@ -77,6 +77,9 @@ public class AiAgentController implements IAiAgentService {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService runSnapshotService;
 
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.evidence.EvidenceMapService evidenceMapService;
+
     @Resource
     private RunEventPublisher runEventPublisher;
 
@@ -808,6 +811,33 @@ public class AiAgentController implements IAiAgentService {
                 .info(ResponseCode.SUCCESS.getInfo())
                 .data(reconciled)
                 .build();
+    }
+
+    /** Generate claim-to-source links on demand using the same small client as intent routing. */
+    @RequestMapping(value = "runs/{runId}/evidence-map", method = RequestMethod.POST)
+    public Response<Map<String, Object>> generateEvidenceMap(
+            @PathVariable("runId") String runId,
+            @RequestBody(required = false) Map<String, Object> request) {
+        if (evidenceMapService == null) {
+            return Response.<Map<String, Object>>builder()
+                    .code(ResponseCode.UN_ERROR.getCode()).info("Evidence Map service is not available").data(null).build();
+        }
+        String sessionId = request == null || request.get("sessionId") == null
+                ? null : String.valueOf(request.get("sessionId"));
+        String finalAnswer = request == null || request.get("finalAnswer") == null
+                ? null : String.valueOf(request.get("finalAnswer"));
+        boolean regenerate = request != null && Boolean.parseBoolean(String.valueOf(request.get("regenerate")));
+        try {
+            return Response.<Map<String, Object>>builder()
+                    .code(ResponseCode.SUCCESS.getCode())
+                    .info(ResponseCode.SUCCESS.getInfo())
+                    .data(evidenceMapService.generate(runId, sessionId, finalAnswer, regenerate))
+                    .build();
+        } catch (Exception error) {
+            log.warn("[EvidenceMap] generate failed runId={} sessionId={} err={}", runId, sessionId, error.getMessage());
+            return Response.<Map<String, Object>>builder()
+                    .code(ResponseCode.UN_ERROR.getCode()).info(error.getMessage()).data(null).build();
+        }
     }
 
     /** Return the single active run for a session, if one still exists in Redis. */

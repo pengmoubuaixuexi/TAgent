@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
+import cn.bugstack.ai.domain.agent.service.memory.longterm.LongTermMemoryRecall;
 
 /**
  * One agent turn should see a stable long-term-memory recall set.
@@ -21,6 +22,7 @@ public class LongTermMemoryTurnSnapshot {
     private static final int MAX_ENTRIES = 100_000;
 
     private final Map<String, List<String>> snapshots = new ConcurrentHashMap<>();
+    private final Map<String, List<LongTermMemoryRecall>> detailedSnapshots = new ConcurrentHashMap<>();
 
     public List<String> getOrLoad(String sessionId, String userId, Supplier<List<String>> loader) {
         if (isBlank(sessionId) || isBlank(userId)) {
@@ -37,12 +39,23 @@ public class LongTermMemoryTurnSnapshot {
     public void clear(String sessionId, String userId) {
         if (isBlank(sessionId) || isBlank(userId)) return;
         snapshots.remove(key(sessionId, userId));
+        detailedSnapshots.remove(key(sessionId, userId));
     }
 
     public void clearSession(String sessionId) {
         if (isBlank(sessionId)) return;
         String prefix = sessionId + "::";
         snapshots.keySet().removeIf(key -> key.startsWith(prefix));
+        detailedSnapshots.keySet().removeIf(key -> key.startsWith(prefix));
+    }
+
+    public List<LongTermMemoryRecall> getOrLoadDetailed(String sessionId, String userId,
+                                                         Supplier<List<LongTermMemoryRecall>> loader) {
+        if (isBlank(sessionId) || isBlank(userId)) return immutableDetailedCopy(loader.get());
+        if (detailedSnapshots.size() >= MAX_ENTRIES && !detailedSnapshots.containsKey(key(sessionId, userId))) {
+            return immutableDetailedCopy(loader.get());
+        }
+        return detailedSnapshots.computeIfAbsent(key(sessionId, userId), ignored -> immutableDetailedCopy(loader.get()));
     }
 
     int size() {
@@ -52,6 +65,11 @@ public class LongTermMemoryTurnSnapshot {
     private static List<String> immutableCopy(List<String> lines) {
         if (lines == null || lines.isEmpty()) return Collections.emptyList();
         return Collections.unmodifiableList(new ArrayList<>(lines));
+    }
+
+    private static List<LongTermMemoryRecall> immutableDetailedCopy(List<LongTermMemoryRecall> recalls) {
+        if (recalls == null || recalls.isEmpty()) return Collections.emptyList();
+        return Collections.unmodifiableList(new ArrayList<>(recalls));
     }
 
     private static String key(String sessionId, String userId) {

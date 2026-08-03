@@ -5,6 +5,7 @@ import cn.bugstack.ai.domain.agent.service.execute.event.RunEventRecord;
 import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot;
 import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService;
 import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunStepSnapshot;
+import cn.bugstack.ai.domain.agent.service.execute.snapshot.ToolEvidenceRecord;
 import com.alibaba.fastjson.JSON;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -42,6 +43,9 @@ public class RedisRunSnapshotService implements RunSnapshotService {
 
     @Value("${agent.run-snapshot.ttl-seconds:21600}")
     private long ttlSeconds;
+
+    @Value("${agent.evidence-map.ttl-seconds:604800}")
+    private long evidenceMapTtlSeconds;
 
     @Value("${agent.run-snapshot.max-content-chars:0}")
     private int maxContentChars;
@@ -111,6 +115,15 @@ public class RedisRunSnapshotService implements RunSnapshotService {
                         : timeline.getJSONArray("events").toJavaList(RunEventRecord.class));
                 snapshot.setLastEventId(timeline.getString("lastEventId"));
             }
+            Map<Object, Object> toolRows = stringRedisTemplate.opsForHash().entries(toolEvidenceKey(runId));
+            if (toolRows != null && !toolRows.isEmpty()) {
+                List<ToolEvidenceRecord> records = toolRows.values().stream()
+                        .map(String::valueOf)
+                        .map(value -> JSON.parseObject(value, ToolEvidenceRecord.class))
+                        .sorted(Comparator.comparingLong(value -> value.getCreatedAt() == null ? Long.MAX_VALUE : value.getCreatedAt()))
+                        .toList();
+                snapshot.setToolEvidences(records);
+            }
             return Optional.of(snapshot);
         } catch (Exception e) {
             log.warn("[RunSnapshot] timeline find failed runId={} err={}", runId, e.getMessage());
@@ -123,11 +136,16 @@ public class RedisRunSnapshotService implements RunSnapshotService {
             return Optional.empty();
         }
         try {
-            String json = stringRedisTemplate.opsForValue().get(key(runId));
+            Duration ttl = runTtl();
+            String json = stringRedisTemplate.opsForValue().getAndExpire(key(runId), ttl);
             if (blank(json)) {
                 return Optional.empty();
             }
-            return Optional.ofNullable(JSON.parseObject(json, RunSnapshot.class));
+            RunSnapshot snapshot = JSON.parseObject(json, RunSnapshot.class);
+            if (snapshot == null) return Optional.empty();
+            snapshot.setExpiresAt(System.currentTimeMillis() + ttl.toMillis());
+            renewRunFamilyTtl(snapshot, ttl);
+            return Optional.of(snapshot);
         } catch (Exception e) {
             log.warn("[RunSnapshot] find failed runId={} err={}", runId, e.getMessage());
             return Optional.empty();
@@ -286,15 +304,80 @@ public class RedisRunSnapshotService implements RunSnapshotService {
             timeline.put("events", events == null ? new ArrayList<>() : new ArrayList<>(events));
             timeline.put("lastEventId", lastEventId);
             timeline.put("updatedAt", System.currentTimeMillis());
-            long now = System.currentTimeMillis();
-            Long expiresAt = snapshot.getExpiresAt();
-            long ttlMillis = expiresAt != null ? expiresAt - now : Math.max(60, ttlSeconds) * 1000L;
-            if (ttlMillis > 0) {
-                stringRedisTemplate.opsForValue().set(
-                        timelineKey(runId), JSON.toJSONString(timeline), Duration.ofMillis(ttlMillis));
-            }
+            Duration ttl = runTtl();
+            snapshot.setExpiresAt(System.currentTimeMillis() + ttl.toMillis());
+            stringRedisTemplate.opsForValue().set(timelineKey(runId), JSON.toJSONString(timeline), ttl);
         } catch (Exception error) {
             log.warn("[RunSnapshot] recordTimeline failed runId={} err={}", runId, error.getMessage());
+        }
+    }
+
+    @Override
+    public void recordToolEvidence(String runId, ToolEvidenceRecord evidence) {
+        if (blank(runId) || evidence == null || blank(evidence.getEvidenceId())) return;
+        try {
+            RunSnapshot snapshot = findMetadata(runId).orElse(null);
+            if (snapshot == null) return;
+            String evidenceKey = toolEvidenceKey(runId);
+            stringRedisTemplate.opsForHash().put(
+                    evidenceKey, evidence.getEvidenceId(), JSON.toJSONString(evidence));
+            Duration ttl = runTtl();
+            snapshot.setExpiresAt(System.currentTimeMillis() + ttl.toMillis());
+            stringRedisTemplate.expire(evidenceKey, ttl);
+        } catch (Exception error) {
+            log.warn("[RunSnapshot] recordToolEvidence failed runId={} evidenceId={} err={}",
+                    runId, evidence.getEvidenceId(), error.getMessage());
+        }
+    }
+
+    @Override
+    public Optional<Map<String, Object>> findEvidenceMap(String runId, String signature) {
+        if (blank(runId) || blank(signature)) return Optional.empty();
+        try {
+            String json = stringRedisTemplate.opsForValue().get(evidenceMapKey(runId));
+            if (blank(json)) return Optional.empty();
+            com.alibaba.fastjson.JSONObject cached = JSON.parseObject(json);
+            if (!signature.equals(cached.getString("signature"))) return Optional.empty();
+            com.alibaba.fastjson.JSONObject data = cached.getJSONObject("data");
+            if (data == null) return Optional.empty();
+            stringRedisTemplate.expire(evidenceMapKey(runId), evidenceMapTtl());
+            return Optional.of(new LinkedHashMap<>(data));
+        } catch (Exception error) {
+            log.warn("[RunSnapshot] findEvidenceMap failed runId={} err={}", runId, error.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    @Override
+    public Optional<Map<String, Object>> findEvidenceMap(String runId) {
+        if (blank(runId)) return Optional.empty();
+        try {
+            String json = stringRedisTemplate.opsForValue().get(evidenceMapKey(runId));
+            if (blank(json)) return Optional.empty();
+            com.alibaba.fastjson.JSONObject cached = JSON.parseObject(json);
+            com.alibaba.fastjson.JSONObject data = cached.getJSONObject("data");
+            if (data == null) return Optional.empty();
+            stringRedisTemplate.expire(evidenceMapKey(runId), evidenceMapTtl());
+            return Optional.of(new LinkedHashMap<>(data));
+        } catch (Exception error) {
+            log.warn("[RunSnapshot] findLatestEvidenceMap failed runId={} err={}", runId, error.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    @Override
+    public void saveEvidenceMap(String runId, String signature, Map<String, Object> evidenceMap) {
+        if (blank(runId) || blank(signature) || evidenceMap == null) return;
+        try {
+            Map<String, Object> cached = new LinkedHashMap<>();
+            cached.put("signature", signature);
+            cached.put("data", evidenceMap);
+            // Only overwrite after the caller has a complete, validated map.
+            // A failed regeneration therefore leaves the previous value untouched.
+            stringRedisTemplate.opsForValue().set(
+                    evidenceMapKey(runId), JSON.toJSONString(cached), evidenceMapTtl());
+        } catch (Exception error) {
+            log.warn("[RunSnapshot] saveEvidenceMap failed runId={} err={}", runId, error.getMessage());
         }
     }
 
@@ -604,21 +687,38 @@ public class RedisRunSnapshotService implements RunSnapshotService {
         if (snapshot == null || blank(snapshot.getRunId())) {
             return;
         }
-        long now = System.currentTimeMillis();
-        Long expiresAt = snapshot.getExpiresAt();
-        long ttlMillis = expiresAt != null ? expiresAt - now : Math.max(60, ttlSeconds) * 1000L;
-        if (ttlMillis <= 0) {
-            stringRedisTemplate.delete(key(snapshot.getRunId()));
-            return;
-        }
+        Duration ttl = runTtl();
+        snapshot.setExpiresAt(System.currentTimeMillis() + ttl.toMillis());
         com.alibaba.fastjson.JSONObject stored = (com.alibaba.fastjson.JSONObject) JSON.toJSON(snapshot);
         // Timeline is updated far more frequently than execution metadata. Keep
         // it in a sibling Redis value so token checkpoints cannot overwrite a
         // concurrent status/step update (or vice versa).
         stored.remove("timelineEvents");
         stored.remove("lastEventId");
+        stored.remove("toolEvidences");
         stringRedisTemplate.opsForValue().set(
-                key(snapshot.getRunId()), stored.toJSONString(), Duration.ofMillis(ttlMillis));
+                key(snapshot.getRunId()), stored.toJSONString(), ttl);
+        renewRunFamilyTtl(snapshot, ttl);
+    }
+
+    private Duration runTtl() {
+        return Duration.ofSeconds(Math.max(60, ttlSeconds));
+    }
+
+    private Duration evidenceMapTtl() {
+        return Duration.ofSeconds(Math.max(60, evidenceMapTtlSeconds));
+    }
+
+    private void renewRunFamilyTtl(RunSnapshot snapshot, Duration ttl) {
+        if (snapshot == null || blank(snapshot.getRunId())) return;
+        stringRedisTemplate.expire(timelineKey(snapshot.getRunId()), ttl);
+        stringRedisTemplate.expire(toolEvidenceKey(snapshot.getRunId()), ttl);
+        if (!blank(snapshot.getSessionId())) {
+            stringRedisTemplate.expire(sessionIndexKey(snapshot.getSessionId()), ttl);
+        }
+        if (!blank(snapshot.getUserId())) {
+            stringRedisTemplate.expire(userIndexKey(snapshot.getUserId()), ttl);
+        }
     }
 
     private void indexBySession(RunSnapshot snapshot) {
@@ -864,6 +964,14 @@ public class RedisRunSnapshotService implements RunSnapshotService {
 
     private String timelineKey(String runId) {
         return keyPrefix + "timeline:" + runId;
+    }
+
+    private String toolEvidenceKey(String runId) {
+        return keyPrefix + "tool-evidence:" + runId;
+    }
+
+    private String evidenceMapKey(String runId) {
+        return keyPrefix + "evidence-map:" + runId;
     }
 
     private String sessionIndexKey(String sessionId) {

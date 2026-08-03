@@ -707,9 +707,23 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
 
         } catch (CancellationException e) {
             log.info("[Cancel] step {} execution cancelled: {}", stepNumber, e.getMessage());
+            recordRunStep(dynamicContext,
+                    "flow_step4_execute_step_" + stepNumber,
+                    displayNameForStep(dynamicContext, stepNumber, stepKey),
+                    "flow_step4_execution",
+                    stepNumber,
+                    "步骤已取消：" + (e.getMessage() == null ? "execution cancelled" : e.getMessage()),
+                    cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_CANCELLED);
             throw e;
         } catch (Exception e) {
             if (dynamicContext.isCancelled() || Thread.currentThread().isInterrupted()) {
+                recordRunStep(dynamicContext,
+                        "flow_step4_execute_step_" + stepNumber,
+                        displayNameForStep(dynamicContext, stepNumber, stepKey),
+                        "flow_step4_execution",
+                        stepNumber,
+                        "步骤已取消：execution cancelled during step " + stepNumber,
+                        cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_CANCELLED);
                 throw new CancellationException("execution cancelled during step " + stepNumber);
             }
             String message = errorMessage(e);

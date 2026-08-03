@@ -5,6 +5,7 @@ import cn.bugstack.ai.domain.agent.service.memory.conflict.IMemoryConflictResolv
 import cn.bugstack.ai.domain.agent.service.memory.longterm.ILongTermMemoryService;
 import cn.bugstack.ai.domain.agent.service.memory.longterm.LongTermMemoryItem;
 import cn.bugstack.ai.domain.agent.service.memory.longterm.LongTermMemoryPage;
+import cn.bugstack.ai.domain.agent.service.memory.longterm.LongTermMemoryRecall;
 import cn.bugstack.ai.infrastructure.dao.IAiLongTermMemoryDao;
 import cn.bugstack.ai.infrastructure.dao.po.AiLongTermMemory;
 import jakarta.annotation.Resource;
@@ -424,12 +425,19 @@ public class LongTermMemoryService implements ILongTermMemoryService {
 
     @Override
     public List<String> retrieveForInjection(String userId, String query, int coreN, int relevantK) {
+        return retrieveForInjectionDetailed(userId, query, coreN, relevantK).stream()
+                .map(LongTermMemoryRecall::toPromptLine)
+                .toList();
+    }
+
+    @Override
+    public List<LongTermMemoryRecall> retrieveForInjectionDetailed(String userId, String query, int coreN, int relevantK) {
         if (userId == null || userId.isBlank()) return Collections.emptyList();
         // 核心记忆 = 全部画像槽位（封闭清单约13个），给足上限确保全取
         if (coreN <= 0) coreN = 20;
         if (relevantK <= 0) relevantK = 5;
 
-        LinkedHashMap<String, String> dedup = new LinkedHashMap<>();
+        LinkedHashMap<String, LongTermMemoryRecall> dedup = new LinkedHashMap<>();
         int coreCount = 0;
 
         // 1. 核心记忆 = 全部画像槽位（mapper 已按 topic, access_count DESC 排）。
@@ -440,7 +448,12 @@ public class LongTermMemoryService implements ILongTermMemoryService {
             for (AiLongTermMemory m : core) {
                 if (m.getContent() == null || m.getContent().isBlank()) continue;
                 if (m.getTopic() != null && !seenCoreTopics.add(m.getTopic())) continue;
-                dedup.putIfAbsent(m.getContent(), m.getTopic());
+                dedup.putIfAbsent(m.getContent(), LongTermMemoryRecall.builder()
+                        .memoryId(m.getMemoryId())
+                        .topic(m.getTopic())
+                        .content(m.getContent())
+                        .kind(LongTermMemoryRecall.KIND_CORE)
+                        .build());
                 coreCount++;
             }
         }
@@ -456,7 +469,18 @@ public class LongTermMemoryService implements ILongTermMemoryService {
                         String topic = (String) d.getMetadata().get("topic");
                         // 画像槽位已由核心记忆全量注入，语义路跳过，不占用相关记忆名额
                         if (topic != null && topic.startsWith("画像")) continue;
-                        dedup.putIfAbsent(content, topic);
+                        Double distance = extractDistance(d);
+                        Double similarity = d.getScore() != null ? d.getScore()
+                                : (distance == null ? null : 1.0d - distance);
+                        if (similarity != null) similarity = Math.max(0.0d, Math.min(1.0d, similarity));
+                        Object memoryId = d.getMetadata().get("memory_id");
+                        dedup.putIfAbsent(content, LongTermMemoryRecall.builder()
+                                .memoryId(memoryId == null ? null : String.valueOf(memoryId))
+                                .topic(topic)
+                                .content(content)
+                                .kind(LongTermMemoryRecall.KIND_RELEVANT)
+                                .similarity(similarity)
+                                .build());
                     }
                 }
             } catch (Exception e) {
@@ -464,16 +488,7 @@ public class LongTermMemoryService implements ILongTermMemoryService {
             }
         }
 
-        // 3. 格式化为 "[topic] content" 便于 advisor 展示
-        List<String> result = new ArrayList<>();
-        for (Map.Entry<String, String> e : dedup.entrySet()) {
-            String topic = e.getValue();
-            if (topic != null && !topic.isBlank()) {
-                result.add("[" + topic + "] " + e.getKey());
-            } else {
-                result.add(e.getKey());
-            }
-        }
+        List<LongTermMemoryRecall> result = new ArrayList<>(dedup.values());
 
         int relevantCount = dedup.size() - coreCount;
         log.info("ltm.retrieveForInjection userId={} core={} relevant={} total={}",

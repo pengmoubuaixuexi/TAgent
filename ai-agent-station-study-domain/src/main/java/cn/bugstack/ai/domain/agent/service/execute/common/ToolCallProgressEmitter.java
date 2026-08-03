@@ -1,12 +1,15 @@
 package cn.bugstack.ai.domain.agent.service.execute.common;
 
 import cn.bugstack.ai.domain.agent.service.execute.event.RunEventPublisher;
+import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService;
+import cn.bugstack.ai.domain.agent.service.execute.snapshot.ToolEvidenceRecord;
 import cn.bugstack.ai.domain.agent.service.security.ApprovalChannelRegistry;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyEmitter;
 
@@ -48,6 +51,9 @@ public class ToolCallProgressEmitter {
 
     @Resource
     private RunEventPublisher runEventPublisher;
+
+    @Autowired(required = false)
+    private RunSnapshotService runSnapshotService;
 
     /**
      * 2026-06-22 评估采集开关：开后 {@code tool_call_end} 携带工具真实返回(截断 {@value #DEFAULT_RESULT_PREVIEW_MAX_CHARS} 字，可配 agent.tool-progress.result-preview.max-chars)。
@@ -141,6 +147,57 @@ public class ToolCallProgressEmitter {
         data.put("latencyMs", latencyMs);
         data.put("timestamp", System.currentTimeMillis());
         sendEvent(emitter, "tool_call_error", data, sessionId, toolName);
+    }
+
+    /**
+     * Persist the complete normalized result that was visible to the model. This deliberately does not
+     * put the result in SSE; the compact progress card remains a privacy/size boundary.
+     */
+    public void recordEvidence(String sessionId, String toolName, String input, String output,
+                               String status, long latencyMs, int rawResultChars,
+                               String step, String callId) {
+        try {
+            if (runSnapshotService == null || runEventPublisher == null || output == null) return;
+            String runId = runEventPublisher.currentRunId(sessionId);
+            if (runId == null || runId.isBlank()) return;
+            String resolvedCallId = callId == null || callId.isBlank()
+                    ? java.util.UUID.randomUUID().toString() : callId;
+            runSnapshotService.recordToolEvidence(runId, ToolEvidenceRecord.builder()
+                    .evidenceId("tool:" + resolvedCallId)
+                    .callId(resolvedCallId)
+                    .toolName(toolName)
+                    .step(step)
+                    .status(status)
+                    .input(input)
+                    .output(output)
+                    .outputType(detectOutputType(output))
+                    .resultChars(output.length())
+                    .rawResultChars(Math.max(0, rawResultChars))
+                    .latencyMs(Math.max(0L, latencyMs))
+                    .createdAt(System.currentTimeMillis())
+                    .build());
+        } catch (Exception error) {
+            log.debug("[ToolCallProgress] evidence persist failed sessionId={} tool={} err={}",
+                    sessionId, toolName, error.toString());
+        }
+    }
+
+    static String detectOutputType(String output) {
+        if (output == null || output.isBlank()) return "empty";
+        String value = output.trim();
+        try {
+            if (value.startsWith("{")) {
+                com.alibaba.fastjson.JSON.parseObject(value);
+                return "json_object";
+            }
+            if (value.startsWith("[")) {
+                com.alibaba.fastjson.JSON.parseArray(value);
+                return "json_array";
+            }
+        } catch (Exception ignored) {
+            // A text response may start with a brace; render it as text when it is not valid JSON.
+        }
+        return "text";
     }
 
     /**

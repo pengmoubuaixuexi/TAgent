@@ -87,9 +87,20 @@ public class ParentDocumentService implements IParentDocumentService {
 
         // 提取去重 parent_id
         Set<String> parentIds = new LinkedHashSet<>();
+        Map<String, Map<String, Object>> relevanceByParent = new HashMap<>();
         for (Document doc : childDocs) {
             Object pid = doc.getMetadata().get("parent_id");
-            if (pid != null) parentIds.add(pid.toString());
+            if (pid != null) {
+                String parentId = pid.toString();
+                parentIds.add(parentId);
+                Map<String, Object> aggregate = relevanceByParent.computeIfAbsent(parentId, ignored -> new HashMap<>());
+                mergeMax(aggregate, "rerank_score", number(doc.getMetadata().get("rerank_score")));
+                mergeMax(aggregate, "semantic_similarity", semanticSimilarity(doc));
+                if (!aggregate.containsKey("matched_child_snippet") && doc.getText() != null) {
+                    aggregate.put("matched_child_snippet", doc.getText());
+                    aggregate.put("matched_child_id", doc.getId());
+                }
+            }
         }
 
         if (parentIds.isEmpty()) {
@@ -111,8 +122,35 @@ public class ParentDocumentService implements IParentDocumentService {
                     if (po.getSource() != null) metadata.put("source", po.getSource());
                     if (po.getTitle() != null && !po.getTitle().isBlank()) metadata.put("title", po.getTitle());
                     if (po.getUserId() != null) metadata.put("user_id", po.getUserId());
+                    Map<String, Object> relevance = relevanceByParent.get(po.getParentId());
+                    if (relevance != null) metadata.putAll(relevance);
                     return new Document(po.getParentId(), po.getContent(), metadata);
                 })
                 .collect(Collectors.toList());
+    }
+
+    private static void mergeMax(Map<String, Object> target, String key, Double value) {
+        if (value == null || !Double.isFinite(value)) return;
+        Double current = number(target.get(key));
+        if (current == null || value > current) target.put(key, value);
+    }
+
+    private static Double semanticSimilarity(Document document) {
+        if (document == null) return null;
+        Double score = document.getScore();
+        if (score != null && Double.isFinite(score)) return clamp01(score);
+        Double distance = number(document.getMetadata().get("distance"));
+        return distance == null ? null : clamp01(1.0d - distance);
+    }
+
+    private static Double number(Object value) {
+        if (value instanceof Number n) return n.doubleValue();
+        if (value == null) return null;
+        try { return Double.parseDouble(String.valueOf(value)); }
+        catch (Exception ignored) { return null; }
+    }
+
+    private static double clamp01(double value) {
+        return Math.max(0.0d, Math.min(1.0d, value));
     }
 }

@@ -270,23 +270,33 @@ public class RagAnswerAdvisor implements BaseAdvisor {
         // 时，编号跨 client 累加（client A 用 [1][2]、client B 用 [3][4]）；前端 append 渲染对应
         // 一张大卡片，模型答案中的 [N] 跟前端卡片中第 N 条 evidence 严格一一对应
         String sessionId = resolveSessionIdForEvidence(chatClientRequest.context());
-        int startRef = (sessionRefCounter != null)
-                ? sessionRefCounter.advance(sessionId, documents.size())
-                : 1;
+        List<Integer> refs;
+        if (sessionRefCounter != null && ragEvidenceEmitter != null) {
+            List<String> fingerprints = documents.stream()
+                    .map(ragEvidenceEmitter::evidenceFingerprint)
+                    .collect(Collectors.toList());
+            refs = sessionRefCounter.resolveReferences(sessionId, fingerprints);
+        } else {
+            refs = new ArrayList<>(documents.size());
+            int startRef = (sessionRefCounter != null)
+                    ? sessionRefCounter.advance(sessionId, documents.size())
+                    : 1;
+            for (int i = 0; i < documents.size(); i++) refs.add(startRef + i);
+        }
         StringBuilder docContextBuilder = new StringBuilder();
         Map<Integer, String> citationMap = new HashMap<>();
         for (int i = 0; i < documents.size(); i++) {
-            int ref = startRef + i;
+            int ref = refs.get(i);
             docContextBuilder.append("[").append(ref).append("] ").append(documents.get(i).getText()).append("\n\n");
             citationMap.put(ref, documents.get(i).getId() != null ? documents.get(i).getId() : "doc-" + ref);
         }
         String documentContext = docContextBuilder.toString();
         // 追加引用指令 —— 编号必须跟 documentContext 第一项对齐（不一定是 [1] 起）
         if (!documents.isEmpty()) {
-            int endRef = startRef + documents.size() - 1;
-            String citeHint = (documents.size() == 1)
-                    ? "回答时请在使用到该资料的位置标注引用编号 [" + startRef + "]。"
-                    : "回答时请在使用到对应资料的位置标注引用编号，引用范围为 [" + startRef + "] 到 [" + endRef + "]。";
+            String refList = refs.stream().distinct()
+                    .map(ref -> "[" + ref + "]")
+                    .collect(Collectors.joining("、"));
+            String citeHint = "回答时请在使用到对应资料的位置标注引用编号，可用编号为 " + refList + "。";
             documentContext = citeHint + "\n\n---\n" + documentContext;
         }
         context.put("qa_citation_map", citationMap);
@@ -296,11 +306,11 @@ public class RagAnswerAdvisor implements BaseAdvisor {
         // 第 61 轮：传 startRef，前端基于这个 ref 渲染 [startRef]..[startRef+n-1]，跟模型答案一致
         try {
             if (ragEvidenceEmitter != null && !documents.isEmpty()) {
-                List<Map<String, Object>> evidenceSnippets = ragEvidenceEmitter.buildEvidenceSnippets(documents, startRef);
+                List<Map<String, Object>> evidenceSnippets = ragEvidenceEmitter.buildEvidenceSnippets(documents, refs);
                 if (!evidenceSnippets.isEmpty()) {
                     context.put("qa_evidence_snippets", evidenceSnippets);
                 }
-                ragEvidenceEmitter.emitEvidence(sessionId, documents, startRef);
+                ragEvidenceEmitter.emitEvidence(sessionId, documents, refs);
             }
         } catch (Exception emitEx) {
             log.debug("[RagAnswerAdvisor] evidence emit skipped: {}", emitEx.toString());

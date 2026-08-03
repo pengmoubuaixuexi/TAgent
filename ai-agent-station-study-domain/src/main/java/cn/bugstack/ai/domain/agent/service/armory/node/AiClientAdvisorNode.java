@@ -273,6 +273,9 @@ public class AiClientAdvisorNode extends AbstractArmorySupport {
         if (advisor instanceof cn.bugstack.ai.domain.agent.service.armory.node.factory.element.EpisodicMemoryAdvisor epAdvisor) {
             epAdvisor.setMemoryEvidenceEmitter(memoryEvidenceEmitter); // H2-A
         }
+        if (advisor instanceof cn.bugstack.ai.domain.agent.service.armory.node.factory.element.ReadOnlyChatMemoryAdvisor chatAdvisor) {
+            chatAdvisor.setMemoryEvidenceEmitter(memoryEvidenceEmitter);
+        }
         return advisor;
     }
 

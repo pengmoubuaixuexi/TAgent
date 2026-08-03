@@ -65,6 +65,7 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 - **执行中干预**：用户可发送 `steer` 重做当前步骤、`answer_now` 跳过剩余步骤、`cancel` 中止执行
 - **主动追问**：模型缺少关键信息时可调用 `ask_user`，通过 SSE 向用户收集补充信息，再回填继续执行
 - **交互通知收件箱**：统一保存主动追问、工具审批、计划确认和后台任务结果；当前会话内隐藏待交互铃铛提醒，切走后仍待处理时自动显示
+- **按需证据地图**：用户可从最终回答主动生成 Evidence Map，把成块结论关联到本次 Run 的 RAG、工具、记忆与用户输入来源，并可查看全部运行来源
 
 ---
 
@@ -89,7 +90,7 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 | **主动追问** | `ask_user` 通过 SSE 向用户请求补充信息，默认关闭、按 session 限次和超时 |
 | **人机协同** | 高风险工具调用通过 SSE 请求人工批准或拒绝 |
 | **交互通知收件箱** | Redis 持久化追问、审批、计划与任务结果通知，支持确认、跳转、归档和过期状态 |
-| **可解释输出** | 工具进度、RAG 依据、记忆依据、步骤状态 |
+| **可解释输出** | 工具进度、RAG/记忆相关度、步骤状态，以及按需生成并缓存的 Evidence Map |
 | **全链路观测** | Prometheus、ELK、Jaeger、event_log、LLM 成本与 MCP 健康页 |
 
 ---
@@ -584,6 +585,11 @@ agent:
     enabled: true
     ttl-seconds: 21600
     session-index-size: 30
+  run-events:
+    enabled: true
+    ttl-seconds: 21600
+  evidence-map:
+    ttl-seconds: 604800
 ```
 
 ---

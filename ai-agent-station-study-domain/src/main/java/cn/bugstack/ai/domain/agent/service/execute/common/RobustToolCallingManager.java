@@ -49,6 +49,8 @@ public class RobustToolCallingManager implements ToolCallingManager {
 
     /** P0-B2b-Step3：repair 专用 ToolContext key——置 {@code Boolean.TRUE} 时 resolveToolDefinitions 直接返回空定义。 */
     public static final String FORCE_NO_TOOLS_KEY = "agent.force_no_tools";
+    private static final com.fasterxml.jackson.databind.ObjectMapper ASK_USER_JSON =
+            new com.fasterxml.jackson.databind.ObjectMapper();
 
     private final ToolCallingManager delegate;
     private final McpToolMetrics metrics;
@@ -89,12 +91,14 @@ public class RobustToolCallingManager implements ToolCallingManager {
             .name(ASK_USER_TOOL_NAME)
             .description("当你缺少完成任务所必需的关键信息，或对用户意图存在多种合理理解、需要用户拍板时，调用本工具向用户提问。"
                     + "请把所有需要澄清的问题一次性放进 questions 数组问全，不要逐条反复追问；每条必须是一个具体、可直接回答的问题，不要写笼统含糊的话。"
-                    + "当问题存在明确且互斥的常见答案时，优先给出 2-4 个具体 options 作为快捷选择，并保持 allowFreeText=true，让用户仍可输入选项之外的答案；"
+                    + "questions 必须直接传 JSON 数组，禁止先将整个数组序列化成字符串再传入。"
+                    + "当问题存在明确的常见答案时，优先给出 2-4 个具体 options 作为快捷选择；默认为单选，只有选项可以同时成立、用户确实可选多项时才设置 multiple=true。"
+                    + "保持 allowFreeText=true，让用户仍可输入选项之外的答案；"
                     + "若信息不足以可靠枚举选项，则不要猜测，可省略 options。选项只是帮助用户快速作答，不能代替用户最终以文本形式提交的回答。"
                     + "用户会以自由文本回答（可能直接回答、也可能补充信息或调整需求），其回答会作为本工具的结果返回给你，请据此继续完成任务。")
             .inputSchema("{\"type\":\"object\",\"properties\":{"
                     + "\"context\":{\"type\":\"string\",\"description\":\"可选。向用户说明你为什么需要这些信息，或你目前的理解，便于用户作答\"},"
-                    + "\"questions\":{\"type\":\"array\",\"description\":\"要问用户的问题列表，优先使用结构化问题；兼容直接传字符串的旧格式\",\"items\":{\"oneOf\":["
+                    + "\"questions\":{\"type\":\"array\",\"description\":\"必须直接传入 JSON 数组，禁止把整个数组序列化成字符串；数组内优先使用结构化问题，兼容单个字符串问题\",\"items\":{\"oneOf\":["
                     + "{\"type\":\"string\",\"description\":\"兼容旧格式：一个具体、可直接回答的问题\"},"
                     + "{\"type\":\"object\",\"properties\":{"
                     + "\"question\":{\"type\":\"string\",\"description\":\"一个具体、可直接回答的问题\"},"
@@ -103,7 +107,8 @@ public class RobustToolCallingManager implements ToolCallingManager {
                     + "\"value\":{\"type\":\"string\",\"description\":\"用户选择后写入最终文本回答的值；省略时等于 label\"},"
                     + "\"description\":{\"type\":\"string\",\"description\":\"可选。用一句话解释该选项的影响或区别\"}"
                     + "},\"required\":[\"label\"]}},"
-                    + "\"allowFreeText\":{\"type\":\"boolean\",\"description\":\"是否允许用户输入选项之外的文本；默认并优先设为 true\",\"default\":true}"
+                    + "\"allowFreeText\":{\"type\":\"boolean\",\"description\":\"是否允许用户输入选项之外的文本；默认并优先设为 true\",\"default\":true},"
+                    + "\"multiple\":{\"type\":\"boolean\",\"description\":\"该问题是否允许同时选择多个 options；默认 false，只有真正的多选题才设为 true\",\"default\":false}"
                     + "},\"required\":[\"question\"]}"
                     + "]}}"
                     + "},\"required\":[\"questions\"]}")
@@ -676,33 +681,36 @@ public class RobustToolCallingManager implements ToolCallingManager {
     /** 解析 ask_user 入参里的 context + questions，兼容旧字符串问题和结构化问题，拼成卡片预览。 */
     private String askUserPreview(String argsJson) {
         try {
-            com.alibaba.fastjson.JSONObject o = com.alibaba.fastjson.JSON.parseObject(argsJson);
-            if (o != null) {
+            com.fasterxml.jackson.databind.JsonNode o = ASK_USER_JSON.readTree(argsJson);
+            if (o != null && o.isObject()) {
                 StringBuilder sb = new StringBuilder();
-                String ctx = o.getString("context");
+                String ctx = o.hasNonNull("context") ? o.get("context").asText() : null;
                 if (ctx != null && !ctx.isBlank()) sb.append(ctx.trim()).append("\n");
-                com.alibaba.fastjson.JSONArray qs = o.getJSONArray("questions");
-                if (qs != null) {
+                com.fasterxml.jackson.databind.JsonNode qs = AskUserQuestionNormalizer.normalize(o.get("questions"));
+                if (qs != null && !qs.isArray() && (qs.isTextual() || qs.isObject())) {
+                    qs = ASK_USER_JSON.createArrayNode().add(qs);
+                }
+                if (qs != null && qs.isArray()) {
                     for (int i = 0; i < qs.size(); i++) {
-                        Object rawQuestion = qs.get(i);
+                        com.fasterxml.jackson.databind.JsonNode rawQuestion = qs.get(i);
                         String question = null;
-                        com.alibaba.fastjson.JSONArray options = null;
-                        if (rawQuestion instanceof String text) {
-                            question = text;
-                        } else if (rawQuestion instanceof com.alibaba.fastjson.JSONObject detail) {
-                            question = detail.getString("question");
-                            options = detail.getJSONArray("options");
+                        com.fasterxml.jackson.databind.JsonNode options = null;
+                        if (rawQuestion.isTextual()) {
+                            question = rawQuestion.asText();
+                        } else if (rawQuestion.isObject()) {
+                            question = rawQuestion.hasNonNull("question") ? rawQuestion.get("question").asText() : null;
+                            options = rawQuestion.get("options");
                         }
                         if (question == null || question.isBlank()) continue;
                         sb.append(i + 1).append(". ").append(question.trim());
-                        if (options != null && !options.isEmpty()) {
+                        if (options != null && options.isArray() && !options.isEmpty()) {
                             List<String> labels = new ArrayList<>();
                             for (int optionIndex = 0; optionIndex < options.size(); optionIndex++) {
-                                Object rawOption = options.get(optionIndex);
-                                if (rawOption instanceof String text && !text.isBlank()) {
-                                    labels.add(text.trim());
-                                } else if (rawOption instanceof com.alibaba.fastjson.JSONObject option) {
-                                    String label = option.getString("label");
+                                com.fasterxml.jackson.databind.JsonNode rawOption = options.get(optionIndex);
+                                if (rawOption.isTextual() && !rawOption.asText().isBlank()) {
+                                    labels.add(rawOption.asText().trim());
+                                } else if (rawOption.isObject()) {
+                                    String label = rawOption.hasNonNull("label") ? rawOption.get("label").asText() : null;
                                     if (label != null && !label.isBlank()) labels.add(label.trim());
                                 }
                             }

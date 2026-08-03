@@ -60,6 +60,25 @@ public interface ILongTermMemoryService {
      */
     List<String> retrieveForInjection(String userId, String query, int coreN, int relevantK);
 
+    /** Same recall as {@link #retrieveForInjection}, with provenance and user-facing similarity retained. */
+    default List<LongTermMemoryRecall> retrieveForInjectionDetailed(String userId, String query, int coreN, int relevantK) {
+        List<String> lines = retrieveForInjection(userId, query, coreN, relevantK);
+        if (lines == null || lines.isEmpty()) return List.of();
+        return lines.stream().filter(line -> line != null && !line.isBlank()).map(line -> {
+            String topic = "other";
+            String content = line.trim();
+            if (content.startsWith("[")) {
+                int close = content.indexOf("] ");
+                if (close > 1) {
+                    topic = content.substring(1, close);
+                    content = content.substring(close + 2);
+                }
+            }
+            return LongTermMemoryRecall.builder().topic(topic).content(content)
+                    .kind(LongTermMemoryRecall.KIND_CORE).build();
+        }).toList();
+    }
+
     /**
      * P2.1 10.2 遗忘衰减（2026-06-07 重设计）：把闲置超过 "基线天数 + 热度宽限" 的冷记忆批量归档
      * （破坏性：删向量 + archived=1）。

@@ -124,6 +124,7 @@ public class LlmRerankService implements IRerankService {
 
     private List<Document> applyScores(String llmOutput, List<Document> candidates, int topN) {
         double[] scores = new double[candidates.size()];
+        boolean[] scored = new boolean[candidates.size()];
         try {
             String cleaned = stripMarkdownFences(llmOutput);
             JSONArray arr = JSON.parseArray(cleaned);
@@ -133,6 +134,7 @@ public class LlmRerankService implements IRerankService {
                 double s = item.getDoubleValue("score");
                 if (idx >= 0 && idx < candidates.size()) {
                     scores[idx] = s;
+                    scored[idx] = true;
                 }
             }
         } catch (Exception e) {
@@ -146,7 +148,14 @@ public class LlmRerankService implements IRerankService {
 
         List<Document> out = new ArrayList<>();
         for (int i = 0; i < Math.min(topN, indices.size()); i++) {
-            out.add(candidates.get(indices.get(i)));
+            int candidateIndex = indices.get(i);
+            Document document = candidates.get(candidateIndex);
+            if (scored[candidateIndex]) {
+                document.getMetadata().put("rerank_score",
+                        Math.max(0.0d, Math.min(1.0d, scores[candidateIndex] / 10.0d)));
+                document.getMetadata().put("rerank_provider", "llm");
+            }
+            out.add(document);
         }
         return out;
     }

@@ -70,6 +70,27 @@ public interface RunSnapshotService {
     default void recordTimeline(String runId, List<RunEventRecord> events, String lastEventId) {
     }
 
+    /** Persist a full tool result separately from the compact UI timeline. */
+    default void recordToolEvidence(String runId, ToolEvidenceRecord evidence) {
+    }
+
+    /** Load a previously generated Evidence Map when its input signature still matches. */
+    default Optional<Map<String, Object>> findEvidenceMap(String runId, String signature) {
+        return Optional.empty();
+    }
+
+    /**
+     * Load the latest generated Evidence Map without requiring the short-lived run snapshot.
+     * This is used to keep an already-paid-for map readable after its source snapshot expires.
+     */
+    default Optional<Map<String, Object>> findEvidenceMap(String runId) {
+        return Optional.empty();
+    }
+
+    /** Cache an Evidence Map with its own, longer sliding TTL. */
+    default void saveEvidenceMap(String runId, String signature, Map<String, Object> evidenceMap) {
+    }
+
     void markStatus(String runId, String status, String lastError);
 
     Optional<String> buildRedoContext(String sourceRunId, Integer redoFromStep, String sessionId);

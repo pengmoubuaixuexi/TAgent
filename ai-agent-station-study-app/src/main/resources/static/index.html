@@ -85,6 +85,11 @@
   .memory-section-title { color:#93c5fd; font-size:11px; font-weight:600; letter-spacing:0; }
   .memory-tag { color:#bfdbfe; font-weight:600; }
   .memory-kind { color:#a7f3d0; font-weight:600; }
+  .evidence-score { color:#c4b5fd; border:1px solid #4c1d95; background:#2e1065; border-radius:999px; padding:1px 6px; white-space:nowrap; }
+  .evidence-map-claim { border:1px solid #334155; background:#111827; border-radius:10px; padding:12px; }
+  .evidence-map-link { margin-left:20px; border-left:2px solid #334155; padding:8px 0 0 16px; }
+  .evidence-map-node { width:100%; text-align:left; border:1px solid #374151; background:#0f172a; border-radius:8px; padding:9px 10px; color:#d1d5db; }
+  .evidence-map-node:hover { border-color:#2563eb; background:#111c33; }
   /* 2026-05-07：markdown 元素样式（深色主题，兼容 marked.js 输出的标准标签） */
   .msg-content h1, .msg-content h2, .msg-content h3,
   .msg-content h4, .msg-content h5, .msg-content h6,
@@ -286,7 +291,10 @@
           <h3 class="text-lg font-bold text-white">需要确认工具调用</h3>
           <p id="approvalCountdown" class="text-xs text-amber-300 mt-1"></p>
         </div>
-        <button onclick="dismissApproval()" class="text-gray-500 hover:text-white text-xl">&times;</button>
+        <div class="flex items-center gap-3">
+          <button onclick="minimizeApproval()" title="最小化，审批仍保持等待" class="text-gray-500 hover:text-white text-xl leading-none">&minus;</button>
+          <button onclick="dismissApproval()" title="关闭并放弃当前审批界面" class="text-gray-500 hover:text-white text-xl">&times;</button>
+        </div>
       </div>
       <div class="space-y-3">
         <div id="approvalStepWrap" class="hidden">
@@ -334,15 +342,18 @@
 
   <!-- D 段：ask_user —— AI 主动请求用户补充信息（与审批独立通道，按 inputId 各解各的，不串话） -->
   <div id="userInputModal" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
-    <div class="bg-gray-900 rounded-2xl p-6 border border-indigo-700/70 w-full max-w-xl shadow-2xl">
-      <div class="flex items-start justify-between gap-4 mb-4">
+    <div id="userInputDialog" class="bg-gray-900 rounded-2xl p-6 border border-indigo-700/70 w-full max-w-xl max-h-[calc(100vh-2rem)] shadow-2xl flex flex-col overflow-hidden">
+      <div class="flex-none flex items-start justify-between gap-4 mb-4">
         <div>
           <h3 class="text-lg font-bold text-white">AI 需要你补充信息</h3>
           <p id="userInputCountdown" class="text-xs text-indigo-300 mt-1"></p>
         </div>
-        <button onclick="dismissUserInput()" class="text-gray-500 hover:text-white text-xl">&times;</button>
+        <div class="flex items-center gap-3">
+          <button onclick="minimizeUserInput()" title="最小化，输入内容和倒计时都会保留" class="text-gray-500 hover:text-white text-xl leading-none">&minus;</button>
+          <button onclick="dismissUserInput()" title="关闭并放弃本次补充" class="text-gray-500 hover:text-white text-xl">&times;</button>
+        </div>
       </div>
-      <div class="space-y-3">
+      <div id="userInputScrollableContent" class="flex-1 min-h-0 overflow-y-auto overscroll-contain pr-1 space-y-3">
         <div id="userInputStepWrap" class="hidden">
           <div class="text-xs text-gray-500 mb-1">所属步骤</div>
           <div id="userInputStep" class="text-sm text-indigo-200 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 break-all"></div>
@@ -362,12 +373,48 @@
           <div class="text-xs text-gray-500 mb-1">你的回答（可回答问题，也可补充信息或调整需求）</div>
           <textarea id="userInputAnswer" rows="4" class="w-full text-sm text-gray-100 bg-gray-950 border border-gray-800 rounded-lg p-3 focus:outline-none focus:border-indigo-600 resize-none" placeholder="自由输入..."></textarea>
         </div>
+      </div>
+      <div class="flex-none pt-3 mt-3 border-t border-gray-800">
         <div id="userInputStatus" class="hidden text-sm"></div>
         <div class="flex justify-end gap-3 pt-2">
           <button id="userInputSubmitBtn" onclick="submitUserInput()" class="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg transition text-sm font-medium">提交</button>
         </div>
       </div>
     </div>
+  </div>
+
+  <div id="evidenceMapModal" class="hidden fixed inset-0 bg-black/70 z-[80] flex items-center justify-center p-4">
+    <div class="bg-[#0b1120] rounded-2xl border border-gray-700 w-full max-w-6xl h-[84vh] shadow-2xl flex flex-col overflow-hidden">
+      <div class="px-5 py-4 border-b border-gray-800 flex items-start justify-between gap-4">
+        <div>
+          <h3 class="text-lg font-bold text-white">Evidence Map</h3>
+          <p id="evidenceMapMeta" class="text-xs text-gray-400 mt-1">正在生成结论与证据关联...</p>
+        </div>
+        <div class="flex items-center gap-3">
+          <button id="evidenceMapSourcesBtn" onclick="toggleEvidenceSources()" class="hidden text-xs border border-violet-800 bg-violet-950/40 text-violet-200 rounded-md px-2.5 py-1.5 hover:bg-violet-900/60">全部来源</button>
+          <button id="evidenceMapRegenerateBtn" onclick="regenerateEvidenceMap()" class="hidden text-xs border border-gray-700 bg-gray-800 text-gray-300 rounded-md px-2.5 py-1.5 hover:bg-gray-700">重新生成</button>
+          <button onclick="minimizeEvidenceMap()" title="最小化" class="text-gray-500 hover:text-white text-xl leading-none">&minus;</button>
+          <button onclick="closeEvidenceMap()" class="text-gray-500 hover:text-white text-xl">&times;</button>
+        </div>
+      </div>
+      <div class="flex-1 grid grid-cols-1 lg:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)] overflow-hidden">
+        <div id="evidenceMapGraph" class="overflow-y-auto p-5 space-y-4 scrollbar">
+          <div class="text-sm text-gray-500 text-center py-12">正在调用小模型生成...</div>
+        </div>
+        <div class="border-t lg:border-t-0 lg:border-l border-gray-800 flex flex-col overflow-hidden">
+          <div class="px-4 py-3 border-b border-gray-800 text-sm font-medium text-gray-200">来源详情</div>
+          <div id="evidenceMapDetail" class="flex-1 overflow-y-auto p-4 scrollbar text-sm text-gray-400">
+            点击左侧证据节点查看完整内容。
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="minimizedInteractionDock" class="fixed right-5 bottom-24 z-[75] flex flex-col items-end gap-2 pointer-events-none">
+    <button id="minimizedApprovalBtn" onclick="restoreApproval()" class="hidden pointer-events-auto max-w-sm bg-amber-950 border border-amber-700 text-amber-100 rounded-full shadow-xl px-4 py-2 text-xs hover:bg-amber-900"></button>
+    <button id="minimizedUserInputBtn" onclick="restoreUserInput()" class="hidden pointer-events-auto max-w-sm bg-indigo-950 border border-indigo-700 text-indigo-100 rounded-full shadow-xl px-4 py-2 text-xs hover:bg-indigo-900"></button>
+    <button id="minimizedEvidenceMapBtn" onclick="restoreEvidenceMap()" class="hidden pointer-events-auto bg-violet-950 border border-violet-700 text-violet-100 rounded-full shadow-xl px-4 py-2 text-xs hover:bg-violet-900">查看 Evidence Map</button>
   </div>
 
   <!-- Input -->
@@ -448,7 +495,15 @@ let state = {
   notifications: [],
   notificationFilter: 'all',
   notificationTimer: null,
-  userInputSelections: {}
+  userInputSelections: {},
+  currentEvidenceMap: null,
+  currentEvidenceRequest: null,
+  evidenceMapCache: new Map(),
+  evidenceMapRequests: new Map(),
+  approvalMinimized: false,
+  userInputMinimized: false,
+  evidenceMapMinimized: false,
+  evidenceSourcesVisible: false
 };
 
 // ==================== INIT ====================
@@ -910,6 +965,10 @@ function detachObservedRunUi() {
   state.pendingApproval = null;
   hideApprovalModal();
   clearApprovalTimer();
+  // ask_user belongs to the session being observed as well.  Leaving its
+  // local modal alive lets an old prompt leak across session switches.
+  state.pendingUserInput = null;
+  hideUserInputModal();
   setSendBtn(false);
   showAnswerNow(false);
 }
@@ -1722,6 +1781,8 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
         setFinalAnswerCopy(aiMsg, fullContent);
       } else if (payload.type === 'error') {
         if (finalAnswerEl) finalAnswerEl.innerHTML = `<span class="text-red-400">❌ ${escapeHtml(payload.content || '')}</span>`;
+      } else if (payload.type === 'execution') {
+        fillEmptyExecutionStepCard(stepBuffers, payload);
       }
     }
     curEvent = 'message';
@@ -2004,6 +2065,34 @@ function normalizeExecutionStepName(displayName, stepId) {
     .replace(/^Fixed(?:_\d+)?\s*[·:：\-]\s*/i, '')
     .trim();
   return cleaned || raw;
+}
+
+function executionResultDisplayFallback(content) {
+  let text = String(content || '').trim();
+  if (!text) return '';
+  const marker = '=== 执行结果 ===';
+  const markerIndex = text.indexOf(marker);
+  if (markerIndex >= 0) text = text.substring(markerIndex + marker.length).trim();
+  else text = text.replace(/^.{0,100}?执行完成\s*[:：]\s*/s, '').trim();
+  text = text
+    .replace(/^```[^\r\n]*[\r\n]*/s, '')
+    .replace(/[\r\n]*```\s*$/s, '')
+    .trim();
+  if (!text) return '';
+  return `> 本步骤未单独生成展示正文，以下为实际执行产物。\n\n${text}`;
+}
+
+function fillEmptyExecutionStepCard(stepBuffers, payload) {
+  if (!stepBuffers || !payload || payload.step == null) return false;
+  const stepNo = Number(payload.step);
+  if (!Number.isInteger(stepNo) || stepNo <= 0) return false;
+  const entry = stepBuffers[`flow_step4_execute_step_${stepNo}`];
+  if (!entry || String(entry.buf || '').trim()) return false;
+  const fallback = executionResultDisplayFallback(payload.content);
+  if (!fallback) return false;
+  entry.buf = fallback;
+  if (entry.body) entry.body.innerHTML = renderMarkdown(fallback);
+  return true;
 }
 
 function dependencyDisplayName(depId, stepBuffers) {
@@ -2994,15 +3083,27 @@ async function sendMessage() {
       }
       bodyEl = card.querySelector('.evidence-body');
       countEl = card.querySelector('.evidence-count');
-      const itemHtml = items.map(item => {
+      const fingerprints = new Set(Array.from(bodyEl.querySelectorAll('.evidence-item[data-fp]'))
+        .map(node => node.dataset.fp));
+      const uniqueItems = items.filter(item => {
+        const source = String(item.source || 'unknown source');
+        const snippet = String(item.snippet || '').replace(/\s+/g, ' ').trim();
+        const fp = `${source}|${snippet}`;
+        if (fingerprints.has(fp)) return false;
+        fingerprints.add(fp);
+        item.__evidenceFingerprint = fp;
+        return true;
+      });
+      const itemHtml = uniqueItems.map(item => {
         const ref = item.ref == null ? '?' : item.ref;
         const source = item.source || 'unknown source';
         const snippet = item.snippet || '';
         return `
-          <div class="evidence-item" id="rag-evidence-${escapeHtml(String(ref))}">
+          <div class="evidence-item" id="rag-evidence-${escapeHtml(String(ref))}" data-fp="${escapeHtml(item.__evidenceFingerprint || '')}">
             <div class="evidence-meta">
               <span class="evidence-ref">[${escapeHtml(String(ref))}]</span>
               <span class="evidence-source" title="${escapeHtml(String(source))}">${escapeHtml(String(source))}</span>
+              ${evidenceScoreHtml(item, null)}
             </div>
             <div class="evidence-snippet">${escapeHtml(String(snippet))}</div>
           </div>
@@ -3017,13 +3118,15 @@ async function sendMessage() {
 
     function memoryTypeLabel(memoryType) {
       if (memoryType === 'long_term') return '长期记忆';
-      if (memoryType === 'episodic') return '会话记忆';
+      if (memoryType === 'episodic') return '情景记忆';
+      if (memoryType === 'chat_summary') return '会话摘要';
       return '记忆';
     }
 
     function memoryKindLabel(kind) {
       if (kind === 'current') return '当前会话';
       if (kind === 'other') return '最近话题';
+      if (kind === 'rolling_summary') return '滚动摘要';
       return kind || '记忆';
     }
 
@@ -3077,6 +3180,7 @@ async function sendMessage() {
             <div class="evidence-item memory-item" data-fp="${escapeHtml(fp)}">
               <div class="evidence-meta">
                 <span class="memory-tag">${escapeHtml(String(topic))}</span>
+                ${evidenceScoreHtml(item, memoryType)}
               </div>
               <div class="evidence-snippet">${escapeHtml(String(content))}</div>
             </div>
@@ -3537,6 +3641,9 @@ async function sendMessage() {
           setFinalAnswerCopy(aiMsg, fullContent);
         } else if (payload.type === 'error') {
           finalAnswerEl.innerHTML = `<span class="text-red-400">❌ ${escapeHtml(payload.content || '')}</span>`;
+        } else if (payload.type === 'execution') {
+          // 正常情况下步骤卡由 token 填充；若模型只返回结构化业务产物，或 token 在重连中缺失，补齐空卡。
+          fillEmptyExecutionStepCard(stepBuffers, payload);
         } else if (payload.type === 'complete') {
           // 全部完成；没必要做什么
         }
@@ -3805,6 +3912,7 @@ function dismissApproval() {
 
 function showApprovalModal(payload) {
   if (!payload || !payload.approvalId) return;
+  const keepMinimized = !!state.approvalMinimized;
   state.pendingApproval = payload;
 
   // 步骤标签：DAG 并行时标注"是哪个步骤要的许可"，后端 payload.step 为空则不显示
@@ -3823,7 +3931,12 @@ function showApprovalModal(payload) {
   renderApprovalQueueCount();
   setApprovalStatus('', '');
   setApprovalButtons(false);
-  document.getElementById('approvalModal').classList.remove('hidden');
+  if (keepMinimized) {
+    document.getElementById('approvalModal').classList.add('hidden');
+    updateMinimizedApprovalButton();
+  } else {
+    document.getElementById('approvalModal').classList.remove('hidden');
+  }
 
   clearApprovalTimer();
   const timeoutSeconds = Number(payload.timeoutSeconds || 0);
@@ -3853,6 +3966,7 @@ function updateApprovalCountdown(deadline) {
   document.getElementById('approvalCountdown').textContent = left > 0
     ? `请在 ${left} 秒内确认，超时会自动拒绝`
     : '已超时，后端会自动拒绝';
+  updateMinimizedApprovalButton(left);
   if (left <= 0) {
     clearApprovalTimer();
     setApprovalButtons(true);
@@ -3869,7 +3983,34 @@ function updateApprovalCountdown(deadline) {
 
 function hideApprovalModal() {
   document.getElementById('approvalModal').classList.add('hidden');
+  state.approvalMinimized = false;
+  document.getElementById('minimizedApprovalBtn').classList.add('hidden');
   clearApprovalTimer();
+}
+
+function minimizeApproval() {
+  if (!state.pendingApproval) return;
+  state.approvalMinimized = true;
+  document.getElementById('approvalModal').classList.add('hidden');
+  updateMinimizedApprovalButton();
+}
+
+function restoreApproval() {
+  if (!state.pendingApproval) return;
+  state.approvalMinimized = false;
+  document.getElementById('minimizedApprovalBtn').classList.add('hidden');
+  document.getElementById('approvalModal').classList.remove('hidden');
+}
+
+function updateMinimizedApprovalButton(leftSeconds) {
+  const btn = document.getElementById('minimizedApprovalBtn');
+  if (!btn || !state.approvalMinimized || !state.pendingApproval) {
+    if (btn) btn.classList.add('hidden');
+    return;
+  }
+  const suffix = Number.isFinite(leftSeconds) ? ` · ${leftSeconds}s` : '';
+  btn.textContent = `待审批：${state.pendingApproval.toolName || '工具调用'}${suffix}`;
+  btn.classList.remove('hidden');
 }
 
 function clearApprovalTimer() {
@@ -3929,7 +4070,15 @@ async function submitApproval(approved) {
 // 与审批独立：按 inputId 各发各的 POST /user-input，互不串话；阻塞在后端 gate，超时后端自动放行
 function showUserInput(payload) {
   if (!payload || !payload.inputId) return;
+  // A restored timeline may still describe a Run as RUNNING for a short
+  // period after ask_user has timed out.  Reject the stale interaction before
+  // mutating state or revealing the modal; the countdown is only presentation
+  // logic and must not be responsible for cleaning up historical prompts.
+  const explicitDeadline = Number(payload.expiresAt || 0);
+  if (explicitDeadline > 0 && explicitDeadline <= Date.now()) return;
   state.pendingUserInput = payload;
+  state.userInputMinimized = false;
+  document.getElementById('minimizedUserInputBtn').classList.add('hidden');
   state.userInputSelections = {};
 
   const stepWrap = document.getElementById('userInputStepWrap');
@@ -3989,11 +4138,20 @@ function renderUserInputOptions(payload) {
   }
   groups.forEach((detail, index) => {
     const key = String(detail.id || index);
+    const multiple = isUserInputMultiSelect(detail);
     const group = document.createElement('div');
     group.className = 'rounded-lg border border-indigo-900/70 bg-indigo-950/20 p-2.5';
     const title = document.createElement('div');
-    title.className = 'text-xs text-indigo-200 mb-2';
-    title.textContent = detail.question || detail.prompt || `问题 ${index + 1}`;
+    title.className = 'text-xs text-indigo-200 mb-2 flex items-start justify-between gap-2';
+    const titleText = document.createElement('span');
+    titleText.textContent = detail.question || detail.prompt || `问题 ${index + 1}`;
+    title.appendChild(titleText);
+    if (multiple) {
+      const badge = document.createElement('span');
+      badge.className = 'flex-none rounded-full border border-indigo-700 bg-indigo-950 px-2 py-0.5 text-[10px] text-indigo-200';
+      badge.textContent = '可多选';
+      title.appendChild(badge);
+    }
     group.appendChild(title);
     const buttons = document.createElement('div');
     buttons.className = 'flex flex-wrap gap-2';
@@ -4004,6 +4162,7 @@ function renderUserInputOptions(payload) {
       const button = document.createElement('button');
       button.type = 'button';
       button.dataset.questionKey = key;
+      button.setAttribute('aria-pressed', 'false');
       button.className = 'text-xs text-indigo-100 border border-indigo-700/70 bg-indigo-950/50 hover:bg-indigo-900/70 rounded-full px-3 py-1.5 transition';
       button.textContent = label;
       if (option.description) button.title = String(option.description);
@@ -4026,19 +4185,51 @@ function selectUserInputOption(detail, option, key, button) {
   const label = String((option && (option.value || option.label)) || '').trim();
   if (!label) return;
   const question = String((detail && (detail.question || detail.prompt)) || '').trim();
-  state.userInputSelections[key] = { question, answer:label };
-  document.querySelectorAll(`#userInputOptions [data-question-key="${CSS.escape(String(key))}"]`).forEach(node => {
-    node.classList.remove('bg-indigo-600', 'border-indigo-400', 'text-white');
-  });
-  button.classList.add('bg-indigo-600', 'border-indigo-400', 'text-white');
-  const selections = Object.values(state.userInputSelections);
+  const multiple = isUserInputMultiSelect(detail);
+  const groupButtons = document.querySelectorAll(`#userInputOptions [data-question-key="${CSS.escape(String(key))}"]`);
+  if (multiple) {
+    const previous = state.userInputSelections[key];
+    const answers = previous && Array.isArray(previous.answers) ? [...previous.answers] : [];
+    const selectedIndex = answers.indexOf(label);
+    if (selectedIndex >= 0) answers.splice(selectedIndex, 1);
+    else answers.push(label);
+    if (answers.length) state.userInputSelections[key] = { question, answers, multiple:true };
+    else delete state.userInputSelections[key];
+    const selected = selectedIndex < 0;
+    button.classList.toggle('bg-indigo-600', selected);
+    button.classList.toggle('border-indigo-400', selected);
+    button.classList.toggle('text-white', selected);
+    button.setAttribute('aria-pressed', String(selected));
+  } else {
+    state.userInputSelections[key] = { question, answer:label, multiple:false };
+    groupButtons.forEach(node => {
+      node.classList.remove('bg-indigo-600', 'border-indigo-400', 'text-white');
+      node.setAttribute('aria-pressed', 'false');
+    });
+    button.classList.add('bg-indigo-600', 'border-indigo-400', 'text-white');
+    button.setAttribute('aria-pressed', 'true');
+  }
+  syncUserInputAnswerFromSelections();
+}
+
+function isUserInputMultiSelect(detail) {
+  if (!detail) return false;
+  if (detail.multiple === true || detail.multiSelect === true
+      || String(detail.selectionMode || '').toLowerCase() === 'multiple') return true;
+  // 历史事件可能只把「可多选」写在问题文字中，没有结构化 multiple 字段。
+  return /(可多选|多选题|选择多个|可选择多项)/.test(String(detail.question || detail.prompt || ''));
+}
+
+function syncUserInputAnswerFromSelections() {
+  const selections = Object.values(state.userInputSelections).map(value => ({
+    question:value.question || '',
+    answer:value.multiple && Array.isArray(value.answers) ? value.answers.join('、') : (value.answer || '')
+  })).filter(value => value.answer);
   const answer = selections.length === 1
     ? selections[0].answer
     : selections.map(value => value.question ? `${value.question}：${value.answer}` : value.answer).join('\n');
   const textarea = document.getElementById('userInputAnswer');
   textarea.value = answer;
-  textarea.focus();
-  textarea.setSelectionRange(textarea.value.length, textarea.value.length);
 }
 
 function updateUserInputCountdown(deadline) {
@@ -4046,6 +4237,7 @@ function updateUserInputCountdown(deadline) {
   document.getElementById('userInputCountdown').textContent = left > 0
     ? `请在 ${left} 秒内回答，超时 AI 会基于现有信息继续`
     : '已超时，AI 会基于现有信息继续';
+  updateMinimizedUserInputButton(left);
   if (left <= 0) {
     clearUserInputTimer();
     document.getElementById('userInputSubmitBtn').disabled = true;
@@ -4068,7 +4260,35 @@ function dismissUserInput() {
 
 function hideUserInputModal() {
   document.getElementById('userInputModal').classList.add('hidden');
+  state.userInputMinimized = false;
+  document.getElementById('minimizedUserInputBtn').classList.add('hidden');
   clearUserInputTimer();
+}
+
+function minimizeUserInput() {
+  if (!state.pendingUserInput) return;
+  state.userInputMinimized = true;
+  document.getElementById('userInputModal').classList.add('hidden');
+  updateMinimizedUserInputButton();
+}
+
+function restoreUserInput() {
+  if (!state.pendingUserInput) return;
+  state.userInputMinimized = false;
+  document.getElementById('minimizedUserInputBtn').classList.add('hidden');
+  document.getElementById('userInputModal').classList.remove('hidden');
+  document.getElementById('userInputAnswer').focus();
+}
+
+function updateMinimizedUserInputButton(leftSeconds) {
+  const btn = document.getElementById('minimizedUserInputBtn');
+  if (!btn || !state.userInputMinimized || !state.pendingUserInput) {
+    if (btn) btn.classList.add('hidden');
+    return;
+  }
+  const suffix = Number.isFinite(leftSeconds) ? ` · ${leftSeconds}s` : '';
+  btn.textContent = `待补充信息${suffix}`;
+  btn.classList.remove('hidden');
 }
 
 function clearUserInputTimer() {
@@ -4135,6 +4355,8 @@ function setMessageRunId(aiMsg, runId) {
     btn.textContent = '复制 runId';
     btn.disabled = false;
   }
+  const evidenceBtn = aiMsg.querySelector('.msg-evidence-map');
+  if (evidenceBtn && evidenceBtn.dataset.finalAnswer) evidenceBtn.classList.remove('hidden');
 }
 
 function setFinalAnswerCopy(aiMsg, content) {
@@ -4144,6 +4366,11 @@ function setFinalAnswerCopy(aiMsg, content) {
     btn.dataset.copyText = String(content);
     btn.classList.remove('hidden');
     btn.textContent = '复制回复';
+  }
+  const evidenceBtn = aiMsg.querySelector('.msg-evidence-map');
+  if (evidenceBtn) {
+    evidenceBtn.dataset.finalAnswer = String(content);
+    if (aiMsg.dataset.runId) evidenceBtn.classList.remove('hidden');
   }
 }
 
@@ -4180,6 +4407,399 @@ async function copyFinalAnswerFromMessage(btn) {
   } catch (e) {
     flashButtonText(btn, '复制失败', oldText);
   }
+}
+
+async function openEvidenceMap(btn) {
+  const msg = btn && btn.closest ? btn.closest('[data-message-role="assistant"]') : null;
+  const runId = msg && msg.dataset ? msg.dataset.runId : '';
+  const finalAnswer = (btn && btn.dataset && btn.dataset.finalAnswer) || extractFinalAnswerText(msg);
+  if (!runId || !finalAnswer) return;
+  state.currentEvidenceRequest = {runId, finalAnswer};
+  await loadEvidenceMap(runId, finalAnswer, false);
+}
+
+async function loadEvidenceMap(runId, finalAnswer, regenerate) {
+  const modal = document.getElementById('evidenceMapModal');
+  const graph = document.getElementById('evidenceMapGraph');
+  const detail = document.getElementById('evidenceMapDetail');
+  const meta = document.getElementById('evidenceMapMeta');
+  const previous = state.evidenceMapCache.get(runId)
+    || (state.currentEvidenceRequest && state.currentEvidenceRequest.runId === runId ? state.currentEvidenceMap : null);
+  modal.classList.remove('hidden');
+  state.evidenceMapMinimized = false;
+  state.evidenceSourcesVisible = false;
+  document.getElementById('minimizedEvidenceMapBtn').classList.add('hidden');
+  const regenerateBtn = document.getElementById('evidenceMapRegenerateBtn');
+  regenerateBtn.disabled = true;
+  regenerateBtn.classList.add('opacity-50', 'cursor-not-allowed');
+  if (previous) {
+    state.currentEvidenceMap = previous;
+    renderEvidenceMap(previous);
+    meta.textContent = regenerate
+      ? '正在重新生成，完成前保留当前证据地图...'
+      : '正在确认缓存并续期...';
+  } else {
+    document.getElementById('evidenceMapSourcesBtn').classList.add('hidden');
+    regenerateBtn.classList.add('hidden');
+    graph.innerHTML = `<div class="text-sm text-gray-500 text-center py-12">${regenerate ? '正在重新生成...' : '正在读取或生成证据地图...'}</div>`;
+    detail.innerHTML = '点击左侧证据节点查看完整内容。';
+    meta.textContent = regenerate ? '正在强制重新分析...' : '正在优先读取缓存...';
+  }
+  try {
+    let pending = state.evidenceMapRequests.get(runId);
+    if (!pending) {
+      pending = (async () => {
+        const response = await fetch(`${API}/runs/${encodeURIComponent(runId)}/evidence-map`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({sessionId: state.sessionId, finalAnswer, regenerate:!!regenerate})
+        });
+        const body = await response.json();
+        if (!body || body.code !== '0000' || !body.data) throw new Error((body && body.info) || '生成失败');
+        return body.data;
+      })();
+      state.evidenceMapRequests.set(runId, pending);
+      pending.finally(() => {
+        if (state.evidenceMapRequests.get(runId) === pending) state.evidenceMapRequests.delete(runId);
+      }).catch(() => {});
+    } else {
+      meta.textContent = '证据地图正在生成，已复用当前生成任务...';
+    }
+    const data = await pending;
+    state.evidenceMapCache.set(runId, data);
+    if (!state.currentEvidenceRequest || state.currentEvidenceRequest.runId !== runId) return;
+    state.currentEvidenceMap = data;
+    renderEvidenceMap(data);
+    updateEvidenceMapActions(data);
+  } catch (error) {
+    if (!state.currentEvidenceRequest || state.currentEvidenceRequest.runId !== runId) return;
+    if (previous) {
+      state.currentEvidenceMap = previous;
+      renderEvidenceMap(previous);
+      updateEvidenceMapActions(previous);
+      meta.textContent = `${regenerate ? '重新生成失败' : '读取失败'}：${error.message || '生成失败'} · 已保留原证据地图`;
+    } else {
+      graph.innerHTML = `<div class="text-sm text-red-300 bg-red-950/30 border border-red-900 rounded-lg p-4">${escapeHtml(error.message || '生成失败')}</div>`;
+      meta.textContent = '生成失败';
+    }
+  } finally {
+    if (state.currentEvidenceRequest && state.currentEvidenceRequest.runId === runId) {
+      regenerateBtn.disabled = false;
+      regenerateBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+    }
+  }
+}
+
+function updateEvidenceMapActions(data) {
+  const sourcesBtn = document.getElementById('evidenceMapSourcesBtn');
+  const regenerateBtn = document.getElementById('evidenceMapRegenerateBtn');
+  const evidences = data && Array.isArray(data.evidences) ? data.evidences : [];
+  if (sourcesBtn) {
+    sourcesBtn.textContent = `全部来源（${evidences.length}）`;
+    sourcesBtn.classList.remove('hidden');
+  }
+  if (regenerateBtn) {
+    regenerateBtn.classList.remove('hidden');
+    regenerateBtn.dataset.available = data && data.regenerateAvailable === false ? 'false' : 'true';
+    regenerateBtn.title = data && data.regenerateAvailable === false
+      ? 'Run Snapshot 已过期，当前地图仍可查看，但无法重新生成'
+      : '';
+  }
+}
+
+function closeEvidenceMap() {
+  document.getElementById('evidenceMapModal').classList.add('hidden');
+  state.evidenceMapMinimized = false;
+  document.getElementById('minimizedEvidenceMapBtn').classList.add('hidden');
+}
+
+function minimizeEvidenceMap() {
+  state.evidenceMapMinimized = true;
+  document.getElementById('evidenceMapModal').classList.add('hidden');
+  document.getElementById('minimizedEvidenceMapBtn').classList.remove('hidden');
+}
+
+function restoreEvidenceMap() {
+  if (!state.currentEvidenceRequest) return;
+  state.evidenceMapMinimized = false;
+  document.getElementById('minimizedEvidenceMapBtn').classList.add('hidden');
+  document.getElementById('evidenceMapModal').classList.remove('hidden');
+}
+
+async function regenerateEvidenceMap() {
+  const request = state.currentEvidenceRequest;
+  if (!request) return;
+  if (state.currentEvidenceMap && state.currentEvidenceMap.regenerateAvailable === false) {
+    document.getElementById('evidenceMapMeta').textContent = '运行证据已过期，无法重新生成；当前已生成的证据地图会继续保留。';
+    return;
+  }
+  await loadEvidenceMap(request.runId, request.finalAnswer, true);
+}
+
+function evidenceScoreHtml(item, memoryType) {
+  if (!item) return '';
+  if (memoryType === 'long_term') {
+    if (item.memoryKind !== 'relevant' || item.similarity == null) return '';
+    const value = Math.max(0, Math.min(1, Number(item.similarity)));
+    if (!Number.isFinite(value)) return '';
+    return `<span class="evidence-score">语义相似度 ${(value * 100).toFixed(1)}%</span>`;
+  }
+  if (item.relevanceScore == null) return '';
+  const value = Math.max(0, Math.min(1, Number(item.relevanceScore)));
+  if (!Number.isFinite(value)) return '';
+  const label = item.relevanceType === 'rerank' ? '重排相关度' : '语义相似度';
+  return `<span class="evidence-score">${label} ${(value * 100).toFixed(1)}%</span>`;
+}
+
+function evidenceTypeLabel(type) {
+  const labels = {user_request:'用户原始请求', user_decision:'用户补充信息', rag:'RAG 文档', tool:'工具返回', long_term:'长期记忆', episodic:'情景记忆', chat_summary:'会话摘要'};
+  return labels[type] || type || '来源';
+}
+
+function evidenceRelationLabel(relation) {
+  const labels = {supports:'完整依据', partial_support:'部分/推导依据', specified_by_user:'用户设定', context:'上下文影响'};
+  return labels[relation] || '来源关联';
+}
+
+function evidenceRelationColor(relation) {
+  if (relation === 'supports') return 'text-emerald-300';
+  if (relation === 'partial_support') return 'text-cyan-300';
+  if (relation === 'specified_by_user') return 'text-blue-300';
+  return 'text-violet-300';
+}
+
+function evidenceCheckStatusLabel(status) {
+  const labels = {supported:'完整依据', partial:'部分/推导', user_specified:'用户设定', context_only:'上下文影响', unsupported:'缺少证据'};
+  return labels[status] || '缺少证据';
+}
+
+function evidenceCheckStatusColor(status) {
+  if (status === 'supported') return 'text-emerald-300 border-emerald-900 bg-emerald-950/20';
+  if (status === 'partial') return 'text-cyan-300 border-cyan-900 bg-cyan-950/20';
+  if (status === 'user_specified') return 'text-blue-300 border-blue-900 bg-blue-950/20';
+  if (status === 'context_only') return 'text-violet-300 border-violet-900 bg-violet-950/20';
+  return 'text-amber-300 border-amber-900 bg-amber-950/20';
+}
+
+function evidenceSourceCounts(evidences) {
+  return (Array.isArray(evidences) ? evidences : []).reduce((counts, item) => {
+    const type = String((item && item.type) || 'other');
+    counts[type] = Number(counts[type] || 0) + 1;
+    return counts;
+  }, {});
+}
+
+function evidenceSourceSummary(evidences) {
+  const counts = evidenceSourceCounts(evidences);
+  const order = ['user_request', 'user_decision', 'rag', 'tool', 'long_term', 'episodic', 'chat_summary'];
+  return order.filter(type => counts[type])
+    .map(type => `${evidenceTypeLabel(type)} ${counts[type]}`)
+    .join(' · ');
+}
+
+function renderEvidenceMap(data) {
+  state.evidenceSourcesVisible = false;
+  const graph = document.getElementById('evidenceMapGraph');
+  const meta = document.getElementById('evidenceMapMeta');
+  const sourcesBtn = document.getElementById('evidenceMapSourcesBtn');
+  const claims = Array.isArray(data.claims) ? data.claims : [];
+  const evidences = Array.isArray(data.evidences) ? data.evidences : [];
+  const byId = new Map(evidences.map(item => [String(item.evidenceId), item]));
+  const stats = data.stats || {};
+  const diagnostics = data.diagnostics || {};
+  const coverage = Number(stats.traceability != null ? stats.traceability : (stats.coverage || 0));
+  const cacheLabel = data.cached ? '缓存结果' : '刚刚生成';
+  meta.textContent = `${cacheLabel} · 来源 ${evidences.length} 条 · 审计 ${claims.length} 个内容块 · ${data.model || 'router-small'}`;
+  if (sourcesBtn) {
+    sourcesBtn.textContent = `全部来源（${evidences.length}）`;
+    sourcesBtn.classList.toggle('hidden', !evidences.length);
+  }
+  if (!evidences.length) {
+    graph.innerHTML = '<div class="text-sm text-gray-400 bg-gray-900 border border-gray-800 rounded-lg p-4"><div class="text-gray-200 font-medium">本次 Run 没有采集到可用于映射的来源</div><div class="text-xs text-gray-500 mt-2">没有保存用户设定、RAG、记忆或成功工具返回，因此无法建立内容块与来源的关联。</div></div>';
+    return;
+  }
+  if (!claims.length) {
+    const modelClaims = Number(diagnostics.modelClaims || 0);
+    const rejectedClaims = Number(diagnostics.rejectedClaims || 0) + Number(diagnostics.duplicateClaims || 0);
+    const stageText = diagnostics.stage === 'MODEL_RETURNED_NO_CLAIMS'
+      ? '小模型没有返回可识别的结论编号。'
+      : (rejectedClaims > 0 ? `${rejectedClaims} 条模型结论因编号或原文不匹配被过滤。` : '没有结论通过映射校验。');
+    graph.innerHTML = `<div class="text-sm text-amber-200 bg-amber-950/20 border border-amber-900 rounded-lg p-4">
+      <div class="font-medium">已经采集 ${evidences.length} 条来源，但没有生成可展示的“结论 → 证据”关联</div>
+      <div class="text-xs text-amber-100/70 mt-2">${escapeHtml(stageText)} 模型返回 ${modelClaims} 条，本次接受 0 条；来源本身仍可人工查看。</div>
+      <div class="text-xs text-gray-500 mt-2">${escapeHtml(evidenceSourceSummary(evidences))}</div>
+    </div>`;
+    return;
+  }
+  const summary = `<div class="grid grid-cols-2 md:grid-cols-5 gap-2">
+    <div class="rounded-lg border border-gray-800 bg-gray-900 p-3"><div class="text-[10px] text-gray-500">可追溯率</div><div class="text-lg text-cyan-300 mt-1">${(Math.max(0, Math.min(1, coverage)) * 100).toFixed(0)}%</div></div>
+    <div class="rounded-lg border border-emerald-900 bg-emerald-950/20 p-3"><div class="text-[10px] text-emerald-400">完整依据</div><div class="text-lg text-emerald-200 mt-1">${Number(stats.supportedClaims || 0)}</div></div>
+    <div class="rounded-lg border border-cyan-900 bg-cyan-950/20 p-3"><div class="text-[10px] text-cyan-400">部分/推导</div><div class="text-lg text-cyan-200 mt-1">${Number(stats.partialClaims || 0)}</div></div>
+    <div class="rounded-lg border border-blue-900 bg-blue-950/20 p-3"><div class="text-[10px] text-blue-400">用户设定</div><div class="text-lg text-blue-200 mt-1">${Number(stats.userSpecifiedClaims || 0)}</div></div>
+    <div class="rounded-lg border border-amber-900 bg-amber-950/20 p-3"><div class="text-[10px] text-amber-400">缺少证据</div><div class="text-lg text-amber-200 mt-1">${Number(stats.unsupportedClaims || 0)}</div></div>
+  </div><div class="text-[11px] text-gray-500">按回答结构逐块关联 ${evidences.length} 条运行来源；部分依据会明确保留尚未核验的缺口。</div>`;
+  graph.innerHTML = summary + claims.map(claim => {
+    const legacyLinks = Array.isArray(claim.links) ? claim.links : [];
+    const suppliedChecks = Array.isArray(claim.checks) ? claim.checks : [];
+    const checks = suppliedChecks.length ? suppliedChecks
+      : (legacyLinks.some(link => link && link.evidenceId)
+        ? [{text:'该内容块的来源关联', links:legacyLinks, status:claim.status || 'supported'}]
+        : []);
+    const status = claim.status || (checks.length ? 'supported' : 'unsupported');
+    const statusLabel = status === 'supported' ? '完整依据' : (status === 'partial' ? '部分/推导依据' : (status === 'user_specified' ? '用户设定' : (status === 'context_only' ? '仅上下文影响' : '证据不足')));
+    const statusColor = status === 'supported' ? 'text-emerald-300' : (status === 'partial' ? 'text-cyan-300' : (status === 'user_specified' ? 'text-blue-300' : (status === 'context_only' ? 'text-violet-300' : 'text-amber-300')));
+    const checksHtml = checks.map((check, checkIndex) => {
+      const checkStatus = String((check && check.status) || 'unsupported');
+      const checkLinks = Array.isArray(check && check.links) ? check.links : [];
+      const nodes = checkLinks.map((link, linkIndex) => {
+        if (!link || !link.evidenceId) return '';
+        const evidence = byId.get(String(link.evidenceId));
+        if (!evidence) return '';
+        const quotes = Array.isArray(link.quotes) && link.quotes.length ? link.quotes : (link.quote ? [link.quote] : []);
+        return `<div class="evidence-map-link">
+          <div class="text-[10px] mb-1 ${evidenceRelationColor(link.relation)}">${evidenceRelationLabel(link.relation)}</div>
+          <button type="button" class="evidence-map-node" data-evidence-id="${escapeHtml(String(evidence.evidenceId))}" data-claim-id="${escapeHtml(String(claim.claimId || ''))}" data-check-index="${checkIndex}" data-link-index="${linkIndex}" onclick="showEvidenceMapDetail(this.dataset.evidenceId, this.dataset.claimId, this.dataset.checkIndex, this.dataset.linkIndex)">
+            <div class="flex items-center gap-2 text-xs"><span class="text-blue-300">${escapeHtml(evidenceTypeLabel(evidence.type))}</span><span class="text-gray-500 truncate">${escapeHtml(String(evidence.title || ''))}</span></div>
+            ${quotes.length ? `<div class="mt-2 text-xs text-gray-300 line-clamp-3">${quotes.map(quote => `“${escapeHtml(String(quote))}”`).join(' · ')}</div>` : ''}
+            ${link.note ? `<div class="mt-1 text-[11px] text-gray-500">${escapeHtml(String(link.note))}</div>` : ''}
+          </button>
+        </div>`;
+      }).join('');
+      return `<div class="mt-3 rounded-lg border border-gray-800 bg-gray-950/30 p-3">
+        <div class="flex items-start justify-between gap-3">
+          <div class="text-xs text-gray-200 leading-relaxed whitespace-pre-wrap break-words">${escapeHtml(String((check && check.text) || '核验点'))}</div>
+          <span class="shrink-0 rounded border px-2 py-0.5 text-[10px] ${evidenceCheckStatusColor(checkStatus)}">${evidenceCheckStatusLabel(checkStatus)}</span>
+        </div>
+        ${nodes || '<div class="mt-2 text-[11px] text-amber-300">该核验点尚未找到可验证来源。</div>'}
+      </div>`;
+    }).join('');
+    const checkCount = suppliedChecks.length;
+    const coveredChecks = Number(claim.coveredChecks || 0);
+    return `<div class="evidence-map-claim">
+      <div class="flex items-center justify-between gap-2 mb-1"><div class="text-[10px] uppercase tracking-wide text-cyan-400">${escapeHtml(String(claim.claimId || 'Claim'))}</div><div class="text-[10px] ${statusColor}">${statusLabel}${checkCount ? ` · 核验点 ${coveredChecks}/${checkCount}` : ''}</div></div>
+      <div class="text-sm font-medium text-gray-100">${escapeHtml(String(claim.title || '回答内容'))}</div>
+      <div class="mt-2 text-xs text-gray-300 leading-relaxed whitespace-pre-wrap">${escapeHtml(String(claim.text || ''))}</div>
+      ${checksHtml || '<div class="mt-3 text-xs text-amber-300 border border-dashed border-amber-900 rounded-md p-2">本次 Run 中没有生成可展示的核验点。</div>'}
+    </div>`;
+  }).join('');
+}
+
+function toggleEvidenceSources() {
+  const data = state.currentEvidenceMap;
+  if (!data) return;
+  if (state.evidenceSourcesVisible) renderEvidenceMap(data);
+  else renderAllEvidenceSources(data);
+}
+
+function renderAllEvidenceSources(data) {
+  const graph = document.getElementById('evidenceMapGraph');
+  const meta = document.getElementById('evidenceMapMeta');
+  const sourcesBtn = document.getElementById('evidenceMapSourcesBtn');
+  const evidences = Array.isArray(data.evidences) ? data.evidences : [];
+  state.evidenceSourcesVisible = true;
+  if (sourcesBtn) sourcesBtn.textContent = '返回证据地图';
+  meta.textContent = `全部运行来源 · ${evidences.length} 条 · 点击查看完整内容`;
+  const groups = new Map();
+  evidences.forEach(item => {
+    const type = String((item && item.type) || 'other');
+    if (!groups.has(type)) groups.set(type, []);
+    groups.get(type).push(item);
+  });
+  const order = ['user_request', 'user_decision', 'rag', 'tool', 'long_term', 'episodic', 'chat_summary', 'other'];
+  graph.innerHTML = order.filter(type => groups.has(type)).map(type => {
+    const items = groups.get(type);
+    return `<section class="space-y-2">
+      <div class="flex items-center gap-2 text-xs text-gray-400 sticky top-0 bg-[#0b1120] py-1 z-10">
+        <span class="text-blue-300 font-medium">${escapeHtml(evidenceTypeLabel(type))}</span><span>${items.length} 条</span>
+      </div>
+      ${items.map(item => {
+        const metadata = item.metadata || {};
+        const score = evidenceScoreHtml({...metadata}, item.type === 'long_term' ? 'long_term' : null);
+        const preview = String(item.content || '').replace(/\s+/g, ' ').trim();
+        return `<button type="button" class="evidence-map-node" data-evidence-id="${escapeHtml(String(item.evidenceId || ''))}" onclick="showEvidenceMapDetail(this.dataset.evidenceId, '')">
+          <div class="flex flex-wrap items-center gap-2 text-xs"><span class="text-gray-200 font-medium">${escapeHtml(String(item.title || evidenceTypeLabel(type)))}</span>${score}</div>
+          <div class="mt-1.5 text-xs text-gray-500 line-clamp-2">${escapeHtml(preview || '无可展示内容')}</div>
+        </button>`;
+      }).join('')}
+    </section>`;
+  }).join('');
+}
+
+function showEvidenceMapDetail(evidenceId, claimId, checkIndex, linkIndex) {
+  const data = state.currentEvidenceMap;
+  const evidence = data && Array.isArray(data.evidences)
+    ? data.evidences.find(item => String(item.evidenceId) === String(evidenceId)) : null;
+  if (!evidence) return;
+  const claim = Array.isArray(data.claims) ? data.claims.find(item => String(item.claimId) === String(claimId)) : null;
+  const check = claim && Array.isArray(claim.checks) && checkIndex !== undefined && checkIndex !== ''
+    ? claim.checks[Number(checkIndex)] : null;
+  const nestedLink = check && Array.isArray(check.links) && linkIndex !== undefined && linkIndex !== ''
+    ? check.links[Number(linkIndex)] : null;
+  const legacyIndexedLink = claim && Array.isArray(claim.links) && checkIndex !== undefined && checkIndex !== '' && linkIndex === undefined
+    ? claim.links[Number(checkIndex)] : null;
+  const link = nestedLink || legacyIndexedLink || (claim && Array.isArray(claim.links)
+    ? claim.links.find(item => String(item.evidenceId) === String(evidenceId)) : null);
+  const metadata = evidence.metadata || {};
+  const score = evidenceScoreHtml({...metadata}, evidence.type === 'long_term' ? 'long_term' : null);
+  let inputHtml = '';
+  if (evidence.type === 'tool' && metadata.input) {
+    inputHtml = `<div class="mt-4"><div class="text-xs text-gray-500 mb-1">调用参数</div>${renderGenericEvidenceContent(metadata.input, 'json_object')}</div>`;
+  }
+  const linkQuotes = link && Array.isArray(link.quotes) && link.quotes.length ? link.quotes : (link && link.quote ? [link.quote] : []);
+  const quoteHtml = link && linkQuotes.length
+    ? `<div class="mt-4"><div class="text-xs ${evidenceRelationColor(link.relation)} mb-1">${evidenceRelationLabel(link.relation)}片段</div>${link.checkText ? `<div class="text-xs text-cyan-200 mb-2">核验点：${escapeHtml(String(link.checkText))}</div>` : ''}<div class="space-y-2">${linkQuotes.map(quote => `<div class="text-sm text-gray-100 bg-gray-950 border border-gray-800 rounded-lg p-3 leading-relaxed">“${escapeHtml(String(quote))}”</div>`).join('')}</div>${link.note ? `<div class="text-xs text-gray-500 mt-2">${escapeHtml(String(link.note))}</div>` : ''}</div>` : '';
+  const childHtml = metadata.matchedChildSnippet
+    ? `<div class="mt-4"><div class="text-xs text-cyan-400 mb-1">实际命中的子块</div>${renderGenericEvidenceContent(metadata.matchedChildSnippet, 'text')}</div>` : '';
+  const fullLabel = evidence.type === 'tool' ? '查看完整工具返回' : '查看完整来源内容';
+  document.getElementById('evidenceMapDetail').innerHTML = `
+    <div class="flex flex-wrap items-center gap-2">
+      <span class="text-xs text-blue-300">${escapeHtml(evidenceTypeLabel(evidence.type))}</span>
+      ${score}
+    </div>
+    <div class="text-base text-gray-100 font-medium mt-2 break-words">${escapeHtml(String(evidence.title || '来源详情'))}</div>
+    ${quoteHtml}
+    ${childHtml}
+    ${inputHtml}
+    <details class="mt-4 rounded-lg border border-gray-800 bg-gray-900/50">
+      <summary class="cursor-pointer select-none px-3 py-2 text-xs text-gray-300 hover:text-white">${fullLabel}</summary>
+      <div class="p-3 pt-1">${renderGenericEvidenceContent(evidence.content, metadata.outputType)}</div>
+    </details>`;
+}
+
+function renderGenericEvidenceContent(content, outputType) {
+  const text = content == null ? '' : String(content);
+  if (outputType === 'json_object' || outputType === 'json_array' || /^[\[{]/.test(text.trim())) {
+    try {
+      const normalized = normalizeGenericEvidenceValue(JSON.parse(text));
+      return `<pre class="text-xs text-gray-200 bg-gray-950 border border-gray-800 rounded-lg p-3 overflow-auto whitespace-pre-wrap break-words">${escapeHtml(JSON.stringify(normalized, null, 2))}</pre>`;
+    } catch (e) {}
+  }
+  return `<div class="text-xs text-gray-200 bg-gray-950 border border-gray-800 rounded-lg p-3 whitespace-pre-wrap break-words leading-relaxed">${escapeHtml(text)}</div>`;
+}
+
+function normalizeGenericEvidenceValue(value) {
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if ((text.startsWith('{') && text.endsWith('}')) || (text.startsWith('[') && text.endsWith(']'))) {
+      try { return normalizeGenericEvidenceValue(JSON.parse(text)); } catch (e) { return value; }
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const normalized = value.map(normalizeGenericEvidenceValue);
+    if (normalized.length === 1 && normalized[0] && typeof normalized[0] === 'object' && !Array.isArray(normalized[0]) && Object.prototype.hasOwnProperty.call(normalized[0], 'text')) {
+      return normalizeGenericEvidenceValue(normalized[0].text);
+    }
+    return normalized;
+  }
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value);
+    if (Object.prototype.hasOwnProperty.call(value, 'text') && (keys.length === 1 || (keys.length === 2 && Object.prototype.hasOwnProperty.call(value, 'type')))) {
+      return normalizeGenericEvidenceValue(value.text);
+    }
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, normalizeGenericEvidenceValue(item)]));
+  }
+  return value;
 }
 
 function extractFinalAnswerText(msg) {
@@ -4255,7 +4875,7 @@ function addMessage(role, content, isPlaceholder, agentId, runId, images) {
       <div class="msg-content text-sm leading-relaxed ${isPlaceholder ? 'typing' : ''}">
         ${isPlaceholder ? '<span class="text-gray-500">思考中...</span>' : renderMessageImages(images) + renderMarkdown(content)}
       </div>
-      ${role === 'assistant' ? '<div class="msg-actions mt-2 text-right"><button type="button" class="msg-copy-final hidden text-[11px] text-gray-400 hover:text-white" onclick="copyFinalAnswerFromMessage(this)">复制回复</button></div>' : ''}
+      ${role === 'assistant' ? '<div class="msg-actions mt-2 text-right flex justify-end gap-3"><button type="button" class="msg-evidence-map hidden text-[11px] text-violet-300 hover:text-white" onclick="openEvidenceMap(this)">生成证据地图</button><button type="button" class="msg-copy-final hidden text-[11px] text-gray-400 hover:text-white" onclick="copyFinalAnswerFromMessage(this)">复制回复</button></div>' : ''}
     </div>
   `;
   attachMessageActions(div, role, content, runId);
@@ -4545,12 +5165,12 @@ function timelineEvidence(view, payload, memory) {
     const text = item.content || item.snippet || '';
     const fingerprint = memory
       ? `${payload.memoryType || 'memory'}|${item.topic || ''}|${item.kind || ''}|${text}`
-      : `${item.ref == null ? '' : item.ref}|${title}|${text}`;
+      : `${title}|${String(text).replace(/\s+/g, ' ').trim()}`;
     if (fingerprints.has(fingerprint)) continue;
     fingerprints.add(fingerprint);
     body.insertAdjacentHTML('beforeend', `
       <div class="evidence-item">
-        <div class="evidence-meta"><span class="evidence-source">${escapeHtml(String(title))}</span></div>
+        <div class="evidence-meta"><span class="evidence-source">${escapeHtml(String(title))}</span>${evidenceScoreHtml(item, memory ? payload.memoryType : null)}</div>
         <div class="evidence-snippet">${escapeHtml(String(text))}</div>
       </div>`);
   }
@@ -5277,7 +5897,7 @@ function buildMessageNode(role, content, agentId, runId, images) {
         ${role === 'assistant' ? `<button type="button" class="msg-copy-run ${runId ? '' : 'hidden'} text-[11px] text-cyan-300 hover:text-white shrink-0" onclick="copyMessageRunId(this)">复制 runId</button>` : ''}
       </div>
       <div class="msg-content text-sm leading-relaxed">${renderMessageImages(images)}${renderMarkdown(content)}</div>
-      ${role === 'assistant' ? '<div class="msg-actions mt-2 text-right"><button type="button" class="msg-copy-final hidden text-[11px] text-gray-400 hover:text-white" onclick="copyFinalAnswerFromMessage(this)">复制回复</button></div>' : ''}
+      ${role === 'assistant' ? '<div class="msg-actions mt-2 text-right flex justify-end gap-3"><button type="button" class="msg-evidence-map hidden text-[11px] text-violet-300 hover:text-white" onclick="openEvidenceMap(this)">生成证据地图</button><button type="button" class="msg-copy-final hidden text-[11px] text-gray-400 hover:text-white" onclick="copyFinalAnswerFromMessage(this)">复制回复</button></div>' : ''}
     </div>
   `;
   attachMessageActions(div, role, content, runId);

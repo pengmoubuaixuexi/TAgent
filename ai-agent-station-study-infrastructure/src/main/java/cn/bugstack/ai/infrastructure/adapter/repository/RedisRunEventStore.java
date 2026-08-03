@@ -61,10 +61,14 @@ public class RedisRunEventStore implements IRunEventStore {
 
     @Override
     public List<RunEventRecord> readAfter(String runId, String afterEventId) {
+        String redisKey = key(runId);
         Range<String> range = afterEventId == null || afterEventId.isBlank()
                 ? Range.unbounded()
                 : Range.leftOpen(afterEventId, "+");
-        List<MapRecord<String, Object, Object>> records = redis.opsForStream().range(key(runId), range);
+        List<MapRecord<String, Object, Object>> records = redis.opsForStream().range(redisKey, range);
+        // Reconnect/replay is active use: keep the event stream alive for another
+        // run-events TTL window, even when there are no newer records yet.
+        redis.expire(redisKey, Duration.ofSeconds(Math.max(60, ttlSeconds)));
         if (records == null || records.isEmpty()) return List.of();
         return records.stream().map(record -> {
             Map<Object, Object> value = record.getValue();

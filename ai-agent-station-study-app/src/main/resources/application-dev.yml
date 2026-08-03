@@ -118,6 +118,12 @@ agent:
     max-rounds: ${AGENT_STEER_MAX_ROUNDS:3}
   answer-now:
     finalize-tools: ${AGENT_ANSWER_NOW_FINALIZE_TOOLS:true}
+  run-snapshot:
+    ttl-seconds: ${AGENT_RUN_SNAPSHOT_TTL_SECONDS:21600}
+  run-events:
+    ttl-seconds: ${AGENT_RUN_EVENTS_TTL_SECONDS:21600}
+  evidence-map:
+    ttl-seconds: ${AGENT_EVIDENCE_MAP_TTL_SECONDS:604800}
   user-input:
     enabled: ${AGENT_USER_INPUT_ENABLED:false}
     max-asks: ${AGENT_USER_INPUT_MAX_ASKS:2}

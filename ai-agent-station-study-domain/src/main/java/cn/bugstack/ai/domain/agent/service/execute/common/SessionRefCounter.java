@@ -3,9 +3,11 @@ package cn.bugstack.ai.domain.agent.service.execute.common;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 第 61 轮新增：sessionId 维度的 RAG 引用累加计数器。
@@ -29,7 +31,12 @@ public class SessionRefCounter {
     /** 防内存泄漏的硬上限；正常每 session 几十字节，10w session ≈ 几 MB */
     private static final int MAX_SESSIONS = 100_000;
 
-    private final Map<String, AtomicInteger> counters = new ConcurrentHashMap<>();
+    private final Map<String, SessionReferences> counters = new ConcurrentHashMap<>();
+
+    private static final class SessionReferences {
+        private int nextRef = 1;
+        private final Map<String, Integer> refByFingerprint = new LinkedHashMap<>();
+    }
 
     /**
      * 预留 count 个引用编号，返回 startRef（下一个可用编号，1-based）。
@@ -48,9 +55,50 @@ public class SessionRefCounter {
             log.warn("[SessionRefCounter] sessions exceed {} hard limit, refusing new; sessionId={}", MAX_SESSIONS, sessionId);
             return 1;
         }
-        AtomicInteger c = counters.computeIfAbsent(sessionId, k -> new AtomicInteger(0));
+        SessionReferences c = counters.computeIfAbsent(sessionId, k -> new SessionReferences());
         // 原子地取当前值并加上 count，得到本批 startRef = 旧值+1
-        return c.getAndAdd(count) + 1;
+        synchronized (c) {
+            int startRef = c.nextRef;
+            c.nextRef += count;
+            return startRef;
+        }
+    }
+
+    /**
+     * Resolve stable citation numbers for a batch of evidence fingerprints.
+     * The same evidence keeps the same number for the whole run, even when a
+     * tool continuation or another ChatClient triggers RAG again.
+     */
+    public List<Integer> resolveReferences(String sessionId, List<String> fingerprints) {
+        if (fingerprints == null || fingerprints.isEmpty()) return List.of();
+        if (sessionId == null || sessionId.isBlank()) {
+            List<Integer> local = new ArrayList<>(fingerprints.size());
+            for (int i = 0; i < fingerprints.size(); i++) local.add(i + 1);
+            return local;
+        }
+        if (counters.size() >= MAX_SESSIONS && !counters.containsKey(sessionId)) {
+            log.warn("[SessionRefCounter] sessions exceed {} hard limit, refusing new; sessionId={}", MAX_SESSIONS, sessionId);
+            List<Integer> local = new ArrayList<>(fingerprints.size());
+            for (int i = 0; i < fingerprints.size(); i++) local.add(i + 1);
+            return local;
+        }
+        SessionReferences references = counters.computeIfAbsent(sessionId, k -> new SessionReferences());
+        List<Integer> resolved = new ArrayList<>(fingerprints.size());
+        synchronized (references) {
+            for (int i = 0; i < fingerprints.size(); i++) {
+                String fingerprint = fingerprints.get(i);
+                if (fingerprint == null || fingerprint.isBlank()) {
+                    fingerprint = "__anonymous__" + references.nextRef + ":" + i;
+                }
+                Integer ref = references.refByFingerprint.get(fingerprint);
+                if (ref == null) {
+                    ref = references.nextRef++;
+                    references.refByFingerprint.put(fingerprint, ref);
+                }
+                resolved.add(ref);
+            }
+        }
+        return resolved;
     }
 
     /**
@@ -64,7 +112,10 @@ public class SessionRefCounter {
 
     /** 仅测试用：观察当前已分配的总数。 */
     int peek(String sessionId) {
-        AtomicInteger c = counters.get(sessionId);
-        return c == null ? 0 : c.get();
+        SessionReferences c = counters.get(sessionId);
+        if (c == null) return 0;
+        synchronized (c) {
+            return c.nextRef - 1;
+        }
     }
 }

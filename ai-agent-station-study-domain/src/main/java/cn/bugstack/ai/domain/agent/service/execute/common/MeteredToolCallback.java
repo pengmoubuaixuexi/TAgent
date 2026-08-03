@@ -297,19 +297,23 @@ public class MeteredToolCallback implements ToolCallback {
         long progressStartedAt = start;
         // H3-A：finally 阶段用此字段决定 emit end 的 status；catch 改写为 error。
         String progressStatus = STATUS_SUCCESS;
+        String callId = java.util.UUID.randomUUID().toString();
         // 2026-05-20：把 rawResult 提到 finally 之外，让 ES trace 拿到未经 normalize/truncate 的真实响应
         String rawResultForTrace = null;
+        // Evidence Map stores exactly what the model received after normalization, not the provider's raw envelope.
+        String returnedResultForEvidence = null;
         try {
             if (isBlockedGithubWriteTool(name)) {
                 if (progress != null) {
                     progressStartedAt = System.currentTimeMillis();
-                    progress.emitStart(sessionId, name, effectiveInput, stepLabel);
+                    progress.emitStart(sessionId, name, effectiveInput, stepLabel, callId);
                     progressStarted = true;
                 }
                 String result = toolBlockedResult(name);
                 rawResultChars = result.length();
                 returnedResultChars = result.length();
                 rawResultForTrace = result;
+                returnedResultForEvidence = result;
                 success = true;
                 progressStatus = STATUS_BLOCKED;
                 return result;
@@ -330,6 +334,7 @@ public class MeteredToolCallback implements ToolCallback {
                     rawResultChars = result.length();
                     returnedResultChars = result.length();
                     rawResultForTrace = result;
+                    returnedResultForEvidence = result;
                     success = true; // 业务侧"拒绝"不是错误，仍记 OK 让 latency/count 正常
                     progressStatus = approvalDecisionToStatus(decision);
                     return result;
@@ -340,7 +345,7 @@ public class MeteredToolCallback implements ToolCallback {
             // 才开始发布工具进度；拒绝/超时/通道不可用都不会产生 tool_call 卡片。
             if (progress != null) {
                 progressStartedAt = System.currentTimeMillis();
-                progress.emitStart(sessionId, name, effectiveInput, stepLabel);
+                progress.emitStart(sessionId, name, effectiveInput, stepLabel, callId);
                 progressStarted = true;
             }
 
@@ -359,6 +364,7 @@ public class MeteredToolCallback implements ToolCallback {
             rawResultForTrace = rawResult;
             String result = normalizeToolResult(name, rawResult);
             returnedResultChars = result == null ? 0 : result.length();
+            returnedResultForEvidence = result;
             resultLimited = returnedResultChars != rawResultChars;
             success = true;
             progressStatus = STATUS_SUCCESS;
@@ -372,6 +378,7 @@ public class MeteredToolCallback implements ToolCallback {
                 rawResultChars = result.length();
                 returnedResultChars = result.length();
                 rawResultForTrace = result;
+                returnedResultForEvidence = result;
                 return result;
             }
             throw e;
@@ -420,13 +427,15 @@ public class MeteredToolCallback implements ToolCallback {
             // emitter 内部对 null sessionId / null emitter / 序列化异常都吞掉，不影响调用方。
             if (progress != null && progressStarted) {
                 if (STATUS_ERROR.equals(progressStatus)) {
-                    progress.emitError(sessionId, name, summarizeFailure(failure), progressLatency, stepLabel);
+                    progress.emitError(sessionId, name, summarizeFailure(failure), progressLatency, stepLabel, callId);
                 } else {
                     // 2026-06-22 评估采集：把工具真实返回(rawResultForTrace=未 normalize/截断 的原始响应)透给 emitter；
                     // emitter 端按 agent.tool-progress.result-preview.enabled 决定是否落进 SSE(默认关,生产不推)。
                     progress.emitEnd(sessionId, name, progressStatus, progressLatency,
-                            returnedResultChars >= 0 ? returnedResultChars : 0, stepLabel, null, rawResultForTrace);
+                            returnedResultChars >= 0 ? returnedResultChars : 0, stepLabel, callId, rawResultForTrace);
                 }
+                progress.recordEvidence(sessionId, name, effectiveInput, returnedResultForEvidence,
+                        progressStatus, progressLatency, rawResultChars, stepLabel, callId);
             }
             // P0（Codex #2）工具调用事实摘要台账：记本轮真实调用（工具名/状态/返回字符数/形态，不含返回内容），
             // 供 Auto Step3 质检确认"确实调过工具/有返回"，消除"查无工具记录→反咬编造"。

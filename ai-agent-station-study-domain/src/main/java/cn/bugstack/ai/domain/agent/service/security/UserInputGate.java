@@ -1,6 +1,7 @@
 package cn.bugstack.ai.domain.agent.service.security;
 
 import cn.bugstack.ai.domain.agent.service.execute.event.RunEventPublisher;
+import cn.bugstack.ai.domain.agent.service.execute.common.AskUserQuestionNormalizer;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -119,7 +120,7 @@ public class UserInputGate {
      * 阻塞式向用户提问。
      * @param sessionId 当前会话；用于反查 emitter + 预算计数
      * @param argsJson  ask_user 工具入参原文。questions 兼容字符串和
-     *                  {@code {question, options, allowFreeText}} 两种元素格式
+     *                  {@code {question, options, allowFreeText, multiple}} 两种元素格式
      * @param stepLabel 当前步骤标签（可空），仅供前端标注「哪个步骤要问的」
      */
     public Result requestUserInput(String sessionId, String argsJson, String stepLabel) {
@@ -148,11 +149,11 @@ public class UserInputGate {
             log.info("[UserInput] requested inputId={} step={}", inputId, stepLabel);
             String answer = future.get(timeoutSeconds, TimeUnit.SECONDS);
             log.info("[UserInput] answered inputId={} len={}", inputId, answer != null ? answer.length() : 0);
-            publishResult(sessionId, inputId, "ANSWERED");
+            publishResult(sessionId, inputId, "ANSWERED", answer);
             return new Result(Status.ANSWERED, answer);
         } catch (TimeoutException e) {
             log.warn("[UserInput] timeout inputId={}", inputId);
-            publishResult(sessionId, inputId, "TIMEOUT");
+            publishResult(sessionId, inputId, "TIMEOUT", null);
             return new Result(Status.TIMEOUT, null);
         } catch (Exception e) {
             log.warn("[UserInput] failed inputId={}: {}", inputId, e.toString());
@@ -162,11 +163,19 @@ public class UserInputGate {
         }
     }
 
-    private void publishResult(String sessionId, String inputId, String status) {
+    private void publishResult(String sessionId, String inputId, String status, String answer) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("inputId", inputId);
         payload.put("status", status);
+        if ("ANSWERED".equals(status) && answer != null) {
+            payload.put("answer", sanitizeTimelineAnswer(answer));
+        }
         runEventPublisher.publishCurrent(sessionId, "user_input_result", payload);
+    }
+
+    private String sanitizeTimelineAnswer(String answer) {
+        String value = answer.replace("\u0000", "").trim();
+        return value.length() <= 12_000 ? value : value.substring(0, 12_000) + "\n...(truncated)";
     }
 
     /** 前端回填入口（由 Controller 调用）。 */
@@ -190,10 +199,26 @@ public class UserInputGate {
             if (node.hasNonNull("context")) {
                 map.put("context", node.get("context").asText());
             }
-            if (node.has("questions") && node.get("questions").isArray()) {
+            if (node.has("questions")) {
                 List<String> qs = new ArrayList<>();
                 List<Map<String, Object>> questionDetails = new ArrayList<>();
-                node.get("questions").forEach(q -> {
+                JsonNode originalQuestions = node.get("questions");
+                JsonNode normalizedQuestions = AskUserQuestionNormalizer.normalize(originalQuestions);
+                if (originalQuestions != null && originalQuestions.isTextual()
+                        && normalizedQuestions != null && !normalizedQuestions.isTextual()) {
+                    log.info("[UserInput] normalized encoded questions inputId={} count={}", inputId,
+                            normalizedQuestions.isArray() ? normalizedQuestions.size() : 1);
+                }
+                List<JsonNode> questionNodes = new ArrayList<>();
+                if (normalizedQuestions != null && normalizedQuestions.isArray()) {
+                    normalizedQuestions.forEach(questionNodes::add);
+                } else if (normalizedQuestions != null
+                        && (normalizedQuestions.isTextual() || normalizedQuestions.isObject())) {
+                    // 不允许 questions 因为形状不标准而静默消失。普通字符串按单题兼容；
+                    // 单个结构化对象也按一道题处理。
+                    questionNodes.add(normalizedQuestions);
+                }
+                questionNodes.forEach(q -> {
                     if (q.isTextual()) {
                         if (!q.asText().isBlank()) qs.add(q.asText());
                         return;
@@ -209,6 +234,21 @@ public class UserInputGate {
                     List<Map<String, String>> options = normalizeOptions(q.get("options"));
                     if (!options.isEmpty()) detail.put("options", options);
                     detail.put("allowFreeText", !q.has("allowFreeText") || q.get("allowFreeText").asBoolean(true));
+                    boolean multiple;
+                    if (q.has("multiple")) {
+                        multiple = q.get("multiple").asBoolean(false);
+                    } else if (q.has("multiSelect")) {
+                        // 兼容早期或其他模型常用的 camelCase 写法。
+                        multiple = q.get("multiSelect").asBoolean(false);
+                    } else {
+                        String selectionMode = textValue(q, "selectionMode");
+                        multiple = "multiple".equalsIgnoreCase(selectionMode)
+                                || question.contains("可多选")
+                                || question.contains("多选题")
+                                || question.contains("选择多个")
+                                || question.contains("可选择多项");
+                    }
+                    detail.put("multiple", multiple);
                     questionDetails.add(detail);
                 });
                 if (!qs.isEmpty()) map.put("questions", qs);

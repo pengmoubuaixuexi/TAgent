@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import cn.bugstack.ai.domain.agent.service.memory.longterm.LongTermMemoryRecall;
 
 /**
  * H2-A：记忆证据 emitter —— 让用户看到"本轮用了哪些记忆"。
@@ -41,6 +42,7 @@ public class MemoryEvidenceEmitter {
 
     public static final String TYPE_LONG_TERM = "long_term";
     public static final String TYPE_EPISODIC = "episodic";
+    public static final String TYPE_CHAT_SUMMARY = "chat_summary";
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -84,6 +86,46 @@ public class MemoryEvidenceEmitter {
             sendEvent(sessionId, TYPE_LONG_TERM, items, emitter);
         } catch (Exception e) {
             log.debug("[MemoryEvidence] long_term emit aborted sessionId={} err={}", sessionId, e.toString());
+        }
+    }
+
+    public void emitLongTermEvidenceDetailed(String sessionId, List<LongTermMemoryRecall> recalls) {
+        if (!explainEnabled || recalls == null || recalls.isEmpty()) return;
+        try {
+            if (sessionId == null || sessionId.isBlank()) return;
+            ResponseBodyEmitter emitter = lookupEmitter(sessionId);
+            if (emitter == null && !hasRun(sessionId)) return;
+            List<Map<String, Object>> items = new ArrayList<>();
+            for (LongTermMemoryRecall recall : recalls) {
+                if (recall == null || recall.getContent() == null || recall.getContent().isBlank()) continue;
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("topic", recall.getTopic() == null ? "other" : recall.getTopic());
+                item.put("content", recall.getContent());
+                item.put("memoryKind", recall.getKind());
+                if (recall.getMemoryId() != null) item.put("memoryId", recall.getMemoryId());
+                if (LongTermMemoryRecall.KIND_RELEVANT.equals(recall.getKind()) && recall.getSimilarity() != null) {
+                    item.put("similarity", recall.getSimilarity());
+                }
+                items.add(item);
+            }
+            if (!items.isEmpty()) sendEvent(sessionId, TYPE_LONG_TERM, items, emitter);
+        } catch (Exception error) {
+            log.debug("[MemoryEvidence] detailed long_term emit aborted sessionId={} err={}", sessionId, error.toString());
+        }
+    }
+
+    public void emitChatSummaryEvidence(String sessionId, String conversationId, String summary) {
+        if (!explainEnabled || summary == null || summary.isBlank()) return;
+        try {
+            ResponseBodyEmitter emitter = lookupEmitter(sessionId);
+            if (emitter == null && !hasRun(sessionId)) return;
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("kind", "rolling_summary");
+            item.put("content", summary.trim());
+            if (conversationId != null) item.put("conversationId", conversationId);
+            sendEvent(sessionId, TYPE_CHAT_SUMMARY, List.of(item), emitter);
+        } catch (Exception error) {
+            log.debug("[MemoryEvidence] chat summary emit aborted sessionId={} err={}", sessionId, error.toString());
         }
     }
 

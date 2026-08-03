@@ -14,6 +14,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 
 /**
  * H1 (F7) RAG 答案引用 — 后端证据片段 emitter。
@@ -98,18 +100,26 @@ public class RagEvidenceEmitter {
      * 前端 append 渲染时直接按 ref 排序，模型答案里的 [N] 和卡片的第 N 条对齐。</p>
      */
     public void emitEvidence(String sessionId, List<Document> documents, int startRef) {
+        List<Integer> refs = new ArrayList<>();
+        if (documents != null) {
+            for (int i = 0; i < documents.size(); i++) refs.add(startRef + i);
+        }
+        emitEvidence(sessionId, documents, refs);
+    }
+
+    public void emitEvidence(String sessionId, List<Document> documents, List<Integer> refs) {
         try {
             if (sessionId == null || sessionId.isBlank()) return;
             if (documents == null || documents.isEmpty()) return;
             ResponseBodyEmitter emitter = lookupEmitter(sessionId);
             if (emitter == null && !hasRun(sessionId)) return;
 
-            List<Map<String, Object>> items = buildEvidenceSnippets(documents, startRef);
+            List<Map<String, Object>> items = buildEvidenceSnippets(documents, refs);
             if (items.isEmpty()) return;
 
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("sessionId", sessionId);
-            data.put("startRef", startRef);
+            data.put("startRef", items.get(0).get("ref"));
             data.put("items", items);
             data.put("timestamp", System.currentTimeMillis());
             sendEvent(emitter, data, sessionId);
@@ -125,15 +135,22 @@ public class RagEvidenceEmitter {
 
     public List<Map<String, Object>> buildEvidenceSnippets(List<Document> documents, int startRef) {
         if (documents == null || documents.isEmpty()) return List.of();
-        return buildItems(documents, startRef);
+        List<Integer> refs = new ArrayList<>(documents.size());
+        for (int i = 0; i < documents.size(); i++) refs.add(startRef + i);
+        return buildItems(documents, refs);
     }
 
-    private List<Map<String, Object>> buildItems(List<Document> documents, int startRef) {
+    public List<Map<String, Object>> buildEvidenceSnippets(List<Document> documents, List<Integer> refs) {
+        if (documents == null || documents.isEmpty()) return List.of();
+        return buildItems(documents, refs);
+    }
+
+    private List<Map<String, Object>> buildItems(List<Document> documents, List<Integer> refs) {
         List<Map<String, Object>> items = new ArrayList<>(documents.size());
         for (int i = 0; i < documents.size(); i++) {
             Document doc = documents.get(i);
             if (doc == null) continue;
-            int ref = startRef + i;
+            int ref = refs != null && i < refs.size() && refs.get(i) != null ? refs.get(i) : i + 1;
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("ref", ref);
             item.put("source", extractSource(doc, ref));
@@ -144,6 +161,22 @@ public class RagEvidenceEmitter {
         return items;
     }
 
+    /** Stable identity used to reuse citation numbers across repeated retrievals. */
+    public String evidenceFingerprint(Document doc) {
+        if (doc == null) return "";
+        String source = extractSource(doc, 0);
+        if ("doc-0".equals(source)) source = "";
+        String raw = source + "\n" + normalize(doc.getText());
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(raw.getBytes(StandardCharsets.UTF_8));
+            StringBuilder value = new StringBuilder(digest.length * 2);
+            for (byte b : digest) value.append(String.format("%02x", b));
+            return value.toString();
+        } catch (Exception ignored) {
+            return raw;
+        }
+    }
+
     /**
      * 2026-06-22 评估采集：给每条 evidence 附上检索分,供事后量化 RAG 检索质量。<b>只读 Document、零副作用、生产安全</b>
      * （score/distance 本就是数字相似度,不含 PII；前端忽略未知字段）。
@@ -152,7 +185,7 @@ public class RagEvidenceEmitter {
      *   <li>{@code distance}: PgVector 余弦距离（低=更相关），key 与 {@code LongTermMemoryService.extractDistance} 一致；</li>
      *   <li>{@code bm25_score}: 词法检索分（混合检索 BM25 路径写入,如有）。</li>
      * </ul>
-     * 注意：rerank 只重排不写回分数,故这里拿到的是<b>检索阶段</b>分；最终 rerank 顺序已体现在 ref 排序里。
+     * 用户侧只消费 relevanceScore/relevanceType：rerank 优先，缺失时回退语义相似度。
      */
     static void putScore(Map<String, Object> item, Document doc) {
         try {
@@ -164,10 +197,37 @@ public class RagEvidenceEmitter {
                 if (dist != null) item.put("distance", dist);
                 Object bm25 = meta.get("bm25_score");
                 if (bm25 != null) item.put("bm25_score", bm25);
+                Double rerank = number(meta.get("rerank_score"));
+                Double semantic = number(meta.get("semantic_similarity"));
+                if (semantic == null && score != null) semantic = clamp01(score);
+                if (semantic == null) {
+                    Double distanceValue = number(dist);
+                    if (distanceValue != null) semantic = clamp01(1.0d - distanceValue);
+                }
+                if (rerank != null) {
+                    item.put("relevanceScore", clamp01(rerank));
+                    item.put("relevanceType", "rerank");
+                } else if (semantic != null) {
+                    item.put("relevanceScore", clamp01(semantic));
+                    item.put("relevanceType", "semantic");
+                }
+                Object matchedChild = meta.get("matched_child_snippet");
+                if (matchedChild != null) item.put("matchedChildSnippet", normalize(String.valueOf(matchedChild)));
             }
         } catch (Exception ignored) {
             // 取分失败绝不能影响 evidence 主体
         }
+    }
+
+    private static Double number(Object value) {
+        if (value instanceof Number n) return n.doubleValue();
+        if (value == null) return null;
+        try { return Double.parseDouble(String.valueOf(value)); }
+        catch (Exception ignored) { return null; }
+    }
+
+    private static double clamp01(double value) {
+        return Math.max(0.0d, Math.min(1.0d, value));
     }
 
     /** 从 metadata 按优先级找 source；都没有用 Document.id 或 doc-N fallback。 */

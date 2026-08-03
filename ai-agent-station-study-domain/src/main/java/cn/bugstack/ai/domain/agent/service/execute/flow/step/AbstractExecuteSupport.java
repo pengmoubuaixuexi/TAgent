@@ -882,7 +882,7 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         // 立即回答/引导 mid-stream 截断触发器：answer_now/steer emit 它 → takeUntilOther 优雅完成 Flux → 拿到半截。
         // 不触发时对原流完全透明（companion 永不 emit）；Sinks.one 的 replay 语义可处理"刚 emit 就被订阅"的竞态。
         reactor.core.publisher.Sinks.One<Object> __cancelTrigger = reactor.core.publisher.Sinks.one();
-        dynamicContext.setCancelTrigger(__cancelTrigger);
+        dynamicContext.registerCancelTrigger(__cancelTrigger);
         // 立即回答 finalize（stepName 含 answer_now）那一发关思考：与 scopeSession 同机制（订阅在调用线程，filter 读 ThreadLocal）。
         // 其余步骤 __noThink=false，scopeNoThinking 退化为 no-op → 零影响。
         boolean __noThink = stepName != null && stepName.contains("answer_now");
@@ -955,6 +955,14 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
                         String full = fullResponse.toString();
                         if (full.length() > displaySentLen[0]) {
                             sendTokenEvent(dynamicContext, full.substring(displaySentLen[0]), stepName, MDC.get("requestId"));
+                        }
+                    } else {
+                        // 模型偶尔会违反“先给用户正文、再给结构化块”的约定，直接从 marker 开始输出。
+                        // 此时原逻辑会把整段都作为下游业务产物隐藏，前端最终只剩一张空步骤卡。
+                        // 仅在 marker 前确实没有可见正文时，完整展示结构化产物作为兜底；正常双段输出不受影响。
+                        String fallback = buildResultBlockDisplayFallback(fullResponse.toString());
+                        if (!fallback.isBlank()) {
+                            sendTokenEvent(dynamicContext, fallback, stepName, MDC.get("requestId"));
                         }
                     }
                     sendTokenEvent(dynamicContext, "[DONE]", stepName, MDC.get("requestId"));
@@ -1055,7 +1063,32 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         return OutputModerationFilter.check(partial);
         } catch (Exception scopeEx) {
             throw new RuntimeException("streaming wrapper failed: " + scopeEx.getMessage(), scopeEx);
+        } finally {
+            dynamicContext.unregisterCancelTrigger(__cancelTrigger);
         }
+    }
+
+    /**
+     * 当模型只返回 {@code === 执行结果 ===} 结构化块时，构造可供步骤卡展示的兜底正文。
+     * 正常情况下 marker 前已经有用户可见回答，此方法返回空串，避免重复展示业务产物。
+     */
+    static String buildResultBlockDisplayFallback(String fullResponse) {
+        if (fullResponse == null || fullResponse.isBlank()) return "";
+        final String marker = "=== 执行结果 ===";
+        int markerIndex = fullResponse.indexOf(marker);
+        if (markerIndex < 0) return "";
+
+        String visiblePrefix = fullResponse.substring(0, markerIndex).trim();
+        // marker 常被包在 Markdown fence 中；单独的 fence 不算用户可见正文。
+        visiblePrefix = visiblePrefix.replaceFirst("(?s)```[^\\r\\n]*$", "").trim();
+        if (!visiblePrefix.isBlank()) return "";
+
+        String resultBlock = fullResponse.substring(markerIndex + marker.length()).trim();
+        resultBlock = resultBlock.replaceFirst("(?s)^```[^\\r\\n]*[\\r\\n]*", "");
+        resultBlock = resultBlock.replaceFirst("(?s)[\\r\\n]*```\\s*$", "").trim();
+        if (resultBlock.isBlank()) return "";
+
+        return "> 本步骤未单独生成展示正文，以下为实际执行产物。\n\n" + resultBlock;
     }
 
     /**

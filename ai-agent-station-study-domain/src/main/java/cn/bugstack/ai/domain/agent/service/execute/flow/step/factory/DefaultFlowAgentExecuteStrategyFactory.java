@@ -11,6 +11,7 @@ import lombok.NoArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -90,14 +91,30 @@ public class DefaultFlowAgentExecuteStrategyFactory {
             return s;
         }
 
-        /** 在飞流式调用断流触发器：每发流式 call 入口装新的，answer_now/steer emit 它实现 mid-stream 截断。
-         *  lombok 生成 get/setCancelTrigger；此处只补 fire 帮手。 */
-        private volatile reactor.core.publisher.Sinks.One<Object> cancelTrigger;
+        /**
+         * 所有在飞流式调用的断流触发器。Flow Step4 会并行执行多个 DAG 子步骤，单个 volatile 引用会被
+         * 后注册分支覆盖，导致 cancel 只能截断最后一个分支。按调用注册并在 finally 注销，广播时命中全部分支。
+         */
+        private final Set<reactor.core.publisher.Sinks.One<Object>> cancelTriggers = ConcurrentHashMap.newKeySet();
 
-        /** 触发当前在飞流式 call 断流；无在飞 call 时 no-op（finalizeRequested 标记仍会在下个 step 边界被捕获）。 */
+        public void registerCancelTrigger(reactor.core.publisher.Sinks.One<Object> trigger) {
+            if (trigger == null) return;
+            cancelTriggers.add(trigger);
+            // 关闭请求可能发生在“创建 trigger”和“注册 trigger”之间。注册后补检查，避免漏掉竞态窗口。
+            if (cancelled.get() || finalizeRequested.get()) {
+                trigger.tryEmitValue(Boolean.TRUE);
+            }
+        }
+
+        public void unregisterCancelTrigger(reactor.core.publisher.Sinks.One<Object> trigger) {
+            if (trigger != null) cancelTriggers.remove(trigger);
+        }
+
+        /** 触发全部在飞流式 call 断流；无在飞 call 时 no-op。 */
         public void fireCancelTrigger() {
-            reactor.core.publisher.Sinks.One<Object> t = this.cancelTrigger;
-            if (t != null) t.tryEmitValue(Boolean.TRUE);
+            for (reactor.core.publisher.Sinks.One<Object> trigger : cancelTriggers) {
+                trigger.tryEmitValue(Boolean.TRUE);
+            }
         }
 
         /** 立即回答可观测：累计本轮各 step（含被截断步的半截）的 token，供 marker 报告"打断之前叠加的 token"。 */

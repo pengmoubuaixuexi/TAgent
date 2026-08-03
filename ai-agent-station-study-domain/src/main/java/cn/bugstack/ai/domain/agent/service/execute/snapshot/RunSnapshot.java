@@ -61,6 +61,10 @@ public class RunSnapshot {
     @Builder.Default
     private List<RunEventRecord> timelineEvents = new ArrayList<>();
 
+    /** Full normalized tool results used by the model; loaded from a sibling Redis hash. */
+    @Builder.Default
+    private List<ToolEvidenceRecord> toolEvidences = new ArrayList<>();
+
     /** Redis Stream cursor already covered by {@link #timelineEvents}. */
     private String lastEventId;
 }

@@ -29,6 +29,11 @@ public class ReadOnlyChatMemoryAdvisor implements BaseAdvisor {
 
     private final ChatMemory chatMemory;
     private final int order;
+    private volatile cn.bugstack.ai.domain.agent.service.execute.common.MemoryEvidenceEmitter memoryEvidenceEmitter;
+
+    public void setMemoryEvidenceEmitter(cn.bugstack.ai.domain.agent.service.execute.common.MemoryEvidenceEmitter emitter) {
+        this.memoryEvidenceEmitter = emitter;
+    }
 
     public ReadOnlyChatMemoryAdvisor(ChatMemory chatMemory) {
         this(chatMemory, 0);
@@ -71,6 +76,7 @@ public class ReadOnlyChatMemoryAdvisor implements BaseAdvisor {
         }
 
         history = completeHistoryTurns(history);
+        emitIncludedSummary(conversationId, history);
 
         List<Message> current = request.prompt().getInstructions();
         List<Message> messages = new ArrayList<>(history.size() + current.size());
@@ -90,6 +96,25 @@ public class ReadOnlyChatMemoryAdvisor implements BaseAdvisor {
                 .prompt(Prompt.builder().messages(messages).chatOptions(request.prompt().getOptions()).build())
                 .context(ctx)
                 .build();
+    }
+
+    private void emitIncludedSummary(String conversationId, List<Message> history) {
+        if (memoryEvidenceEmitter == null || history == null) return;
+        for (Message message : history) {
+            if (!(message instanceof SystemMessage)) continue;
+            String text = message.getText();
+            if (text == null || !text.startsWith("【对话历史摘要】")) continue;
+            String summary = text.substring("【对话历史摘要】".length()).trim();
+            memoryEvidenceEmitter.emitChatSummaryEvidence(
+                    extractSessionIdFromConversationId(conversationId), conversationId, summary);
+        }
+    }
+
+    private static String extractSessionIdFromConversationId(String conversationId) {
+        if (conversationId == null || conversationId.isBlank()) return null;
+        String trimmed = conversationId.trim();
+        int index = trimmed.lastIndexOf(':');
+        return index >= 0 && index + 1 < trimmed.length() ? trimmed.substring(index + 1) : trimmed;
     }
 
     @Override

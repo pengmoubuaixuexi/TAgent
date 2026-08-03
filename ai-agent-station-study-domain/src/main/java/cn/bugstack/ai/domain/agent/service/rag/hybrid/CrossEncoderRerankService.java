@@ -108,7 +108,13 @@ public class CrossEncoderRerankService implements IRerankService {
                 JSONObject r = results.getJSONObject(i);
                 int idx = r.getIntValue("index");
                 if (idx >= 0 && idx < candidates.size()) {
-                    reranked.add(candidates.get(idx));
+                    Document document = candidates.get(idx);
+                    Double relevance = r.getDouble("relevance_score");
+                    if (relevance != null && Double.isFinite(relevance)) {
+                        document.getMetadata().put("rerank_score", clamp01(relevance));
+                        document.getMetadata().put("rerank_provider", "cross_encoder");
+                    }
+                    reranked.add(document);
                 }
             }
         } catch (Exception e) {
@@ -131,5 +137,9 @@ public class CrossEncoderRerankService implements IRerankService {
             MDC.remove("latencyMs");
         }
         return reranked;
+    }
+
+    private static double clamp01(double value) {
+        return Math.max(0.0d, Math.min(1.0d, value));
     }
 }
