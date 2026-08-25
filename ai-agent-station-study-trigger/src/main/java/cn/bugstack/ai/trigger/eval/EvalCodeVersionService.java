@@ -40,11 +40,13 @@ import java.util.stream.Stream;
 public class EvalCodeVersionService {
 
     private static final String HASH_ALGORITHM = "GIT_TREE_SHA1";
-    private static final String SCOPE_VERSION = "evalops-v1";
+    private static final String SCOPE_VERSION = "evalops-v2";
     private static final int MAX_GIT_OUTPUT_BYTES = 16 * 1024 * 1024;
     private static final List<String> DEFAULT_IGNORE_PATTERNS = List.of(
             "**/target/**", "**/build/**", "**/node_modules/**", "**/src/test/**", "**/*.log",
             "logs/**", "tmp/**", "docs/dev-ops/log/**", ".idea/**", ".understand-anything/**",
+            "ai-agent-station-study-app/src/main/resources/application-dev.yml",
+            "docs/dev-ops/docker-compose-*.yml", "面试/**",
             "docs/dev-ops/test/**", "docs/dev-ops/sql-backups/**", "docs/dev-ops/_*",
             "docs/images/**", "**/api-docs/**", "**/*.md", "**/*.tsv", "**/*.mp4", "**/*.pdf"
     );
@@ -64,8 +66,13 @@ public class EvalCodeVersionService {
 
     @PostConstruct
     public void initializeRuntimeSnapshot() {
+        captureRuntimeSnapshot("APPLICATION_START");
+    }
+
+    private synchronized Map<String, Object> captureRuntimeSnapshot(String captureTrigger) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("capturedAt", LocalDateTime.now().toString());
+        snapshot.put("captureTrigger", captureTrigger);
         snapshot.put("hashAlgorithm", HASH_ALGORITHM);
         snapshot.put("scopeVersion", SCOPE_VERSION);
         try {
@@ -98,10 +105,13 @@ public class EvalCodeVersionService {
             snapshot.put("ignorePatterns", DEFAULT_IGNORE_PATTERNS);
             runtimeSnapshot = Map.copyOf(snapshot);
         }
+        return runtimeSnapshot;
     }
 
     public AiEvalCodeVersion createRunSnapshot(String evalRunId, LocalDateTime now) {
-        Map<String, Object> snapshot = new LinkedHashMap<>(runtimeSnapshot);
+        // Do not reuse the application-start snapshot. A run must bind to the exact
+        // working tree visible when the user starts that evaluation.
+        Map<String, Object> snapshot = new LinkedHashMap<>(captureRuntimeSnapshot("RUN_CREATE"));
         boolean available = Boolean.TRUE.equals(snapshot.get("available"));
         boolean dirty = Boolean.TRUE.equals(snapshot.get("dirty"));
         List<String> tags = stringList(snapshot.get("headTags"));
@@ -290,6 +300,7 @@ public class EvalCodeVersionService {
         view.put("lastCheckedAt", value.getLastCheckedAt());
         JSONObject snapshot = parseObject(value.getSnapshotJson());
         view.put("capturedAt", snapshot == null ? null : snapshot.getString("capturedAt"));
+        view.put("captureTrigger", snapshot == null ? null : snapshot.getString("captureTrigger"));
         view.put("ignoreRulesHash", snapshot == null ? null : snapshot.getString("ignoreRulesHash"));
         view.put("warning", snapshot == null ? null : snapshot.getString("warning"));
         return view;

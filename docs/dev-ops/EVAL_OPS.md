@@ -88,11 +88,11 @@ CodeVersion: WAITING_TAG -> AUTO_VERIFIED/MANUAL_VERIFIED
 
 ## 代码版本双阶段绑定
 
-应用启动时会读取当前 Git 工作区，用临时 Index 和临时对象目录生成过滤后的 Git Tree Hash；不会修改真实 Git Index。评测创建时将这个运行实例快照复制到评测记录，保证随后修改磁盘源码不会改变历史记录。
+应用启动时会初始化 Git 仓库访问能力；每次点击发起评测时都会重新读取当前 Git 工作区，用临时 Index 和临时对象目录即时生成过滤后的 Git Tree Hash，不会修改真实 Git Index。每次运行独立保存当时的快照，保证随后修改磁盘源码不会改变历史记录，也不会误用应用启动时的旧工作区状态。
 
 评测完成后可以先提交代码、再创建 Tag。下一次发起评测前，平台会扫描尚未处理的 Tag，用历史评测保存的忽略规则重新计算 Tag Tree Hash；完全一致时自动标记为 `AUTO_VERIFIED`。没有下一次评测时，也可以在详情页手动选择 Tag：一致为 `MANUAL_VERIFIED`，强制关联必须填写原因并标记为 `MANUAL_UNVERIFIED`。
 
-根目录 `.evalopsignore` 独立于 `.gitignore`，默认排除日志、`target`/`build`、测试源码、临时目录、文档与历史评测报告、图片、视频和 PDF，只保留会影响应用运行、配置和数据库结构的文件。每次评测同时保存忽略规则快照，后续校验不会受到规则变更影响。
+根目录 `.evalopsignore` 独立于 `.gitignore`，默认排除日志、`target`/`build`、测试源码、临时目录、文档与历史评测报告、图片、视频、PDF、本地 `application-dev.yml`、Docker Compose 编排文件和个人研究资料，只保留 TAgent 产品源码及数据库结构。每次评测同时保存忽略规则快照，后续校验不会受到规则变更影响；旧评测仍沿用其历史规则，不会被新版范围静默改写。
 
 如果应用不是从 Git 工作区运行，可通过 `eval.ops.git.repository-path` 指向本机仓库；仍不可访问时，代码快照状态为 `CAPTURE_UNAVAILABLE`。
 
