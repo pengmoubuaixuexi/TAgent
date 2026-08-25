@@ -1,0 +1,26 @@
+# Build output and dependency caches
+**/target/**
+**/build/**
+**/node_modules/**
+**/src/test/**
+
+# Runtime logs and temporary data
+**/*.log
+logs/**
+tmp/**
+docs/dev-ops/log/**
+
+# Local IDE and analysis caches
+.idea/**
+.understand-anything/**
+
+# Generated reports and large presentation assets
+docs/dev-ops/test/**
+docs/dev-ops/sql-backups/**
+docs/dev-ops/_*
+docs/images/**
+**/api-docs/**
+**/*.md
+**/*.tsv
+**/*.mp4
+**/*.pdf

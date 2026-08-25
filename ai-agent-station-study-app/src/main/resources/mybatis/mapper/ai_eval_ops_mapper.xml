@@ -1,0 +1,460 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="cn.bugstack.ai.infrastructure.dao.IAiEvalOpsDao">
+
+    <resultMap id="DatasetMap" type="cn.bugstack.ai.infrastructure.dao.po.AiEvalDataset">
+        <id column="id" property="id"/>
+        <result column="dataset_id" property="datasetId"/>
+        <result column="name" property="name"/>
+        <result column="description" property="description"/>
+        <result column="execution_mode" property="executionMode"/>
+        <result column="owner_user_id" property="ownerUserId"/>
+        <result column="status" property="status"/>
+        <result column="latest_version_no" property="latestVersionNo"/>
+        <result column="created_at" property="createdAt"/>
+        <result column="updated_at" property="updatedAt"/>
+    </resultMap>
+
+    <resultMap id="VersionMap" type="cn.bugstack.ai.infrastructure.dao.po.AiEvalDatasetVersion">
+        <id column="id" property="id"/>
+        <result column="version_id" property="versionId"/>
+        <result column="dataset_id" property="datasetId"/>
+        <result column="version_no" property="versionNo"/>
+        <result column="status" property="status"/>
+        <result column="description" property="description"/>
+        <result column="case_count" property="caseCount"/>
+        <result column="evaluator_version" property="evaluatorVersion"/>
+        <result column="evaluator_config_json" property="evaluatorConfigJson"/>
+        <result column="checksum" property="checksum"/>
+        <result column="published_at" property="publishedAt"/>
+        <result column="created_at" property="createdAt"/>
+        <result column="updated_at" property="updatedAt"/>
+    </resultMap>
+
+    <resultMap id="CaseMap" type="cn.bugstack.ai.infrastructure.dao.po.AiEvalCase">
+        <id column="id" property="id"/>
+        <result column="case_id" property="caseId"/>
+        <result column="version_id" property="versionId"/>
+        <result column="stable_key" property="stableKey"/>
+        <result column="sequence_no" property="sequenceNo"/>
+        <result column="conversation_group" property="conversationGroup"/>
+        <result column="category" property="category"/>
+        <result column="tags_json" property="tagsJson"/>
+        <result column="question" property="question"/>
+        <result column="config_json" property="configJson"/>
+        <result column="reference_answer" property="referenceAnswer"/>
+        <result column="enabled" property="enabled"/>
+        <result column="created_at" property="createdAt"/>
+        <result column="updated_at" property="updatedAt"/>
+    </resultMap>
+
+    <resultMap id="RunMap" type="cn.bugstack.ai.infrastructure.dao.po.AiEvalRun">
+        <id column="id" property="id"/>
+        <result column="eval_run_id" property="evalRunId"/>
+        <result column="dataset_id" property="datasetId"/>
+        <result column="version_id" property="versionId"/>
+        <result column="version_no" property="versionNo"/>
+        <result column="name" property="name"/>
+        <result column="status" property="status"/>
+        <result column="execution_mode" property="executionMode"/>
+        <result column="user_id" property="userId"/>
+        <result column="tenant_id" property="tenantId"/>
+        <result column="selected_agent_id" property="selectedAgentId"/>
+        <result column="memory_policy" property="memoryPolicy"/>
+        <result column="concurrency" property="concurrency"/>
+        <result column="evaluator_version" property="evaluatorVersion"/>
+        <result column="config_snapshot_json" property="configSnapshotJson"/>
+        <result column="total_cases" property="totalCases"/>
+        <result column="completed_cases" property="completedCases"/>
+        <result column="passed_cases" property="passedCases"/>
+        <result column="failed_cases" property="failedCases"/>
+        <result column="rule_score" property="ruleScore"/>
+        <result column="judge_score" property="judgeScore"/>
+        <result column="started_at" property="startedAt"/>
+        <result column="finished_at" property="finishedAt"/>
+        <result column="error_message" property="errorMessage"/>
+        <result column="created_at" property="createdAt"/>
+        <result column="updated_at" property="updatedAt"/>
+    </resultMap>
+
+    <resultMap id="CodeVersionMap" type="cn.bugstack.ai.infrastructure.dao.po.AiEvalCodeVersion">
+        <id column="id" property="id"/>
+        <result column="eval_run_id" property="evalRunId"/>
+        <result column="repository_name" property="repositoryName"/>
+        <result column="branch_name" property="branchName"/>
+        <result column="captured_head_sha" property="capturedHeadSha"/>
+        <result column="captured_tags_json" property="capturedTagsJson"/>
+        <result column="dirty" property="dirty"/>
+        <result column="source_tree_hash" property="sourceTreeHash"/>
+        <result column="hash_algorithm" property="hashAlgorithm"/>
+        <result column="scope_version" property="scopeVersion"/>
+        <result column="ignore_rules_json" property="ignoreRulesJson"/>
+        <result column="snapshot_json" property="snapshotJson"/>
+        <result column="binding_status" property="bindingStatus"/>
+        <result column="bound_tag" property="boundTag"/>
+        <result column="bound_commit_sha" property="boundCommitSha"/>
+        <result column="matched_tags_json" property="matchedTagsJson"/>
+        <result column="binding_method" property="bindingMethod"/>
+        <result column="binding_note" property="bindingNote"/>
+        <result column="bound_at" property="boundAt"/>
+        <result column="last_checked_at" property="lastCheckedAt"/>
+        <result column="created_at" property="createdAt"/>
+        <result column="updated_at" property="updatedAt"/>
+    </resultMap>
+
+    <resultMap id="CaseResultMap" type="cn.bugstack.ai.infrastructure.dao.po.AiEvalCaseResult">
+        <id column="id" property="id"/>
+        <result column="result_id" property="resultId"/>
+        <result column="eval_run_id" property="evalRunId"/>
+        <result column="case_id" property="caseId"/>
+        <result column="stable_key" property="stableKey"/>
+        <result column="attempt_no" property="attemptNo"/>
+        <result column="status" property="status"/>
+        <result column="agent_run_id" property="agentRunId"/>
+        <result column="session_id" property="sessionId"/>
+        <result column="agent_id" property="agentId"/>
+        <result column="strategy" property="strategy"/>
+        <result column="final_answer" property="finalAnswer"/>
+        <result column="trace_json" property="traceJson"/>
+        <result column="signals_json" property="signalsJson"/>
+        <result column="route_score" property="routeScore"/>
+        <result column="answer_score" property="answerScore"/>
+        <result column="step_score" property="stepScore"/>
+        <result column="tool_score" property="toolScore"/>
+        <result column="grounding_score" property="groundingScore"/>
+        <result column="memory_score" property="memoryScore"/>
+        <result column="stability_score" property="stabilityScore"/>
+        <result column="efficiency_score" property="efficiencyScore"/>
+        <result column="safety_score" property="safetyScore"/>
+        <result column="overall_score" property="overallScore"/>
+        <result column="grade" property="grade"/>
+        <result column="warnings_json" property="warningsJson"/>
+        <result column="latency_ms" property="latencyMs"/>
+        <result column="error_message" property="errorMessage"/>
+        <result column="started_at" property="startedAt"/>
+        <result column="finished_at" property="finishedAt"/>
+        <result column="created_at" property="createdAt"/>
+        <result column="updated_at" property="updatedAt"/>
+    </resultMap>
+
+    <resultMap id="JudgeJobMap" type="cn.bugstack.ai.infrastructure.dao.po.AiEvalJudgeJob">
+        <id column="id" property="id"/>
+        <result column="judge_job_id" property="judgeJobId"/>
+        <result column="eval_run_id" property="evalRunId"/>
+        <result column="scope_type" property="scopeType"/>
+        <result column="status" property="status"/>
+        <result column="model_id" property="modelId"/>
+        <result column="api_id" property="apiId"/>
+        <result column="rubric_version" property="rubricVersion"/>
+        <result column="config_json" property="configJson"/>
+        <result column="total_cases" property="totalCases"/>
+        <result column="completed_cases" property="completedCases"/>
+        <result column="failed_cases" property="failedCases"/>
+        <result column="average_score" property="averageScore"/>
+        <result column="started_at" property="startedAt"/>
+        <result column="finished_at" property="finishedAt"/>
+        <result column="error_message" property="errorMessage"/>
+        <result column="created_at" property="createdAt"/>
+        <result column="updated_at" property="updatedAt"/>
+    </resultMap>
+
+    <resultMap id="JudgeResultMap" type="cn.bugstack.ai.infrastructure.dao.po.AiEvalJudgeResult">
+        <id column="id" property="id"/>
+        <result column="judge_result_id" property="judgeResultId"/>
+        <result column="judge_job_id" property="judgeJobId"/>
+        <result column="result_id" property="resultId"/>
+        <result column="status" property="status"/>
+        <result column="correctness" property="correctness"/>
+        <result column="relevance" property="relevance"/>
+        <result column="completeness" property="completeness"/>
+        <result column="usefulness" property="usefulness"/>
+        <result column="safety" property="safety"/>
+        <result column="overall" property="overall"/>
+        <result column="verdict" property="verdict"/>
+        <result column="reason" property="reason"/>
+        <result column="issues_json" property="issuesJson"/>
+        <result column="raw_response" property="rawResponse"/>
+        <result column="error_message" property="errorMessage"/>
+        <result column="created_at" property="createdAt"/>
+        <result column="updated_at" property="updatedAt"/>
+    </resultMap>
+
+    <insert id="insertDataset" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_eval_dataset
+        (dataset_id, name, description, execution_mode, owner_user_id, status, latest_version_no, created_at, updated_at)
+        VALUES (#{datasetId}, #{name}, #{description}, #{executionMode}, #{ownerUserId}, #{status}, #{latestVersionNo}, #{createdAt}, #{updatedAt})
+    </insert>
+
+    <select id="findDataset" resultMap="DatasetMap">
+        SELECT * FROM ai_eval_dataset WHERE dataset_id = #{datasetId} LIMIT 1
+    </select>
+
+    <select id="listDatasets" resultMap="DatasetMap">
+        SELECT * FROM ai_eval_dataset
+        <where><if test="ownerUserId != null and ownerUserId != ''">owner_user_id = #{ownerUserId}</if></where>
+        ORDER BY updated_at DESC LIMIT #{limit}
+    </select>
+
+    <update id="updateDataset">
+        UPDATE ai_eval_dataset SET name=#{name}, description=#{description}, execution_mode=#{executionMode}
+        WHERE dataset_id=#{datasetId} AND status='ACTIVE'
+    </update>
+
+    <update id="updateDatasetLatestVersion">
+        UPDATE ai_eval_dataset SET latest_version_no=#{latestVersionNo} WHERE dataset_id=#{datasetId}
+    </update>
+
+    <select id="countActiveRunsByDataset" resultType="int">
+        SELECT COUNT(*) FROM ai_eval_run
+        WHERE dataset_id=#{datasetId} AND status IN ('QUEUED','RUNNING','JUDGING')
+    </select>
+
+    <delete id="deleteRunsByDataset">
+        DELETE FROM ai_eval_run WHERE dataset_id=#{datasetId}
+    </delete>
+
+    <delete id="deleteDataset">
+        DELETE FROM ai_eval_dataset WHERE dataset_id=#{datasetId}
+    </delete>
+
+    <insert id="insertVersion" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_eval_dataset_version
+        (version_id, dataset_id, version_no, status, description, case_count, evaluator_version,
+         evaluator_config_json, checksum, published_at, created_at, updated_at)
+        VALUES (#{versionId}, #{datasetId}, #{versionNo}, #{status}, #{description}, #{caseCount},
+                #{evaluatorVersion}, #{evaluatorConfigJson}, #{checksum}, #{publishedAt}, #{createdAt}, #{updatedAt})
+    </insert>
+
+    <select id="findVersion" resultMap="VersionMap">
+        SELECT * FROM ai_eval_dataset_version WHERE version_id=#{versionId} LIMIT 1
+    </select>
+
+    <select id="findDraftVersion" resultMap="VersionMap">
+        SELECT * FROM ai_eval_dataset_version WHERE dataset_id=#{datasetId} AND status='DRAFT'
+        ORDER BY version_no DESC LIMIT 1
+    </select>
+
+    <select id="listVersions" resultMap="VersionMap">
+        SELECT * FROM ai_eval_dataset_version WHERE dataset_id=#{datasetId} ORDER BY version_no DESC
+    </select>
+
+    <update id="publishVersion">
+        UPDATE ai_eval_dataset_version
+        SET status='PUBLISHED', case_count=#{caseCount}, checksum=#{checksum}, published_at=#{publishedAt}
+        WHERE version_id=#{versionId} AND status='DRAFT'
+    </update>
+
+    <insert id="insertCase" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_eval_case
+        (case_id, version_id, stable_key, sequence_no, conversation_group, category, tags_json,
+         question, config_json, reference_answer, enabled, created_at, updated_at)
+        VALUES (#{caseId}, #{versionId}, #{stableKey}, #{sequenceNo}, #{conversationGroup}, #{category},
+                #{tagsJson}, #{question}, #{configJson}, #{referenceAnswer}, #{enabled}, #{createdAt}, #{updatedAt})
+    </insert>
+
+    <update id="updateCase">
+        UPDATE ai_eval_case SET stable_key=#{stableKey}, sequence_no=#{sequenceNo},
+            conversation_group=#{conversationGroup}, category=#{category}, tags_json=#{tagsJson},
+            question=#{question}, config_json=#{configJson}, reference_answer=#{referenceAnswer}, enabled=#{enabled}
+        WHERE case_id=#{caseId} AND version_id=#{versionId}
+    </update>
+
+    <delete id="deleteCase">
+        DELETE FROM ai_eval_case WHERE case_id=#{caseId} AND version_id=#{versionId}
+    </delete>
+
+    <select id="findCase" resultMap="CaseMap">
+        SELECT * FROM ai_eval_case WHERE case_id=#{caseId} LIMIT 1
+    </select>
+
+    <select id="listCases" resultMap="CaseMap">
+        SELECT * FROM ai_eval_case WHERE version_id=#{versionId}
+        <if test="enabledOnly">AND enabled=1</if>
+        ORDER BY conversation_group, sequence_no, id
+    </select>
+
+    <select id="countCases" resultType="int">
+        SELECT COUNT(*) FROM ai_eval_case WHERE version_id=#{versionId}
+        <if test="enabledOnly">AND enabled=1</if>
+    </select>
+
+    <insert id="insertRun" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_eval_run
+        (eval_run_id, dataset_id, version_id, version_no, name, status, execution_mode, user_id,
+         tenant_id, selected_agent_id, memory_policy, concurrency, evaluator_version,
+         config_snapshot_json, total_cases, completed_cases, passed_cases, failed_cases,
+         created_at, updated_at)
+        VALUES (#{evalRunId}, #{datasetId}, #{versionId}, #{versionNo}, #{name}, #{status},
+                #{executionMode}, #{userId}, #{tenantId}, #{selectedAgentId}, #{memoryPolicy},
+                #{concurrency}, #{evaluatorVersion}, #{configSnapshotJson}, #{totalCases},
+                #{completedCases}, #{passedCases}, #{failedCases}, #{createdAt}, #{updatedAt})
+    </insert>
+
+    <select id="findRun" resultMap="RunMap">
+        SELECT * FROM ai_eval_run WHERE eval_run_id=#{evalRunId} LIMIT 1
+    </select>
+
+    <select id="listRuns" resultMap="RunMap">
+        SELECT * FROM ai_eval_run
+        <where><if test="datasetId != null and datasetId != ''">dataset_id=#{datasetId}</if></where>
+        ORDER BY created_at DESC LIMIT #{limit}
+    </select>
+
+    <update id="markRunStarted">
+        UPDATE ai_eval_run SET status='RUNNING', started_at=#{startedAt}, error_message=NULL
+        WHERE eval_run_id=#{evalRunId} AND status='QUEUED'
+    </update>
+
+    <update id="refreshRunProgress">
+        UPDATE ai_eval_run r SET
+          r.completed_cases=(SELECT COUNT(*) FROM ai_eval_case_result x WHERE x.eval_run_id=#{evalRunId} AND x.status IN ('PASS','FAIL','TIMEOUT','ERROR')),
+          r.passed_cases=(SELECT COUNT(*) FROM ai_eval_case_result x WHERE x.eval_run_id=#{evalRunId} AND x.status='PASS'),
+          r.failed_cases=(SELECT COUNT(*) FROM ai_eval_case_result x WHERE x.eval_run_id=#{evalRunId} AND x.status IN ('FAIL','TIMEOUT','ERROR')),
+          r.rule_score=(SELECT AVG(x.overall_score) FROM ai_eval_case_result x WHERE x.eval_run_id=#{evalRunId} AND x.overall_score IS NOT NULL)
+        WHERE r.eval_run_id=#{evalRunId}
+    </update>
+
+    <update id="finishRuleRun">
+        UPDATE ai_eval_run SET status=#{status}, finished_at=#{finishedAt}, error_message=#{errorMessage}
+        WHERE eval_run_id=#{evalRunId} AND (status&lt;&gt;'CANCELLED' OR #{status}='CANCELLED')
+    </update>
+
+    <update id="updateRunStatus">
+        UPDATE ai_eval_run SET status=#{status}, error_message=#{errorMessage}
+        WHERE eval_run_id=#{evalRunId} AND status&lt;&gt;'CANCELLED'
+    </update>
+
+    <update id="restoreRuleCompletedForJudgeRetry">
+        UPDATE ai_eval_run SET status='RULE_COMPLETED', error_message=NULL
+        WHERE eval_run_id=#{evalRunId} AND status='CANCELLED'
+          AND total_cases&gt;0 AND completed_cases=total_cases
+    </update>
+
+    <update id="updateRunJudgeScore">
+        UPDATE ai_eval_run SET judge_score=#{judgeScore}, status=#{status}
+        WHERE eval_run_id=#{evalRunId} AND status='JUDGING'
+    </update>
+
+    <update id="cancelPendingCaseResults">
+        UPDATE ai_eval_case_result
+        SET status='CANCELLED', finished_at=#{finishedAt}, error_message=#{errorMessage}
+        WHERE eval_run_id=#{evalRunId} AND status IN ('QUEUED','RUNNING')
+    </update>
+
+    <delete id="deleteRun">
+        DELETE FROM ai_eval_run WHERE eval_run_id=#{evalRunId}
+    </delete>
+
+    <insert id="insertCodeVersion" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_eval_code_version
+        (eval_run_id, repository_name, branch_name, captured_head_sha, captured_tags_json,
+         dirty, source_tree_hash, hash_algorithm, scope_version, ignore_rules_json,
+         snapshot_json, binding_status, bound_tag, bound_commit_sha, matched_tags_json,
+         binding_method, binding_note, bound_at, last_checked_at, created_at, updated_at)
+        VALUES
+        (#{evalRunId}, #{repositoryName}, #{branchName}, #{capturedHeadSha}, #{capturedTagsJson},
+         #{dirty}, #{sourceTreeHash}, #{hashAlgorithm}, #{scopeVersion}, #{ignoreRulesJson},
+         #{snapshotJson}, #{bindingStatus}, #{boundTag}, #{boundCommitSha}, #{matchedTagsJson},
+         #{bindingMethod}, #{bindingNote}, #{boundAt}, #{lastCheckedAt}, #{createdAt}, #{updatedAt})
+    </insert>
+
+    <select id="findCodeVersion" resultMap="CodeVersionMap">
+        SELECT * FROM ai_eval_code_version WHERE eval_run_id=#{evalRunId} LIMIT 1
+    </select>
+
+    <select id="listPendingCodeVersions" resultMap="CodeVersionMap">
+        SELECT * FROM ai_eval_code_version
+        WHERE binding_status='WAITING_TAG'
+        ORDER BY created_at DESC LIMIT #{limit}
+    </select>
+
+    <update id="updateCodeVersionBinding">
+        UPDATE ai_eval_code_version SET binding_status=#{bindingStatus}, bound_tag=#{boundTag},
+          bound_commit_sha=#{boundCommitSha}, matched_tags_json=#{matchedTagsJson},
+          binding_method=#{bindingMethod}, binding_note=#{bindingNote}, bound_at=#{boundAt},
+          last_checked_at=#{lastCheckedAt}
+        WHERE eval_run_id=#{evalRunId}
+    </update>
+
+    <update id="touchCodeVersionCheck">
+        UPDATE ai_eval_code_version SET last_checked_at=#{lastCheckedAt} WHERE eval_run_id=#{evalRunId}
+    </update>
+
+    <insert id="insertCaseResult" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_eval_case_result
+        (result_id, eval_run_id, case_id, stable_key, attempt_no, status, created_at, updated_at)
+        VALUES (#{resultId}, #{evalRunId}, #{caseId}, #{stableKey}, #{attemptNo}, #{status}, #{createdAt}, #{updatedAt})
+    </insert>
+
+    <select id="findCaseResult" resultMap="CaseResultMap">
+        SELECT * FROM ai_eval_case_result WHERE result_id=#{resultId} LIMIT 1
+    </select>
+
+    <select id="listCaseResults" resultMap="CaseResultMap">
+        SELECT * FROM ai_eval_case_result WHERE eval_run_id=#{evalRunId} ORDER BY created_at, id
+    </select>
+
+    <update id="markCaseResultRunning">
+        UPDATE ai_eval_case_result SET status='RUNNING', agent_run_id=#{agentRunId}, session_id=#{sessionId}, started_at=#{startedAt}
+        WHERE result_id=#{resultId} AND status='QUEUED'
+    </update>
+
+    <update id="finishCaseResult">
+        UPDATE ai_eval_case_result SET status=#{status}, agent_run_id=#{agentRunId}, session_id=#{sessionId},
+          agent_id=#{agentId}, strategy=#{strategy}, final_answer=#{finalAnswer}, trace_json=#{traceJson},
+          signals_json=#{signalsJson}, route_score=#{routeScore}, answer_score=#{answerScore},
+          step_score=#{stepScore}, tool_score=#{toolScore}, grounding_score=#{groundingScore},
+          memory_score=#{memoryScore}, stability_score=#{stabilityScore}, efficiency_score=#{efficiencyScore},
+          safety_score=#{safetyScore}, overall_score=#{overallScore}, grade=#{grade}, warnings_json=#{warningsJson},
+          latency_ms=#{latencyMs}, error_message=#{errorMessage}, finished_at=#{finishedAt}
+        WHERE result_id=#{resultId} AND status='RUNNING'
+    </update>
+
+    <insert id="insertJudgeJob" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_eval_judge_job
+        (judge_job_id, eval_run_id, scope_type, status, model_id, api_id, rubric_version,
+         config_json, total_cases, completed_cases, failed_cases, created_at, updated_at)
+        VALUES (#{judgeJobId}, #{evalRunId}, #{scopeType}, #{status}, #{modelId}, #{apiId},
+                #{rubricVersion}, #{configJson}, #{totalCases}, #{completedCases}, #{failedCases},
+                #{createdAt}, #{updatedAt})
+    </insert>
+
+    <select id="findJudgeJob" resultMap="JudgeJobMap">
+        SELECT * FROM ai_eval_judge_job WHERE judge_job_id=#{judgeJobId} LIMIT 1
+    </select>
+
+    <select id="listJudgeJobs" resultMap="JudgeJobMap">
+        SELECT * FROM ai_eval_judge_job WHERE eval_run_id=#{evalRunId} ORDER BY created_at DESC
+    </select>
+
+    <update id="markJudgeJobStarted">
+        UPDATE ai_eval_judge_job SET status='RUNNING', total_cases=#{totalCases}, started_at=#{startedAt}
+        WHERE judge_job_id=#{judgeJobId} AND status='QUEUED'
+    </update>
+
+    <update id="finishJudgeJob">
+        UPDATE ai_eval_judge_job SET status=#{status}, completed_cases=#{completedCases},
+          failed_cases=#{failedCases}, average_score=#{averageScore}, finished_at=#{finishedAt}, error_message=#{errorMessage}
+        WHERE judge_job_id=#{judgeJobId} AND status&lt;&gt;'CANCELLED'
+    </update>
+
+    <update id="cancelJudgeJobsByRun">
+        UPDATE ai_eval_judge_job
+        SET status='CANCELLED', finished_at=#{finishedAt}, error_message=#{errorMessage}
+        WHERE eval_run_id=#{evalRunId} AND status IN ('QUEUED','RUNNING')
+    </update>
+
+    <insert id="insertJudgeResult" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_eval_judge_result
+        (judge_result_id, judge_job_id, result_id, status, correctness, relevance, completeness,
+         usefulness, safety, overall, verdict, reason, issues_json, raw_response, error_message,
+         created_at, updated_at)
+        VALUES (#{judgeResultId}, #{judgeJobId}, #{resultId}, #{status}, #{correctness}, #{relevance},
+                #{completeness}, #{usefulness}, #{safety}, #{overall}, #{verdict}, #{reason},
+                #{issuesJson}, #{rawResponse}, #{errorMessage}, #{createdAt}, #{updatedAt})
+    </insert>
+
+    <select id="listJudgeResults" resultMap="JudgeResultMap">
+        SELECT * FROM ai_eval_judge_result WHERE judge_job_id=#{judgeJobId} ORDER BY id
+    </select>
+</mapper>
