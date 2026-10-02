@@ -1,0 +1,346 @@
+# Generated from current feature configuration; deploy with the cloud profile only.
+server:
+  port: 8099
+  forward-headers-strategy: framework
+  servlet:
+    session:
+      timeout: 8h
+      cookie:
+        http-only: true
+        same-site: lax
+        secure: ${SESSION_COOKIE_SECURE:true}
+      tracking-modes: cookie
+thread:
+  pool:
+    executor:
+      config:
+        core-pool-size: 4
+        max-pool-size: 12
+        keep-alive-time: 5000
+        block-queue-size: 100
+        policy: AbortPolicy
+spring:
+  application:
+    name: ai-agent-station-study
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 100MB
+  datasource:
+    mysql:
+      username: ${MYSQL_USER:tagent}
+      password: ${MYSQL_PASSWORD}
+      url: jdbc:mysql://mysql:3306/ai-agent-station-study?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
+      driver-class-name: com.mysql.cj.jdbc.Driver
+      type: com.zaxxer.hikari.HikariDataSource
+      hikari:
+        pool-name: Retail_HikariCP
+        minimum-idle: 1
+        idle-timeout: 180000
+        maximum-pool-size: 5
+        auto-commit: true
+        max-lifetime: 1800000
+        connection-timeout: 30000
+        connection-test-query: SELECT 1
+    pgvector:
+      driver-class-name: org.postgresql.Driver
+      username: ${POSTGRES_USER:tagent}
+      password: ${POSTGRES_PASSWORD}
+      url: jdbc:postgresql://vector_db:5432/ai-rag-knowledge
+      type: com.zaxxer.hikari.HikariDataSource
+      hikari:
+        maximum-pool-size: 3
+        minimum-idle: 1
+        idle-timeout: 30000
+        connection-timeout: 30000
+  data:
+    redis:
+      host: redis
+      port: 6379
+      timeout: 3s
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+          max-wait: 2s
+  ai:
+    openai:
+      base-url: ${LLM_BASE_URL}
+      api-key: ${LLM_API_KEY}
+      connect-timeout: 10s
+      read-timeout: 60s
+      chat:
+        completions-path: ${LLM_COMPLETIONS_PATH:/chat/completions}
+        options:
+          model: ${LLM_MODEL:mimo-v2.5-pro}
+      embedding:
+        embeddings-path: ${EMBEDDING_PATH:/embeddings}
+        enabled: false
+    agent:
+      auto-config:
+        enabled: true
+        preload-enabled: false
+agent:
+  mcp:
+    return-error-on-failure: true
+    disable-tools-on-nonexec-steps: false
+    github:
+      write-enabled: ${GITHUB_MCP_WRITE_ENABLED:false}
+    tool-call:
+      max-attempts: ${MCP_TOOL_CALL_MAX_ATTEMPTS:2}
+      retry-delay-ms: ${MCP_TOOL_CALL_RETRY_DELAY_MS:1000}
+      parallel-enabled: ${MCP_TOOL_CALL_PARALLEL_ENABLED:true}
+      max-serial-rounds-per-client: ${MCP_TOOL_CALL_MAX_SERIAL_ROUNDS_PER_CLIENT:3}
+  intent-router:
+    client-id: router-small
+    confidence-threshold: 0.6
+    live-mode: false
+    low-confidence-fallback:
+      enabled: true
+      threshold: 0.9
+      fixed-agent-id: '8011'
+      auto-agent-id: '8012'
+      flow-agent-id: '8013'
+  fallback-agent-id: '8011'
+  rag-router:
+    enabled: true
+    llm-enabled: true
+    client-id: ${agent.intent-router.client-id:router-small}
+    min-length-chars: 4
+  chat-memory:
+    summarize-enabled: true
+    max-messages: 20
+    summarize-trigger: 30
+    summarize-keep-recent: 10
+  multimodal:
+    max-images: 4
+    max-image-bytes: 10485760
+    remote-image-proxy-url: ${TAGENT_IMAGE_PROXY_URL:}
+    oss:
+      enabled: ${TAGENT_OSS_ENABLED:false}
+      region: ${TAGENT_OSS_REGION:cn-beijing}
+      endpoint: ${TAGENT_OSS_ENDPOINT:https://oss-cn-beijing.aliyuncs.com}
+      bucket: ${TAGENT_OSS_BUCKET:tagent-img}
+      object-prefix: ${TAGENT_OSS_OBJECT_PREFIX:chat-images}
+      signed-url-ttl-seconds: ${TAGENT_OSS_SIGNED_URL_TTL_SECONDS:1800}
+      migrate-legacy-on-startup: ${TAGENT_OSS_MIGRATE_LEGACY_ON_STARTUP:false}
+  memory-cache:
+    enabled: true
+    ttl-seconds: 3600
+  run-snapshot:
+    ttl-seconds: 21600
+  run-events:
+    ttl-seconds: 21600
+  evidence-map:
+    ttl-seconds: 604800
+  memory:
+    profile-max: 64
+    explain-enabled: true
+    long-term:
+      semantic-dedupe-enabled: true
+      semantic-dedupe-threshold-unique: 0.15
+      semantic-dedupe-threshold-cumulative: 0.1
+    decay:
+      enabled: false
+  query-rewriter:
+    client-id: router-small
+    min-length-chars: 6
+    max-length-chars: 80
+  reflexion:
+    enabled: true
+    max-retries: 2
+  sensitive-tools:
+    enabled: false
+    names: delete_user,drop_table,truncate,delete_all,reset_password,transfer_funds
+  prompt-injection:
+    block-on-detect: false
+  rate-limit:
+    enabled: false
+    limit-for-period: 10
+    limit-refresh-period: 1s
+    timeout-duration: 5s
+  idempotency:
+    enabled: true
+    ttl-seconds: 3600
+  event-log:
+    enabled: true
+  tool-progress:
+    result-preview:
+      enabled: true
+  plan-dag:
+    enabled: true
+  dag-executor:
+    core-pool-size: 30
+    max-pool-size: 100
+    queue-size: 200
+    keep-alive-seconds: 60
+  semantic-cache:
+    enabled: false
+    min-similarity: 0.95
+  token-streaming:
+    enabled: true
+  streaming:
+    idle-timeout-seconds: 120
+    retry-max-attempts: 3
+  thinking-vis:
+    enabled: true
+  intervention:
+    enabled: true
+  answer-now:
+    finalize-tools: true
+    no-think-directive: '[立即作答模式] 用户已要求立即回答，请直接基于以上已有信息给出最终答案，不要再展开额外的思考或分析过程，简明扼要。'
+  no-think:
+    reasoning-effort: ''
+    body-params: '{"thinking":{"type":"disabled"}}'
+  steer:
+    enabled: true
+    max-rounds: 3
+  user-input:
+    enabled: false
+    max-asks: 3
+    timeout-seconds: 60
+  request-tool:
+    enabled: true
+    max-calls: 3
+  dynamic-tools:
+    enabled: false
+  human-approval:
+    enabled: ${HUMAN_APPROVAL_ENABLED:true}
+    timeout-seconds: 60
+    required-tools:
+    - JavaSDKMCPClient_AIsearch
+    - JavaSDKMCPClient_search_repositories
+    - webSearch
+  token-budget:
+    step1-max-tokens: 0
+    step2-max-tokens: 0
+    step3-max-tokens: 0
+    step4-max-tokens: 0
+  working-memory:
+    enabled: false
+    key-prefix: 'wm:'
+    ttl-seconds: 3600
+  router-pool:
+    enabled: true
+    entries:
+    - id: router-small
+      tier: small
+    - id: router-medium
+      tier: medium
+    - id: router-large
+      tier: large
+  rag:
+    contextual-retrieval:
+      enabled: true
+      client-id: router-small
+      max-chunk-chars: 2000
+    parent-title:
+      enabled: true
+      client-id: router-small
+      max-chunk-chars: 2000
+      max-title-chars: 30
+  embedding:
+    base-url: ${EMBEDDING_BASE_URL}
+    api-key: ${EMBEDDING_API_KEY}
+    model: ${EMBEDDING_MODEL:BAAI/bge-m3}
+    embeddings-path: ${EMBEDDING_PATH:/embeddings}
+  rerank:
+    provider: siliconflow
+    api-url: ${RERANK_API_URL:${EMBEDDING_BASE_URL:https://api.siliconflow.cn/v1}/rerank}
+    api-key: ${RERANK_API_KEY:${EMBEDDING_API_KEY}}
+    model: ${RERANK_MODEL:Qwen/Qwen3-Reranker-8B}
+    timeout-seconds: 10
+  auth:
+    registration-enabled: ${REGISTRATION_ENABLED:true}
+xfg:
+  wrench:
+    task:
+      job:
+        enabled: true
+        pool-size: 5
+        thread-name-prefix: test-task-scheduler-
+        wait-for-tasks-to-complete-on-shutdown: true
+        await-termination-seconds: 30
+        refresh-interval: 30000
+        clean-invalid-tasks-cron: 0 0/5 * * * ?
+logging:
+  level:
+    root: info
+  config: classpath:logback-spring.xml
+  logstash:
+    destination: logstash:4560
+elasticsearch:
+  uris: http://elasticsearch:9200
+  rag-index: ai-agent-rag
+  connect-timeout-ms: 2000
+  socket-timeout-ms: 5000
+resilience4j:
+  retry:
+    instances:
+      llmCall:
+        max-attempts: 3
+        retry-exceptions:
+        - java.io.IOException
+        - java.net.SocketTimeoutException
+        - org.springframework.web.client.ResourceAccessException
+        - org.springframework.web.client.HttpServerErrorException
+        ignore-exceptions:
+        - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+        - org.springframework.web.client.HttpClientErrorException
+        - java.lang.IllegalArgumentException
+  circuitbreaker:
+    instances:
+      llmCall:
+        register-health-indicator: true
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 20
+        minimum-number-of-calls: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 5
+        automatic-transition-from-open-to-half-open-enabled: true
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: never
+  health:
+    circuitbreakers:
+      enabled: true
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+  metrics:
+    distribution:
+      percentiles-histogram:
+        '[llm.call]': true
+        '[mcp.tool.call]': true
+      percentiles:
+        '[llm.call]': 0.5, 0.95, 0.99
+        '[mcp.tool.call]': 0.5, 0.95, 0.99
+      expiry:
+        '[llm.call]': 30m
+        '[mcp.tool.call]': 30m
+      buffer-length:
+        '[llm.call]': 5
+        '[mcp.tool.call]': 5
+    tags:
+      application: ai-agent-station-study
+  tracing:
+    enabled: true
+    sampling:
+      probability: 0.1
+    propagation:
+      type: w3c
+  otlp:
+    tracing:
+      endpoint: http://jaeger:4318/v1/traces
+      transport: http
+      timeout: 10s
+  server:
+    port: 9091

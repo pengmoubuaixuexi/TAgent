@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 30s
+scrape_configs:
+  - job_name: ai-agent-station
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ['app:9091']
+  - job_name: node
+    static_configs:
+      - targets: ['node-exporter:9100']

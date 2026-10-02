@@ -5,7 +5,6 @@ target/
 
 ### Node (mcp-wrappers proxy bootstrap) ###
 docs/dev-ops/mcp-wrappers/node_modules/
-docs/dev-ops/mcp-wrappers/package-lock.json
 
 ### IntelliJ IDEA ###
 .idea/modules.xml
@@ -82,3 +81,10 @@ docs/demo-videos/*.failure.png
 docs/demo-videos/node_modules/
 !docs/demo-videos/scripts/
 !docs/demo-videos/scripts/**
+
+### Server private inputs ###
+docs/dev-ops/server/.env
+docs/dev-ops/server/certs/
+docs/dev-ops/server/backups/
+docs/dev-ops/server/import/
+docs/dev-ops/server/__pycache__/

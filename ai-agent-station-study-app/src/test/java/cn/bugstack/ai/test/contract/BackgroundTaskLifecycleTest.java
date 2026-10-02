@@ -5,6 +5,8 @@ import cn.bugstack.ai.domain.agent.service.IAgentDispatchService;
 import cn.bugstack.ai.domain.agent.service.dispatch.RunDispatchConflictException;
 import cn.bugstack.ai.domain.agent.service.execute.event.RunEventPublisher;
 import cn.bugstack.ai.infrastructure.dao.IAiBackgroundTaskDao;
+import cn.bugstack.ai.infrastructure.dao.IAiAgentDao;
+import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService;
 import cn.bugstack.ai.infrastructure.dao.po.AiBackgroundTask;
 import cn.bugstack.ai.infrastructure.dao.po.AiBackgroundTaskExecution;
 import cn.bugstack.ai.trigger.background.BackgroundTaskCommand;
@@ -49,7 +51,7 @@ public class BackgroundTaskLifecycleTest {
     public void createCommandOnlyPersistsDraftUntilExplicitConfirmation() {
         IAiBackgroundTaskDao dao = mock(IAiBackgroundTaskDao.class);
         BackgroundTaskCommandRouter router = mock(BackgroundTaskCommandRouter.class);
-        BackgroundTaskService service = new BackgroundTaskService(dao, router);
+        BackgroundTaskService service = new BackgroundTaskService(dao, router, mock(IAiAgentDao.class), java.util.Optional.of(mock(RunSnapshotService.class)));
         Map<String, Object> trigger = new LinkedHashMap<>();
         trigger.put("path", "v6.md");
         trigger.put("quiet_seconds", 120);
@@ -81,7 +83,7 @@ public class BackgroundTaskLifecycleTest {
     public void dueFileTriggerWaitsWhenOriginalSessionAlreadyHasRun() throws Exception {
         IAiBackgroundTaskDao dao = mock(IAiBackgroundTaskDao.class);
         BackgroundTaskCommandRouter router = mock(BackgroundTaskCommandRouter.class);
-        BackgroundTaskService service = new BackgroundTaskService(dao, router);
+        BackgroundTaskService service = new BackgroundTaskService(dao, router, mock(IAiAgentDao.class), java.util.Optional.of(mock(RunSnapshotService.class)));
         IAgentDispatchService dispatch = mock(IAgentDispatchService.class);
         RunEventPublisher publisher = mock(RunEventPublisher.class);
         BackgroundTaskScheduler scheduler = new BackgroundTaskScheduler(dao, service, dispatch, publisher);
@@ -120,7 +122,7 @@ public class BackgroundTaskLifecycleTest {
     public void dispatchBusyRaceDefersReservedTaskInsteadOfFailingIt() throws Exception {
         IAiBackgroundTaskDao dao = mock(IAiBackgroundTaskDao.class);
         BackgroundTaskCommandRouter router = mock(BackgroundTaskCommandRouter.class);
-        BackgroundTaskService service = new BackgroundTaskService(dao, router);
+        BackgroundTaskService service = new BackgroundTaskService(dao, router, mock(IAiAgentDao.class), java.util.Optional.of(mock(RunSnapshotService.class)));
         IAgentDispatchService dispatch = mock(IAgentDispatchService.class);
         RunEventPublisher publisher = mock(RunEventPublisher.class);
         BackgroundTaskScheduler scheduler = new BackgroundTaskScheduler(dao, service, dispatch, publisher);
@@ -164,7 +166,7 @@ public class BackgroundTaskLifecycleTest {
     public void startingExecutionIsNotCompletedInsideStartupGraceWindow() {
         IAiBackgroundTaskDao dao = mock(IAiBackgroundTaskDao.class);
         BackgroundTaskCommandRouter router = mock(BackgroundTaskCommandRouter.class);
-        BackgroundTaskService service = new BackgroundTaskService(dao, router);
+        BackgroundTaskService service = new BackgroundTaskService(dao, router, mock(IAiAgentDao.class), java.util.Optional.of(mock(RunSnapshotService.class)));
         IAgentDispatchService dispatch = mock(IAgentDispatchService.class);
         RunEventPublisher publisher = mock(RunEventPublisher.class);
         BackgroundTaskScheduler scheduler = new BackgroundTaskScheduler(dao, service, dispatch, publisher);
@@ -193,7 +195,7 @@ public class BackgroundTaskLifecycleTest {
     public void successfulDispatchPromotesStartingExecutionToRunning() throws Exception {
         IAiBackgroundTaskDao dao = mock(IAiBackgroundTaskDao.class);
         BackgroundTaskCommandRouter router = mock(BackgroundTaskCommandRouter.class);
-        BackgroundTaskService service = new BackgroundTaskService(dao, router);
+        BackgroundTaskService service = new BackgroundTaskService(dao, router, mock(IAiAgentDao.class), java.util.Optional.of(mock(RunSnapshotService.class)));
         IAgentDispatchService dispatch = mock(IAgentDispatchService.class);
         RunEventPublisher publisher = mock(RunEventPublisher.class);
         BackgroundTaskScheduler scheduler = new BackgroundTaskScheduler(dao, service, dispatch, publisher);

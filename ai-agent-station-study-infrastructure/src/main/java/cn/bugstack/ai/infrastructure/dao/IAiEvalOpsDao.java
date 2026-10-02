@@ -74,6 +74,9 @@ public interface IAiEvalOpsDao {
     List<AiEvalRun> listRuns(@Param("datasetId") String datasetId,
                              @Param("limit") int limit);
 
+    List<AiEvalRun> listRunsByOwner(@Param("ownerUserId") String ownerUserId,
+                                  @Param("datasetId") String datasetId, @Param("limit") int limit);
+
     int markRunStarted(@Param("evalRunId") String evalRunId,
                        @Param("startedAt") LocalDateTime startedAt);
 

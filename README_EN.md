@@ -27,6 +27,10 @@ It is not another one-call model wrapper. TAgent makes the complete Agent-reques
 
 *This repository is a sanitized public version without real API keys, runtime logs, chat histories, temporary reports, database backups, or personal data.*
 
+> **🌐 Try TAgent: [http://49.232.209.30:8099](http://49.232.209.30:8099)**
+>
+> Access is temporarily provided through the public IP address. A domain will be available later, and this link will be updated here.
+
 ### Who Is This For?
 
 - Developers learning **Java / Spring AI Agent engineering** beyond a simple model wrapper.
@@ -534,6 +538,8 @@ Dashboard pages:
 
 ## 🚀 Quick Start
 
+See the [single-host deployment guide (Chinese)](docs/dev-ops/server/README.md). Before upgrading to v1.27.0, back up your database and apply [V061](docs/dev-ops/sql-migrations/V061__user_roles_and_registration.sql) once. Do not rerun an already applied migration.
+
 ### Prerequisites
 
 Default addresses:
@@ -616,6 +622,8 @@ Default port: `8099`
 ---
 
 ## 📤 Example Streaming Request
+
+Starting with v1.27.0, authenticate first and send the session cookie. POST requests also require the token from `/api/v1/auth/csrf`, using its returned `headerName`. The server derives user identity from the session, not the supplied `userId`. The browser client handles this through `auth.js`.
 
 ```http
 POST /api/v1/agent/auto_agent

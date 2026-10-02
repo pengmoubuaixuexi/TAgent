@@ -27,6 +27,10 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 
 *本仓库是脱敏后的公开版本，不包含真实密钥、运行日志、历史对话、临时报告、数据库备份和个人文件。*
 
+> **🌐 在线体验：[http://49.232.209.30:8099](http://49.232.209.30:8099)**
+>
+> 当前暂时提供公网 IP 访问，后续将上线正式域名，届时会在此更新访问地址。
+
 ### 适合谁
 
 - 想系统学习 **Java / Spring AI Agent 工程化落地**的开发者。
@@ -442,6 +446,8 @@ TAgent 同时记录模型、工具和 Agent 步骤：
 
 ## 🚀 本地运行
 
+单机部署与数据迁移请参考 [服务器部署指南](docs/dev-ops/server/README.md)。升级 v1.27.0 前请备份数据库，并执行一次 [V061 角色与会话归属迁移](docs/dev-ops/sql-migrations/V061__user_roles_and_registration.sql)；已执行过的环境不要重复执行。
+
 ### 外部依赖
 
 默认地址：
@@ -524,6 +530,8 @@ java -jar ai-agent-station-study-app/target/ai-agent-station-study-app.jar
 ---
 
 ## 📤 流式请求示例
+
+v1.27.0 起，请先登录并携带会话 Cookie；POST 请求还需携带 `/api/v1/auth/csrf` 返回的 CSRF token（按返回的 `headerName` 设置请求头）。用户身份取自登录会话，示例中的 `userId` 不用于证明身份。浏览器页面的 `auth.js` 会自动处理。
 
 ```http
 POST /api/v1/agent/auto_agent

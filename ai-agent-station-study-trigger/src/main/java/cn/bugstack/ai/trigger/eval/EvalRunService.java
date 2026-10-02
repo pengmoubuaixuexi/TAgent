@@ -156,6 +156,11 @@ public class EvalRunService {
                 .stream().map(this::runView).toList();
     }
 
+    public List<Map<String, Object>> listRunsByOwner(String ownerUserId, String datasetId, int limit) {
+        return dao.listRunsByOwner(ownerUserId, blankToNull(datasetId), Math.max(1, Math.min(limit, 200)))
+                .stream().map(this::runView).toList();
+    }
+
     public Map<String, Object> getRun(String evalRunId) {
         AiEvalRun run = requireRun(evalRunId);
         Map<String, Object> view = runView(run);

@@ -156,6 +156,7 @@ public class BackgroundTaskController {
         private String name;
         private Map<String, Object> trigger;
         private String actionPrompt;
+        /** null/omitted keeps the current choice; empty string means automatic routing. */
         private String actionAgentId;
         private Integer maxStep;
         private Boolean runOnce;

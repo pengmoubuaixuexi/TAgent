@@ -1,5 +1,17 @@
 spring:
+  session:
+    timeout: 8h
+    redis:
+      namespace: tagent:login
+      flush-mode: on_save
   config:
     name: ai-agent-station-study-app
   profiles:
     active: dev
+server:
+  servlet:
+    session:
+      tracking-modes: cookie
+      cookie:
+        http-only: true
+        same-site: lax

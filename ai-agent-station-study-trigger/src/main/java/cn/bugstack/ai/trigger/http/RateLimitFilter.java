@@ -27,7 +27,7 @@ import java.util.Map;
  */
 @Slf4j
 @Component
-@Order(-100)
+@Order(-70)
 public class RateLimitFilter implements Filter {
 
     @Value("${agent.rate-limit.enabled:false}")

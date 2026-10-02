@@ -38,13 +38,13 @@ public class EvalOpsController {
     public Response<List<Map<String, Object>>> datasets(
             @RequestParam(required = false) String ownerUserId,
             @RequestParam(defaultValue = "100") int limit) {
-        return execute(() -> datasetService.listDatasets(ownerUserId, limit));
+        return execute(() -> datasetService.listDatasets(cn.bugstack.ai.trigger.security.EvalAccess.userId(), limit));
     }
 
     @PostMapping("/datasets")
     public Response<Map<String, Object>> createDataset(@RequestBody DatasetRequest request) {
         return execute(() -> datasetService.createDataset(request.getName(), request.getDescription(),
-                request.getExecutionMode(), request.getOwnerUserId()));
+                request.getExecutionMode(), cn.bugstack.ai.trigger.security.EvalAccess.userId()));
     }
 
     @GetMapping("/datasets/{datasetId}")
@@ -100,12 +100,12 @@ public class EvalOpsController {
 
     @PostMapping("/datasets/import/e2e100")
     public Response<Map<String, Object>> importE2E100(@RequestBody(required = false) ImportRequest request) {
-        return execute(() -> datasetService.importE2E100(request == null ? null : request.getOwnerUserId()));
+        return execute(() -> datasetService.importE2E100(cn.bugstack.ai.trigger.security.EvalAccess.userId()));
     }
 
     @PostMapping("/datasets/import/quality-benchmark")
     public Response<Map<String, Object>> importQualityBenchmark(@RequestBody(required = false) ImportRequest request) {
-        return execute(() -> datasetService.importQualityBenchmark(request == null ? null : request.getOwnerUserId()));
+        return execute(() -> datasetService.importQualityBenchmark(cn.bugstack.ai.trigger.security.EvalAccess.userId()));
     }
 
     @PostMapping("/runs")
@@ -117,7 +117,7 @@ public class EvalOpsController {
     @GetMapping("/runs")
     public Response<List<Map<String, Object>>> runs(@RequestParam(required = false) String datasetId,
                                                     @RequestParam(defaultValue = "100") int limit) {
-        return execute(() -> runService.listRuns(datasetId, limit));
+        return execute(() -> runService.listRunsByOwner(cn.bugstack.ai.trigger.security.EvalAccess.userId(), datasetId, limit));
     }
 
     @GetMapping("/runs/{evalRunId}")

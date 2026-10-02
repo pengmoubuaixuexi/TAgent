@@ -2,6 +2,14 @@
 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="cn.bugstack.ai.infrastructure.dao.IAiEvalOpsDao">
 
+    <select id="listRunsByOwner" resultMap="RunMap">
+        SELECT r.* FROM ai_eval_run r
+        JOIN ai_eval_dataset d ON d.dataset_id = r.dataset_id
+        WHERE d.owner_user_id = #{ownerUserId}
+        <if test="datasetId != null and datasetId != ''">AND r.dataset_id = #{datasetId}</if>
+        ORDER BY r.created_at DESC LIMIT #{limit}
+    </select>
+
     <resultMap id="DatasetMap" type="cn.bugstack.ai.infrastructure.dao.po.AiEvalDataset">
         <id column="id" property="id"/>
         <result column="dataset_id" property="datasetId"/>

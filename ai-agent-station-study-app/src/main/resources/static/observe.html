@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
+<script src="/auth.js"></script>
     <meta charset="utf-8"/>
     <title>AI Agent Station · 观测面板</title>
     <meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -56,6 +57,7 @@
             <option value="6">最近 6h</option>
             <option value="24" selected>最近 24h</option>
             <option value="168">最近 7d</option>
+            <option value="720">最近 30d</option>
         </select>
         <button onclick="refresh()">刷新</button>
         <button onclick="toggleAuto()" id="autoBtn">自动刷新：关</button>

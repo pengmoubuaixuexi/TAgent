@@ -35,11 +35,16 @@ public class AdminUserAdminController implements IAdminUserAdminService {
     @Resource
     private IAdminUserDao adminUserDao;
 
+    @Resource
+    private cn.bugstack.ai.trigger.security.AccountService accountService;
+    @Resource
+    private org.springframework.security.crypto.password.PasswordEncoder accountPasswordEncoder;
+
     @Override
     @PostMapping("/create")
     public Response<Boolean> createAdminUser(@RequestBody AdminUserRequestDTO request) {
         try {
-            log.info("创建管理员用户请求：{}", request);
+            log.info("创建用户 username={}", request.getUsername());
             
             // DTO转PO
             AdminUser adminUser = convertToAdminUser(request);
@@ -67,7 +72,7 @@ public class AdminUserAdminController implements IAdminUserAdminService {
     @PutMapping("/update-by-id")
     public Response<Boolean> updateAdminUserById(@RequestBody AdminUserRequestDTO request) {
         try {
-            log.info("根据ID更新管理员用户请求：{}", request);
+            log.info("更新用户 id={}", request.getId());
             
             if (request.getId() == null) {
                 return Response.<Boolean>builder()
@@ -102,7 +107,7 @@ public class AdminUserAdminController implements IAdminUserAdminService {
     @PutMapping("/update-by-user-id")
     public Response<Boolean> updateAdminUserByUserId(@RequestBody AdminUserRequestDTO request) {
         try {
-            log.info("根据用户ID更新管理员用户请求：{}", request);
+            log.info("更新用户 userId={}", request.getUserId());
             
             if (!StringUtils.hasText(request.getUserId())) {
                 return Response.<Boolean>builder()
@@ -400,7 +405,7 @@ public class AdminUserAdminController implements IAdminUserAdminService {
         try {
             log.info("管理员用户登录请求：{}", request.getUsername());
             
-            AdminUser adminUser = adminUserDao.queryByUsernameAndPassword(request.getUsername(), request.getPassword());
+            AdminUser adminUser = accountService.authenticate(request.getUsername(), request.getPassword());
             if (adminUser == null) {
                 return Response.<AdminUserResponseDTO>builder()
                         .code(ResponseCode.ILLEGAL_PARAMETER.getCode())
@@ -459,7 +464,7 @@ public class AdminUserAdminController implements IAdminUserAdminService {
             }
             
             // 查询用户
-            AdminUser adminUser = adminUserDao.queryByUsernameAndPassword(request.getUsername(), request.getPassword());
+            AdminUser adminUser = accountService.authenticate(request.getUsername(), request.getPassword());
             if (adminUser == null) {
                 return Response.<Boolean>builder()
                         .code(ResponseCode.LOGIN_FAILED.getCode())
@@ -507,6 +512,15 @@ public class AdminUserAdminController implements IAdminUserAdminService {
     private AdminUser convertToAdminUser(AdminUserRequestDTO requestDTO) {
         AdminUser adminUser = new AdminUser();
         BeanUtils.copyProperties(requestDTO, adminUser);
+        adminUser.setRole("USER");
+        if (StringUtils.hasText(requestDTO.getPassword())) {
+            adminUser.setPassword(accountPasswordEncoder.encode(requestDTO.getPassword()));
+        } else {
+            AdminUser existing = requestDTO.getId() != null ? adminUserDao.queryById(requestDTO.getId())
+                    : adminUserDao.queryByUserId(requestDTO.getUserId());
+            if (existing == null) throw new IllegalArgumentException("密码不能为空");
+            adminUser.setPassword(existing.getPassword());
+        }
         return adminUser;
     }
 

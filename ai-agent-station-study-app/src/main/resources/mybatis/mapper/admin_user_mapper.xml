@@ -8,15 +8,16 @@
         <result column="username" property="username"/>
         <result column="password" property="password"/>
         <result column="status" property="status"/>
+        <result column="role" property="role"/>
         <result column="create_time" property="createTime"/>
         <result column="update_time" property="updateTime"/>
     </resultMap>
 
     <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AdminUser" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO admin_user (
-            user_id, username, password, status, create_time, update_time
+            user_id, username, password, status, role, create_time, update_time
         ) VALUES (
-            #{userId}, #{username}, #{password}, #{status}, #{createTime}, #{updateTime}
+            #{userId}, #{username}, #{password}, #{status}, COALESCE(#{role}, 'USER'), #{createTime}, #{updateTime}
         )
     </insert>
 
@@ -48,45 +49,45 @@
     </delete>
 
     <select id="queryById" parameterType="java.lang.Long" resultMap="AdminUserMap">
-        SELECT id, user_id, username, password, status, create_time, update_time
+        SELECT id, user_id, username, password, status, role, create_time, update_time
         FROM admin_user
         WHERE id = #{id}
     </select>
 
     <select id="queryByUserId" parameterType="java.lang.String" resultMap="AdminUserMap">
-        SELECT id, user_id, username, password, status, create_time, update_time
+        SELECT id, user_id, username, password, status, role, create_time, update_time
         FROM admin_user
         WHERE user_id = #{userId}
     </select>
 
     <select id="queryByUsername" parameterType="java.lang.String" resultMap="AdminUserMap">
-        SELECT id, user_id, username, password, status, create_time, update_time
+        SELECT id, user_id, username, password, status, role, create_time, update_time
         FROM admin_user
         WHERE username = #{username}
     </select>
 
     <select id="queryEnabledUsers" resultMap="AdminUserMap">
-        SELECT id, user_id, username, password, status, create_time, update_time
+        SELECT id, user_id, username, password, status, role, create_time, update_time
         FROM admin_user
         WHERE status = 1
         ORDER BY create_time DESC
     </select>
 
     <select id="queryByStatus" parameterType="java.lang.Integer" resultMap="AdminUserMap">
-        SELECT id, user_id, username, password, status, create_time, update_time
+        SELECT id, user_id, username, password, status, role, create_time, update_time
         FROM admin_user
         WHERE status = #{status}
         ORDER BY create_time DESC
     </select>
 
     <select id="queryAll" resultMap="AdminUserMap">
-        SELECT id, user_id, username, password, status, create_time, update_time
+        SELECT id, user_id, username, password, status, role, create_time, update_time
         FROM admin_user
         ORDER BY create_time DESC
     </select>
 
     <select id="queryByUsernameAndPassword" resultMap="AdminUserMap">
-        SELECT id, user_id, username, password, status, create_time, update_time
+        SELECT id, user_id, username, password, status, role, create_time, update_time
         FROM admin_user
         WHERE username = #{username} AND password = #{password} AND status = 1
     </select>
@@ -100,7 +101,7 @@
     </sql>
 
     <select id="queryPageByCondition" resultMap="AdminUserMap">
-        SELECT id, user_id, username, password, status, create_time, update_time
+        SELECT id, user_id, username, password, status, role, create_time, update_time
         FROM admin_user
         <include refid="conditionWhere"/>
         ORDER BY create_time DESC

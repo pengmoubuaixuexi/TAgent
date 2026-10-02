@@ -177,7 +177,7 @@ public class BackgroundTaskScheduler {
         dao.insertExecution(execution);
         ExecuteCommandEntity command = ExecuteCommandEntity.builder()
                 .aiAgentId(task.getActionAgentId())
-                .message("[后台任务触发：" + task.getName() + "]\n" + task.getActionPrompt())
+                .message(task.getActionPrompt())
                 .images(java.util.List.of())
                 .sessionId(task.getSessionId())
                 .runId(runId)

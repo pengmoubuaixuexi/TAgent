@@ -38,6 +38,9 @@ public class AdminUser {
      */
     private String password;
 
+    /** ADMIN / USER. Public registration always assigns USER. */
+    private String role;
+
     /**
      * 状态(0:禁用,1:启用,2:锁定)
      */

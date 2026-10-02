@@ -27,7 +27,7 @@ import java.util.UUID;
  * <p>
  * 两键并存，logback whitelist 都暴露到 ES，按需检索。
  */
-@Order(Ordered.HIGHEST_PRECEDENCE)
+@Order(-80)
 @Component
 public class MdcTraceFilter extends OncePerRequestFilter {
 

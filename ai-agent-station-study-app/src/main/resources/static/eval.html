@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
+<script src="/auth.js"></script>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>EvalOps · TAgent</title>
@@ -51,7 +52,7 @@
     <div class="field"><label>名称</label><input class="input" id="dsName" placeholder="例如：工具调用回归集"></div>
     <div class="field"><label>执行模式</label><select class="input" id="dsMode"><option value="INDEPENDENT">独立样本（可并行）</option><option value="SCENARIO">有状态场景（组内串行）</option></select></div>
     <div class="field full"><label>描述</label><textarea class="input" id="dsDescription"></textarea></div>
-    <div class="field"><label>所有者 User ID</label><input class="input" id="dsOwner" value="10001"></div>
+    <div class="field"><label>所有者 User ID</label><input class="input" id="dsOwner" value="" readonly></div>
   </div><div class="modal-foot"><button class="btn" onclick="closeModal('datasetModal')">取消</button><button class="btn primary" onclick="createDataset()">创建</button></div>
 </div></div>
 
@@ -85,7 +86,7 @@
     <div class="field"><label>任务名称</label><input class="input" id="runName"></div>
     <div class="field"><label>指定 Agent ID（留空走路由）</label><input class="input" id="runAgent" placeholder="8011"></div>
     <div class="field"><label>记忆策略</label><select class="input" id="runMemory"><option value="ISOLATED_USER">隔离用户（推荐）</option><option value="FIXED_USER">固定用户</option></select></div>
-    <div class="field"><label>固定 User ID / 数据权限</label><input class="input" id="runUser" value="10001"></div>
+    <div class="field"><label>固定 User ID / 数据权限</label><input class="input" id="runUser" value="" readonly></div>
     <div class="field"><label>Tenant ID</label><input class="input" id="runTenant" value="default"></div>
     <div class="field"><label>单次评测内部并发数</label><input class="input" id="runConcurrency" type="number" min="1" max="8" value="3"></div>
     <div class="field"><label>场景题间等待（秒）</label><input class="input" id="runDelay" type="number" min="0" max="120" value="30"></div>
@@ -122,6 +123,13 @@
 <div id="toast" class="toast hidden"></div>
 
 <script>
+let currentUserId = '';
+fetch('/api/v1/auth/me').then(r => r.json()).then(p => {
+  currentUserId = p.data.userId;
+  document.getElementById('dsOwner').value = currentUserId;
+  document.getElementById('runUser').value = currentUserId;
+}).catch(() => location.replace('/index.html'));
+
 const API='/api/v1/eval';
 const state={tab:'datasets',datasets:[],runs:[],selectedDataset:null,dataset:null,versions:[],cases:[],selectedRun:null,run:null,judgeJobs:[],poll:null,ruleSort:{key:'sequenceNo',dir:'asc'},judgeSort:{key:'overall',dir:'asc'},currentJudge:null};
 const $=id=>document.getElementById(id);
@@ -159,8 +167,8 @@ function openCaseModalById(id){openCaseModal(state.cases.find(c=>c.caseId===id)|
 async function saveCase(){try{const id=$('caseId').value;const body={stableKey:$('caseKey').value,sequenceNo:Number($('caseSeq').value),conversationGroup:$('caseGroup').value,category:$('caseCategory').value,tags:arr($('caseTags').value),question:$('caseQuestion').value,referenceAnswer:$('caseReference').value,enabled:$('caseEnabled').checked,config:{expectedCapabilities:arr($('caseCapabilities').value),mustMention:arr($('caseMustMention').value),mustNotMention:arr($('caseMustNotMention').value),allowGeneralFallback:true,expectRag:$('caseRag').checked,expectMemory:$('caseMemory').checked,expectTools:$('caseTools').checked,allowTools:$('caseAllowTools').checked,simpleTask:$('caseSimple').checked,financialSafety:$('caseFinance').checked,maxSteps:Number($('caseMaxSteps').value),minAnswerLength:Number($('caseMinAnswerLength').value),maxLatencyMs:Number($('caseMaxLatency').value)}};await api(`/datasets/${state.selectedDataset}/cases${id?'/'+id:''}`,{method:'POST',body:JSON.stringify(body)});closeModal('caseModal');await selectDataset(state.selectedDataset);toast('题目已保存')}catch(e){toast(e.message,true)}}
 async function deleteCase(id){if(!confirm('确认从当前草稿删除这道题？'))return;try{await api(`/datasets/${state.selectedDataset}/cases/${id}`,{method:'DELETE'});await selectDataset(state.selectedDataset);toast('题目已删除')}catch(e){toast(e.message,true)}}
 async function publishDataset(){if(!confirm(`发布 v${state.dataset.draftVersionNo}？发布后该版本不可修改。`))return;try{await api(`/datasets/${state.selectedDataset}/publish`,{method:'POST',body:JSON.stringify({description:`${state.dataset.name} v${state.dataset.draftVersionNo}`})});await loadDatasets();await selectDataset(state.selectedDataset);toast('数据集版本已发布')}catch(e){toast(e.message,true)}}
-async function importE2E100(){if(!confirm('将原测试类中的 100 道题迁移为 E2E100 v1，并保留一份 v2 草稿？'))return;try{const data=await api('/datasets/import/e2e100',{method:'POST',body:JSON.stringify({ownerUserId:'10001'})});await loadDatasets();await selectDataset(data.datasetId);toast('E2E100 已迁移并发布')}catch(e){toast(e.message,true)}}
-async function importQualityBenchmark(){if(!confirm('导入“Agent 14维场景基准集（80题版）”？\n\n将创建80道题、16个隔离会话组并发布 v1，同时保留可编辑的 v2 草稿。RAG 场景评测建议选择 FIXED_USER 10001。'))return;try{const data=await api('/datasets/import/quality-benchmark',{method:'POST',body:JSON.stringify({ownerUserId:'10001'})});await loadDatasets();await selectDataset(data.datasetId);toast('14维场景基准集（80题版）已导入并发布')}catch(e){toast(e.message,true)}}
+async function importE2E100(){if(!confirm('将原测试类中的 100 道题迁移为 E2E100 v1，并保留一份 v2 草稿？'))return;try{const data=await api('/datasets/import/e2e100',{method:'POST',body:JSON.stringify({ownerUserId:currentUserId})});await loadDatasets();await selectDataset(data.datasetId);toast('E2E100 已迁移并发布')}catch(e){toast(e.message,true)}}
+async function importQualityBenchmark(){if(!confirm('导入“Agent 14维场景基准集（80题版）”？\n\n将创建80道题、16个隔离会话组并发布 v1，同时保留可编辑的 v2 草稿。RAG 场景评测可选择 FIXED_USER，使用当前登录账户的数据。'))return;try{const data=await api('/datasets/import/quality-benchmark',{method:'POST',body:JSON.stringify({ownerUserId:currentUserId})});await loadDatasets();await selectDataset(data.datasetId);toast('14维场景基准集（80题版）已导入并发布')}catch(e){toast(e.message,true)}}
 async function openRunModal(){try{if(!state.datasets.length)throw new Error('请先创建数据集');const options=[];for(const d of state.datasets){const versions=await api(`/datasets/${d.datasetId}/versions`);for(const v of versions.filter(x=>x.status==='PUBLISHED'))options.push({d,v})}if(!options.length)throw new Error('没有已发布的数据集版本');$('runVersion').innerHTML=options.map(({d,v})=>`<option value="${v.versionId}" data-mode="${esc(d.executionMode)}" ${d.datasetId===state.selectedDataset?'selected':''}>${esc(d.name)} · v${v.versionNo} · ${v.caseCount}题 · ${esc(d.executionMode)}</option>`).join('');$('runName').value='';syncRunMode();$('runModal').classList.remove('hidden')}catch(e){toast(e.message,true)}}
 function syncRunMode(){const option=$('runVersion').selectedOptions[0],mode=option?.dataset.mode||'INDEPENDENT',scenario=mode==='SCENARIO',active=state.runs.filter(r=>['QUEUED','RUNNING','JUDGING'].includes(r.status)).length;$('runConcurrency').disabled=scenario;$('runDelay').disabled=!scenario;if(scenario){$('runConcurrency').value=1;$('runModeHint').innerHTML=`<b>SCENARIO 场景模式</b><br>本次评测会强制单线程顺序执行，同组题目共享 Session。固定用户模式下不建议同时运行多个评测，避免长期记忆互相影响。${active?`<br><span style="color:var(--yellow)">当前还有 ${active} 个评测正在排队或运行。</span>`:''}`}else{if(Number($('runConcurrency').value)<=1)$('runConcurrency').value=3;$('runModeHint').innerHTML=`<b>INDEPENDENT 独立样本模式</b><br>并发数表示这一次评测内部最多同时执行多少道题；每道题使用独立 Session。${active?` 当前另有 ${active} 个评测正在运行。`:''}`}}
 function backToDatasetHome(){state.selectedDataset=null;state.dataset=null;state.versions=[];state.cases=[];renderDatasetSidebar();renderDatasetWelcome()}

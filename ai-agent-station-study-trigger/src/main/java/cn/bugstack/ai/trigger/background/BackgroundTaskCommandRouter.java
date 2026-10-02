@@ -48,6 +48,7 @@ public class BackgroundTaskCommandRouter {
             The only action is RUN_AGENT_PROMPT. action_prompt is the complete instruction that the
             Agent should execute after the trigger; it must retain the user's real intent and relevant
             paths, not merely say "notify me".
+            Always set action_agent_id to null. Execution agents are selected separately in the task UI.
 
             Output exactly one JSON object matching this application schema. Do not use markdown:
             {

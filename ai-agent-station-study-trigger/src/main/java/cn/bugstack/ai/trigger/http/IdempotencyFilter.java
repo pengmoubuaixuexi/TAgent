@@ -29,7 +29,7 @@ import java.util.concurrent.TimeUnit;
  */
 @Slf4j
 @Component
-@Order(-90)
+@Order(-60)
 public class IdempotencyFilter implements Filter {
 
     @Value("${agent.idempotency.enabled:false}")
@@ -82,6 +82,9 @@ public class IdempotencyFilter implements Filter {
             return;
         }
 
+        // Identity has already been replaced by AuthenticatedUserFilter. Never share replay caches across users/routes.
+        idempotencyKey = httpReq.getHeader("X-User-Id") + ":" + httpReq.getMethod() + ":" + path
+                + ":" + String.valueOf(httpReq.getQueryString()) + ":" + idempotencyKey;
         // 检查是否已有缓存响应
         CachedResponse cached = cache.getIfPresent(idempotencyKey);
         if (cached != null) {
