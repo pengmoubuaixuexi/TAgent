@@ -2,6 +2,7 @@ package cn.bugstack.ai.test.domain;
 
 import cn.bugstack.ai.domain.agent.model.valobj.AiClientToolMcpVO;
 import cn.bugstack.ai.domain.agent.service.armory.node.AiClientToolMcpNode;
+import cn.bugstack.ai.domain.agent.service.security.WorkspaceMcpPolicy;
 import cn.bugstack.ai.infrastructure.adapter.repository.AgentRepository;
 import cn.bugstack.ai.infrastructure.dao.IAiClientToolMcpDao;
 import cn.bugstack.ai.infrastructure.dao.po.AiClientToolMcp;
@@ -51,6 +52,14 @@ public class ParallelSearchMcpTest {
         assertNotNull(configVO);
         assertEquals(Map.of("User-Agent", USER_AGENT), configVO.getTransportConfigStreamableHttp().getHeaders());
         return configVO;
+    }
+
+    private AiClientToolMcpNode mcpNode() {
+        AiClientToolMcpNode node = new AiClientToolMcpNode();
+        // This fixture represents administrator configuration, not a personal
+        // workspace endpoint. Keep the real policy without allowing localhost.
+        ReflectionTestUtils.setField(node, "workspaceMcpPolicy", new WorkspaceMcpPolicy(""));
+        return node;
     }
 
     private void execute(McpSyncClient client) throws Exception {
@@ -120,7 +129,7 @@ public class ParallelSearchMcpTest {
         try {
             var config = (com.fasterxml.jackson.databind.node.ObjectNode) fixture;
             config.put("url", "http://127.0.0.1:" + server.getAddress().getPort() + "/mcp");
-            McpSyncClient client = new AiClientToolMcpNode().createMcpSyncClient(load(config.toString()));
+            McpSyncClient client = mcpNode().createMcpSyncClient(load(config.toString()));
             try { execute(client); } finally { client.closeGracefully(); }
             assertEquals(List.of(), failures);
             assertTrue(methods.containsAll(List.of("initialize", "tools/list", "web_search", "web_fetch")));
@@ -132,7 +141,7 @@ public class ParallelSearchMcpTest {
     @Test
     public void liveAnonymousSearchAndFetch() throws Exception {
         Assume.assumeTrue("Enable with -Dparallel.search.live=true", Boolean.getBoolean("parallel.search.live"));
-        McpSyncClient client = new AiClientToolMcpNode().createMcpSyncClient(load(fixture()));
+        McpSyncClient client = mcpNode().createMcpSyncClient(load(fixture()));
         try { execute(client); } finally { client.closeGracefully(); }
     }
 }

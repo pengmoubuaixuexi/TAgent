@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+- 新增可选的 Parallel Search MCP 接入示例，支持匿名网页搜索与读取，不改变默认搜索服务。
+- 示例适配 v1.28.0 的 MCP 所有权与工作区绑定；提供本地 HTTP 契约测试，真实服务测试需显式启用。感谢 [@georgeatparallel](https://github.com/georgeatparallel) 的 [PR #4](https://github.com/pengmoubuaixuexi/TAgent/pull/4)。
+
 ## [v1.28.0] - 2026-10-09
 
 ### 更新
