@@ -227,6 +227,10 @@ UnifiedAgentRouter
 
 ---
 
+可选的免费联网搜索示例：[Parallel Search MCP 配置与 smoke test](docs/dev-ops/parallel-search/README.md)。
+
+---
+
 ## 🔧 MCP 工具治理与自动重连
 
 MCP 调用不是直接执行裸 callback，而是经过 `MeteredToolCallback`、`RobustToolCallingManager` 和 `McpClientRegistry` 三层治理。
