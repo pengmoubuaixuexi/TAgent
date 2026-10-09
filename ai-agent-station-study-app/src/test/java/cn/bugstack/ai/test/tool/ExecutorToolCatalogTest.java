@@ -20,6 +20,16 @@ import static org.mockito.Mockito.when;
  */
 public class ExecutorToolCatalogTest {
 
+    @Test
+    public void hintWrapperMustNotChangeSchemaOrFingerprint() {
+        ToolCallback raw = cb("AIsearch", "search", "{\"type\":\"object\",\"required\":[\"query\"]}");
+        ToolCallback hinted = new cn.bugstack.ai.domain.agent.service.execute.common.HintedToolCallback(raw, "Use for web search");
+        ExecutorToolCatalog before = ExecutorToolCatalog.from(List.of(raw), ExecutorToolCatalog.Source.DYNAMIC, 1);
+        ExecutorToolCatalog after = ExecutorToolCatalog.from(List.of(hinted), ExecutorToolCatalog.Source.DYNAMIC, 2);
+        assertEquals(before.entry("AIsearch").orElseThrow().inputSchemaJson(), after.entry("AIsearch").orElseThrow().inputSchemaJson());
+        assertTrue(after.missingOrChangedFrom(before).isEmpty());
+    }
+
     private static ToolCallback cb(String name, String desc, String schema) {
         ToolCallback c = mock(ToolCallback.class);
         when(c.getToolDefinition()).thenReturn(

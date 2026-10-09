@@ -4,6 +4,7 @@
 
     <resultMap id="AiClientAdvisorMap" type="cn.bugstack.ai.infrastructure.dao.po.AiClientAdvisor">
         <id column="id" property="id"/>
+        <result column="owner_user_id" property="ownerUserId"/>
         <result column="advisor_id" property="advisorId"/>
         <result column="advisor_name" property="advisorName"/>
         <result column="advisor_type" property="advisorType"/>
@@ -16,8 +17,10 @@
 
     <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientAdvisor" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO ai_client_advisor (
+            owner_user_id,
             advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
         ) VALUES (
+            COALESCE(#{ownerUserId}, '__legacy_unowned__'),
             #{advisorId}, #{advisorName}, #{advisorType}, #{orderNum}, #{extParam}, #{status}, #{createTime}, #{updateTime}
         )
     </insert>
@@ -54,32 +57,32 @@
     </delete>
 
     <select id="queryById" parameterType="java.lang.Long" resultMap="AiClientAdvisorMap">
-        SELECT id, advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
+        SELECT id, owner_user_id, advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
         FROM ai_client_advisor
         WHERE id = #{id}
     </select>
 
     <select id="queryByAdvisorId" parameterType="java.lang.String" resultMap="AiClientAdvisorMap">
-        SELECT id, advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
+        SELECT id, owner_user_id, advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
         FROM ai_client_advisor
         WHERE advisor_id = #{advisorId}
     </select>
 
     <select id="queryAll" resultMap="AiClientAdvisorMap">
-        SELECT id, advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
+        SELECT id, owner_user_id, advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
         FROM ai_client_advisor
         ORDER BY order_num ASC, create_time DESC
     </select>
 
     <select id="queryByStatus" parameterType="java.lang.Integer" resultMap="AiClientAdvisorMap">
-        SELECT id, advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
+        SELECT id, owner_user_id, advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
         FROM ai_client_advisor
         WHERE status = #{status}
         ORDER BY order_num ASC, create_time DESC
     </select>
 
     <select id="queryByAdvisorType" parameterType="java.lang.String" resultMap="AiClientAdvisorMap">
-        SELECT id, advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
+        SELECT id, owner_user_id, advisor_id, advisor_name, advisor_type, order_num, ext_param, status, create_time, update_time
         FROM ai_client_advisor
         WHERE advisor_type = #{advisorType}
         ORDER BY order_num ASC, create_time DESC

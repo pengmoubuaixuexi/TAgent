@@ -18,6 +18,8 @@ public class AuthenticatedBodyAdvice extends RequestBodyAdviceAdapter {
     private final ObjectMapper json;
     private final HttpServletRequest request;
     private final ConversationAccess access;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository workspaceAccess;
     public AuthenticatedBodyAdvice(ObjectMapper json, HttpServletRequest request, ConversationAccess access) {
         this.json = json; this.request = request; this.access = access;
     }
@@ -35,6 +37,10 @@ public class AuthenticatedBodyAdvice extends RequestBodyAdviceAdapter {
         // This public deployment has one tenant; clients cannot select another tenant.
         body.remove("tenantId");
         String path = request.getRequestURI();
+        String agentId = body.path("aiAgentId").asText(null);
+        if (path.endsWith("/auto_agent") && agentId != null && !agentId.isBlank()
+                && workspaceAccess != null && !workspaceAccess.ownsAgent(userId, agentId))
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Agent 不存在、未启用或无权使用");
         boolean create = path.endsWith("/auto_agent") || path.endsWith("/background-tasks/interpret");
         if (path.endsWith("/auto_agent") && body.path("sessionId").asText("").isBlank())
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "缺少会话标识");

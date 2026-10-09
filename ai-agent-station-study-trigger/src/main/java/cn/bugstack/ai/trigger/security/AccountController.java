@@ -27,12 +27,15 @@ public class AccountController {
     private final AccountService accounts;
     private final IAdminUserDao users;
     private final SecurityContextRepository contexts;
+    private final cn.bugstack.ai.trigger.workspace.WorkspaceService workspace;
     private final Cache<String, AtomicInteger> attempts = Caffeine.newBuilder()
             .maximumSize(10000).expireAfterWrite(Duration.ofMinutes(10)).build();
     @Value("${agent.auth.registration-enabled:true}") private boolean registrationEnabled;
 
-    public AccountController(AccountService accounts, IAdminUserDao users, SecurityContextRepository contexts) {
+    public AccountController(AccountService accounts, IAdminUserDao users, SecurityContextRepository contexts,
+                             cn.bugstack.ai.trigger.workspace.WorkspaceService workspace) {
         this.accounts = accounts; this.users = users; this.contexts = contexts;
+        this.workspace=workspace;
     }
     @com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)
     public record Credentials(String username, String password) {}
@@ -51,6 +54,7 @@ public class AccountController {
         throttle("login:" + request.getRemoteAddr(), 60);
         throttle("account:" + (input.username() == null ? "" : input.username().trim().toLowerCase(java.util.Locale.ROOT)), 20);
         AdminUser user = accounts.authenticate(input.username(), input.password());
+        workspace.provisionPublicResources(user.getUserId());
         if (request.getSession(false) != null) request.changeSessionId();
         var session = request.getSession();
         session.setAttribute("userId", user.getUserId());
@@ -69,6 +73,7 @@ public class AccountController {
         AdminUser user = users.queryByUserId(authentication.getName());
         if (user == null || !Integer.valueOf(1).equals(user.getStatus()))
             throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "账户不可用");
+        workspace.provisionPublicResources(user.getUserId());
         return result(user);
     }
     @GetMapping("/admin-check") public void adminCheck(Authentication authentication, HttpServletResponse response) {

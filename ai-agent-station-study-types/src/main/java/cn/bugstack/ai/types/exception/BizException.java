@@ -24,23 +24,25 @@ public class BizException extends RuntimeException{
     private String info;
 
     public BizException(String code) {
+        super(code);
         this.code = code;
     }
 
     public BizException(String code, Throwable cause) {
+        super(cause == null || cause.getMessage() == null ? code : cause.getMessage(), cause);
         this.code = code;
-        super.initCause(cause);
     }
 
     public BizException(String code, String message) {
+        super(message);
         this.code = code;
         this.info = message;
     }
 
     public BizException(String code, String message, Throwable cause) {
+        super(message, cause);
         this.code = code;
         this.info = message;
-        super.initCause(cause);
     }
 
     @Override

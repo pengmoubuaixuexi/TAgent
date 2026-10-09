@@ -159,6 +159,14 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
      * <p>为空时回退 sessionId（保持旧行为，零影响）。{@link #LATEST_REASONING}/no-think 仍按 sessionId。</p>
      */
     private static final ThreadLocal<String> CURRENT_RUN_ID = new ThreadLocal<>();
+    static final String SESSION_CONTEXT_KEY = "agent.reasoning_session";
+    static final String RUN_CONTEXT_KEY = "agent.reasoning_run";
+
+    /** Capture the lexical scope before an advisor moves subscription to another thread. */
+    static Map<String, String> captureContext() {
+        String sessionId = resolveSessionId();
+        return Map.of(SESSION_CONTEXT_KEY, sessionId, RUN_CONTEXT_KEY, resolveReasoningKey(sessionId));
+    }
 
     /** 调用方在 streaming LLM 调用前后包一层。{@code @return} AutoCloseable 用于 try-with-resources 清理。*/
     public static AutoCloseable scopeSession(String sessionId) {
@@ -179,7 +187,7 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
     }
 
     /** 注入缓存隔离键：优先 runId（每次执行唯一），回退 sessionId。 */
-    private String resolveReasoningKey(String sessionId) {
+    private static String resolveReasoningKey(String sessionId) {
         String rid = CURRENT_RUN_ID.get();
         if (rid != null && !rid.isBlank()) return rid;
         String mdcRun = MDC.get("runId");
@@ -221,13 +229,19 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
 
     @Override
     public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
-        // filter 入口在调用者同步线程上跑（subscribe 时触发），此时 ThreadLocal/MDC 仍可用
-        String sessionId = resolveSessionId();
+        Map<String, String> captured = captureContext();
+        return Mono.deferContextual(context -> filterActive(request, next,
+                context.getOrDefault(StreamingActivityTracker.CONTEXT_KEY, StreamingActivityTracker.current()),
+                context.getOrDefault(SESSION_CONTEXT_KEY, captured.get(SESSION_CONTEXT_KEY)),
+                context.getOrDefault(RUN_CONTEXT_KEY, captured.get(RUN_CONTEXT_KEY))));
+    }
+
+    private Mono<ClientResponse> filterActive(ClientRequest request, ExchangeFunction next,
+                                             StreamingActivityTracker.Activity streamingActivity,
+                                             String sessionId, String reasoningKey) {
+        // Resolve per-attempt state at subscription, after advisor publishOn/thread switches.
+        StreamingActivityTracker.checkActive(streamingActivity);
         // 注入缓存按 runId 隔离（跨题/并发不串扰）；sessionId 仍用于 LATEST_REASONING / 日志。
-        String reasoningKey = resolveReasoningKey(sessionId);
-        // Captured on the subscribing thread. The Activity object itself is thread-safe and is
-        // passed into the async response-body pipeline explicitly (no Reactor ThreadLocal reliance).
-        StreamingActivityTracker.Activity streamingActivity = StreamingActivityTracker.current();
         List<String> reasonings = sessionReasonings.computeIfAbsent(reasoningKey,
                 k -> Collections.synchronizedList(new ArrayList<>()));
 
@@ -248,11 +262,13 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
         }
 
         // ============ Response 侧：抓取 reasoning_content append 到 session 列表 ============
-        return next.exchange(finalRequest).map(resp -> wrapResponse(resp, reasonings, sessionId, streamingActivity));
+        Mono<ClientResponse> exchange = next.exchange(finalRequest);
+        if (streamingActivity != null) exchange = exchange.takeUntilOther(streamingActivity.cancellation());
+        return exchange.map(resp -> wrapResponse(resp, reasonings, sessionId, streamingActivity));
     }
 
     /** 优先级：ThreadLocal > MDC.sessionId > MDC.requestId > "unknown-session" */
-    private String resolveSessionId() {
+    private static String resolveSessionId() {
         String tl = CURRENT_SESSION_ID.get();
         if (tl != null && !tl.isBlank()) return tl;
         String mdcSid = MDC.get("sessionId");
@@ -269,6 +285,9 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
     private ClientResponse wrapResponse(ClientResponse response, List<String> reasonings, String sessionId,
                                         StreamingActivityTracker.Activity streamingActivity) {
         Flux<DataBuffer> originalBody = response.body(BodyExtractors.toDataBuffers());
+        // An internal recursive model request may outlive the outer ChatClient subscription.
+        // The explicit attempt signal also cancels this HTTP body, without waiting for another chunk.
+        if (streamingActivity != null) originalBody = originalBody.takeUntilOther(streamingActivity.cancellation());
         StringBuilder sseBuffer = new StringBuilder();
         StringBuilder reasoningBuffer = new StringBuilder();
 
@@ -277,6 +296,7 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
                     byte[] bytes = new byte[buffer.readableByteCount()];
                     buffer.read(bytes);
                     DataBufferUtils.release(buffer);
+                    StreamingActivityTracker.checkActive(streamingActivity);
                     try {
                         sseBuffer.append(new String(bytes, StandardCharsets.UTF_8));
                         int sepIndex;
@@ -332,6 +352,13 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
                 if (!(first instanceof Map<?, ?> choice)) continue;
                 Object delta = choice.get("delta");
                 if (delta instanceof Map<?, ?> d) {
+                    if (streamingActivity != null &&
+                            ((d.get("content") instanceof String text && !text.isEmpty())
+                                    || (d.get("tool_calls") instanceof List<?> calls && !calls.isEmpty()))) {
+                        // Internal tool-call frames never reach ChatClientResponse: Spring AI
+                        // consumes them to execute tools before emitting the final answer.
+                        streamingActivity.markDecodedResponse();
+                    }
                     Object rc = d.get("reasoning_content");
                     if (rc instanceof String s && !s.isEmpty()) {
                         reasoningBuffer.append(s);

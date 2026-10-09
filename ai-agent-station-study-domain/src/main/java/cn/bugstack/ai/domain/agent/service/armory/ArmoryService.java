@@ -33,21 +33,42 @@ public class ArmoryService implements IArmoryService {
     @Resource
     private DefaultArmoryStrategyFactory defaultArmoryStrategyFactory;
 
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository workspaceAccess;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    private org.springframework.context.ApplicationContext applicationContext;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    private cn.bugstack.ai.domain.agent.service.router.AgentToolRegistry agentToolRegistry;
+
+    private void requireOwned(String agentId) {
+        String userId = org.slf4j.MDC.get("userId");
+        if (userId == null || userId.isBlank() || workspaceAccess == null || !workspaceAccess.ownsAgent(userId, agentId)) {
+            throw new IllegalArgumentException("Agent 不存在、已停用或无权访问");
+        }
+    }
+
     /** 懒加载缓存：已装配的 agentId 集合 */
     private final ConcurrentHashMap<String, Boolean> armedAgents = new ConcurrentHashMap<>();
 
     @Override
-    public List<AiAgentVO> acceptArmoryAllAvailableAgents() {
+    public synchronized List<AiAgentVO> acceptArmoryAllAvailableAgents() {
         List<AiAgentVO> aiAgentVOS = repository.queryAvailableAgents();
         for (AiAgentVO aiAgentVO : aiAgentVOS) {
             String agentId = aiAgentVO.getAgentId();
-            acceptArmoryAgent(agentId);
+            assembleAgent(agentId);
         }
         return aiAgentVOS;
     }
 
     @Override
-    public void acceptArmoryAgent(String agentId) {
+    public synchronized void acceptArmoryAgent(String agentId) {
+        requireOwned(agentId);
+        assembleAgent(agentId);
+    }
+
+    private void assembleAgent(String agentId) {
         List<AiAgentClientFlowConfigVO> aiAgentClientFlowConfigVOS = repository.queryAiAgentClientsByAgentId(agentId);
         if (aiAgentClientFlowConfigVOS.isEmpty()) return;
 
@@ -67,13 +88,19 @@ public class ArmoryService implements IArmoryService {
                             .build(),
                     new DefaultArmoryStrategyFactory.DynamicContext());
         } catch (Exception e) {
+            if (e instanceof cn.bugstack.ai.domain.agent.service.execute.common.McpToolNameGuard.CollisionException collision) {
+                throw collision;
+            }
             throw new RuntimeException("装配智能体失败", e);
         }
     }
 
     @Override
     public List<AiAgentVO> queryAvailableAgents() {
-        return repository.queryAvailableAgents();
+        String userId = org.slf4j.MDC.get("userId");
+        if (userId == null || userId.isBlank() || workspaceAccess == null) return List.of();
+        java.util.Set<String> allowed = workspaceAccess.ownedAgentIds(userId);
+        return repository.queryAvailableAgents().stream().filter(agent -> allowed.contains(agent.getAgentId())).toList();
     }
 
     @Override
@@ -99,7 +126,7 @@ public class ArmoryService implements IArmoryService {
     }
 
     @Override
-    public void reloadAll() {
+    public synchronized void reloadAll() {
         log.info("[HotReload] Reloading all agents...");
         armedAgents.clear();
         acceptArmoryAllAvailableAgents();
@@ -107,20 +134,62 @@ public class ArmoryService implements IArmoryService {
     }
 
     @Override
-    public void ensureArmed(String agentId) {
+    public synchronized void ensureArmed(String agentId) {
+        requireOwned(agentId);
         if (armedAgents.containsKey(agentId)) return;
-        synchronized (this) {
-            if (armedAgents.containsKey(agentId)) return;
-            log.info("[LazyArmory] Agent {} 首次命中，装配中...", agentId);
-            acceptArmoryAgent(agentId);
-            armedAgents.put(agentId, Boolean.TRUE);
-            log.info("[LazyArmory] Agent {} 装配完成", agentId);
-        }
+        log.info("[LazyArmory] Agent {} 首次命中，装配中...", agentId);
+        acceptArmoryAgent(agentId);
+        armedAgents.put(agentId, Boolean.TRUE);
+        log.info("[LazyArmory] Agent {} 装配完成", agentId);
     }
 
     @Override
     public boolean isAgentArmed(String agentId) {
         return armedAgents.containsKey(agentId);
+    }
+
+    @Override
+    public synchronized void invalidateAgent(String agentId) {
+        if (agentId != null) armedAgents.remove(agentId);
+    }
+
+    @Override
+    public synchronized void invalidateAll() {
+        armedAgents.clear();
+    }
+
+    @Override
+    public synchronized void invalidateAgent(String agentId, java.util.Map<String, java.util.Set<String>> obsoleteResources) {
+        evictResources(obsoleteResources);
+        invalidateAgent(agentId);
+    }
+
+    @Override
+    public synchronized void invalidateAgents(java.util.Set<String> agentIds, Runnable resourceInvalidation) {
+        try {
+            resourceInvalidation.run();
+        } finally {
+            agentIds.forEach(this::invalidateAgent);
+        }
+    }
+
+    /** Call only with old graph IDs captured before a committed workspace update. */
+    @Override
+    public synchronized void evictResources(java.util.Map<String, java.util.Set<String>> resources) {
+        if (resources == null) return;
+        var factory = (org.springframework.beans.factory.support.DefaultListableBeanFactory)
+                applicationContext.getAutowireCapableBeanFactory();
+        for (var entry : resources.entrySet()) {
+            // Shared providers and reusable MCP connections have separate lifecycles.
+            if (!java.util.Set.of("client", "model", "advisor", "prompt").contains(entry.getKey())) continue;
+            AiAgentEnumVO type = AiAgentEnumVO.getByCode(entry.getKey());
+            for (String id : entry.getValue()) {
+                if ("client".equals(entry.getKey())) agentToolRegistry.unregister(id);
+                String name = type.getBeanName(id);
+                if (factory.containsBeanDefinition(name)) factory.removeBeanDefinition(name);
+                else if (factory.containsSingleton(name)) factory.destroySingleton(name);
+            }
+        }
     }
 
 }

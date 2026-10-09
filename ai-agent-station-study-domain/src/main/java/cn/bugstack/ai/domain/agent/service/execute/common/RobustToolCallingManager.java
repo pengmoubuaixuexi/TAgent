@@ -91,6 +91,7 @@ public class RobustToolCallingManager implements ToolCallingManager {
             .name(ASK_USER_TOOL_NAME)
             .description("当你缺少完成任务所必需的关键信息，或对用户意图存在多种合理理解、需要用户拍板时，调用本工具向用户提问。"
                     + "请把所有需要澄清的问题一次性放进 questions 数组问全，不要逐条反复追问；每条必须是一个具体、可直接回答的问题，不要写笼统含糊的话。"
+                    + "先检查本轮跨节点共享的用户补充信息，已回答的问题直接复用；只有仍缺失或确有冲突的信息才继续询问。"
                     + "questions 必须直接传 JSON 数组，禁止先将整个数组序列化成字符串再传入。"
                     + "当问题存在明确的常见答案时，优先给出 2-4 个具体 options 作为快捷选择；默认为单选，只有选项可以同时成立、用户确实可选多项时才设置 multiple=true。"
                     + "保持 allowFreeText=true，让用户仍可输入选项之外的答案；"
@@ -198,8 +199,19 @@ public class RobustToolCallingManager implements ToolCallingManager {
         this.maxSerialToolRoundsPerClient = maxSerialToolRoundsPerClient;
     }
 
+    private cn.bugstack.ai.domain.agent.model.valobj.WorkspaceNodePolicy workspaceNodePolicy;
+    public void setWorkspaceNodePolicy(cn.bugstack.ai.domain.agent.model.valobj.WorkspaceNodePolicy policy) {
+        this.workspaceNodePolicy=policy;
+    }
+    private void restrictNodeOptions(ToolCallingChatOptions options) {
+        if (workspaceNodePolicy==null || options==null) return;
+        options.setToolCallbacks(new ArrayList<>(workspaceNodePolicy.filter(options.getToolCallbacks())));
+        // A name-only resolver must not bypass the connection + tool identity ceiling.
+        options.setToolNames(Set.of());
+    }
     @Override
     public List<ToolDefinition> resolveToolDefinitions(ToolCallingChatOptions options) {
+        restrictNodeOptions(options);
         // P0-B2b-Step3：请求级强制无工具（repair 专用，类型化 flag，模型不可伪造）——
         // 必须在 delegate / 非执行步 gate / ask_user / request_tool 之前返回空（连元工具也不广播）。
         if (isForceNoTools(options)) {
@@ -210,7 +222,7 @@ public class RobustToolCallingManager implements ToolCallingManager {
                 ? new ArrayList<>(delegate.resolveToolDefinitions(options))
                 : new ArrayList<>();
         // policy ceiling 与运行期 availability 取交集；NONE/BUSINESS_ONLY 不得再泄出元工具。
-        if (policy.allows(ToolCapability.ASK_USER) && askUserAvailable()) {
+        if (policy.allows(ToolCapability.ASK_USER) && askUserAvailable(options)) {
             base.add(ASK_USER_DEFINITION);
         }
         if (policy.allows(ToolCapability.REQUEST_TOOL) && requestToolAvailable()) {
@@ -256,10 +268,10 @@ public class RobustToolCallingManager implements ToolCallingManager {
         return prompt != null && prompt.getOptions() instanceof ToolCallingChatOptions options && isForceNoTools(options);
     }
 
-    /** ask_user 当前是否可广播：gate 存在且开启，且本次执行预算未用尽。sessionId 取自 MDC。 */
-    private boolean askUserAvailable() {
+    /** Prefer request-local ToolContext over MDC, which may be absent on Reactor workers. */
+    private boolean askUserAvailable(ToolCallingChatOptions options) {
         if (userInputGate == null || !userInputGate.isEnabled()) return false;
-        return userInputGate.remainingFor(org.slf4j.MDC.get("sessionId")) > 0;
+        return userInputGate.remainingFor(toolIdentity(options, "sessionId")) > 0;
     }
 
     /** request_tool 当前是否可广播：开关开且匹配服务在。预算在执行处限，不在此 gate。 */
@@ -277,13 +289,71 @@ public class RobustToolCallingManager implements ToolCallingManager {
 
     @Override
     public ToolExecutionResult executeToolCalls(Prompt prompt, ChatResponse chatResponse) {
+        StreamingActivityTracker.Activity activity = activityFor(prompt);
+        StreamingActivityTracker.checkActive(activity);
+        try (StreamingActivityTracker.Scope ignored = StreamingActivityTracker.scope(activity)) {
+            if (activity != null) activity.markToolActivity();
+            ToolExecutionResult result = executeActiveToolCalls(prompt, chatResponse);
+            StreamingActivityTracker.checkActive(activity);
+            if (activity != null) activity.markDecodedResponse();
+            return result;
+        }
+    }
+
+    private StreamingActivityTracker.Activity activityFor(Prompt prompt) {
+        return StreamingActivityTracker.from(prompt != null && prompt.getOptions() instanceof ToolCallingChatOptions options
+                ? options.getToolContext() : null);
+    }
+
+    /** Guard every callback, including the second callback in the framework's serial batch. */
+    private ToolExecutionResult executeDelegate(Prompt prompt, ChatResponse response) {
+        StreamingActivityTracker.Activity activity = activityFor(prompt);
+        StreamingActivityTracker.checkActive(activity);
+        if (activity == null || prompt == null || !(prompt.getOptions() instanceof ToolCallingChatOptions options)) {
+            return delegate.executeToolCalls(prompt, response);
+        }
+        ToolCallingChatOptions scoped = (ToolCallingChatOptions) options.copy();
+        if (options.getToolCallbacks() != null) {
+            scoped.setToolCallbacks(options.getToolCallbacks().stream().map(callback -> (ToolCallback) new ToolCallback() {
+                @Override public ToolDefinition getToolDefinition() { return callback.getToolDefinition(); }
+                @Override public org.springframework.ai.tool.metadata.ToolMetadata getToolMetadata() { return callback.getToolMetadata(); }
+                @Override public String call(String input) { return call(input, null); }
+                @Override public String call(String input, org.springframework.ai.chat.model.ToolContext context) {
+                    activity.markToolActivity();
+                    try (StreamingActivityTracker.Scope ignored = StreamingActivityTracker.scope(activity)) {
+                        String result = context == null ? callback.call(input) : callback.call(input, context);
+                        activity.checkActive();
+                        return result;
+                    } finally {
+                        activity.markDecodedResponse();
+                    }
+                }
+            }).toList());
+        }
+        ToolExecutionResult result = delegate.executeToolCalls(new Prompt(prompt.getInstructions(), scoped), response);
+        activity.checkActive();
+        return result;
+    }
+
+    private ToolExecutionResult executeActiveToolCalls(Prompt prompt, ChatResponse chatResponse) {
         if (prompt == null || chatResponse == null) {
-            return delegate.executeToolCalls(prompt, chatResponse);
+            return executeDelegate(prompt, chatResponse);
         }
 
         // definitions 是第一道门；这里是第二道门，防模型幻觉/旧上下文直接发起未授权调用。
         ToolCapabilityProfile policy = isForceNoTools(prompt) ? ToolCapabilityProfile.NONE : effectivePolicy(prompt);
         Set<String> denied = findPolicyDeniedToolNames(chatResponse, policy);
+        if (workspaceNodePolicy!=null) {
+            if (prompt.getOptions() instanceof ToolCallingChatOptions options) restrictNodeOptions(options);
+            var names=buildLowerToOriginalNameMap(prompt);
+            for (var generation:chatResponse.getResults()) {
+                if (generation.getOutput()==null || !generation.getOutput().hasToolCalls()) continue;
+                for (var call:generation.getOutput().getToolCalls()) {
+                    if (!isAskUserName(call.name()) && !isRequestToolName(call.name())
+                            && !names.containsKey(call.name().toLowerCase(java.util.Locale.ROOT))) denied.add(call.name());
+                }
+            }
+        }
         if (!denied.isEmpty()) {
             log.warn("[ToolPolicy] denied tool calls at execution stage: {}", denied);
             return buildPolicyDeniedResult(prompt, chatResponse, denied);
@@ -300,7 +370,7 @@ public class RobustToolCallingManager implements ToolCallingManager {
         // 拿 prompt 自带的真实工具名（注入到 ChatClient.defaultToolCallbacks 的那一组）
         Map<String, String> caseMap = buildLowerToOriginalNameMap(prompt);
         if (caseMap.isEmpty()) {
-            return delegate.executeToolCalls(prompt, chatResponse);
+            return executeDelegate(prompt, chatResponse);
         }
 
         // 重建 ChatResponse，把 ToolCall.name 按 case-insensitive 校正
@@ -337,7 +407,7 @@ public class RobustToolCallingManager implements ToolCallingManager {
             }
         }
 
-        return delegate.executeToolCalls(prompt, normalized);
+        return executeDelegate(prompt, normalized);
     }
 
     private Set<String> findPolicyDeniedToolNames(ChatResponse response, ToolCapabilityProfile policy) {
@@ -457,7 +527,7 @@ public class RobustToolCallingManager implements ToolCallingManager {
         ChatResponse normalized = caseMap.isEmpty() ? chatResponse : normalizeToolCallNames(chatResponse, caseMap);
         Generation toolGen = firstGenerationWithToolCalls(normalized);
         if (toolGen == null || toolGen.getOutput() == null) {
-            return delegate.executeToolCalls(prompt, normalized);
+            return executeDelegate(prompt, normalized);
         }
         AssistantMessage fullAm = toolGen.getOutput();
         List<AssistantMessage.ToolCall> calls = fullAm.getToolCalls();
@@ -465,13 +535,15 @@ public class RobustToolCallingManager implements ToolCallingManager {
 
         boolean askUserActive = userInputGate != null && userInputGate.isEnabled();
         boolean requestToolActive = requestToolAvailable();
-        String sessionId = org.slf4j.MDC.get("sessionId");
+        String sessionId = toolIdentity(prompt.getOptions() instanceof ToolCallingChatOptions options ? options : null,
+                "sessionId");
         String stepLabel = currentStepLabel(prompt);
 
         List<ToolResponseMessage.ToolResponse> responses = new ArrayList<>(calls.size());
         for (AssistantMessage.ToolCall tc : calls) {
+            StreamingActivityTracker.checkActive(activityFor(prompt));
             if (askUserActive && isAskUserName(tc.name())) {
-                responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(), runAskUser(sessionId, tc, stepLabel)));
+                responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(), runAskUser(prompt, sessionId, tc, stepLabel)));
             } else if (requestToolActive && isRequestToolName(tc.name())) {
                 responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(), runRequestTool(prompt, tc, sessionId, stepLabel)));
             } else if (!realNames.contains(tc.name())) {
@@ -483,6 +555,8 @@ public class RobustToolCallingManager implements ToolCallingManager {
                 try {
                     responses.add(executeSingleToolCall(prompt, normalized, toolGen, tc));
                 } catch (Exception e) {
+                    StreamingActivityTracker.rethrowCancellation(e);
+                    StreamingActivityTracker.checkActive(activityFor(prompt));
                     log.warn("[RobustToolMgr] tool '{}' failed in meta-tool batch: {}", tc.name(), e.getMessage());
                     responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(),
                             "工具执行失败（tool execution failed）：" + e.getMessage()
@@ -529,15 +603,31 @@ public class RobustToolCallingManager implements ToolCallingManager {
                     "未提供需要的能力描述。请在 needs 数组里用一句话描述你需要的工具能力（可一次多条）后重试。");
         }
         List<ToolCallback> resolved;
+        String priorUser = org.slf4j.MDC.get("userId");
+        String priorAgent = org.slf4j.MDC.get("agentId");
         try {
+            if (prompt.getOptions() instanceof ToolCallingChatOptions scopedOptions
+                    && scopedOptions.getToolContext() != null) {
+                Object owner = scopedOptions.getToolContext().get("userId");
+                if (owner != null && !owner.toString().isBlank()) org.slf4j.MDC.put("userId", owner.toString());
+                Object agent = scopedOptions.getToolContext().get("agentId");
+                if (agent != null && !agent.toString().isBlank()) org.slf4j.MDC.put("agentId", agent.toString());
+            }
             // needs 多条换行连接；resolveDynamicToolCallbacks 内部 splitNeeds 拆开、各取 top-k 再并集。
             // currentTools 传空：去重在 injectIntoOptions 按工具名统一做；clientId/query 仅供匹配器日志。
             resolved = mcpToolCatalogService.resolveDynamicToolCallbacks(currentRunId(prompt), sessionId,
-                    REQUEST_TOOL_TOOL_NAME, needs, needs, java.util.List.of());
+                    workspaceNodePolicy==null ? REQUEST_TOOL_TOOL_NAME : workspaceNodePolicy.clientId(), needs, needs, java.util.List.of());
         } catch (Exception e) {
+            StreamingActivityTracker.rethrowCancellation(e);
+            StreamingActivityTracker.checkActive(activityFor(prompt));
             log.warn("[RequestTool] resolve failed needs='{}': {}", needs, e.getMessage());
             return requestToolEnd(sessionId, stepLabel, "error", "匹配出错：" + e.getMessage(),
                     "工具匹配出错：" + e.getMessage() + "。可换一种能力描述再试，或基于现有工具完成任务。");
+        } finally {
+            if (priorUser == null) org.slf4j.MDC.remove("userId");
+            else org.slf4j.MDC.put("userId", priorUser);
+            if (priorAgent == null) org.slf4j.MDC.remove("agentId");
+            else org.slf4j.MDC.put("agentId", priorAgent);
         }
         if (resolved == null || resolved.isEmpty()) {
             return requestToolEnd(sessionId, stepLabel, "error", "未匹配到「" + needs.replace("\n", " / ") + "」对应的工具",
@@ -559,10 +649,12 @@ public class RobustToolCallingManager implements ToolCallingManager {
         log.info("[RequestTool] needs='{}' matched={} injected={}", needs, names, added);
         // detail 用"工具名按行排列"，前端按行拆成"装配的工具"列表 + 计数("装配了 N 个工具")；
         // 给模型的文本仍用友好句（modelText 与卡片 detail 解耦）。
+        String displayNames = ToolCapabilitySummary.boundedNames(names);
         String modelText = businessAllowedNow
-                ? "已为你装载工具：" + names + "。现在可以直接调用上述工具完成任务（同样的能力不要再次 request_tool）。"
-                : "已登记并为后续执行阶段准备工具：" + names
+                ? "已为你装载工具：" + displayNames + "。现在可以直接调用上述工具完成任务（同样的能力不要再次 request_tool）。"
+                : "已登记并为后续执行阶段准备工具：" + displayNames
                     + "。当前阶段没有业务工具执行权限，请继续完成本阶段职责，不要在本阶段调用上述工具。";
+        modelText += ToolCapabilitySummary.render(resolved);
         return requestToolEnd(sessionId, stepLabel, "success", String.join("\n", names), modelText);
     }
 
@@ -584,6 +676,7 @@ public class RobustToolCallingManager implements ToolCallingManager {
      */
     private int injectIntoOptions(Prompt prompt, List<ToolCallback> resolved) {
         if (!(prompt.getOptions() instanceof ToolCallingChatOptions opts)) return 0;
+        if (workspaceNodePolicy!=null) resolved=workspaceNodePolicy.filter(resolved);
         List<ToolCallback> existing = opts.getToolCallbacks();
         List<ToolCallback> union = new ArrayList<>();
         Set<String> names = new HashSet<>();
@@ -633,13 +726,19 @@ public class RobustToolCallingManager implements ToolCallingManager {
     }
 
     /** 调 gate 阻塞提问，把状态翻译成给 LLM 的工具结果文本；同时发 ask_user 元工具观察卡片。 */
-    private String runAskUser(String sessionId, AssistantMessage.ToolCall tc, String stepLabel) {
+    private String runAskUser(Prompt prompt, String sessionId, AssistantMessage.ToolCall tc, String stepLabel) {
         ToolCallProgressEmitter p = this.toolCallProgressEmitter;
         if (p != null) {
             p.emitMetaStart(sessionId, ASK_USER_TOOL_NAME, askUserPreview(tc.arguments()), stepLabel);
         }
-        cn.bugstack.ai.domain.agent.service.security.UserInputGate.Result r =
-                userInputGate.requestUserInput(sessionId, tc.arguments(), stepLabel);
+        StreamingActivityTracker.Activity activity = activityFor(prompt);
+        cn.bugstack.ai.domain.agent.service.security.UserInputGate.Result r;
+        try (StreamingActivityTracker.Scope ignored = activity == null ? () -> {} :
+                activity.awaitingUser(java.time.Duration.ofSeconds(Math.max(1, userInputGate.getTimeoutSeconds()) + 5L))) {
+            r = userInputGate.requestUserInput(sessionId, tc.arguments(), stepLabel, currentRunId(prompt),
+                    toolIdentity(prompt.getOptions() instanceof ToolCallingChatOptions options ? options : null, "userId"));
+        }
+        StreamingActivityTracker.checkActive(activity);
         String status;
         String detail;
         String modelText;
@@ -745,6 +844,14 @@ public class RobustToolCallingManager implements ToolCallingManager {
         return fromMdc != null && !fromMdc.isBlank() ? fromMdc : null;
     }
 
+    private String toolIdentity(ToolCallingChatOptions options, String key) {
+        if (options != null && options.getToolContext() != null && options.getToolContext().containsKey(key)) {
+            Object value = options.getToolContext().get(key);
+            return value == null || String.valueOf(value).isBlank() ? null : String.valueOf(value);
+        }
+        return org.slf4j.MDC.get(key);
+    }
+
     /** 取第一个含 tool call 的 Generation（与 buildUnknownToolErrorResult 取法一致，通常只有一个）。 */
     private Generation firstGenerationWithToolCalls(ChatResponse chatResponse) {
         for (Generation gen : chatResponse.getResults()) {
@@ -778,23 +885,29 @@ public class RobustToolCallingManager implements ToolCallingManager {
         // 全在同一个 MCP server（或无法识别 mcpId）→ 没有可安全并行的，退回 delegate 原生串行（零风险、零自定义合并）。
         if (groups.size() <= 1) {
             log.debug("[RobustToolMgr] {} tool calls in one MCP group, executing serially via delegate", calls.size());
-            return delegate.executeToolCalls(prompt, normalized);
+            return executeDelegate(prompt, normalized);
         }
 
         // 组间并行：每个 group 一个 task，task 内部按原顺序串行跑该连接的工具；结果写回原始 index 槽位。
         ToolResponseMessage.ToolResponse[] ordered = new ToolResponseMessage.ToolResponse[calls.size()];
         List<CompletableFuture<Void>> futures = new ArrayList<>(groups.size());
+        StreamingActivityTracker.Activity activity = activityFor(prompt);
         for (List<Integer> indices : groups.values()) {
             futures.add(CompletableFuture.runAsync(() -> {
-                for (int idx : indices) {
-                    AssistantMessage.ToolCall tc = calls.get(idx);
-                    try {
-                        ordered[idx] = executeSingleToolCall(prompt, normalized, toolGen, tc);
-                    } catch (Exception e) {
-                        log.warn("[RobustToolMgr] tool '{}' failed: {}", tc.name(), e.getMessage());
-                        ordered[idx] = new ToolResponseMessage.ToolResponse(
-                                tc.id(), tc.name(), "工具执行失败（tool execution failed）：" + e.getMessage()
-                                + "。请不要重复同样的无效调用，可基于已有信息回答，或改用其它真实可用工具。");
+                try (StreamingActivityTracker.Scope ignored = StreamingActivityTracker.scope(activity)) {
+                    for (int idx : indices) {
+                        StreamingActivityTracker.checkActive(activity);
+                        AssistantMessage.ToolCall tc = calls.get(idx);
+                        try {
+                            ordered[idx] = executeSingleToolCall(prompt, normalized, toolGen, tc);
+                        } catch (Exception e) {
+                            StreamingActivityTracker.rethrowCancellation(e);
+                            StreamingActivityTracker.checkActive(activity);
+                            log.warn("[RobustToolMgr] tool '{}' failed: {}", tc.name(), e.getMessage());
+                            ordered[idx] = new ToolResponseMessage.ToolResponse(
+                                    tc.id(), tc.name(), "工具执行失败（tool execution failed）：" + e.getMessage()
+                                    + "。请不要重复同样的无效调用，可基于已有信息回答，或改用其它真实可用工具。");
+                        }
                     }
                 }
             }, toolExecutor));
@@ -803,6 +916,11 @@ public class RobustToolCallingManager implements ToolCallingManager {
             try {
                 f.join();
             } catch (Exception e) {
+                if (activity != null && activity.isCancelled()) {
+                    futures.forEach(future -> future.cancel(true));
+                }
+                StreamingActivityTracker.rethrowCancellation(e);
+                StreamingActivityTracker.checkActive(activity);
                 log.warn("[RobustToolMgr] tool group join failed: {}", e.getMessage());
             }
         }
@@ -853,7 +971,7 @@ public class RobustToolCallingManager implements ToolCallingManager {
         Generation singleGen = new Generation(singleAm, toolGen.getMetadata());
         ChatResponse single = new ChatResponse(List.of(singleGen), normalized.getMetadata());
 
-        ToolExecutionResult result = delegate.executeToolCalls(prompt, single);
+        ToolExecutionResult result = executeDelegate(prompt, single);
         return extractToolResponse(result, tc);
     }
 

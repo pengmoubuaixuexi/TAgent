@@ -23,6 +23,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.springframework.context.ApplicationContext;
 
@@ -32,8 +33,8 @@ import org.springframework.context.ApplicationContext;
  * before() 按当前用户 + query 召回 top-K 记忆前置到 user message；
  * after() 用小模型从对话中抽取用户事实/偏好/技能/决策，异步写入长期记忆。
  * <p>
- * P1.2.3 多租户隔离：用户 ID 优先从 MDC 取 {@code userId}（MdcTraceFilter 写入），
- * fallback 到 advisor context 的 {@code chat_memory_conversation_id}。
+ * 用户身份来自服务端 context / MDC，冲突时不读取或写入记忆。
+ * 抽取状态随本次请求传递，避免 Reactor 线程切换及线程复用造成串用户。
  */
 @Slf4j
 public class LongTermMemoryAdvisor implements BaseAdvisor {
@@ -98,12 +99,9 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
         this.memoryEvidenceEmitter = emitter;
     }
 
-    /** before() → after() 同线程传用户原文（Context propagation 不可靠，ThreadLocal 最稳） */
-    private final ThreadLocal<String> currentUserText = new ThreadLocal<>();
-
-    /** before() → after() 传递 userId，避免 MDC 在 advisor 链线程上丢失 */
-    private final ThreadLocal<String> currentUserId = new ThreadLocal<>();
-    private final ThreadLocal<Boolean> currentPersistEnabled = new ThreadLocal<>();
+    private static final String EXTRACTION_TURN_CONTEXT_KEY = LongTermMemoryAdvisor.class.getName() + ".extractionTurn";
+    private record ExtractionTurn(String userText, String userId, String tenantId, String sessionId,
+                                  String agentId, AtomicBoolean claimed) {}
 
     public LongTermMemoryAdvisor(ILongTermMemoryService ltm, int topK) {
         this(ltm, topK, -100, null, null);
@@ -139,33 +137,35 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
 
     @Override
     public ChatClientRequest before(ChatClientRequest request, AdvisorChain chain) {
+        // A reused context must never carry another invocation's pending extraction.
+        if (request.context().containsKey(EXTRACTION_TURN_CONTEXT_KEY)) {
+            Map<String, Object> cleanContext = new LinkedHashMap<>(request.context());
+            cleanContext.remove(EXTRACTION_TURN_CONTEXT_KEY);
+            request = ChatClientRequest.builder().prompt(request.prompt()).context(cleanContext).build();
+        }
         if (ltm == null) {
             log.warn("[LTM] before SKIP: ltm is null (advisor created without ILongTermMemoryService)");
             return request;
         }
 
         Map<String, Object> ctx = request.context();
-        currentPersistEnabled.set(Boolean.TRUE.equals(ctx == null ? null : ctx.get(MEMORY_PERSIST_CONTEXT_KEY)));
-        String userId = MDC.get("userId");
-        if (userId == null || userId.isBlank()) {
-            Object uidObj = ctx == null ? null : firstNonNull(ctx.get("userId"), ctx.get("user_id"));
-            userId = uidObj == null ? null : uidObj.toString();
-        }
-        if (userId == null || userId.isBlank()) {
-            Object sidObj = ctx == null ? null : ctx.get(SESSION_CONTEXT_KEY);
-            userId = extractUserIdFromConversationId(sidObj == null ? null : sidObj.toString());
-        }
+        String userId = TrustedAdvisorIdentity.userId(ctx);
         if (userId == null || userId.isBlank()) {
             return request;
         }
-        currentUserId.set(userId);
-
         UserMessage userMsg = request.prompt().getUserMessage();
         if (userMsg == null) return request;
         String userText = userMsg.getText();
         if (userText == null || userText.isBlank()) return request;
 
-        currentUserText.set(userText);
+        if (Boolean.TRUE.equals(ctx.get(MEMORY_PERSIST_CONTEXT_KEY))) {
+            Map<String, Object> extractionContext = new LinkedHashMap<>(ctx);
+            extractionContext.put(EXTRACTION_TURN_CONTEXT_KEY, new ExtractionTurn(userText, userId,
+                    TrustedAdvisorIdentity.tenantId(ctx), TrustedAdvisorIdentity.sessionId(ctx),
+                    MDC.get("agentId"), new AtomicBoolean()));
+            request = ChatClientRequest.builder().prompt(request.prompt()).context(extractionContext).build();
+            ctx = request.context();
+        }
         String retrievalQuery = userText;
         Object retrievalQueryObj = ctx == null ? null : ctx.get(RETRIEVAL_QUERY_CONTEXT_KEY);
         if (retrievalQueryObj != null && !retrievalQueryObj.toString().isBlank()) {
@@ -173,7 +173,7 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
         }
 
         // 混合检索：核心记忆（高频+近期）+ 语义相关记忆（向量相似度）
-        String evidenceSessionId = resolveSessionIdForEvidence(ctx);
+        String evidenceSessionId = TrustedAdvisorIdentity.sessionId(ctx);
         List<LongTermMemoryRecall> recalls = loadTurnMemorySnapshot(evidenceSessionId, userId, retrievalQuery);
         List<String> profileLines = recalls.stream().map(LongTermMemoryRecall::toPromptLine).toList();
         if (profileLines == null || profileLines.isEmpty()) return request;
@@ -231,8 +231,8 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
 
     private List<LongTermMemoryRecall> retrieveProfileLines(String userId, String retrievalQuery) {
         try {
-            // 核心记忆=全部画像槽位(封闭约13个)，给足上限确保全取；语义相关记忆 5 条
-            return ltm.retrieveForInjectionDetailed(userId, retrievalQuery, 30, 5);
+            // 核心画像保留足够槽位；相关记忆数量采用当前 Advisor 的配置。
+            return ltm.retrieveForInjectionDetailed(userId, retrievalQuery, 30, topK);
         } catch (Exception e) {
             log.warn("ltm.retrieveForInjection failed, fallback to retrieveProfile: {}", e.getMessage());
             try {
@@ -249,13 +249,9 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
 
     @Override
     public ChatClientResponse after(ChatClientResponse response, AdvisorChain chain) {
-        boolean persistEnabled = Boolean.TRUE.equals(currentPersistEnabled.get());
-        currentPersistEnabled.remove();
-        if (!persistEnabled) {
-            currentUserText.remove();
-            currentUserId.remove();
-            return response;
-        }
+        Object pending = response.context().get(EXTRACTION_TURN_CONTEXT_KEY);
+        if (!(pending instanceof ExtractionTurn turn) || !turn.claimed().compareAndSet(false, true)) return response;
+        if (TrustedAdvisorIdentity.conflictsWith(turn.userId(), response.context())) return response;
         // 延迟获取 extractionClient：armory 阶段 RouterPool 可能还没创建 routerSmall
         if (ltm != null && extractionClient == null && applicationContext != null) {
             try {
@@ -266,7 +262,7 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
             }
         }
         if (ltm != null && extractionClient != null) {
-            extractAndSaveAsync(response);
+            extractAndSaveAsync(response, turn);
         } else {
             log.warn("[LTM] after skip: ltm={} extractionClient={} applicationContext={}",
                     ltm != null, extractionClient != null, applicationContext != null);
@@ -274,9 +270,8 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
         return response;
     }
 
-    private void extractAndSaveAsync(ChatClientResponse response) {
-        String userText = currentUserText.get();
-        currentUserText.remove();
+    private void extractAndSaveAsync(ChatClientResponse response, ExtractionTurn turn) {
+        String userText = turn.userText();
 
         // 从 response output 取 assistant 回复
         String assistantText = null;
@@ -295,28 +290,10 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
         // 由调用节点（FixedAgentExecuteStrategy / Step4LogExecutionSummaryNode）流式聚合后
         // 直接调 triggerExtractionAsync(...)，绕开本路径。
         if (assistantText == null || assistantText.isBlank()) {
-            currentUserId.remove();
             return;
         }
-
-        // userId 优先从 MDC 取，缺失时 fallback 到 before() 设置的 ThreadLocal
-        String resolvedUserId = MDC.get("userId");
-        if (resolvedUserId == null || resolvedUserId.isBlank()) {
-            resolvedUserId = currentUserId.get();
-        }
-        currentUserId.remove();
-        if (resolvedUserId == null || resolvedUserId.isBlank()) {
-            log.warn("[LTM] after skip: userId is null (MDC={} threadLocal={})",
-                    MDC.get("userId"), "removed");
-            return;
-        }
-        String tenantId = MDC.get("tenantId");
-        if (tenantId == null || tenantId.isBlank()) tenantId = "default";
-        String sessionId = MDC.get("sessionId");
-        String agentId = MDC.get("agentId");
-
         triggerExtractionAsync(ltm, extractionClient,
-                userText, assistantText, resolvedUserId, tenantId, sessionId, agentId);
+                userText, assistantText, turn.userId(), turn.tenantId(), turn.sessionId(), turn.agentId());
     }
 
     /**
@@ -348,7 +325,12 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
         if (assistantText.length() < 30) return;
         if (userId == null || userId.isBlank()) return;
 
-        Map<String, String> mdcSnapshot = MDC.getCopyOfContextMap();
+        Map<String, String> currentMdc = MDC.getCopyOfContextMap();
+        Map<String, String> mdcSnapshot = currentMdc == null ? new LinkedHashMap<>() : new LinkedHashMap<>(currentMdc);
+        mdcSnapshot.put("userId", userId);
+        mdcSnapshot.put("tenantId", tenantId == null || tenantId.isBlank() ? "default" : tenantId);
+        if (sessionId == null) mdcSnapshot.remove("sessionId"); else mdcSnapshot.put("sessionId", sessionId);
+        if (agentId == null) mdcSnapshot.remove("agentId"); else mdcSnapshot.put("agentId", agentId);
         final String finalUserText = userText;
         final String finalAssistantText = assistantText;
         final String finalUserId = userId;
@@ -476,36 +458,6 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
      * 寻找首个英文/中文冒号；若冒号前的标签匹配任一已知关键字（大小写不敏感、忽略首尾空白），
      * 返回冒号后的内容；否则原样返回。同时兼容半角 ":" 和全角 "："。
      */
-    private Object firstNonNull(Object first, Object second) {
-        return first != null ? first : second;
-    }
-
-    private String extractUserIdFromConversationId(String conversationId) {
-        if (conversationId == null || conversationId.isBlank()) return null;
-        String[] parts = conversationId.split(":");
-        if (parts.length >= 3) return parts[1];
-        if (parts.length == 2) return parts[0];
-        return null;
-    }
-
-    private String resolveSessionIdForEvidence(Map<String, Object> context) {
-        String mdcSid = MDC.get("sessionId");
-        if (mdcSid != null && !mdcSid.isBlank()) return mdcSid;
-        if (context != null) {
-            Object sid = context.get(SESSION_CONTEXT_KEY);
-            String sessionId = extractSessionIdFromConversationId(sid == null ? null : String.valueOf(sid));
-            if (sessionId != null && !sessionId.isBlank()) return sessionId;
-        }
-        return null;
-    }
-
-    private String extractSessionIdFromConversationId(String conversationId) {
-        if (conversationId == null || conversationId.isBlank()) return null;
-        String trimmed = conversationId.trim();
-        int idx = trimmed.lastIndexOf(':');
-        return idx >= 0 && idx + 1 < trimmed.length() ? trimmed.substring(idx + 1) : trimmed;
-    }
-
     private static String stripLabelPrefix(String s, String[] knownLabels) {
         if (s == null) return "";
         String trimmed = s.trim();

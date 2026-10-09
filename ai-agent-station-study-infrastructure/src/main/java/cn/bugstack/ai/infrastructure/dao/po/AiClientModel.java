@@ -23,6 +23,9 @@ public class AiClientModel {
      */
     private Long id;
 
+    /** Set by the server on creation; never transferred through an update DTO. */
+    private String ownerUserId;
+
     /**
      * 全局唯一模型ID
      */
@@ -63,6 +66,9 @@ public class AiClientModel {
      * 状态：0-禁用，1-启用
      */
     private Integer status;
+
+    /** Explicit admin opt-in: 1 makes this model selectable by personal workspaces. */
+    private Integer platformEnabled;
 
     /**
      * 创建时间

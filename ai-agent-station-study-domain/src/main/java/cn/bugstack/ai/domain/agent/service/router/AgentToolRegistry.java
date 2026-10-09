@@ -69,6 +69,12 @@ public class AgentToolRegistry {
         return clientTools.getOrDefault(clientId, Collections.emptyList());
     }
 
+    public void unregister(String clientId) {
+        if (clientId == null) return;
+        clientTools.remove(clientId);
+        clientCallbacks.remove(clientId);
+    }
+
     public boolean hasAnyTools(String clientId) {
         return !getTools(clientId).isEmpty();
     }

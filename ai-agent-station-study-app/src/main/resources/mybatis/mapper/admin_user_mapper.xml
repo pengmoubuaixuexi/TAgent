@@ -114,4 +114,11 @@
         <include refid="conditionWhere"/>
     </select>
 
+    <select id="countRegistrationsByDay" resultType="cn.bugstack.ai.infrastructure.dao.po.DailyRegistrationCount">
+        SELECT DATE_FORMAT(create_time, '%Y-%m-%d') AS day, COUNT(*) AS count
+        FROM admin_user
+        WHERE create_time &gt;= #{start} AND create_time &lt; #{end}
+        GROUP BY DATE_FORMAT(create_time, '%Y-%m-%d')
+        ORDER BY day
+    </select>
 </mapper>

@@ -113,6 +113,18 @@ public class ToolVectorStore implements IToolVectorStore {
 
     @Override
     public List<AiMcpToolCatalogVO> search(String need, Set<String> excludeNames, int topN) {
+        return searchInternal(need, excludeNames, topN, null);
+    }
+
+    @Override
+    public List<AiMcpToolCatalogVO> searchOwned(String need, Set<String> excludeNames, int topN,
+                                              Set<String> allowedMcpIds) {
+        if (allowedMcpIds == null || allowedMcpIds.isEmpty()) return List.of();
+        return searchInternal(need, excludeNames, topN, allowedMcpIds);
+    }
+
+    private List<AiMcpToolCatalogVO> searchInternal(String need, Set<String> excludeNames, int topN,
+                                                   Set<String> allowedMcpIds) {
         if (need == null || need.isBlank() || topN <= 0) {
             return List.of();
         }
@@ -126,10 +138,18 @@ public class ToolVectorStore implements IToolVectorStore {
                            1 - (embedding <=> ?::vector) AS similarity
                     FROM mcp_tool_vector
                     WHERE embedding IS NOT NULL
-                    ORDER BY embedding <=> ?::vector
+                    %s ORDER BY embedding <=> ?::vector
                     LIMIT ?
                     """;
-            List<Map<String, Object>> rows = pgVectorJdbcTemplate.queryForList(sql, vectorStr, vectorStr, fetch);
+            String ownership = allowedMcpIds == null ? "" : "AND mcp_id IN ("
+                    + String.join(",", java.util.Collections.nCopies(allowedMcpIds.size(), "?")) + ")";
+            sql = sql.formatted(ownership);
+            List<Object> args = new ArrayList<>();
+            args.add(vectorStr);
+            if (allowedMcpIds != null) args.addAll(allowedMcpIds);
+            args.add(vectorStr);
+            args.add(fetch);
+            List<Map<String, Object>> rows = pgVectorJdbcTemplate.queryForList(sql, args.toArray());
 
             // 通过 排除 + 绝对下限 的候选（已按相似度降序），最多 topN 个；并记下各自相似度供相对阈值用
             List<AiMcpToolCatalogVO> survivors = new ArrayList<>();

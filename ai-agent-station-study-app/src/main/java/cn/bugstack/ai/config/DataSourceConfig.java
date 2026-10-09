@@ -94,6 +94,14 @@ public class DataSourceConfig {
         return dataSource;
     }
 
+    // A custom PostgreSQL JdbcTemplate makes Boot's default template back off.
+    // DataSource @Primary alone does not select a JdbcTemplate for MySQL queries.
+    @Bean({"mysqlJdbcTemplate", "jdbcTemplate"})
+    @Primary
+    public JdbcTemplate mysqlJdbcTemplate(@Qualifier("mysqlDataSource") DataSource dataSource) {
+        return new JdbcTemplate(dataSource);
+    }
+
     @Bean("pgVectorJdbcTemplate")
     public JdbcTemplate pgVectorJdbcTemplate(@Qualifier("pgVectorDataSource") DataSource dataSource) {
         return new JdbcTemplate(dataSource);

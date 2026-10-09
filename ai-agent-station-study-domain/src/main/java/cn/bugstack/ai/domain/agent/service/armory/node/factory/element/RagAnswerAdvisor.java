@@ -169,6 +169,23 @@ public class RagAnswerAdvisor implements BaseAdvisor {
 
     @Override
     public ChatClientRequest before(ChatClientRequest chatClientRequest, AdvisorChain advisorChain) {
+        String userId = TrustedAdvisorIdentity.userId(chatClientRequest.context());
+        if (!StringUtils.hasText(userId)) {
+            // A lost asynchronous context must never turn a private search into a global search.
+            log.debug("[RagAnswerAdvisor] retrieval skipped: missing or conflicting user identity");
+            return chatClientRequest;
+        }
+        String previousUserId = org.slf4j.MDC.get("userId");
+        org.slf4j.MDC.put("userId", userId);
+        try {
+            return beforeForUser(chatClientRequest, userId);
+        } finally {
+            if (previousUserId == null) org.slf4j.MDC.remove("userId");
+            else org.slf4j.MDC.put("userId", previousUserId);
+        }
+    }
+
+    private ChatClientRequest beforeForUser(ChatClientRequest chatClientRequest, String userId) {
         HashMap<String, Object> context = new HashMap(chatClientRequest.context());
 
         UserMessage originalUserMessage = chatClientRequest.prompt().getUserMessage();
@@ -192,20 +209,17 @@ public class RagAnswerAdvisor implements BaseAdvisor {
         }
 
         // A 重构：去掉无条件 queryRewriter + 无条件 HyDE，统一交给 RAG Router 一次决策出查询策略。
-        // 构建 filter expression：DB 配置的 knowledge tag + MDC 里的 userId（如有）
+        // Mandatory authenticated owner constraint, inherited by vector, BM25 and fusion workers.
         // 用 Filter.Expression 树直接 AND，不走 toString → parse（Spring AI Filter.Expression 是 record，
         // 默认 toString 输出 "Expression[type=EQ, left=...]"，不是 FilterExpressionTextParser 能识别的 DSL）
         Filter.Expression filterExpr = this.doGetFilterExpression(context);
-        String userId = org.slf4j.MDC.get("userId");
-        if (userId != null && !userId.isBlank()) {
-            Filter.Expression userIdExpr = new Filter.Expression(
-                    Filter.ExpressionType.EQ,
-                    new Filter.Key("user_id"),
-                    new Filter.Value(userId));
-            filterExpr = (filterExpr == null)
-                    ? userIdExpr
-                    : new Filter.Expression(Filter.ExpressionType.AND, filterExpr, userIdExpr);
-        }
+        Filter.Expression userIdExpr = new Filter.Expression(
+                Filter.ExpressionType.EQ,
+                new Filter.Key("user_id"),
+                new Filter.Value(userId));
+        filterExpr = (filterExpr == null)
+                ? userIdExpr
+                : new Filter.Expression(Filter.ExpressionType.AND, filterExpr, userIdExpr);
 
         List<Document> documents;
         // P2.3 12.3 Agentic RAG：上游 AgenticRagAdvisor.before() 写入了 skip 标志 → 直接跳过检索
@@ -258,7 +272,9 @@ public class RagAnswerAdvisor implements BaseAdvisor {
         // 第 61 轮修：原 resolveParents 返回 List<String> + new Document(text) 会丢光 source/knowledge metadata，
         // 导致前端引用依据卡片走 doc.getId() fallback 显示 UUID。改用 resolveParentDocuments 保留 metadata。
         if (parentDocumentService != null && !documents.isEmpty()) {
-            List<Document> parentDocs = parentDocumentService.resolveParentDocuments(documents);
+            List<Document> parentDocs = parentDocumentService.resolveParentDocuments(documents).stream()
+                    .filter(document -> userId.equals(String.valueOf(document.getMetadata().get("user_id"))))
+                    .toList();
             if (!parentDocs.isEmpty()) {
                 documents = parentDocs;
                 context.put("qa_retrieved_documents", documents);

@@ -35,8 +35,8 @@ public class SiteSecurityConfig {
                         .requestMatchers("/", "/index.html", "/auth.js", "/favicon.ico", "/error").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/v1/auth/csrf").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/v1/auth/login", "/api/v1/auth/register").permitAll()
-                        .requestMatchers("/observe.html", "/observe-mcp.html", "/agent-config.html",
-                                "/api/v1/observe/**", "/api/v1/agent/query_agent_config/**",
+                        .requestMatchers("/admin-stats.html", "/api/v1/observe/site-stats", "/agent-config.html",
+                                "/api/v1/agent/query_agent_config/**",
                                 "/api/v1/agent/armory_api", "/api/v1/agent/armory_agent",
                                 "/actuator/**", "/ops/**").hasRole("ADMIN")
                         // This existing upload endpoint is also used by the ordinary chat UI.

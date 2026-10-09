@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh TAgent site statistics every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=tagent-site-stats.service
+
+[Install]
+WantedBy=timers.target

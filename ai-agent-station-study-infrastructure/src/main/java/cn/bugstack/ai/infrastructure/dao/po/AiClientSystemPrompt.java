@@ -21,6 +21,9 @@ public class AiClientSystemPrompt {
      */
     private Long id;
 
+    /** Set by the server on creation; never transferred through an update DTO. */
+    private String ownerUserId;
+
     /**
      * 提示词ID
      */

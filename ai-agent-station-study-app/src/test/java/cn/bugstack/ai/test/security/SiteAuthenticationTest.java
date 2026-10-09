@@ -33,14 +33,19 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 public class SiteAuthenticationTest {
     @Configuration @EnableWebMvc
     @Import({SiteSecurityConfig.class, AccountService.class, AccountController.class,
-            AuthenticatedBodyAdvice.class, ProbeController.class})
+            AuthenticatedBodyAdvice.class, ProbeController.class,
+            cn.bugstack.ai.trigger.http.SiteStatsController.class})
     static class Config {
         @Bean IAdminUserDao users() { return mock(IAdminUserDao.class); }
         @Bean ConversationAccess access() { return mock(ConversationAccess.class); }
         @Bean ObjectMapper json() { return new ObjectMapper(); }
+        @Bean cn.bugstack.ai.trigger.workspace.WorkspaceService workspace() { return mock(cn.bugstack.ai.trigger.workspace.WorkspaceService.class); }
+        @Bean cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository workspaceAccess() {
+            return mock(cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository.class);
+        }
     }
     @RestController static class ProbeController {
-        @GetMapping({"/observe.html", "/observe-mcp.html", "/agent-config.html", "/eval.html",
+        @GetMapping({"/observe.html", "/observe-mcp.html", "/agent-config.html", "/eval.html", "/admin-stats.html", "/user-agents.html",
                 "/api/v1/observe/test", "/api/v1/admin/test", "/api/v1/eval/test"})
         String admin() { return "ok"; }
         @PostMapping({"/api/v1/agent/probe", "/api/v1/agent/auto_agent"}) Map<String, Object> echo(@RequestBody Map<String,Object> body,
@@ -51,10 +56,11 @@ public class SiteAuthenticationTest {
     @Autowired WebApplicationContext context;
     @Autowired IAdminUserDao users;
     @Autowired ConversationAccess access;
+    @Autowired cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository workspaceAccess;
     @Autowired org.springframework.security.crypto.password.PasswordEncoder passwords;
     MockMvc mvc;
     @Before public void setup() {
-        reset(users, access);
+        reset(users, access, workspaceAccess);
         mvc = org.springframework.test.web.servlet.setup.MockMvcBuilders.webAppContextSetup(context)
                 .defaultRequest(get("/").accept("application/json"))
                 .apply(springSecurity()).addFilters(new AuthenticatedUserFilter(users, access)).build();
@@ -66,11 +72,12 @@ public class SiteAuthenticationTest {
     }
     @Test public void anonymousCannotReadAdminApiOrPage() throws Exception {
         mvc.perform(get("/api/v1/observe/test")).andExpect(status().isUnauthorized());
+        mvc.perform(get("/api/v1/observe/site-stats")).andExpect(status().isUnauthorized());
         mvc.perform(get("/observe-mcp.html")).andExpect(status().is3xxRedirection());
     }
     @Test public void ordinaryUserCannotEnterAnyManagementSurface() throws Exception {
-        for (String path : new String[]{"/observe.html", "/observe-mcp.html", "/agent-config.html",
-                "/api/v1/observe/test", "/api/v1/admin/test"}) {
+        for (String path : new String[]{"/admin-stats.html", "/agent-config.html",
+                "/api/v1/observe/site-stats", "/api/v1/admin/test"}) {
             mvc.perform(get(path).with(user("u1").roles("USER"))).andExpect(status().isForbidden());
             mvc.perform(get(path).with(user("10001").roles("ADMIN"))).andExpect(status().isOk());
         }
@@ -135,6 +142,22 @@ public class SiteAuthenticationTest {
                 .when(access).session("someone-elses-session", "u1", false);
         mvc.perform(get("/api/v1/agent/conversation_messages?conversationId=someone-elses-session")
                 .with(user("u1"))).andExpect(status().isForbidden());
+    }
+    @Test public void usersCanOpenScopedObservationAndWorkspace() throws Exception {
+        for (String path : new String[]{"/observe.html", "/observe-mcp.html", "/user-agents.html", "/api/v1/observe/test"})
+            mvc.perform(get(path).with(user("u1"))).andExpect(status().isOk());
+    }
+    @Test public void foreignAgentIsRejectedBeforeConversationOrRunReservation() throws Exception {
+        mvc.perform(post("/api/v1/agent/auto_agent").with(user("u1")).with(csrf())
+                .contentType("application/json").content("{\"sessionId\":\"new-s\",\"aiAgentId\":\"foreign-agent\",\"userId\":\"10001\"}"))
+                .andExpect(status().isForbidden());
+        verify(access, never()).session(anyString(), anyString(), eq(true));
+        verify(access, never()).run(anyString(), anyString(), eq(true));
+        verify(workspaceAccess).ownsAgent("u1", "foreign-agent");
+        when(workspaceAccess.ownsAgent("u1", "own-agent")).thenReturn(true);
+        mvc.perform(post("/api/v1/agent/auto_agent").with(user("u1")).with(csrf())
+                .contentType("application/json").content("{\"sessionId\":\"own-s\",\"aiAgentId\":\"own-agent\"}"))
+                .andExpect(status().isOk());
     }
     @Test public void newChatReservesClientGeneratedRunInsteadOfRequiringAnExistingSnapshot() throws Exception {
         mvc.perform(post("/api/v1/agent/auto_agent").with(user("u1")).with(csrf())

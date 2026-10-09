@@ -8,6 +8,7 @@ import cn.bugstack.ai.api.response.Response;
 import cn.bugstack.ai.infrastructure.dao.IAiClientAdvisorDao;
 import cn.bugstack.ai.infrastructure.dao.po.AiClientAdvisor;
 import cn.bugstack.ai.types.enums.ResponseCode;
+import cn.bugstack.ai.trigger.http.admin.util.AdminConfigurationOwnership;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.BeanUtils;
 import org.springframework.util.StringUtils;
@@ -36,11 +37,13 @@ public class AiClientAdvisorAdminController implements IAiClientAdvisorAdminServ
     @Override
     @PostMapping("/create")
     public Response<Boolean> createAiClientAdvisor(@RequestBody AiClientAdvisorRequestDTO request) {
+        String owner = AdminConfigurationOwnership.currentOwner();
         try {
             log.info("创建顾问配置请求：{}", request);
             
             // DTO转PO
             AiClientAdvisor aiClientAdvisor = convertToAiClientAdvisor(request);
+            aiClientAdvisor.setOwnerUserId(owner);
             aiClientAdvisor.setCreateTime(LocalDateTime.now());
             aiClientAdvisor.setUpdateTime(LocalDateTime.now());
             

@@ -11,6 +11,7 @@ import cn.bugstack.ai.infrastructure.dao.po.AiAgentDrawConfig;
 import cn.bugstack.ai.infrastructure.dao.po.AiAgentFlowConfig;
 import cn.bugstack.ai.infrastructure.dao.po.AiClientConfig;
 import cn.bugstack.ai.trigger.http.admin.util.DrawConfigParser;
+import cn.bugstack.ai.trigger.http.admin.util.AdminConfigurationOwnership;
 import cn.bugstack.ai.types.enums.ResponseCode;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -46,6 +47,8 @@ public class AiAgentDrawAdminController implements IAiAgentDrawAdminService {
     private IAiAgentDao aiAgentDao;
     @Resource
     private IAiAgentFlowConfigDao aiAgentFlowConfigDao;
+    @Resource
+    private AdminConfigurationOwnership configurationOwnership;
 
     @Override
     @PostMapping("/query-list")
@@ -114,11 +117,33 @@ public class AiAgentDrawAdminController implements IAiAgentDrawAdminService {
     @PostMapping("/save-config")
     @Transactional(rollbackFor = Exception.class)
     public Response<String> saveDrawConfig(@RequestBody AiAgentDrawConfigRequestDTO request) {
+        String owner = AdminConfigurationOwnership.currentOwner();
+        request.setCreateBy(owner);
+        request.setUpdateBy(owner);
+        if (!StringUtils.hasText(request.getConfigName()) || !StringUtils.hasText(request.getConfigData())) {
+            throw new org.springframework.web.server.ResponseStatusException(
+                    org.springframework.http.HttpStatus.BAD_REQUEST, "配置名称和内容不能为空");
+        }
+        // Validate every graph edge before writing. Admin UI lists may include other users' resources.
+        if (StringUtils.hasText(request.getConfigId())) {
+            AiAgentDrawConfig previous = aiAgentDrawConfigDao.queryByConfigId(request.getConfigId());
+            if (previous != null) configurationOwnership.requireOwned(owner, "agent", previous.getAgentId());
+        }
+        List<AiClientConfig> ownedRelations = new ArrayList<>(DrawConfigParser.parseConfigData(request.getConfigData()));
+        ownedRelations.removeIf(r -> "agent".equals(r.getSourceType()) || "agent".equals(r.getTargetType()));
+        for (AiClientConfig relation : ownedRelations) {
+            configurationOwnership.requireOwned(owner, relation.getSourceType(), relation.getSourceId());
+            configurationOwnership.requireOwned(owner, relation.getTargetType(), relation.getTargetId());
+        }
+        for (AiAgentFlowConfig flow : parseClientInfoFromJson(request.getConfigData(), "pending")) {
+            configurationOwnership.requireOwned(owner, "client", flow.getClientId());
+        }
+
         try {
             log.info("保存流程图配置请求：{}", request);
 
-            // 生成8位数字的唯一AgentId
-            String agentId = String.format("%08d", System.currentTimeMillis() % 100000000L);
+            // Opaque IDs avoid collisions between concurrent administrators.
+            String agentId = "ad_" + UUID.randomUUID().toString().replace("-", "");
             request.setAgentId(agentId);
 
             // 参数校验
@@ -145,6 +170,7 @@ public class AiAgentDrawAdminController implements IAiAgentDrawAdminService {
 
             aiAgentDao.insert(AiAgent.builder()
                     .agentId(request.getAgentId())
+                    .ownerUserId(owner)
                     .agentName(agentName)
                     .channel(channel)
                     .strategy(strategy)
@@ -186,7 +212,7 @@ public class AiAgentDrawAdminController implements IAiAgentDrawAdminService {
             if (result > 0) {
                 // 解析JSON配置数据，生成关系映射并存储到ai_client_config表
                 try {
-                    List<AiClientConfig> configRelations = DrawConfigParser.parseConfigData(request.getConfigData());
+                    List<AiClientConfig> configRelations = ownedRelations;
                     if (!configRelations.isEmpty()) {
                         // 先删除该配置相关的旧关系数据（如果是更新操作）
                         if (existingConfig != null) {
@@ -219,6 +245,7 @@ public class AiAgentDrawAdminController implements IAiAgentDrawAdminService {
                     }
                 } catch (Exception e) {
                     log.error("解析和保存配置关系数据失败，configId: {}", configId, e);
+                    throw new IllegalStateException("配置关系保存失败", e);
                 }
 
                 // 解析JSON配置数据，提取client信息并保存agent-client关系
@@ -239,7 +266,7 @@ public class AiAgentDrawAdminController implements IAiAgentDrawAdminService {
                     }
                 } catch (Exception e) {
                     log.error("解析和保存agent-client关系数据失败，agentId: {}", agentId, e);
-                    // 这里不影响主流程，只记录错误日志
+                    throw new IllegalStateException("Agent 流程配置保存失败", e);
                 }
 
                 return Response.<String>builder()
@@ -256,9 +283,12 @@ public class AiAgentDrawAdminController implements IAiAgentDrawAdminService {
 
         } catch (Exception e) {
             log.error("保存流程图配置失败", e);
+            if (org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive()) {
+                org.springframework.transaction.interceptor.TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+            }
             return Response.<String>builder()
                     .code(ResponseCode.UN_ERROR.getCode())
-                    .info("保存失败：" + e.getMessage())
+                    .info("保存失败，未提交配置变更")
                     .build();
         }
     }

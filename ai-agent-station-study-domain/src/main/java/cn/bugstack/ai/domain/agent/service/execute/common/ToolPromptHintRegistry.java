@@ -53,6 +53,10 @@ public class ToolPromptHintRegistry {
                 "`precision` 字段只接受数字（整数或小数）或空字符串 \"\"，不要传 \"high\"、\"default\" 这类非数字字符串；不需要精度控制时请省略该字段。");
         toolHint.putIfAbsent("aisearch",
                 "不要传 `model`、`instruction`、`temperature`，这些是服务端 LLM 控制参数，会被剥离；这里只需要提供用户查询内容。");
+        toolHint.putIfAbsent("maps_schema_personal_map",
+                "创建个人地图前，pointList 中每个地点必须有非空 poiId，使用地点搜索结果返回的真实 POI ID。"
+                        + "只有经纬度或地名不够，不能编造 poiId 或用坐标代替。缺少 ID 时先查询地点；"
+                        + "仍无法取得则说明无法生成地图，并继续提供已有资料支持的文字行程，不重复提交相同的无效参数。");
         log.info("[ToolPromptHintRegistry] initialized with {} hints (yml-config + built-in defaults)", toolHint.size());
     }
 

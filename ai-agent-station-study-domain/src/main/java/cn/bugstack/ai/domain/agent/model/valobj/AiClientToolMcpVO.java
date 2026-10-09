@@ -67,6 +67,8 @@ public class AiClientToolMcpVO {
     public static class TransportConfigSse {
         private String baseUri;
         private String sseEndpoint;
+        private Map<String, String> headers;
+        private boolean workspaceOwned;
     }
 
     @Data
@@ -90,6 +92,7 @@ public class AiClientToolMcpVO {
     @AllArgsConstructor
     @NoArgsConstructor
     public static class TransportConfigStreamableHttp {
+        private boolean workspaceOwned;
         /** 完整 MCP 端点 URL，如 https://qianfan.baidubce.com/v2/tools/web-search/mcp */
         private String url;
         /** 自定义请求头（如 Authorization: Bearer xxx）；streamable-http 走 header 认证，不在 URL 带 key */

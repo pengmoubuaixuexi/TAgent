@@ -170,6 +170,8 @@ public class RobustToolCallingManagerGateTest {
         UserInputGate gate = mock(UserInputGate.class);
         when(gate.isEnabled()).thenReturn(true);
         when(gate.requestUserInput(anyString(), anyString(),
+                org.mockito.ArgumentMatchers.nullable(String.class),
+                org.mockito.ArgumentMatchers.nullable(String.class),
                 org.mockito.ArgumentMatchers.nullable(String.class)))
                 .thenReturn(new UserInputGate.Result(UserInputGate.Status.ANSWERED, "user-selected"));
         ToolCallProgressEmitter progress = mock(ToolCallProgressEmitter.class);
@@ -189,6 +191,24 @@ public class RobustToolCallingManagerGateTest {
                 (org.springframework.ai.chat.messages.ToolResponseMessage) result.conversationHistory()
                         .get(result.conversationHistory().size() - 1);
         assertTrue(response.getResponses().get(0).responseData().contains("user-selected"));
+    }
+
+    @Test
+    public void askUserUsesExplicitRunAndUserWithoutWorkerThreadMdc() {
+        MDC.clear();
+        RobustToolCallingManager mgr = new RobustToolCallingManager(new StaticDelegate());
+        UserInputGate gate = mock(UserInputGate.class);
+        when(gate.isEnabled()).thenReturn(true);
+        when(gate.remainingFor("session-explicit")).thenReturn(1);
+        when(gate.requestUserInput(eq("session-explicit"), anyString(), eq("analysis"), eq("run1"), eq("u1")))
+                .thenReturn(new UserInputGate.Result(UserInputGate.Status.ANSWERED, "date 10/12"));
+        mgr.setUserInputGate(gate);
+        var options = OpenAiChatOptions.builder().toolContext(Map.of("sessionId", "session-explicit",
+                "userId", "u1", "agent.run_id", "run1", "stepLabel", "analysis",
+                ToolCapabilities.TOOL_CONTEXT_KEY, ToolCapabilityProfile.INTERACTIVE_META.name())).build();
+        assertTrue(mgr.resolveToolDefinitions(options).stream().anyMatch(tool -> "ask_user".equals(tool.name())));
+        mgr.executeToolCalls(new Prompt("task", options), responseWithToolCall("ask_user", "{\"questions\":[\"date?\"]}"));
+        verify(gate).requestUserInput("session-explicit", "{\"questions\":[\"date?\"]}", "analysis", "run1", "u1");
     }
 
     @Test
@@ -232,11 +252,14 @@ public class RobustToolCallingManagerGateTest {
                 mock(cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService.class);
         ToolCallback callback = mock(ToolCallback.class);
         when(callback.getToolDefinition()).thenReturn(
-                ToolDefinition.builder().name("calculate").description("calc").inputSchema("{}").build());
+                ToolDefinition.builder().name("calculate").description("精确计算数学表达式")
+                        .inputSchema("{\"type\":\"object\",\"required\":[\"expression\"],\"properties\":{\"expression\":{\"type\":\"string\"}}}").build());
         when(catalog.resolveDynamicToolCallbacks(any(), any(), anyString(), anyString(), anyString(), any()))
                 .thenReturn(List.of(callback));
         mgr.setRequestToolEnabled(true);
         mgr.setMcpToolCatalogService(catalog);
+        ToolCallProgressEmitter progress = mock(ToolCallProgressEmitter.class);
+        mgr.setToolCallProgressEmitter(progress);
         MDC.put("sessionId", "s1");
 
         Prompt discoveryPrompt = promptWithProfile(ToolCapabilityProfile.DISCOVERY_ONLY);
@@ -246,6 +269,11 @@ public class RobustToolCallingManagerGateTest {
                 (org.springframework.ai.chat.messages.ToolResponseMessage) discovery.conversationHistory()
                         .get(discovery.conversationHistory().size() - 1);
         assertTrue(discoveryResponse.getResponses().get(0).responseData().contains("后续执行阶段"));
+        assertTrue(discoveryResponse.getResponses().get(0).responseData().contains("精确计算数学表达式"));
+        assertTrue(discoveryResponse.getResponses().get(0).responseData().contains("required=expression"));
+        assertTrue(discoveryResponse.getResponses().get(0).responseData().contains("property.expression=type=string"));
+        verify(progress).emitMetaEnd(eq("s1"), eq("request_tool"), eq("success"), eq("calculate"),
+                org.mockito.ArgumentMatchers.nullable(String.class));
         assertTrue(((OpenAiChatOptions) discoveryPrompt.getOptions()).getToolCallbacks() == null
                 || ((OpenAiChatOptions) discoveryPrompt.getOptions()).getToolCallbacks().isEmpty());
 
@@ -256,6 +284,7 @@ public class RobustToolCallingManagerGateTest {
                 (org.springframework.ai.chat.messages.ToolResponseMessage) all.conversationHistory()
                         .get(all.conversationHistory().size() - 1);
         assertTrue(allResponse.getResponses().get(0).responseData().contains("现在可以直接调用"));
+        assertTrue(allResponse.getResponses().get(0).responseData().contains("required=expression"));
         assertEquals(1, ((OpenAiChatOptions) allPrompt.getOptions()).getToolCallbacks().size());
     }
 

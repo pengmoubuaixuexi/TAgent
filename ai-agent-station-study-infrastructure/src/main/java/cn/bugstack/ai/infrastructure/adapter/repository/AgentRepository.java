@@ -62,7 +62,7 @@ public class AgentRepository implements IAgentRepository {
     @Resource
     private IAiMcpToolCatalogDao aiMcpToolCatalogDao;
 
-    @Resource
+    @Resource(name = "mysqlJdbcTemplate")
     private org.springframework.jdbc.core.JdbcTemplate jdbcTemplate;
 
     @Resource
@@ -431,7 +431,7 @@ public class AgentRepository implements IAgentRepository {
                         if ("ChatMemory".equals(aiClientAdvisor.getAdvisorType())) {
                             // 解析chatMemory配置
                             chatMemory = JSON.parseObject(extParam, AiClientAdvisorVO.ChatMemory.class);
-                        } else if ("RagAnswer".equals(aiClientAdvisor.getAdvisorType())) {
+                        } else if (Set.of("RagAnswer", "LongTermMemory", "EpisodicMemory").contains(aiClientAdvisor.getAdvisorType())) {
                             // 解析ragAnswer配置
                             ragAnswer = JSON.parseObject(extParam, AiClientAdvisorVO.RagAnswer.class);
                         }
@@ -614,6 +614,20 @@ public class AgentRepository implements IAgentRepository {
     }
 
     @Override
+    public WorkspaceNodePolicy queryWorkspaceNodePolicy(String clientId) {
+        if (clientId==null || clientId.isBlank()) return null;
+        var models=AiClientModelVOByClientIds(List.of(clientId));
+        for (var model:models) {
+            var policy=WorkspaceNodePolicy.fromCapabilities(model.getCapabilitiesJson());
+            if (policy!=null && policy.clientId().equals(clientId)) return policy;
+        }
+        return null;
+    }
+    private String workspaceTaskPrompt(String clientId) {
+        var policy=queryWorkspaceNodePolicy(clientId);
+        return policy==null ? "" : policy.taskPrompt();
+    }
+    @Override
     public Map<String, AiAgentClientFlowConfigVO> queryAiAgentClientFlowConfig(String aiAgentId) {
         if (aiAgentId == null || aiAgentId.trim().isEmpty()) {
             return Map.of();
@@ -639,6 +653,8 @@ public class AgentRepository implements IAgentRepository {
                         .stepPrompt(flowConfig.getStepPrompt())
                         .build();
 
+                if ("EXECUTOR_CLIENT".equals(flowConfig.getClientType()))
+                    configVO.setTaskPrompt(workspaceTaskPrompt(flowConfig.getClientId()));
                 result.put(flowConfig.getClientType(), configVO);
             }
 

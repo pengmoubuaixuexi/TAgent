@@ -8,6 +8,7 @@ import cn.bugstack.ai.api.response.Response;
 import cn.bugstack.ai.infrastructure.dao.IAiClientModelDao;
 import cn.bugstack.ai.infrastructure.dao.po.AiClientModel;
 import cn.bugstack.ai.types.enums.ResponseCode;
+import cn.bugstack.ai.trigger.http.admin.util.AdminConfigurationOwnership;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.BeanUtils;
 import org.springframework.util.StringUtils;
@@ -36,11 +37,14 @@ public class AiClientModelAdminController implements IAiClientModelAdminService 
     @Override
     @PostMapping("/create")
     public Response<Boolean> createAiClientModel(@RequestBody AiClientModelRequestDTO request) {
+        String owner = AdminConfigurationOwnership.currentOwner();
         try {
             log.info("创建AI客户端模型配置请求：{}", request);
             
             // DTO转PO
             AiClientModel aiClientModel = convertToAiClientModel(request);
+            aiClientModel.setOwnerUserId(owner);
+            if (aiClientModel.getPlatformEnabled() == null) aiClientModel.setPlatformEnabled(0);
             aiClientModel.setCreateTime(LocalDateTime.now());
             aiClientModel.setUpdateTime(LocalDateTime.now());
             
@@ -409,6 +413,12 @@ public class AiClientModelAdminController implements IAiClientModelAdminService 
     private AiClientModel convertToAiClientModel(AiClientModelRequestDTO requestDTO) {
         AiClientModel aiClientModel = new AiClientModel();
         BeanUtils.copyProperties(requestDTO, aiClientModel);
+        if (requestDTO.getPlatformEnabled() != null) {
+            AdminConfigurationOwnership.currentOwner();
+            if (requestDTO.getPlatformEnabled() != 0 && requestDTO.getPlatformEnabled() != 1) {
+                throw new IllegalArgumentException("平台模型开关仅允许 0 或 1");
+            }
+        }
         return aiClientModel;
     }
 

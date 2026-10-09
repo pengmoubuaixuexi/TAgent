@@ -147,8 +147,9 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         // 2. 工具能力分析
         prompt.append("## 🔧 MCP工具能力分析结果\n");
         prompt.append(mcpToolsAnalysis).append("\n\n");
-        prompt.append("## 🧰 实际可执行工具目录（含参数 schema）\n");
+        prompt.append("## 🧰 已装载工具与授权 MCP 能力目录（含参数说明）\n");
         prompt.append(toolRuntime).append("\n\n");
+        prompt.append("绑定目录中的工具可以规划为后续执行时按需装载，但不能写成已经调用。只在运行时确认不可用后才说明失败；未装载不等于无能力。\n");
 
         // 3. 工具映射验证 - 使用动态获取的工具信息
         prompt.append("## ✅ 工具映射验证要求\n");

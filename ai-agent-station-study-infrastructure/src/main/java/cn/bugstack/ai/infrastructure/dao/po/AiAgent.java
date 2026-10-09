@@ -23,6 +23,9 @@ public class AiAgent {
      */
     private Long id;
 
+    /** Set by the server on creation; never transferred through an update DTO. */
+    private String ownerUserId;
+
     /**
      * 智能体ID
      */

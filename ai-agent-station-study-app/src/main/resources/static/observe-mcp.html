@@ -2,11 +2,14 @@
 <html lang="zh-CN">
 <head>
 <script src="/auth.js"></script>
+<script src="/observe-scope.js"></script>
     <meta charset="utf-8"/>
-    <title>AI Agent Station · MCP 治理控制台</title>
+    <title>TAgent · MCP 连接与工具</title>
     <meta name="viewport" content="width=device-width,initial-scale=1"/>
     <style>
         * { box-sizing: border-box; }
+        [hidden] { display: none !important; }
+        header { flex-wrap: wrap; }
         :root {
             --bg: #0f1419;
             --panel: #161b22;
@@ -43,7 +46,7 @@
         }
         .muted { color: var(--muted); font-size: 13px; }
         .right { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
-        .tabs { display: flex; gap: 6px; align-items: center; }
+        .tabs { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
         .tabs a {
             color: var(--muted);
             text-decoration: none;
@@ -113,13 +116,15 @@
         }
         .section-head h2 { margin: 0; font-size: 14px; font-weight: 650; }
         .section-head .tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-        table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+        .table-scroll { width: 100%; overflow-x: auto; }
+        table { width: 100%; min-width: 1600px; border-collapse: collapse; table-layout: fixed; }
         th, td {
             padding: 10px 12px;
             border-bottom: 1px solid var(--line);
             text-align: left;
             font-size: 13px;
             vertical-align: middle;
+            overflow-wrap: anywhere;
         }
         th {
             background: var(--panel-2);
@@ -139,7 +144,14 @@
             color: var(--text);
             font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
             font-size: 12px;
+            overflow-wrap: anywhere;
         }
+        .connection-name { display: block; font-weight: 600; line-height: 1.5; }
+        .connection-detail { margin-top: 4px; color: var(--muted); font-size: 11px; }
+        .connection-detail summary { cursor: pointer; width: fit-content; }
+        .connection-detail code { display: block; margin-top: 5px; font-size: 11px; user-select: all; }
+        .tools-detail summary { cursor: pointer; color: var(--info); font-size: 12px; }
+        .tools-detail[open] .tool-list { margin-top: 8px; }
         .pill {
             display: inline-flex;
             align-items: center;
@@ -182,20 +194,18 @@
         }
         .status-dot.err { background: var(--bad); }
         .nowrap { white-space: nowrap; }
-        .w-mcp { width: 14%; }
-        .w-status { width: 12%; }
-        .w-num { width: 8%; }
-        .w-tools { width: 38%; }
-        .w-tool { width: 18%; }
-        .w-error { width: 22%; }
+        .w-mcp { width: 220px; }
+        .w-status { width: 120px; }
+        .w-num { width: 90px; }
+        .w-tools { width: 260px; }
+        .w-tool { width: 200px; }
+        .w-error { width: 240px; }
         @media (max-width: 980px) {
             header { align-items: flex-start; flex-direction: column; }
             .tabs { width: 100%; }
             .right { margin-left: 0; width: 100%; justify-content: flex-start; }
             main { padding: 16px; }
             .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-            .section { overflow-x: auto; }
-            table { min-width: 1500px; }
         }
         @media (max-width: 560px) {
             .stats { grid-template-columns: 1fr; }
@@ -208,21 +218,19 @@
 <body>
 <header>
     <div>
-        <h1>AI Agent Station · MCP 治理控制台</h1>
+        <h1>TAgent · MCP 连接与工具</h1>
         <div class="muted" id="status"><span class="status-dot"></span>等待首次刷新</div>
     </div>
     <nav class="tabs" aria-label="观测视图">
-        <a href="/observe.html">LLM 观测</a>
-        <a class="active" href="/observe-mcp.html">MCP 工具治理</a>
+        <a href="/index.html">对话</a>
+        <a href="/user-agents.html">我的 Agent</a>
+        <a href="/observe.html">用量观测</a>
+        <a class="active" href="/observe-mcp.html">MCP 连接与工具</a>
+        <a data-admin-only hidden href="/admin-stats.html">网站统计</a>
     </nav>
     <div class="right">
-        <span class="muted">工具窗口</span>
-        <select id="range" title="工具指标窗口">
-            <option value="1">最近 1h</option>
-            <option value="6">最近 6h</option>
-            <option value="24" selected>最近 24h</option>
-            <option value="168">最近 7d</option>
-        </select>
+        <label id="scope-control" hidden>范围 <select id="observation-scope"><option value="mine">仅本人</option><option value="all">全站（管理员）</option></select></label>
+        <span class="pill" id="process-window">本次启动以来</span>
         <input id="search" placeholder="搜索 MCP / 工具 / 错误" autocomplete="off"/>
         <button id="refreshBtn" onclick="refresh()">刷新</button>
         <button id="autoBtn" onclick="toggleAuto()">自动刷新：10s</button>
@@ -230,14 +238,15 @@
 </header>
 
 <main>
+    <p id="scope-note" class="muted" style="margin:0 0 16px">仅展示本人 MCP 连接和工具调用。调用次数从本次应用启动起累计；每分钟速率按最近两次刷新之差计算。</p>
     <section class="stats">
         <div class="stat">
-            <div class="label">客户端健康</div>
+            <div class="label">可用 / 已加载连接</div>
             <div class="value" id="s-clients">-</div>
             <div class="sub" id="s-clients-sub">&nbsp;</div>
         </div>
         <div class="stat">
-            <div class="label">注册工具</div>
+            <div class="label">已发现工具</div>
             <div class="value" id="s-tools">-</div>
             <div class="sub" id="s-tools-sub">&nbsp;</div>
         </div>
@@ -256,17 +265,17 @@
     <section class="section">
         <div class="section-head">
             <div>
-                <h2>MCP 客户端健康</h2>
-                <div class="muted">来自 `/api/v1/observe/mcp-client-health`</div>
+                <h2>MCP 连接健康</h2>
+                <div class="muted">仅显示本次启动后已加载的连接；绑定后会在运行时按需加载。</div>
             </div>
             <div class="tools">
                 <span class="pill" id="generatedAt">-</span>
             </div>
         </div>
-        <table>
+        <div class="table-scroll" role="region" aria-label="MCP 连接健康表格" tabindex="0"><table>
             <thead>
             <tr>
-                <th class="w-mcp">MCP ID</th>
+                <th class="w-mcp">MCP 连接</th>
                 <th class="w-status">状态</th>
                 <th class="w-num">失败</th>
                 <th class="w-num">上次成功</th>
@@ -274,30 +283,30 @@
                 <th class="w-num">探活成功</th>
                 <th class="w-num">熔断冷却</th>
                 <th class="w-num">重连冷却</th>
-                <th class="w-tools">注册工具</th>
+                <th class="w-tools">已发现工具</th>
                 <th class="w-error">客户端最近错误</th>
             </tr>
             </thead>
             <tbody id="clientRows"></tbody>
-        </table>
+        </table></div>
     </section>
 
     <section class="section">
         <div class="section-head">
             <div>
                 <h2>MCP 工具治理明细</h2>
-                <div class="muted">来自 `/api/v1/observe/mcp-tools-status`，按调用数降序</div>
+                <div class="muted">按实际调用次数降序，调用后才会出现指标。</div>
             </div>
             <div class="tools">
                 <span class="pill info" id="slowestTool">最慢工具 -</span>
                 <span class="pill warn" id="mostErrorTool">错误最多 -</span>
             </div>
         </div>
-        <table>
+        <div class="table-scroll" role="region" aria-label="MCP 工具调用表格" tabindex="0"><table>
             <thead>
             <tr>
                 <th class="w-tool">工具</th>
-                <th class="w-mcp">MCP ID</th>
+                <th class="w-mcp">所属 MCP 连接</th>
                 <th class="w-num">调用</th>
                 <th class="w-num">调用/min</th>
                 <th class="w-num">首败</th>
@@ -313,12 +322,12 @@
             </tr>
             </thead>
             <tbody id="toolRows"></tbody>
-        </table>
+        </table></div>
     </section>
 </main>
 
 <script>
-let autoTimer = setInterval(refresh, 10000);
+let autoTimer = null;
 let lastClientData = null;
 let lastToolData = null;
 let rateData = null;
@@ -328,19 +337,23 @@ function unwrap(payload) {
 }
 
 async function fetchJson(url) {
-    const response = await fetch(url, { headers: { 'Accept': 'application/json' } });
+    const response = await fetch(ObserveScope.url(url), { headers: { 'Accept': 'application/json' } });
     if (!response.ok) throw new Error(`${url} ${response.status}`);
-    return unwrap(await response.json());
+    const payload = await response.json();
+    if (payload.code && payload.code !== '0000') throw new Error(payload.info || '读取观测数据失败');
+    return unwrap(payload);
 }
 
 async function refresh() {
-    const hours = document.getElementById('range').value;
+    if (!ObserveScope.ready) return;
+    const version = ObserveScope.version;
     setBusy(true);
     try {
         const [health, tools] = await Promise.all([
             fetchJson('/api/v1/observe/mcp-client-health'),
-            fetchJson(`/api/v1/observe/mcp-tools-status?hours=${encodeURIComponent(hours)}`)
+            fetchJson('/api/v1/observe/mcp-tools-status')
         ]);
+        if (version !== ObserveScope.version) return;
         const nextToolData = tools || {};
         nextToolData._localAt = Date.now();
         lastClientData = health || {};
@@ -382,9 +395,10 @@ function renderSummary(health, tools) {
 
     document.getElementById('s-clients').textContent = `${aliveClients}/${totalClients}`;
     document.getElementById('s-clients-sub').textContent =
-        `${idleClients ? `待确认 ${idleClients} 个，` : ''}死亡 ${deadClients} 个${circuitOpen ? `，熔断 ${circuitOpen} 个` : ''}`;
+        `${idleClients ? `待确认 ${idleClients} 个，` : ''}不可用 ${deadClients} 个${circuitOpen ? `，熔断 ${circuitOpen} 个` : ''}`;
     document.getElementById('s-tools').textContent = fmt(totalRegisteredTools);
     document.getElementById('s-tools-sub').textContent = `名称校正 ${fmt(toolSummary.nameNormalizedTotal)} 次`;
+    document.getElementById('process-window').title = tools && tools.startedAt ? `应用启动：${new Date(tools.startedAt).toLocaleString()}` : '应用重启后重新累计';
     document.getElementById('s-calls').textContent = fmt(totalCalls);
     document.getElementById('s-calls-sub').textContent = callsPerMin == null ? `首败 ${fmt(totalErrors)} 次` : `${rate(callsPerMin)} / min`;
     document.getElementById('s-errors').textContent = pct(errorRate);
@@ -399,14 +413,17 @@ function renderSummary(health, tools) {
 function renderClients(items) {
     const tbody = document.getElementById('clientRows');
     if (!items.length) {
-        tbody.innerHTML = '<tr><td class="empty" colspan="10">暂无 MCP 客户端快照</td></tr>';
+        const message = document.getElementById('search').value.trim()
+            ? '没有匹配的 MCP 连接，请调整搜索条件。'
+            : '尚未加载 MCP 连接。模型按需使用或在编辑器刷新连接后，这里会显示健康状态。';
+        tbody.innerHTML = `<tr><td class="empty" colspan="10">${message}</td></tr>`;
         return;
     }
     tbody.innerHTML = items.map(item => {
         const tools = Array.isArray(item.registeredTools) ? item.registeredTools : [];
         const lastClientError = item.lastClientError ? `${item.lastClientError.exception || ''}: ${item.lastClientError.message || ''}` : '';
         return `<tr>
-            <td><code>${esc(item.mcpId)}</code></td>
+            <td>${connectionLabel(item)}</td>
             <td>${statusPill(item.status)}</td>
             <td class="num">${fmt(item.consecutiveFailures)}</td>
             <td class="num" title="${esc(absoluteTime(item.lastSuccessAt))}">${relativeTime(item.lastSuccessAt)}</td>
@@ -414,7 +431,7 @@ function renderClients(items) {
             <td class="num" title="${esc(absoluteTime(item.lastProbeOkAt))}">${relativeTime(item.lastProbeOkAt)}</td>
             <td class="num">${seconds(item.circuitCooldownRemainingSec)}</td>
             <td class="num">${seconds(item.reconnectCooldownRemainingSec)}</td>
-            <td><div class="tool-list">${tools.length ? tools.map(t => `<span class="pill">${esc(t)}</span>`).join('') : '<span class="muted">未注册工具</span>'}</div></td>
+            <td>${tools.length ? `<details class="tools-detail"><summary>${tools.length} 个工具 · 查看</summary><div class="tool-list">${tools.map(t => `<span class="pill">${esc(t)}</span>`).join('')}</div></details>` : '<span class="muted">尚未发现工具</span>'}</td>
             <td><span class="error-cell" title="${esc(lastClientError)}">${lastClientError ? esc(lastClientError) : '<span class="muted">无</span>'}</span></td>
         </tr>`;
     }).join('');
@@ -423,16 +440,19 @@ function renderClients(items) {
 function renderTools(items) {
     const tbody = document.getElementById('toolRows');
     if (!items.length) {
-        tbody.innerHTML = '<tr><td class="empty" colspan="14">暂无 MCP 工具指标。触发工具调用后这里会自动出现。</td></tr>';
+        const message = document.getElementById('search').value.trim()
+            ? '没有匹配的工具调用，请调整搜索条件。'
+            : '暂无 MCP 工具调用。连接已加载不代表工具已被调用；实际调用后这里会自动出现。';
+        tbody.innerHTML = `<tr><td class="empty" colspan="14">${message}</td></tr>`;
         return;
     }
     tbody.innerHTML = items.map(item => {
         const governanceHits = num(item.normalizeApplied) + num(item.resultTruncated) + num(item.retries) + num(item.unknownNameHits);
-        const toolRate = rateData && rateData.tools[item.tool] ? rateData.tools[item.tool] : null;
+        const toolRate = rateData && rateData.tools[toolKey(item)] ? rateData.tools[toolKey(item)] : null;
         const lastError = item.lastError ? `${item.lastError.exception || ''}: ${item.lastError.message || ''}` : '';
         return `<tr>
             <td><code>${esc(item.tool)}</code></td>
-            <td>${item.mcpId ? `<code>${esc(item.mcpId)}</code>` : '<span class="muted">unknown</span>'}</td>
+            <td>${connectionLabel(item)}</td>
             <td class="num">${fmt(item.calls)}</td>
             <td class="num">${toolRate ? rate(toolRate.callsPerMin) : '-'}</td>
             <td class="num">${fmt(item.errors)}</td>
@@ -449,8 +469,15 @@ function renderTools(items) {
     }).join('');
 }
 
+function connectionLabel(item) {
+    const name = item.mcpName || (item.mcpId ? '名称暂不可用' : '未关联连接');
+    return `<span class="connection-name">${esc(name)}</span>` + (item.mcpId
+        ? `<details class="connection-detail"><summary>连接详情</summary><code aria-label="连接 ID">${esc(item.mcpId)}</code></details>` : '');
+}
+
 function buildRateData(previous, current) {
     if (!previous || !previous.summary || !current || !current.summary) return null;
+    if (previous.startedAt !== current.startedAt) return null;
     const previousAt = num(previous.generatedAt) || num(previous._localAt);
     const currentAt = num(current.generatedAt) || num(current._localAt);
     const intervalSec = Math.max(1, (currentAt - previousAt) / 1000);
@@ -460,11 +487,11 @@ function buildRateData(previous, current) {
     const currentTools = current.tools || [];
     const tools = {};
     currentTools.forEach(item => {
-        const old = previousTools[item.tool];
+        const old = previousTools[toolKey(item)];
         if (!old) return;
         const oldGovernance = governanceTotal(old);
         const newGovernance = governanceTotal(item);
-        tools[item.tool] = {
+        tools[toolKey(item)] = {
             callsPerMin: perMinute(num(item.calls) - num(old.calls), intervalSec),
             errorsPerMin: perMinute(num(item.errors) - num(old.errors), intervalSec),
             governancePerMin: perMinute(newGovernance - oldGovernance, intervalSec)
@@ -479,9 +506,11 @@ function buildRateData(previous, current) {
     };
 }
 
+function toolKey(item) { return JSON.stringify([item.mcpId || '', item.tool || '']); }
+
 function indexTools(items) {
     return items.reduce((acc, item) => {
-        if (item && item.tool) acc[item.tool] = item;
+        if (item && item.tool) acc[toolKey(item)] = item;
         return acc;
     }, {});
 }
@@ -496,11 +525,12 @@ function perMinute(delta, intervalSec) {
 
 function statusPill(status) {
     const map = {
-        alive: ['ok', 'alive'],
-        dead: ['bad', 'dead'],
-        reconnect_cooldown: ['warn', 'reconnect cooldown'],
-        circuit_open: ['bad', 'circuit open'],
-        unknown: ['', 'unknown']
+        alive: ['ok', '可用'],
+        idle: ['warn', '待确认'],
+        dead: ['bad', '不可用'],
+        reconnect_cooldown: ['warn', '重连冷却中'],
+        circuit_open: ['bad', '熔断中'],
+        unknown: ['', '未知']
     };
     const item = map[status] || ['', status || 'unknown'];
     return `<span class="pill ${item[0]}">${esc(item[1])}</span>`;
@@ -513,12 +543,12 @@ function filterRows(items, query, projector) {
 
 function clientText(item) {
     const error = item.lastClientError ? `${item.lastClientError.exception || ''} ${item.lastClientError.message || ''}` : '';
-    return [item.mcpId, item.status, item.lastSuccessAt, item.lastProbeAt, item.lastProbeOkAt, (item.registeredTools || []).join(' '), error].join(' ').toLowerCase();
+    return [item.mcpName, item.mcpId, item.status, item.lastSuccessAt, item.lastProbeAt, item.lastProbeOkAt, (item.registeredTools || []).join(' '), error].join(' ').toLowerCase();
 }
 
 function toolText(item) {
     const error = item.lastError ? `${item.lastError.exception || ''} ${item.lastError.message || ''}` : '';
-    return [item.tool, item.mcpId, item.calls, item.errors, item.firstAttemptFailures, item.finalErrors, item.recovered,
+    return [item.tool, item.mcpName, item.mcpId, item.calls, item.errors, item.firstAttemptFailures, item.finalErrors, item.recovered,
         item.normalizeApplied, item.resultTruncated, item.retries, item.unknownNameHits, error].join(' ').toLowerCase();
 }
 
@@ -588,9 +618,14 @@ function esc(value) {
         .replace(/"/g, '&quot;');
 }
 
-document.getElementById('range').addEventListener('change', refresh);
 document.getElementById('search').addEventListener('input', render);
-refresh();
+window.addEventListener('observation-scope-change', () => {
+    lastClientData = null; lastToolData = null; rateData = null; render();
+});
+ObserveScope.initialize().then(() => {
+    refresh();
+    autoTimer = setInterval(refresh, 10000);
+}).catch(error => setStatus(false, error.message));
 </script>
 </body>
 </html>

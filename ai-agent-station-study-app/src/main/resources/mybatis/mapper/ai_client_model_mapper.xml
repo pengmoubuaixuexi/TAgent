@@ -4,6 +4,7 @@
 
     <resultMap id="AiClientModelMap" type="cn.bugstack.ai.infrastructure.dao.po.AiClientModel">
         <id column="id" property="id"/>
+        <result column="owner_user_id" property="ownerUserId"/>
         <result column="model_id" property="modelId"/>
         <result column="api_id" property="apiId"/>
         <result column="model_name" property="modelName"/>
@@ -12,14 +13,17 @@
         <result column="tier" property="tier"/>
         <result column="capabilities_json" property="capabilitiesJson"/>
         <result column="status" property="status"/>
+        <result column="platform_enabled" property="platformEnabled"/>
         <result column="create_time" property="createTime"/>
         <result column="update_time" property="updateTime"/>
     </resultMap>
 
     <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientModel" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO ai_client_model (
+            owner_user_id, platform_enabled,
             model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
         ) VALUES (
+            COALESCE(#{ownerUserId}, '__legacy_unowned__'), COALESCE(#{platformEnabled}, 0),
             #{modelId}, #{apiId}, #{modelName}, #{modelType}, #{modelUsage}, #{tier}, #{capabilitiesJson}, #{status}, #{createTime}, #{updateTime}
         )
     </insert>
@@ -34,6 +38,7 @@
             tier = #{tier},
             capabilities_json = #{capabilitiesJson},
             status = #{status},
+            <if test="platformEnabled != null">platform_enabled = #{platformEnabled},</if>
             update_time = #{updateTime}
         WHERE id = #{id}
     </update>
@@ -47,6 +52,7 @@
             tier = #{tier},
             capabilities_json = #{capabilitiesJson},
             status = #{status},
+            <if test="platformEnabled != null">platform_enabled = #{platformEnabled},</if>
             update_time = #{updateTime}
         WHERE model_id = #{modelId}
     </update>
@@ -60,40 +66,40 @@
     </delete>
 
     <select id="queryById" parameterType="java.lang.Long" resultMap="AiClientModelMap">
-        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
+        SELECT id, owner_user_id, platform_enabled, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
         FROM ai_client_model
         WHERE id = #{id}
     </select>
 
     <select id="queryByModelId" parameterType="java.lang.String" resultMap="AiClientModelMap">
-        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
+        SELECT id, owner_user_id, platform_enabled, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
         FROM ai_client_model
         WHERE model_id = #{modelId}
     </select>
 
     <select id="queryByApiId" parameterType="java.lang.String" resultMap="AiClientModelMap">
-        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
+        SELECT id, owner_user_id, platform_enabled, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
         FROM ai_client_model
         WHERE api_id = #{apiId}
         ORDER BY create_time DESC
     </select>
 
     <select id="queryByModelType" parameterType="java.lang.String" resultMap="AiClientModelMap">
-        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
+        SELECT id, owner_user_id, platform_enabled, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
         FROM ai_client_model
         WHERE model_type = #{modelType}
         ORDER BY create_time DESC
     </select>
 
     <select id="queryEnabledModels" resultMap="AiClientModelMap">
-        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
+        SELECT id, owner_user_id, platform_enabled, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
         FROM ai_client_model
         WHERE status = 1
         ORDER BY create_time DESC
     </select>
 
     <select id="queryAll" resultMap="AiClientModelMap">
-        SELECT id, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
+        SELECT id, owner_user_id, platform_enabled, model_id, api_id, model_name, model_type, model_usage, tier, capabilities_json, status, create_time, update_time
         FROM ai_client_model
         ORDER BY create_time DESC
     </select>

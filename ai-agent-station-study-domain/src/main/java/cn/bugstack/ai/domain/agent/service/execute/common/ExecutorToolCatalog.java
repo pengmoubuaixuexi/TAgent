@@ -48,7 +48,7 @@ public final class ExecutorToolCatalog {
     }
 
     /**
-     * 从工具回调派生快照。schema 取自 ToolDefinition.inputSchema()（反射，复用 McpToolCatalogService.readInputSchema 口径），
+     * 从工具回调派生快照。schema 取自 ToolDefinition.inputSchema()，与租约指纹保持一致，
      * hash=sha256(schema)，与 P2-A1 toolIdentity 的 definitionHash 同口径，便于 V1/V2/V3 与 lease 对齐。
      */
     public static ExecutorToolCatalog from(List<ToolCallback> callbacks, Source source, int snapshotVersion) {
@@ -186,13 +186,8 @@ public final class ExecutorToolCatalog {
     }
 
     private static String readInputSchema(ToolCallback cb) {
-        try {
-            Object def = cb.getToolDefinition();
-            Object schema = def.getClass().getMethod("inputSchema").invoke(def);
-            return schema == null ? "" : String.valueOf(schema);
-        } catch (Exception e) {
-            return "";
-        }
+        var definition = cb == null ? null : cb.getToolDefinition();
+        return definition == null ? "" : safe(definition.inputSchema());
     }
 
     private static String sha256(String s) {

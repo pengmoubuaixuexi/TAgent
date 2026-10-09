@@ -29,7 +29,9 @@ It is not another one-call model wrapper. TAgent makes the complete Agent-reques
 
 > **🌐 Try TAgent: [http://49.232.209.30:8099](http://49.232.209.30:8099)**
 >
-> Access is temporarily provided through the public IP address. A domain will be available later, and this link will be updated here.
+> Access is temporarily provided through the public IP address; this link will be updated when the domain is available. After registering, you can try preconfigured Agents or open “My Agents” to build Fixed, Auto, and Flow Agents. Configure System Prompts, MCP connections, and Advisors per node, and connect your own RAG knowledge base. Personal Agent configuration, knowledge retrieval, and usage observations are scoped to each user.
+>
+> The service is currently a trial. Models are provided by the platform, primarily `mimo-v2.5` and `deepseek-v4-flash`. Personal MCP connections are subject to the platform's domain allowlist. Support for user-supplied model API endpoints and keys is planned. See the [Agent workspace guide (Chinese)](docs/dev-ops/USER_AGENT_WORKSPACE.md).
 
 ### Who Is This For?
 
@@ -85,6 +87,7 @@ User Request
 | Capability | Implementation |
 |---|---|
 | **Three Agent Modes** | Fixed (single-step Q&A), Auto (analyze-execute loop), Flow (DAG orchestration) |
+| **Personal Agent Workspace** | Mode-specific nodes with independent model, Prompt, MCP, and Advisor settings; personal configurations from public templates and user-scoped observations |
 | **Database-Driven Assembly** | Agent, Client, Model, Prompt, Advisor, RAG, MCP relationships configured via DB |
 | **Unified Agent Router** | Single LLM call to select Agent and infer missing tool capabilities |
 | **Dynamic MCP Tools** | Tool catalog localization, intent expansion, PgVector semantic matching, on-demand attachment |
@@ -502,6 +505,8 @@ TAgent records model, tool, and Agent step metrics:
 Dashboard pages:
 - System Observability: `http://localhost:8099/observe.html`
 - MCP Observability: `http://localhost:8099/observe-mcp.html`
+- My Agents: `http://localhost:8099/user-agents.html`
+- Website Traffic and Registrations (admin): `http://localhost:8099/admin-stats.html`
 
 ---
 
@@ -538,7 +543,7 @@ Dashboard pages:
 
 ## 🚀 Quick Start
 
-See the [single-host deployment guide (Chinese)](docs/dev-ops/server/README.md). Before upgrading to v1.27.0, back up your database and apply [V061](docs/dev-ops/sql-migrations/V061__user_roles_and_registration.sql) once. Do not rerun an already applied migration.
+See the [single-host deployment guide (Chinese)](docs/dev-ops/server/README.md). Before upgrading to v1.28.0, back up MySQL and stop the application. Confirm [V061](docs/dev-ops/sql-migrations/V061__user_roles_and_registration.sql) is already applied, then apply [V062](docs/dev-ops/sql-migrations/V062__user_agent_workspace.sql) and [V063](docs/dev-ops/sql-migrations/V063__public_workspace_catalog.sql) in order before starting the new version. Review administrator ownership and the Agent / MCP sharing scope first. Do not rerun migrations that are already applied.
 
 ### Prerequisites
 

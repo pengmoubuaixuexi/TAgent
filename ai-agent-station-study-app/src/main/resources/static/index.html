@@ -205,9 +205,11 @@
         计划确认
       </label>
       <span class="text-xs text-gray-500">|</span>
-      <a data-admin-only hidden href="/observe.html" class="text-xs text-blue-300">Observe</a>
-      <a data-admin-only hidden href="/observe-mcp.html" class="text-xs text-blue-300">MCP</a>
-      <a data-admin-only hidden href="/agent-config.html" class="text-xs text-blue-300">Agent 配置</a>
+      <a href="/user-agents.html" class="text-xs text-blue-300">我的 Agent</a>
+      <a href="/observe.html" class="text-xs text-blue-300">我的用量</a>
+      <a href="/observe-mcp.html" class="text-xs text-blue-300">MCP 观测</a>
+      <a data-admin-only hidden href="/admin-stats.html" class="text-xs text-blue-300">网站统计</a>
+      <a data-admin-only hidden href="/agent-config.html" class="text-xs text-blue-300">配置详情</a>
       <!-- User Info -->
       <div class="flex items-center gap-2">
         <div class="w-7 h-7 bg-blue-600 rounded-full flex items-center justify-center text-xs font-bold" id="userAvatar"></div>
@@ -622,6 +624,15 @@ async function showChat() {
   await loadAgents();
   await refreshNotifications();
   startNotificationPolling();
+  // An explicit workspace entry starts a fresh conversation with the selected Agent.
+  // Consume the link so reloading subsequently restores that conversation normally.
+  const entryUrl = new URL(location.href);
+  if (entryUrl.searchParams.get('agentId') && state.currentAgentId) {
+    entryUrl.searchParams.delete('agentId');
+    history.replaceState(null, '', entryUrl.pathname + entryUrl.search + entryUrl.hash);
+    newSession();
+    return;
+  }
   const pendingPlan = loadPendingFlowPlan();
   if (pendingPlan) {
     await restorePendingFlowPlanAfterRefresh(pendingPlan);
@@ -925,6 +936,16 @@ document.addEventListener('click', () => {
   if (panel) panel.classList.add('hidden');
 });
 
+function agentDisplayLabel(agent) {
+  const name = String(agent.agentName || '').trim() || '未命名 Agent';
+  const sameName = (state.agents || []).filter(item => (String(item.agentName || '').trim() || '未命名 Agent') === name);
+  if (sameName.length < 2) return name;
+  const mode = {fixed: '顺序执行', auto: '自主执行', flow: '流程编排'}[agent.strategy] || 'Agent';
+  const sameMode = sameName.filter(item => item.strategy === agent.strategy);
+  const ordinal = sameMode.length > 1 ? ` · ${sameMode.findIndex(item => String(item.agentId) === String(agent.agentId)) + 1}` : '';
+  return `${name} · ${mode}${ordinal}`;
+}
+
 async function loadAgents() {
   try {
     const res = await fetch(API + '/query_available_agents');
@@ -933,11 +954,14 @@ async function loadAgents() {
       state.agents = data.data.filter(a => a.status === 1);
       const sel = document.getElementById('agentSelect');
       sel.innerHTML = '<option value="">自动（AI 路由选择）</option>' + state.agents.map(a =>
-        `<option value="${a.agentId}">${a.agentName} (${a.agentId})</option>`
+        `<option value="${escapeHtml(a.agentId)}">${escapeHtml(agentDisplayLabel(a))}</option>`
       ).join('');
-      // 默认停在「自动（AI 路由选择）」空值选项 → 走后端统一路由，不强制选具体 agent
-      sel.value = '';
-      state.currentAgentId = '';
+      // Workspace links choose an owned Agent; otherwise route within available Agents.
+      const requestedAgentId = new URLSearchParams(location.search).get('agentId');
+      const requestedAgent = state.agents.find(agent => String(agent.agentId) === requestedAgentId);
+      sel.value = requestedAgent ? String(requestedAgent.agentId) : '';
+      state.currentAgentId = sel.value;
+      if (!state.agents.length) sel.innerHTML = '<option value="">请先在「我的 Agent」创建 Agent</option>';
     }
   } catch(e) {
     console.error('load agents failed:', e);
@@ -966,8 +990,51 @@ function newSession(options = {}) {
   saveActiveConversation(state.sessionId);
   renderNotifications();
   document.getElementById('messageArea').innerHTML =
-    '<div class="text-center text-gray-600 text-sm py-8"><p class="text-4xl mb-3">🆕</p><p>新会话已开始</p></div>';
+    state.agents.length
+      ? '<div class="text-center text-gray-600 text-sm py-8"><p class="text-4xl mb-3">🆕</p><p>新会话已开始</p></div>'
+      : '<div id="workspaceWelcome" class="text-center text-gray-400 text-sm py-8"><p class="text-4xl mb-3">👋</p><p>选择一个公共 Agent 即可开始，也可以创建自己的 Agent。</p><div id="welcomePublicAgents" class="flex flex-wrap justify-center gap-3 mt-5"></div><div class="flex flex-wrap justify-center gap-4 mt-5"><a class="text-blue-300" href="/user-agents.html">创建我的 Agent →</a><button type="button" class="text-blue-300" onclick="startWorkspaceBuilder(this)">让搭建助手教我 →</button></div><p id="welcomeAgentError" class="text-red-300 mt-3" role="status"></p></div>';
+  if (!state.agents.length) loadPublicAgentWelcome(state.sessionId);
 }
+
+async function loadPublicAgentWelcome(sessionId) {
+  const container = document.getElementById('welcomePublicAgents');
+  const userId = state.userId;
+  try {
+    const response = await fetch('/api/v1/workspace/public-agents', {headers: {Accept: 'application/json'}});
+    const payload = await response.json();
+    if (!response.ok || payload.code !== '0000') throw new Error(payload.info || '读取公共 Agent 失败');
+    if (!container?.isConnected || state.sessionId !== sessionId || state.userId !== userId) return;
+    for (const agent of payload.data || []) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'px-4 py-3 rounded-lg border border-blue-800 bg-gray-800 text-blue-200 hover:bg-gray-700';
+      button.textContent = agent.name;
+      button.addEventListener('click', () => activateWorkspaceAgent('/public-agents/' + encodeURIComponent(agent.agentId) + '/use', button));
+      container.appendChild(button);
+    }
+  } catch (error) {
+    if (container?.isConnected && state.userId === userId) document.getElementById('welcomeAgentError').textContent = error.message;
+  }
+}
+
+async function activateWorkspaceAgent(path, button) {
+  if (button.disabled) return;
+  const userId = state.userId;
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/v1/workspace' + path, {method: 'POST', headers: {Accept: 'application/json'}});
+    const payload = await response.json();
+    if (!response.ok || payload.code !== '0000' || !payload.data?.agentId) throw new Error(payload.info || '暂时无法准备 Agent');
+    if (state.userId !== userId) return;
+    location.href = '/?agentId=' + encodeURIComponent(payload.data.agentId);
+  } catch (error) {
+    const output = document.getElementById('welcomeAgentError');
+    if (output && state.userId === userId) output.textContent = error.message;
+    button.disabled = false;
+  }
+}
+
+function startWorkspaceBuilder(button) { return activateWorkspaceAgent('/builder/use', button); }
 
 /**
  * Stop observing the previous session without cancelling its backend Run.
@@ -1106,22 +1173,25 @@ async function restorePendingFlowPlanAfterRefresh(payload = null) {
   }
 
   const snapshot = payload.turnSnapshot || {};
-  if (snapshot.userMessage) {
+  let aiMsg = document.querySelector(`#messageArea [data-message-role="assistant"][data-run-id="${cssEscape(payload.runId)}"]`);
+  if (!aiMsg && snapshot.userMessage) {
     addMessage('user', snapshot.userMessage);
   }
-  const aiMsg = addMessage('assistant', '', false, snapshot.agentId || payload.agentId, payload.runId);
+  const existingMessage = !!aiMsg;
+  aiMsg ||= addMessage('assistant', '', false, snapshot.agentId || payload.agentId, payload.runId);
   const authorEl = aiMsg.querySelector('.msg-author');
   if (authorEl && snapshot.assistantAuthor) authorEl.textContent = snapshot.assistantAuthor;
   const msgContent = aiMsg.querySelector('.msg-content');
-  if (snapshot.assistantHtml) {
+  if (snapshot.assistantHtml && !existingMessage) {
     msgContent.innerHTML = snapshot.assistantHtml;
+    initializeRunEventLedger(aiMsg, payload.runId, sessionId, snapshot.eventLedger);
     rebindRestoredMessageInteractions(msgContent);
     const restoredCard = findRestoredPlanReviewCard(msgContent, payload.runId);
     if (restoredCard) {
       bindRestoredPlanReviewCard(restoredCard, payload, aiMsg);
       return;
     }
-  } else {
+  } else if (!existingMessage) {
     msgContent.innerHTML = '<div class="steps-container"></div><div class="final-answer mt-3"></div>';
   }
   const stepsContainer = msgContent.querySelector('.steps-container') || msgContent;
@@ -1129,6 +1199,8 @@ async function restorePendingFlowPlanAfterRefresh(payload = null) {
 }
 
 function createRestoredPlanReviewRow(payload, aiMsg, stepsContainer) {
+  const existing = findRestoredPlanReviewCard(stepsContainer, payload && payload.runId);
+  if (existing) { bindRestoredPlanReviewCard(existing, payload, aiMsg); return existing; }
   const card = document.createElement('div');
   card.className = 'tool-card blocked fade-in';
   card.dataset.planReviewCard = 'true';
@@ -1146,6 +1218,7 @@ function createRestoredPlanReviewRow(payload, aiMsg, stepsContainer) {
   applyPlanReviewCardStatus(card, payload && payload.status ? payload.status : 'PENDING', restoredPlanSummary(payload), payload && payload.lastError);
   bindRestoredPlanReviewCard(card, payload, aiMsg);
   stepsContainer.appendChild(card);
+  return card;
 }
 
 function bindRestoredPlanReviewCard(card, payload, aiMsg) {
@@ -1153,6 +1226,7 @@ function bindRestoredPlanReviewCard(card, payload, aiMsg) {
   card.dataset.planReviewCard = 'true';
   if (payload && payload.runId) card.dataset.runId = payload.runId;
   applyPlanReviewCardStatus(card, payload && payload.status ? payload.status : (card.dataset.planReviewStatus || 'PENDING'), null, payload && payload.lastError);
+  card._planPayload = payload;
   const head = card.querySelector('.tool-head');
   const quickBtn = card.querySelector('[data-action="quick-confirm"]');
   if (!head || !quickBtn) return;
@@ -1162,7 +1236,7 @@ function bindRestoredPlanReviewCard(card, payload, aiMsg) {
   };
   quickBtn.onclick = (event) => {
     event.stopPropagation();
-    if (!planReviewCanExecute(payload && payload.status ? payload.status : card.dataset.planReviewStatus)) return;
+    if (!planReviewCanExecute(card.dataset.planReviewStatus)) return;
     confirmRestoredFlowPlan(payload, Array.isArray(payload.steps) ? payload.steps : [], aiMsg, card);
   };
 }
@@ -1172,6 +1246,7 @@ function findRestoredPlanReviewCard(root, runId) {
   if (runId) {
     const exact = root.querySelector(`[data-plan-review-card="true"][data-run-id="${cssEscape(runId)}"]`);
     if (exact) return exact;
+    return root.querySelector('[data-plan-review-card="true"]:not([data-run-id])');
   }
   return root.querySelector('[data-plan-review-card="true"]') || root.querySelector('.tool-card.blocked [data-action="quick-confirm"]')?.closest('.tool-card');
 }
@@ -1263,6 +1338,7 @@ function applyPlanReviewCardStatus(card, status, summary, lastError) {
   if (!card) return null;
   const meta = planReviewStatusMeta(status, summary, lastError);
   card.dataset.planReviewStatus = meta.status;
+  if (card._planPayload) card._planPayload.status = meta.status;
   card.className = `tool-card ${meta.cardClass} fade-in`;
   const statusEl = card.querySelector('.tool-status');
   const summaryEl = card.querySelector('.tool-summary');
@@ -1555,10 +1631,12 @@ function ensureRestoredExecutionContainers(aiMsg) {
 async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload) {
   const { stepsContainer, finalAnswerEl } = ensureRestoredExecutionContainers(aiMsg);
   const stepBuffers = {};
-  const toolProgressByName = {};
+  const toolProgressByName = restoreToolCardEntries(stepsContainer);
+  initializeRunEventLedger(aiMsg, restoredPayload.runId, restoredPayload.sessionId || state.sessionId);
   let fullContent = '';
   let curEvent = 'message';
   let curData = '';
+  let curEventId = '';
 
   function depBadgeHtml(dependsOn) {
     if (!Array.isArray(dependsOn) || dependsOn.length === 0) return '';
@@ -1675,6 +1753,8 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
   function createRestoredToolCard(payload) {
     if (!stepsContainer) return null;
     const toolName = (payload && payload.toolName) || 'unknown_tool';
+    const existing = findToolCallEntry(toolProgressByName[toolName], payload, false);
+    if (existing) return existing;
     const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card):not(.tool-card)');
     if (placeholder) placeholder.remove();
     const card = document.createElement('div');
@@ -1694,6 +1774,7 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
     const entry = { card, toolName, status: 'running', payload: { ...(payload || {}) } };
     if (!toolProgressByName[toolName]) toolProgressByName[toolName] = [];
     toolProgressByName[toolName].push(entry);
+    rememberToolCard(entry);
     scrollBottom();
     return entry;
   }
@@ -1702,8 +1783,8 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
     const toolName = (payload && payload.toolName) || 'unknown_tool';
     const normalized = restoredToolStatusClass(status);
     const queue = toolProgressByName[toolName] || [];
-    let entry = queue.find(x => x.status === 'running');
-    if (!entry) entry = createRestoredToolCard({ toolName });
+    let entry = findToolCallEntry(queue, payload, true);
+    if (!entry) entry = createRestoredToolCard(payload);
     if (!entry) return;
     entry.status = normalized;
     entry.payload = { ...(entry.payload || {}), ...(payload || {}) };
@@ -1720,14 +1801,17 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
       summaryEl.textContent = parts.join(' · ') || restoredToolStatusText(normalized);
     }
     if (bodyEl) bodyEl.innerHTML = restoredToolBody(entry.payload, normalized, detail);
+    rememberToolCard(entry);
     scrollBottom();
   }
 
   function dispatchEvent() {
-    if (!curData) { curEvent = 'message'; return; }
+    if (!curData) { curEvent = 'message'; curEventId = ''; return; }
     let payload = null;
     try { payload = JSON.parse(curData); } catch (e) { /* ignore malformed frame */ }
-    if (!payload) { curEvent = 'message'; curData = ''; return; }
+    if (!payload || !acceptRunEvent(aiMsg, payload, curEventId)) {
+      curEvent = 'message'; curData = ''; curEventId = ''; return;
+    }
 
     if (curEvent === 'step_pending') {
       if (!stepBuffers[payload.stepId]) {
@@ -1814,6 +1898,7 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
     }
     curEvent = 'message';
     curData = '';
+    curEventId = '';
   }
 
   const reader = response.body.getReader();
@@ -1833,6 +1918,8 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
         curEvent = line.substring(7).trim();
       } else if (line.startsWith('data: ')) {
         curData += (curData ? '\n' : '') + line.substring(6);
+      } else if (line.startsWith('id:')) {
+        curEventId = line.substring(3).trim();
       }
     }
   }
@@ -2454,7 +2541,7 @@ async function loadBackgroundTasks() {
 function backgroundTaskAgentLabel(agentId) {
   if (!agentId) return '自动（每次触发时按任务内容选择）';
   const agent = (state.agents || []).find(item => String(item.agentId) === String(agentId));
-  return agent ? `${agent.agentName} (${agentId})` : `指定 Agent (${agentId})`;
+  return agent ? agentDisplayLabel(agent) : '原 Agent（当前不可用）';
 }
 
 function backgroundTaskAgentControl(task) {
@@ -2465,11 +2552,11 @@ function backgroundTaskAgentControl(task) {
   const agents = state.agents || [];
   const choices = [{agentId: '', agentName: '自动（每次触发时按任务内容选择）'}, ...agents];
   if (selected && !agents.some(agent => String(agent.agentId) === selected)) {
-    choices.push({agentId: selected, agentName: `原 Agent (${selected}，请检查是否可用)`});
+    choices.push({agentId: selected, agentName: '原 Agent（当前不可用）'});
   }
   const options = choices.map(agent => {
     const id = String(agent.agentId);
-    const label = id ? `${agent.agentName} (${id})` : agent.agentName;
+    const label = id ? agentDisplayLabel(agent) : agent.agentName;
     return `<option value="${escapeHtml(id)}" ${id === selected ? 'selected' : ''}>${escapeHtml(label)}</option>`;
   }).join('');
   return `<div class="mt-2 text-xs text-gray-400">
@@ -2704,12 +2791,13 @@ async function sendMessage() {
   addMessage('user', userDisplayMessage, false, null, null, messageImages);
   // 添加 AI 占位
   const aiMsg = addMessage('assistant', '', true, null, runId);
+  initializeRunEventLedger(aiMsg, runId, state.sessionId);
   // 顶部作者标题：手动选了 agent 直接显示「名称(id)」；自动模式先显示「路由中…」，收到 agent_routed 再替换
   const aiAuthorEl = aiMsg.querySelector('.msg-author');
   if (aiAuthorEl) {
     if (state.currentAgentId) {
       const selA = (state.agents || []).find(x => String(x.agentId) === String(state.currentAgentId));
-      aiAuthorEl.textContent = selA ? `${selA.agentName}(${selA.agentId})` : `Agent ${state.currentAgentId}`;
+      aiAuthorEl.textContent = selA ? agentDisplayLabel(selA) : 'Agent';
     } else {
       aiAuthorEl.textContent = '路由中…';
     }
@@ -3097,6 +3185,8 @@ async function sendMessage() {
 
     function createToolProgressCard(payload) {
       const toolName = payload.toolName || 'unknown_tool';
+      const existing = findToolCallEntry(toolProgressByName[toolName], payload, false);
+      if (existing) return existing;
       const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card):not(.tool-card)');
       if (placeholder) placeholder.remove();
       const card = document.createElement('div');
@@ -3118,6 +3208,7 @@ async function sendMessage() {
       const entry = { card, toolName, status: 'running', payload: {...payload} };
       if (!toolProgressByName[toolName]) toolProgressByName[toolName] = [];
       toolProgressByName[toolName].push(entry);
+      rememberToolCard(entry);
       scrollBottom();
       return entry;
     }
@@ -3130,9 +3221,9 @@ async function sendMessage() {
     function finishToolProgress(payload, status, detail) {
       const toolName = payload.toolName || 'unknown_tool';
       const normalized = toolStatusClass(status);
-      let entry = findRunningToolProgress(toolName);
+      let entry = findToolCallEntry(toolProgressByName[toolName], payload, true);
       if (!entry) {
-        entry = createToolProgressCard({ toolName, inputPreview: '' });
+        entry = createToolProgressCard(payload);
       }
       entry.status = normalized;
       entry.payload = {...(entry.payload || {}), ...payload};
@@ -3145,6 +3236,7 @@ async function sendMessage() {
       if (bodyEl) {
         bodyEl.innerHTML = renderToolBody(entry.payload, normalized, detail);
       }
+      rememberToolCard(entry);
       scrollBottom();
     }
 
@@ -3302,7 +3394,8 @@ async function sendMessage() {
         userMessage: message,
         agentId: payload && payload.agentId ? payload.agentId : state.currentAgentId,
         assistantAuthor: aiAuthorEl ? aiAuthorEl.textContent : '',
-        assistantHtml: msgContent.innerHTML
+        assistantHtml: msgContent.innerHTML,
+        eventLedger: serializeRunEventLedger(aiMsg)
       });
     }
 
@@ -3317,6 +3410,14 @@ async function sendMessage() {
 
     function createPlanReviewProgressRow(payload) {
       const runId = payload && payload.runId ? payload.runId : '';
+      const existing = runId && planReviewEntriesByRunId[runId];
+      if (existing) {
+        if (!['RUNNING', 'COMPLETED'].includes(existing.status)) {
+          existing.payload = {...existing.payload, ...payload};
+          setPlanReviewEntryStatus(existing, payload.status || 'PENDING', planReviewSummary(payload));
+        }
+        return existing;
+      }
       const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card):not(.tool-card)');
       if (placeholder) placeholder.remove();
       const card = document.createElement('div');
@@ -3614,7 +3715,9 @@ async function sendMessage() {
       let payload = null;
       try { payload = JSON.parse(curData); } catch (e) { /* skip */ }
       if (!payload) { curEvent = 'message'; curData = ''; curEventId = ''; return; }
-      if (curEventId) state.lastRunEventId = curEventId;
+      if (!acceptRunEvent(aiMsg, payload, curEventId)) {
+        curEvent = 'message'; curData = ''; curEventId = ''; return;
+      }
 
       if (curEvent === 'run_replay_context') {
         renderInheritedRunSteps(payload);
@@ -3668,7 +3771,7 @@ async function sendMessage() {
       } else if (curEvent === 'agent_routed') {
         // 路由命中：把作者标题从「路由中…」替换成「名称(id)」
         if (aiAuthorEl) {
-          aiAuthorEl.textContent = payload.agentName ? `${payload.agentName}(${payload.agentId})` : `Agent ${payload.agentId}`;
+          aiAuthorEl.textContent = payload.agentName || agentLabel(payload.agentId);
         }
       } else if (curEvent === 'human_approval_required') {
         enqueueApproval(payload);
@@ -4428,7 +4531,7 @@ async function submitUserInput() {
 function agentLabel(agentId) {
   if (!agentId) return 'AI Assistant';
   const a = (state.agents || []).find(x => String(x.agentId) === String(agentId));
-  return a ? `${a.agentName}(${a.agentId})` : `Agent ${agentId}`;
+  return a ? agentDisplayLabel(a) : 'Agent';
 }
 
 function attachMessageActions(node, role, content, runId) {
@@ -4448,6 +4551,72 @@ function setMessageRunId(aiMsg, runId) {
   }
   const evidenceBtn = aiMsg.querySelector('.msg-evidence-map');
   if (evidenceBtn && evidenceBtn.dataset.finalAnswer) evidenceBtn.classList.remove('hidden');
+}
+
+// A confirm/reconnect stream may replay the whole run. Event identity, never text or tool name,
+// decides whether it has already been rendered. The ledger belongs to one account/session/run.
+function initializeRunEventLedger(aiMsg, runId, sessionId, seed, reset = false) {
+  const scope = JSON.stringify([String(state.userId || ''), String(sessionId || ''), String(runId || '')]);
+  if (!reset && aiMsg._runEventLedger?.scope === scope) return aiMsg._runEventLedger;
+  const saved = seed && seed.scope === scope ? seed : {};
+  return aiMsg._runEventLedger = {scope, userId: String(state.userId || ''), runId: String(runId || ''), sessionId: String(sessionId || ''),
+    seen: new Set(Array.isArray(saved.eventIds) ? saved.eventIds.map(String) : []), lastEventId: saved.lastEventId || null};
+}
+
+function serializeRunEventLedger(aiMsg) {
+  const ledger = aiMsg && aiMsg._runEventLedger;
+  return ledger ? {scope: ledger.scope, eventIds: [...ledger.seen], lastEventId: ledger.lastEventId} : null;
+}
+
+function acceptRunEvent(aiMsg, payload, eventId) {
+  const ledger = aiMsg && (aiMsg._runEventLedger || initializeRunEventLedger(aiMsg, aiMsg.dataset.runId, state.sessionId));
+  if (!ledger) return false;
+  if (ledger.userId !== String(state.userId || '')) return false;
+  if (payload && ((payload.runId && String(payload.runId) !== ledger.runId)
+      || (payload.sessionId && String(payload.sessionId) !== ledger.sessionId))) return false;
+  if (!eventId) return true; // Legacy streams have no event ID; do not conflate legitimate repeated calls.
+  const id = String(eventId);
+  if (ledger.seen.has(id)) return false;
+  ledger.seen.add(id);
+  const old = ledger.lastEventId;
+  const redisId = /^(\d+)-(\d+)$/;
+  const a = redisId.exec(id), b = old && redisId.exec(old);
+  if (!old || !a || !b || BigInt(a[1]) > BigInt(b[1]) || (a[1] === b[1] && BigInt(a[2]) > BigInt(b[2]))) {
+    ledger.lastEventId = id;
+  }
+  if (state.activeRunId === ledger.runId && String(state.sessionId || '') === ledger.sessionId) {
+    state.lastRunEventId = ledger.lastEventId;
+  }
+  return true;
+}
+
+function findToolCallEntry(entries, payload, matchRunning) {
+  const queue = entries || [];
+  if (payload && payload.callId) return queue.find(entry => entry.payload?.callId === payload.callId) || null;
+  if (!matchRunning) return null;
+  return queue.find(entry => entry.status === 'running' && (!payload?.step || entry.payload?.step === payload.step)) || null;
+}
+
+function rememberToolCard(entry) {
+  if (!entry || !entry.card) return;
+  const stored = {};
+  // Persist only card identity and already displayed summaries, never optional raw result previews.
+  for (const key of ['toolName', 'callId', 'step', 'inputPreview', 'meta', 'status', 'detail', 'latencyMs', 'resultChars']) {
+    if (entry.payload?.[key] !== undefined) stored[key] = entry.payload[key];
+  }
+  entry.card.dataset.toolPayload = JSON.stringify(stored);
+  entry.card.dataset.toolCallStatus = entry.status;
+}
+
+function restoreToolCardEntries(container) {
+  const entries = {};
+  container?.querySelectorAll('[data-tool-payload]').forEach(card => {
+    try {
+      const payload = JSON.parse(card.dataset.toolPayload), toolName = payload.toolName || 'unknown_tool';
+      (entries[toolName] ||= []).push({card, toolName, payload, status:card.dataset.toolCallStatus || 'running'});
+    } catch (ignored) { /* Older saved HTML has no tool identity; retain legacy event pairing. */ }
+  });
+  return entries;
 }
 
 function setFinalAnswerCopy(aiMsg, content) {
@@ -5201,9 +5370,8 @@ function timelineToolSummary(payload) {
 
 function timelineToolCard(view, payload, status, detail) {
   const toolName = String((payload && payload.toolName) || 'unknown_tool');
-  let entry = status === 'running'
-    ? null
-    : ((view.runningTools[toolName] || []).find(item => item.status === 'running') || null);
+  let entry = findToolCallEntry(view.runningTools[toolName], payload, status !== 'running');
+  if (entry && status === 'running') return;
   if (!entry) {
     const card = document.createElement('div');
     card.className = 'tool-card running fade-in';
@@ -5229,6 +5397,7 @@ function timelineToolCard(view, payload, status, detail) {
   entry.card.querySelector('.tool-summary').textContent = timelineToolSummary(entry.payload);
   entry.card.querySelector('.tool-body').innerHTML =
     timelineToolBody(entry.payload, normalized, detail);
+  rememberToolCard(entry);
 }
 
 function timelineEvidence(view, payload, memory) {
@@ -5291,10 +5460,8 @@ function timelineInteraction(view, eventType, payload) {
 
 function applyRunTimelineEvent(view, eventType, payload, eventId, interactive) {
   if (!view || !eventType) return;
-  if (eventId) {
-    view.lastEventId = eventId;
-    state.lastRunEventId = eventId;
-  }
+  if (!acceptRunEvent(view.aiMsg, payload, eventId)) return;
+  view.lastEventId = view.aiMsg._runEventLedger.lastEventId;
   if (eventType === 'ack') {
     view.interventionEnabled = !!(payload && payload.intervention);
     if (interactive && state.activeRunId && state.sessionId) {
@@ -5326,6 +5493,12 @@ function applyRunTimelineEvent(view, eventType, payload, eventId, interactive) {
   else if (eventType === 'tool_call_error') timelineToolCard(view, payload, 'error', payload.error || '');
   else if (eventType === 'rag_evidence') timelineEvidence(view, payload, false);
   else if (eventType === 'memory_evidence') timelineEvidence(view, payload, true);
+  else if (eventType === 'plan_review_required') {
+    createRestoredPlanReviewRow(payload, view.aiMsg, view.steps);
+  } else if (eventType === 'plan_review_resumed' || eventType === 'plan_review_status') {
+    const card = findRestoredPlanReviewCard(view.steps, payload && payload.runId);
+    if (card) applyPlanReviewCardStatus(card, eventType === 'plan_review_resumed' ? 'RUNNING' : payload.status, null, payload.lastError);
+  }
   else if (eventType === 'human_approval_required' || eventType === 'user_input_required'
       || eventType === 'human_approval_result' || eventType === 'user_input_result') {
     timelineInteraction(view, eventType, payload || {});
@@ -5333,7 +5506,7 @@ function applyRunTimelineEvent(view, eventType, payload, eventId, interactive) {
     if (interactive && eventType === 'user_input_required') showUserInput(payload);
   } else if (eventType === 'agent_routed' && payload) {
     const author = view.aiMsg.querySelector('.msg-author');
-    if (author) author.textContent = payload.agentName ? `${payload.agentName}(${payload.agentId})` : `Agent ${payload.agentId}`;
+    if (author) author.textContent = payload.agentName || agentLabel(payload.agentId);
   } else if ((eventType === 'message' || !eventType) && payload && payload.type === 'summary') {
     view.finalContent = payload.content || '';
     view.finalAnswer.innerHTML = renderMarkdown(view.finalContent);
@@ -5344,6 +5517,7 @@ function applyRunTimelineEvent(view, eventType, payload, eventId, interactive) {
 }
 
 function restoreTimelineSnapshot(aiMsg, snapshot, finalContent) {
+  initializeRunEventLedger(aiMsg, snapshot.runId || aiMsg.dataset.runId, snapshot.sessionId || state.sessionId, null, true);
   const view = createRunTimelineView(aiMsg, finalContent);
   if (!view) return null;
   for (const record of (snapshot.timelineEvents || [])) {

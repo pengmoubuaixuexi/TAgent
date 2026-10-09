@@ -1,0 +1,12 @@
+[Unit]
+Description=TAgent daily homepage statistics (GoAccess)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/tagent/docs/dev-ops/server
+ExecStart=/usr/bin/python3 /opt/tagent/docs/dev-ops/server/collect_site_stats.py
+TimeoutStartSec=280
+UMask=0077
+Nice=10
