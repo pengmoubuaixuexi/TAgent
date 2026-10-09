@@ -40,5 +40,6 @@ public class AiAgentClientFlowConfigVO {
      * 执行步骤提示词
      */
     private String stepPrompt;
+    private String taskPrompt;
 
 }

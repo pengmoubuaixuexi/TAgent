@@ -4,6 +4,7 @@
 
     <resultMap id="AiClientMap" type="cn.bugstack.ai.infrastructure.dao.po.AiClient">
         <id column="id" property="id"/>
+        <result column="owner_user_id" property="ownerUserId"/>
         <result column="client_id" property="clientId"/>
         <result column="client_name" property="clientName"/>
         <result column="description" property="description"/>
@@ -14,8 +15,10 @@
 
     <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClient" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO ai_client (
+            owner_user_id,
             client_id, client_name, description, status, create_time, update_time
         ) VALUES (
+            COALESCE(#{ownerUserId}, '__legacy_unowned__'),
             #{clientId}, #{clientName}, #{description}, #{status}, #{createTime}, #{updateTime}
         )
     </insert>
@@ -48,33 +51,33 @@
     </delete>
 
     <select id="queryById" parameterType="java.lang.Long" resultMap="AiClientMap">
-        SELECT id, client_id, client_name, description, status, create_time, update_time
+        SELECT id, owner_user_id, client_id, client_name, description, status, create_time, update_time
         FROM ai_client
         WHERE id = #{id}
     </select>
 
     <select id="queryByClientId" parameterType="java.lang.String" resultMap="AiClientMap">
-        SELECT id, client_id, client_name, description, status, create_time, update_time
+        SELECT id, owner_user_id, client_id, client_name, description, status, create_time, update_time
         FROM ai_client
         WHERE client_id = #{clientId}
     </select>
 
     <select id="queryEnabledClients" resultMap="AiClientMap">
-        SELECT id, client_id, client_name, description, status, create_time, update_time
+        SELECT id, owner_user_id, client_id, client_name, description, status, create_time, update_time
         FROM ai_client
         WHERE status = 1
         ORDER BY create_time DESC
     </select>
 
     <select id="queryByClientName" parameterType="java.lang.String" resultMap="AiClientMap">
-        SELECT id, client_id, client_name, description, status, create_time, update_time
+        SELECT id, owner_user_id, client_id, client_name, description, status, create_time, update_time
         FROM ai_client
         WHERE client_name LIKE CONCAT('%', #{clientName}, '%')
         ORDER BY create_time DESC
     </select>
 
     <select id="queryAll" resultMap="AiClientMap">
-        SELECT id, client_id, client_name, description, status, create_time, update_time
+        SELECT id, owner_user_id, client_id, client_name, description, status, create_time, update_time
         FROM ai_client
         ORDER BY create_time DESC
     </select>

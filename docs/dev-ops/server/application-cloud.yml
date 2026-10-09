@@ -1,5 +1,14 @@
 # Generated from current feature configuration; deploy with the cloud profile only.
 server:
+  tomcat:
+    accesslog:
+      enabled: true
+      directory: /app/data/access-logs
+      pattern: combined
+      prefix: access
+      suffix: .log
+      encoding: UTF-8
+      max-days: 30
   port: 8099
   forward-headers-strategy: framework
   servlet:

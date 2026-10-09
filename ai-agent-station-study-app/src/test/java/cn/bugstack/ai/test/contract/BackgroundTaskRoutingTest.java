@@ -96,6 +96,9 @@ public class BackgroundTaskRoutingTest {
     private void runThroughRealDispatcher(String selected) throws Exception {
         AiBackgroundTask task = task(selected);
         AgentDispatchDispatchService dispatch = new AgentDispatchDispatchService();
+        var access = mock(cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository.class);
+        when(access.ownsAgent(eq("user"), anyString())).thenReturn(true);
+        ReflectionTestUtils.setField(dispatch, "workspaceAccess", access);
         UnifiedAgentRouter router = mock(UnifiedAgentRouter.class);
         IAgentRepository repository = mock(IAgentRepository.class);
         IExecuteStrategy strategy = mock(IExecuteStrategy.class);

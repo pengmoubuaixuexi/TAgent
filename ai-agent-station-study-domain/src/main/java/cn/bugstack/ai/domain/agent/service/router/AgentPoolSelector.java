@@ -37,8 +37,15 @@ public class AgentPoolSelector implements IAgentSelector {
     @Autowired
     private LlmCallGateway llmCallGateway;
 
+    @Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository workspaceAccess;
+
     @Override
     public String select(String query, List<AiAgentVO> pool) {
+        String userId = org.slf4j.MDC.get("userId");
+        if (userId == null || userId.isBlank() || workspaceAccess == null) return null;
+        java.util.Set<String> allowed = workspaceAccess.ownedAgentIds(userId);
+        if (pool != null) pool = pool.stream().filter(a -> a != null && allowed.contains(a.getAgentId())).toList();
         if (pool == null || pool.isEmpty()) return null;
         if (pool.size() == 1) {
             log.info("[AgentPool] only 1 agent, auto-select agentId={}", pool.get(0).getAgentId());

@@ -25,6 +25,15 @@ public interface IToolVectorStore {
      */
     List<AiMcpToolCatalogVO> search(String need, Set<String> excludeNames, int topN);
 
+    /** Implementations must filter ownership before ranking, not after the global top-N. */
+    default List<AiMcpToolCatalogVO> searchOwned(String need, Set<String> excludeNames, int topN,
+                                               Set<String> allowedMcpIds) {
+        if (allowedMcpIds == null || allowedMcpIds.isEmpty()) return List.of();
+        List<AiMcpToolCatalogVO> hits = search(need, excludeNames, topN);
+        return hits == null ? List.of() : hits.stream()
+                .filter(hit -> hit != null && allowedMcpIds.contains(hit.getMcpId())).toList();
+    }
+
     /** 向量库是否可用且有数据——决定 matcher 是否走 embedding（否则回退 BM25）。 */
     boolean isAvailable();
 }

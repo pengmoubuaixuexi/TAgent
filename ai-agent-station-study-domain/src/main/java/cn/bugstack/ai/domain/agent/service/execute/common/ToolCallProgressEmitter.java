@@ -150,7 +150,7 @@ public class ToolCallProgressEmitter {
     }
 
     /**
-     * Persist the complete normalized result that was visible to the model. This deliberately does not
+     * Persist the normalized result, or the original source for an explicitly compacted route. This deliberately does not
      * put the result in SSE; the compact progress card remains a privacy/size boundary.
      */
     public void recordEvidence(String sessionId, String toolName, String input, String output,

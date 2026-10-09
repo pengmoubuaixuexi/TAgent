@@ -83,26 +83,27 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
                         ## 必须先做的判断
                         在输出工具能力分析前，先判断用户任务是否需要外部能力：
                         - 天气、路线、地图、地点/POI、开放时间、票价、交通班次、实时资讯、网页检索等，都属于外部能力。
-                        - 如果【实际可用工具】为空，或缺少这些外部能力，请先调用 request_tool，一次性在 needs 中列出所缺能力。
-                        - 调用 request_tool 并收到装载结果后，再基于【实际可用工具】和 request_tool 返回的真实工具继续分析。
-                        - 只有 request_tool 未匹配到工具、工具不可用，或任务确实不需要外部能力时，才允许写降级策略。
+                        - 先检查已装载工具和已授权绑定目录。目录中已存在的能力即使尚未装载，也应纳入分析，并标记为执行前按需装载。
+                        - 如需核实装载，请调用 request_tool，优先在 needs 中填写目录里的准确工具名；目录未覆盖的需求再使用能力描述检索。
+                        - 单次 request_tool 的匹配结果可能只是一部分，不能据此否定目录中的其他能力。只有确认所需能力无法装载或执行，才说明相应降级策略；目录读取失败则说明能力未知。
 
-                        ## 实际可用工具（必读）
+                        ## 已装载工具与执行节点绑定的能力目录（必读）
                         %s
 
                         ## 用户请求
                         %s
 
                         ## 分析要求
-                        基于上面【实际可用工具】列表、request_tool 返回的真实装载结果（如有）和用户请求，给出工具能力分析：
+                        基于已装载工具、已绑定 MCP 的只读能力目录、request_tool 返回的真实结果和用户请求，给出工具能力分析。
+                        必须区分“已绑定但未装载”“已装载”“目录未知/读取失败”；不能因为一轮只装载少量工具就断言其他能力不存在。
 
                         ### 1. 任务匹配度
                         - 用户请求属于什么类别（信息检索 / 内容生成 / 计算 / 工具操作 / 纯对话 等）
-                        - 真实可用工具中，哪些能直接满足？哪些不能？匹配度（高/中/低）
+                        - 已装载工具及已授权绑定目录中，哪些能力能满足任务？哪些仍需发现或核实？匹配度（高/中/低）
 
-                        ### 2. 工具使用建议（仅针对真实可用工具）
+                        ### 2. 工具使用建议（仅针对已确认的授权能力）
                         - 给出**真实存在**的工具的调用方式、参数提示
-                        - **严禁**引用【实际可用工具】和 request_tool 装载结果之外的工具（如自己脑补 web_search / summarize / run_code 等）
+                        - 工具来源限于已装载工具、已授权绑定目录和 request_tool 返回结果，严禁编造工具。目录中的未装载工具可以建议后续按需装载，但不能声称已经调用或验证可用。
 
                         ### 3. 降级策略
                         - 如果 request_tool 未能装载到所需工具，或实际工具不能完成需求，应该如何基于 LLM 自身知识给出合理回复
@@ -112,7 +113,7 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
                         - 建议规划阶段（Step2）只规划"使用上面列出的真实工具"或"纯知识回答"两种路径
                         - 提醒执行阶段（Step4）：禁止虚构工具调用过程
 
-                        请先完成必要的 request_tool 装载，再基于真实工具列表进行分析，禁止编造工具。""",
+                        请综合已装载工具、已授权绑定目录和必要的 request_tool 结果进行分析，明确区分能力存在、已装载与已执行，禁止编造工具。""",
                 toolListBlockForPrompt,
                 effectiveTaskForStep(requestParameter, dynamicContext, 1)
         ) + metaToolPromptHint(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_STEP1_TOOL_ANALYSIS,
@@ -167,24 +168,7 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
 
     private String renderStep1ToolRuntimeForPrompt(cn.bugstack.ai.domain.agent.service.execute.common.ExecutorToolCatalog catalog,
                                                    String clientId) {
-        String rendered = cn.bugstack.ai.domain.agent.service.prompt.RuntimeToolPromptComposer.renderToolRuntime(catalog);
-        if (rendered != null && !rendered.isBlank()) {
-            return rendered;
-        }
-        if (requestToolEnabled) {
-            return "<tool_runtime>\n"
-                    + "  <no_business_tools client_id=\"" + escapeXmlForStep1(clientId) + "\">"
-                    + "当前 Agent 尚未装载业务 MCP 工具。若用户任务需要外部能力，请优先调用 request_tool 描述所缺能力，"
-                    + "不要直接退化为模型知识回答。"
-                    + "</no_business_tools>\n"
-                    + "</tool_runtime>";
-        }
         return renderToolRuntimeForPrompt(catalog, clientId);
-    }
-
-    private static String escapeXmlForStep1(String value) {
-        if (value == null) return "";
-        return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
     }
 
     private String flowStep1RequestToolDirective() {
@@ -195,9 +179,10 @@ public class Step1McpToolsAnalysisNode extends AbstractExecuteSupport {
 
                 ## Flow Step1 动态补工具要求
                 request_tool 是本阶段允许使用的元工具，不属于业务/执行类工具，也不算执行用户的实际请求。
-                当【实际可用工具】为空，或缺少完成用户任务所必需的外部能力时，请先调用 request_tool，在 needs 中逐条描述缺失能力，
-                为后续规划和执行步骤装载真实工具。尤其是涉及天气、地图路线、地点/POI、开放时间、票价、交通班次、实时资讯等外部信息的任务，
-                不要直接退化为模型知识回答；只有 request_tool 未匹配到工具或工具不可用时，才在分析里说明降级策略。
+                已授权绑定目录中的工具无需预先全部装载即可纳入能力分析；执行前再通过 request_tool 按需装载。
+                需要装载已知工具时，在 needs 中使用目录里的准确工具名；目录未覆盖的需求再逐条描述能力。
+                天气、地图路线、地点/POI、开放时间、票价、交通班次、实时资讯等外部任务，不要因为当前没有装载工具就退化为模型知识回答。
+                一次检索未匹配不能证明能力不存在；结合绑定目录核实后再说明降级策略，目录读取失败时应说明能力未知。
                 """;
     }
 

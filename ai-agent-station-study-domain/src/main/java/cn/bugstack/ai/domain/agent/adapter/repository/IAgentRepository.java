@@ -12,6 +12,7 @@ import java.util.Map;
  * 2025/6/27 16:48
  */
 public interface IAgentRepository {
+    default WorkspaceNodePolicy queryWorkspaceNodePolicy(String clientId) { return null; }
 
     List<AiClientApiVO> queryAiClientApiVOListByClientIds(List<String> clientIdList);
 

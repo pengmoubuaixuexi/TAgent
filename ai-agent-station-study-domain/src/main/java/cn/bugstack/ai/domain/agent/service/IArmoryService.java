@@ -31,4 +31,21 @@ public interface IArmoryService {
     /** 懒加载：检查 agent 是否已装配 */
     boolean isAgentArmed(String agentId);
 
+    default void invalidateAgent(String agentId) {}
+
+    default void invalidateAll() {}
+
+    default void evictResources(java.util.Map<String, java.util.Set<String>> resources) {}
+
+    default void invalidateAgent(String agentId, java.util.Map<String, java.util.Set<String>> obsoleteResources) {
+        evictResources(obsoleteResources);
+        invalidateAgent(agentId);
+    }
+
+    /** Resource invalidation must run after any in-flight assembly has released its old configuration. */
+    default void invalidateAgents(java.util.Set<String> agentIds, Runnable resourceInvalidation) {
+        resourceInvalidation.run();
+        agentIds.forEach(this::invalidateAgent);
+    }
+
 }

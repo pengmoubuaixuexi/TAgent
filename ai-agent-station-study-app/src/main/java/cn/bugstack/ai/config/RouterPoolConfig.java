@@ -59,6 +59,9 @@ public class RouterPoolConfig implements ApplicationListener<ApplicationReadyEve
     @Resource
     private IAgentRepository agentRepository;
 
+    @Resource
+    private cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository workspaceAccess;
+
     @Override
     public void onApplicationEvent(ApplicationReadyEvent event) {
         if (!props.isEnabled()) {
@@ -71,8 +74,10 @@ public class RouterPoolConfig implements ApplicationListener<ApplicationReadyEve
         }
 
         // 一次性拉全部启用 model，按 tier 分组（同档按 modelId 升序，保证 "select 第一个" 稳定）
+        java.util.Set<String> platformModelIds = workspaceAccess.platformModelIds();
         Map<ModelTierEnumVO, List<AiClientModelVO>> modelsByTier = agentRepository.queryEnabledAiClientModelVOList()
                 .stream()
+                .filter(model -> platformModelIds.contains(model.getModelId()))
                 .sorted(Comparator.comparing(AiClientModelVO::getModelId))
                 .collect(Collectors.groupingBy(m -> ModelTierEnumVO.fromCode(m.getTier())));
 
@@ -133,7 +138,11 @@ public class RouterPoolConfig implements ApplicationListener<ApplicationReadyEve
                         .build())
                 .build();
 
-        ChatClient chatClient = ChatClient.builder(chatModel).build();
+        // Credentials/base URL are an assembly snapshot; changing them requires rebuilding/restarting the pool.
+        // Authorization is live: disabled platform models or API connections cannot use an already cached client.
+        ChatClient chatClient = ChatClient.builder(
+                new cn.bugstack.ai.domain.agent.service.support.PlatformAuthorizedChatModel(
+                        chatModel, model.getModelId(), workspaceAccess)).build();
 
         String beanName = AiAgentEnumVO.AI_CLIENT.getBeanName(e.getId());
         DefaultListableBeanFactory factory =

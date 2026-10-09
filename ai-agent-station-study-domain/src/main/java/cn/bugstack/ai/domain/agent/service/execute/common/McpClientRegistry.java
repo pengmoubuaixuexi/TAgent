@@ -50,6 +50,23 @@ public class McpClientRegistry {
     @Autowired(required = false)
     private McpToolMetrics mcpToolMetrics;
 
+    @Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository workspaceAccess;
+
+    public void assertAccessible(String mcpId, String userId) {
+        if (userId == null || userId.isBlank() || mcpId == null || workspaceAccess == null
+                || !workspaceAccess.ownsMcp(userId, mcpId)) {
+            throw new IllegalStateException("MCP 不存在、已停用或无权访问");
+        }
+    }
+
+    public void assertAccessible(String mcpId, String userId, String agentId) {
+        assertAccessible(mcpId, userId);
+        if (agentId == null || agentId.isBlank() || !workspaceAccess.agentMcpIds(userId, agentId).contains(mcpId)) {
+            throw new IllegalStateException("当前 Agent 未配置此 MCP");
+        }
+    }
+
     /** mcpId → 客户端工厂函数（由 AiClientToolMcpNode 注入，打破循环依赖） */
     private final Map<String, Function<AiClientToolMcpVO, McpSyncClient>> clientFactories = new ConcurrentHashMap<>();
 
@@ -60,10 +77,10 @@ public class McpClientRegistry {
     private final Map<String, AiClientToolMcpVO> configRegistry = new ConcurrentHashMap<>();
 
     /** toolName → 可原子替换的 ToolCallback 引用 */
-    private final Map<String, AtomicReference<ToolCallback>> callbackRegistry = new ConcurrentHashMap<>();
+    private final Map<ToolKey, AtomicReference<ToolCallback>> callbackRegistry = new ConcurrentHashMap<>();
 
     /** toolName → mcpId 反向索引 */
-    private final Map<String, String> toolToMcpId = new ConcurrentHashMap<>();
+    private record ToolKey(String mcpId, String name) {}
 
     /** mcpId → 连续重建失败次数 */
     private final Map<String, AtomicInteger> consecutiveFailures = new ConcurrentHashMap<>();
@@ -129,6 +146,29 @@ public class McpClientRegistry {
         return mcpId == null ? null : clientRegistry.get(mcpId);
     }
 
+    /** Revoke cached credentials/callbacks after an owned MCP is changed or removed. */
+    public void unregister(String mcpId) {
+        if (mcpId == null) return;
+        synchronized (locks.computeIfAbsent(mcpId, ignored -> new Object())) {
+            closeQuietly(clientRegistry.remove(mcpId));
+            configRegistry.remove(mcpId);
+            clientFactories.remove(mcpId);
+            callbackRegistry.keySet().removeIf(key -> mcpId.equals(key.mcpId()));
+            consecutiveFailures.computeIfAbsent(mcpId, ignored -> new AtomicInteger()).set(0);
+            failFastUntil.remove(mcpId);
+            lastSuccessTime.remove(mcpId);
+            lastReconnectTime.remove(mcpId);
+            lastProbeTime.remove(mcpId);
+            lastProbeOkTime.remove(mcpId);
+            lastProbeFailTime.remove(mcpId);
+            if (applicationContext != null) {
+                DefaultListableBeanFactory factory = (DefaultListableBeanFactory) applicationContext.getAutowireCapableBeanFactory();
+                String bean = AiAgentEnumVO.AI_CLIENT_TOOL_MCP.getBeanName(mcpId);
+                if (factory.containsBeanDefinition(bean)) factory.removeBeanDefinition(bean);
+            }
+        }
+    }
+
     /**
      * List tool callbacks during model assembly.
      *
@@ -179,11 +219,14 @@ public class McpClientRegistry {
      * 注册工具回调并建立反向索引（在 AiClientModelNode 装配时调用）
      */
     public void registerCallbacks(String mcpId, ToolCallback[] callbacks) {
+        if (mcpId == null || callbacks == null) return;
+        Set<String> current = new LinkedHashSet<>();
         for (ToolCallback cb : callbacks) {
             String toolName = cb.getToolDefinition().name();
-            toolToMcpId.put(toolName, mcpId);
-            callbackRegistry.put(toolName, new AtomicReference<>(cb));
+            current.add(toolName);
+            callbackRegistry.computeIfAbsent(new ToolKey(mcpId, toolName), ignored -> new AtomicReference<>()).set(cb);
         }
+        callbackRegistry.keySet().removeIf(key -> mcpId.equals(key.mcpId()) && !current.contains(key.name()));
         log.info("[McpRegistry] registered {} callbacks for mcpId={}", callbacks.length, mcpId);
     }
 
@@ -191,7 +234,13 @@ public class McpClientRegistry {
      * 获取工具名对应的 mcpId（供 MeteredToolCallback 构造时使用）
      */
     public String getMcpIdForTool(String toolName) {
-        return toolToMcpId.get(toolName);
+        String match = null;
+        for (ToolKey key : callbackRegistry.keySet()) {
+            if (!java.util.Objects.equals(toolName, key.name())) continue;
+            if (match != null && !match.equals(key.mcpId())) return null;
+            match = key.mcpId();
+        }
+        return match;
     }
 
     /**
@@ -201,8 +250,17 @@ public class McpClientRegistry {
      * has already been rebuilt by another tool.
      */
     public ToolCallback getCurrentCallback(String toolName) {
-        AtomicReference<ToolCallback> ref = callbackRegistry.get(toolName);
+        return getCurrentCallback(getMcpIdForTool(toolName), toolName);
+    }
+
+    public ToolCallback getCurrentCallback(String mcpId, String toolName) {
+        if (mcpId == null || toolName == null) return null;
+        AtomicReference<ToolCallback> ref = callbackRegistry.get(new ToolKey(mcpId, toolName));
         return ref != null ? ref.get() : null;
+    }
+    public ToolCallback[] currentCallbacks(String mcpId) {
+        return callbackRegistry.entrySet().stream().filter(e->java.util.Objects.equals(mcpId,e.getKey().mcpId()))
+                .map(e->e.getValue().get()).filter(java.util.Objects::nonNull).toArray(ToolCallback[]::new);
     }
 
     /**
@@ -256,13 +314,18 @@ public class McpClientRegistry {
      * 熔断中 → 返回 null。
      */
     public ToolCallback getFreshCallback(String toolName) {
-        String mcpId = toolToMcpId.get(toolName);
+        return getFreshCallback(getMcpIdForTool(toolName), toolName);
+    }
+
+    public ToolCallback getFreshCallback(String mcpId, String toolName) {
         if (mcpId == null) {
             return null;
         }
 
         // 熔断快失败
-        long failFast = failFastUntil.get(mcpId).get();
+        AtomicLong cutoff = failFastUntil.get(mcpId);
+        if (cutoff == null) return null;
+        long failFast = cutoff.get();
         if (failFast > 0 && System.currentTimeMillis() < failFast) {
             log.warn("[McpRegistry] circuit OPEN for mcpId={}, fail-fast", mcpId);
             return null;
@@ -280,7 +343,7 @@ public class McpClientRegistry {
 
             // 快速路径：客户端健康，直接返回
             if (isHealthy(client)) {
-                AtomicReference<ToolCallback> ref = callbackRegistry.get(toolName);
+                AtomicReference<ToolCallback> ref = callbackRegistry.get(new ToolKey(mcpId, toolName));
                 return ref != null ? ref.get() : null;
             }
 
@@ -297,7 +360,11 @@ public class McpClientRegistry {
      * @return 新的 ToolCallback，或 null（重建失败 / 熔断中）
      */
     public ToolCallback forceReconnect(String toolName) {
-        return reconnect(toolName, "force");
+        return forceReconnect(getMcpIdForTool(toolName), toolName);
+    }
+
+    public ToolCallback forceReconnect(String mcpId, String toolName) {
+        return reconnect(mcpId, toolName, "force");
     }
 
     /**
@@ -307,15 +374,20 @@ public class McpClientRegistry {
      * 方便区分主动强制重连和工具调用超时后的自愈。</p>
      */
     public ToolCallback reconnectAfterTimeout(String toolName) {
-        return reconnect(toolName, "timeout");
+        return reconnectAfterTimeout(getMcpIdForTool(toolName), toolName);
     }
 
-    private ToolCallback reconnect(String toolName, String trigger) {
-        String mcpId = toolToMcpId.get(toolName);
+    public ToolCallback reconnectAfterTimeout(String mcpId, String toolName) {
+        return reconnect(mcpId, toolName, "timeout");
+    }
+
+    private ToolCallback reconnect(String mcpId, String toolName, String trigger) {
         if (mcpId == null) return null;
 
         // 熔断快失败
-        long failFast = failFastUntil.get(mcpId).get();
+        AtomicLong cutoff = failFastUntil.get(mcpId);
+        if (cutoff == null) return null;
+        long failFast = cutoff.get();
         if (failFast > 0 && System.currentTimeMillis() < failFast) {
             log.warn("[McpRegistry] circuit OPEN for mcpId={}, skip {} reconnect", mcpId, trigger);
             return null;
@@ -331,7 +403,7 @@ public class McpClientRegistry {
                     if (mcpToolMetrics != null) {
                         mcpToolMetrics.recordReconnectCooldownHit(mcpId);
                     }
-                    AtomicReference<ToolCallback> ref = callbackRegistry.get(toolName);
+                    AtomicReference<ToolCallback> ref = callbackRegistry.get(new ToolKey(mcpId, toolName));
                     return ref != null ? ref.get() : null;
                 }
             }
@@ -347,7 +419,10 @@ public class McpClientRegistry {
      * @return true 连接活着（服务端慢），false 连接死了（仅判定，不在这里重建）
      */
     public boolean probeAfterTimeout(String toolName) {
-        String mcpId = toolToMcpId.get(toolName);
+        return probeAfterTimeout(getMcpIdForTool(toolName), toolName);
+    }
+
+    public boolean probeAfterTimeout(String mcpId, String toolName) {
         if (mcpId == null) return false;
 
         McpSyncClient client = clientRegistry.get(mcpId);
@@ -359,7 +434,7 @@ public class McpClientRegistry {
         if (newCallbacks == null) {
             return null;
         }
-        AtomicReference<ToolCallback> ref = callbackRegistry.get(toolName);
+        AtomicReference<ToolCallback> ref = callbackRegistry.get(new ToolKey(mcpId, toolName));
         return ref != null ? ref.get() : null;
     }
 
@@ -383,13 +458,7 @@ public class McpClientRegistry {
             clientRegistry.put(mcpId, newClient);
 
             ToolCallback[] newCallbacks = new SyncMcpToolCallbackProvider(List.of(newClient)).getToolCallbacks();
-            for (ToolCallback cb : newCallbacks) {
-                String name = cb.getToolDefinition().name();
-                AtomicReference<ToolCallback> ref = callbackRegistry.get(name);
-                if (ref != null) {
-                    ref.set(cb);
-                }
-            }
+            registerCallbacks(mcpId, newCallbacks);
 
             registerBean(AiAgentEnumVO.AI_CLIENT_TOOL_MCP.getBeanName(mcpId), McpSyncClient.class, newClient);
 
@@ -480,11 +549,17 @@ public class McpClientRegistry {
      * 探活有 {@link #PROBE_THROTTLE_MS} 节流：同一个 mcp 5min 内只探一次，HTTP polling 不会形成探活风暴。
      */
     public List<ClientHealthSnapshot> snapshotAll() {
+        return snapshotSelected(null);
+    }
+
+    /** Select before probes, so a personal dashboard never contacts another owner's MCP. */
+    public List<ClientHealthSnapshot> snapshotSelected(Set<String> selectedIds) {
         long now = System.currentTimeMillis();
         // 把已注册 mcpId 与有 callback 的 mcpId 合并，避免漏算
         Set<String> ids = new LinkedHashSet<>(configRegistry.keySet());
         ids.addAll(clientRegistry.keySet());
-        toolToMcpId.values().forEach(ids::add);
+        callbackRegistry.keySet().forEach(key -> ids.add(key.mcpId()));
+        if (selectedIds != null) ids.retainAll(selectedIds);
 
         // 第一步：找出本轮需要懒探活的 mcpId —— 当前有 client 引用但业务调用 & 探活都 5min+ 没成功，且节流过期
         List<String> probeTargets = new ArrayList<>();
@@ -573,8 +648,8 @@ public class McpClientRegistry {
 
             // 反向找 tools：toolToMcpId 是 toolName→mcpId，反查
             List<String> tools = new ArrayList<>();
-            for (Map.Entry<String, String> e : toolToMcpId.entrySet()) {
-                if (mcpId.equals(e.getValue())) tools.add(e.getKey());
+            for (ToolKey key : callbackRegistry.keySet()) {
+                if (mcpId.equals(key.mcpId())) tools.add(key.name());
             }
             Collections.sort(tools);
 

@@ -28,6 +28,22 @@ import java.util.List;
 @Service
 public class UnifiedAgentRouter {
 
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository workspaceAccess;
+
+    private boolean mayUseAgent(String agentId) {
+        String userId = MDC.get("userId");
+        return userId != null && !userId.isBlank() && workspaceAccess != null
+                && workspaceAccess.ownsAgent(userId, agentId);
+    }
+
+    private List<AiAgentVO> ownedAgents() {
+        String userId = MDC.get("userId");
+        if (userId == null || userId.isBlank() || workspaceAccess == null) return List.of();
+        java.util.Set<String> ids = workspaceAccess.ownedAgentIds(userId);
+        return repository.queryAvailableAgents().stream().filter(agent -> ids.contains(agent.getAgentId())).toList();
+    }
+
     private static final String ROUTE_PROMPT_TEMPLATE = """
             你是智能体路由器。请根据用户问题，从候选智能体中选择最匹配的一个；并判断：被选中的智能体当前能力是否足以完成该问题，如果可能缺少某类外部工具能力，用一句中文描述这个"可能缺失的工具能力"。
 
@@ -142,7 +158,7 @@ public class UnifiedAgentRouter {
     public RouteDecision routeDecision(String query) {
         if (query == null || query.isBlank()) return null;
 
-        List<AiAgentVO> agents = repository.queryAvailableAgents();
+        List<AiAgentVO> agents = ownedAgents();
         if (agents.isEmpty()) {
             log.warn("[UnifiedRouter] no enabled agents");
             return null;
@@ -221,6 +237,7 @@ public class UnifiedAgentRouter {
         if (agentId == null || agentId.isBlank()) {
             return null;
         }
+        if (!mayUseAgent(agentId)) return null;
         AiAgentVO agent = repository.queryAiAgentByAgentId(agentId);
         if (agent == null || agent.getStatus() == null || agent.getStatus() != 1) {
             log.warn("[UnifiedRouter] low-confidence fallback agent '{}' not enabled or not found", agentId);
@@ -237,6 +254,7 @@ public class UnifiedAgentRouter {
         if (agentId == null || agentId.isBlank() || query == null || query.isBlank()) {
             return List.of();
         }
+        if (!mayUseAgent(agentId)) return List.of();
         AiAgentVO agent = repository.queryAiAgentByAgentId(agentId);
         if (agent == null) {
             return List.of();

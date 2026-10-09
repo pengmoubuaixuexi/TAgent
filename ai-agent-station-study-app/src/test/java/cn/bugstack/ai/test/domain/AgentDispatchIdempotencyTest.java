@@ -22,7 +22,7 @@ public class AgentDispatchIdempotencyTest {
 
     @Test
     public void sameActiveRunIdIsAnIdempotentJoinNotASecondExecution() throws Exception {
-        AgentDispatchDispatchService service = new AgentDispatchDispatchService();
+        AgentDispatchDispatchService service = authenticatedService();
         activeRuns(service).put("session-1", "run-1");
 
         service.dispatch(command("session-1", "run-1"), new ResponseBodyEmitter());
@@ -32,7 +32,7 @@ public class AgentDispatchIdempotencyTest {
 
     @Test
     public void differentRunIdReportsTypedSessionBusyConflict() {
-        AgentDispatchDispatchService service = new AgentDispatchDispatchService();
+        AgentDispatchDispatchService service = authenticatedService();
         activeRuns(service).put("session-1", "run-existing");
 
         try {
@@ -48,7 +48,7 @@ public class AgentDispatchIdempotencyTest {
 
     @Test
     public void terminalSnapshotPreventsRunIdReuseAfterLeaseWasReleased() {
-        AgentDispatchDispatchService service = new AgentDispatchDispatchService();
+        AgentDispatchDispatchService service = authenticatedService();
         RunSnapshotService snapshots = mock(RunSnapshotService.class);
         ReflectionTestUtils.setField(service, "runSnapshotService", snapshots);
         when(snapshots.find("run-used")).thenReturn(Optional.of(RunSnapshot.builder()
@@ -75,9 +75,17 @@ public class AgentDispatchIdempotencyTest {
 
     private static ExecuteCommandEntity command(String sessionId, String runId) {
         return ExecuteCommandEntity.builder()
+                .userId("alice")
                 .sessionId(sessionId)
                 .runId(runId)
                 .message("test")
                 .build();
+    }
+
+    private static AgentDispatchDispatchService authenticatedService() {
+        AgentDispatchDispatchService service = new AgentDispatchDispatchService();
+        ReflectionTestUtils.setField(service, "workspaceAccess",
+                mock(cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository.class));
+        return service;
     }
 }

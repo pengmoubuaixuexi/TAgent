@@ -26,6 +26,8 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyEmitter
 import reactor.core.publisher.Flux;
 
 import javax.annotation.Resource;
+import cn.bugstack.ai.domain.agent.service.execute.common.StreamingRetryPolicy;
+
 import java.io.IOException;
 import java.time.Duration;
 import java.time.LocalDate;
@@ -221,6 +223,8 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             log.info("[ToolCtxDiag][fixed] stepId={} sessionId={} inject={}", stepId, sessionId, (sessionId != null && !sessionId.isBlank()));
             java.util.Map<String, Object> tc = new java.util.HashMap<>();
             if (sessionId != null && !sessionId.isBlank()) tc.put("sessionId", sessionId);
+            if (requestParameter.getUserId() != null && !requestParameter.getUserId().isBlank()) tc.put("userId", requestParameter.getUserId());
+            if (requestParameter.getAiAgentId() != null) tc.put("agentId", requestParameter.getAiAgentId());
             if (runId != null && !runId.isBlank()) tc.put("agent.run_id", runId);
             if (displayName != null && !displayName.isBlank()) tc.put("stepLabel", displayName);
             cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilities.put(tc,
@@ -238,6 +242,9 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
                     StringBuilder buf = new StringBuilder();
                     final ChatResponse[] last = new ChatResponse[1];
                     for (int attempt = 1; attempt <= streamingRetryMaxAttempts; attempt++) {
+                        if (cancelled.get() || Thread.currentThread().isInterrupted()) {
+                            throw new java.util.concurrent.CancellationException("execution cancelled before retry");
+                        }
                         buf.setLength(0);
                         last[0] = null;
                     // v1.3.2：scopeSession 让 ReasoningContentFilter 隔离缓存；2026-06-23 改按 runId 隔离防跨题串
@@ -249,7 +256,9 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
                         // 立即回答 mid-stream 截断触发器：answer_now emit 它 → takeUntilOther 优雅完成 → 拿到半截
                         reactor.core.publisher.Sinks.One<Object> __trigger = reactor.core.publisher.Sinks.one();
                         if (sessionId != null) cancelTriggers.put(sessionId, __trigger);
-                        Flux<ChatClientResponse> flux = spec.stream().chatClientResponse()
+                        Flux<ChatClientResponse> flux = spec.toolContext(java.util.Map.of(
+                            cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.CONTEXT_KEY, __activity))
+                            .stream().chatClientResponse()
                                 .doOnNext(__activity::markDecodedResponse);
                         cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker
                         .timeoutOnInactivity(flux, __activity, Duration.ofSeconds(streamingIdleTimeoutSeconds))
@@ -277,40 +286,39 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
                         }
                         break;
                     } catch (Exception e) {
-                        if (isStreamingTimeout(e)) {
-                            if (buf.length() <= 200 && attempt < streamingRetryMaxAttempts) {
-                                log.warn("[FixedAgent] streaming idle timeout stepId={} chars={} attempt {}/{}, retrying",
-                                        stepId, buf.length(), attempt, streamingRetryMaxAttempts);
-                                sleepBeforeStreamingRetry(stepId, attempt);
-                                continue;
-                            }
-                            log.warn("[FixedAgent] streaming idle timeout stepId={} chars={}, returning partial result",
-                                    stepId, buf.length());
-                            sendTokenEvent(emitter, "[DONE]", stepId, sessionId);
-                            break;
-                        } else {
-                            if (attempt < streamingRetryMaxAttempts) {
-                                log.warn("[FixedAgent] streaming attempt {}/{} failed stepId={} error={}, retrying",
-                                        attempt, streamingRetryMaxAttempts, stepId, e.getMessage());
-                                sleepBeforeStreamingRetry(stepId, attempt);
-                                continue;
-                            }
-                            throw e;
+                        __activity.cancel();
+                        java.util.concurrent.CancellationException cancellation = StreamingRetryPolicy.cancellation(e);
+                        if (cancellation != null) throw cancellation;
+                        if (StreamingRetryPolicy.canRetry(e, __activity.hasToolActivity(), buf.length(),
+                                attempt, streamingRetryMaxAttempts)) {
+                            log.warn("[FixedAgent] retrying before output or tools, stepId={} attempt={}: {}", stepId, attempt, e.toString());
+                            sleepBeforeStreamingRetry(stepId, attempt);
+                            continue;
                         }
+                        sendTokenEvent(emitter, "[DONE]", stepId, sessionId);
+                        throw StreamingRetryPolicy.failed(stepId, e);
+                    } finally {
+                        __activity.cancel();
                     }
                     }
                     stepResult = buf.toString();
                     lastResponse = last[0];
+                    AtomicBoolean finalizing = sessionId == null ? null : finalizeFlags.get(sessionId);
+                    boolean steering = sessionId != null && steerInbox.containsKey(sessionId);
+                    if (stepResult.isBlank() && !cancelled.get() && !(finalizing != null && finalizing.get()) && !steering) {
+                        throw new IllegalStateException("LLM stream completed without an answer");
+                    }
                 } else {
                     lastResponse = spec.call().chatResponse();
                     stepResult = lastResponse != null && lastResponse.getResult() != null && lastResponse.getResult().getOutput() != null
                             ? lastResponse.getResult().getOutput().getText() : "";
                 }
+                sendStepEnd(emitter, stepId, displayName + " 已完成", sessionId);
             } catch (Exception streamingEx) {
+                sendStepEnd(emitter, stepId, displayName + " 失败: " + streamingEx.getMessage(),
+                        StreamingRetryPolicy.cancellation(streamingEx) != null ? "cancelled" : "failed", sessionId);
                 if (streamingEx instanceof RuntimeException re) throw re;
                 throw new RuntimeException(streamingEx);
-            } finally {
-                sendStepEnd(emitter, stepId, displayName + " 已完成", sessionId);
             }
 
             // 检查取消：blockLast() 或 spec.call() 返回后，如果已被取消则丢弃结果
@@ -430,10 +438,15 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
     }
 
     private void sendStepEnd(ResponseBodyEmitter emitter, String stepId, String summary, String sessionId) {
+        sendStepEnd(emitter, stepId, summary, "completed", sessionId);
+    }
+
+    private void sendStepEnd(ResponseBodyEmitter emitter, String stepId, String summary, String status, String sessionId) {
         try {
             Map<String, Object> p = new LinkedHashMap<>();
             p.put("stepId", stepId);
             p.put("summary", summary);
+            p.put("status", status);
             p.put("sessionId", sessionId);
             p.put("timestamp", System.currentTimeMillis());
             emitter.send("event: step_end\ndata: " + JSON.toJSONString(p) + "\n\n");
@@ -794,6 +807,8 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         }
         java.util.Map<String, Object> finalizeToolContext = new java.util.HashMap<>();
         if (sessionId != null && !sessionId.isBlank()) finalizeToolContext.put("sessionId", sessionId);
+        if (req.getUserId() != null && !req.getUserId().isBlank()) finalizeToolContext.put("userId", req.getUserId());
+        if (req.getAiAgentId() != null) finalizeToolContext.put("agentId", req.getAiAgentId());
         if (req.getRunId() != null && !req.getRunId().isBlank()) finalizeToolContext.put("agent.run_id", req.getRunId());
         finalizeToolContext.put("stepLabel", "立即回答");
         cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilities.put(finalizeToolContext,
@@ -808,7 +823,9 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(sessionId, req.getRunId());
              AutoCloseable __noThink = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeNoThinking(sessionId);
              AutoCloseable __activityScope = cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.scope(__activity)) {
-            Flux<ChatClientResponse> flux = spec.stream().chatClientResponse()
+            Flux<ChatClientResponse> flux = spec.toolContext(java.util.Map.of(
+                            cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.CONTEXT_KEY, __activity))
+                            .stream().chatClientResponse()
                     .doOnNext(__activity::markDecodedResponse);
             cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker
                 .timeoutOnInactivity(flux, __activity, Duration.ofSeconds(streamingIdleTimeoutSeconds))
@@ -831,11 +848,15 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             log.info("[AnswerNow][fixed] 立即回答收尾完成(流式) len={}", ans.length());
             return (!ans.isBlank()) ? ans : partialAnswer;
         } catch (Exception e) {
+            java.util.concurrent.CancellationException cancellation = StreamingRetryPolicy.cancellation(e);
+            if (cancellation != null) throw cancellation;
             log.warn("[AnswerNow][fixed] 立即回答收尾失败，退回半截: {}", e.getMessage());
             logTokenUsage(last[0], System.currentTimeMillis() - start, fStepId, clientId, req, prompt, null);
             sendTokenEvent(emitter, "[DONE]", fStepId, sessionId);
-            sendStepEnd(emitter, fStepId, "立即回答 失败", sessionId);
+            sendStepEnd(emitter, fStepId, "立即回答 失败", "failed", sessionId);
             return partialAnswer;
+        } finally {
+            __activity.cancel();
         }
     }
 
@@ -898,6 +919,8 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         }
         java.util.Map<String, Object> steerToolContext = new java.util.HashMap<>();
         if (sessionId != null && !sessionId.isBlank()) steerToolContext.put("sessionId", sessionId);
+        if (req.getUserId() != null && !req.getUserId().isBlank()) steerToolContext.put("userId", req.getUserId());
+        if (req.getAiAgentId() != null) steerToolContext.put("agentId", req.getAiAgentId());
         if (req.getRunId() != null && !req.getRunId().isBlank()) steerToolContext.put("agent.run_id", req.getRunId());
         steerToolContext.put("stepLabel", "引导重做");
         cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilities.put(steerToolContext,
@@ -910,7 +933,9 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         // 引导重做：流式逐 token 推；思考不关（与设计一致，引导要让模型重新想）。
         try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(sessionId, req.getRunId());
              AutoCloseable __activityScope = cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.scope(__activity)) {
-            Flux<ChatClientResponse> flux = spec.stream().chatClientResponse()
+            Flux<ChatClientResponse> flux = spec.toolContext(java.util.Map.of(
+                            cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.CONTEXT_KEY, __activity))
+                            .stream().chatClientResponse()
                     .doOnNext(__activity::markDecodedResponse);
             cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker
                 .timeoutOnInactivity(flux, __activity, Duration.ofSeconds(streamingIdleTimeoutSeconds))
@@ -932,11 +957,15 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             log.info("[Steer][fixed] 引导重做完成(流式) len={}", ans.length());
             return (!ans.isBlank()) ? ans : partialAnswer;
         } catch (Exception e) {
+            java.util.concurrent.CancellationException cancellation = StreamingRetryPolicy.cancellation(e);
+            if (cancellation != null) throw cancellation;
             log.warn("[Steer][fixed] 引导重做失败，退回原答案: {}", e.getMessage());
             logTokenUsage(last[0], System.currentTimeMillis() - start, fStepId, clientId, req, prompt, null);
             sendTokenEvent(emitter, "[DONE]", fStepId, sessionId);
-            sendStepEnd(emitter, fStepId, "引导重做 失败", sessionId);
+            sendStepEnd(emitter, fStepId, "引导重做 失败", "failed", sessionId);
             return partialAnswer;
+        } finally {
+            __activity.cancel();
         }
     }
 

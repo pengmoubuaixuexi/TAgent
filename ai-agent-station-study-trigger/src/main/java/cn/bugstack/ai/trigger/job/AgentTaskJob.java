@@ -29,6 +29,8 @@ public class AgentTaskJob implements ITaskDataProvider {
 
     @Resource
     private IAgentDispatchService dispatchService;
+    @Resource(name = "mysqlJdbcTemplate")
+    private org.springframework.jdbc.core.JdbcTemplate jdbcTemplate;
 
     @Override
     public List<TaskScheduleVO> queryAllValidTaskSchedule() {
@@ -42,9 +44,19 @@ public class AgentTaskJob implements ITaskDataProvider {
             taskScheduleVO.setTaskParam(aiAgentTaskScheduleVO.getTaskParam());
             taskScheduleVO.setTaskLogic(() -> {
                 try {
+                    List<String> owners = jdbcTemplate.queryForList("""
+                            SELECT a.owner_user_id FROM ai_agent a JOIN admin_user u ON u.user_id=a.owner_user_id
+                            WHERE a.agent_id=? AND a.status=1 AND a.archived=0 AND u.status=1
+                            """, String.class, aiAgentTaskScheduleVO.getAgentId());
+                    if (owners.size() != 1) {
+                        log.warn("Scheduled agent unavailable or has no active owner: {}", aiAgentTaskScheduleVO.getAgentId());
+                        return;
+                    }
                     dispatchService.dispatch(
                             ExecuteCommandEntity.builder()
                                     .aiAgentId(aiAgentTaskScheduleVO.getAgentId())
+                                    .userId(owners.get(0))
+                                    .message(aiAgentTaskScheduleVO.getTaskParam())
                                     .sessionId(String.valueOf(System.nanoTime()))
                                     .maxStep(1)
                                     .build(), new ResponseBodyEmitter());

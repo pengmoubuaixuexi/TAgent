@@ -13,6 +13,8 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyEmitter
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.LinkedHashMap;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -48,6 +50,13 @@ public class RunEventPublisher {
 
     public String currentRunId(String sessionId) {
         return blank(sessionId) ? null : sessionRunIds.get(sessionId);
+    }
+
+    /** User-supplied facts shared by the nodes of one active run, never by session or globally. */
+    public List<Map<String, Object>> answeredUserInputs(String runId, String userId) {
+        if (blank(runId) || blank(userId) || !sessionRunIds.containsValue(runId)) return List.of();
+        // Seeding from the existing snapshot also retains answers when the same run is resumed.
+        return timeline(runId).answeredUserInputs(userId);
     }
 
     public void attach(String runId, String sessionId, ResponseBodyEmitter emitter, String afterEventId) {
@@ -175,6 +184,29 @@ public class RunEventPublisher {
             boolean milestone = !"token".equals(record.getEventType())
                     || System.currentTimeMillis() - lastCheckpointAt >= 1_000L;
             if (milestone) checkpoint(false);
+        }
+
+        private synchronized List<Map<String, Object>> answeredUserInputs(String userId) {
+            Map<String, Map<String, Object>> answered = new LinkedHashMap<>();
+            for (RunEventRecord event : compactEvents) {
+                if (!"user_input_result".equals(event.getEventType())) continue;
+                try {
+                    JSONObject result = JSON.parseObject(event.getPayloadJson());
+                    if (!"ANSWERED".equals(result.getString("status"))
+                            || !userId.equals(result.getString("userId"))
+                            || blank(result.getString("answer"))) continue;
+                    String inputId = result.getString("inputId");
+                    if (blank(inputId)) continue;
+                    Map<String, Object> fact = new LinkedHashMap<>();
+                    for (String key : List.of("step", "context", "questions", "answer")) {
+                        if (result.get(key) != null) fact.put(key, result.get(key));
+                    }
+                    answered.put(inputId, Map.copyOf(fact));
+                } catch (RuntimeException ignored) {
+                    // Legacy/unreadable events cannot be treated as an authenticated answer.
+                }
+            }
+            return List.copyOf(answered.values());
         }
 
         /** Compact adjacent token events for the snapshot while Stream keeps exact chunks. */

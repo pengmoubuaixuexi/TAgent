@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<script src="/auth.js"></script>
+<script src="/observe-scope.js"></script>
+    <meta charset="utf-8"/>
+    <title>TAgent · 网站统计</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        [hidden] { display: none !important; }
+        header { flex-wrap: wrap; }
+        body { margin: 0; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+               background: #0f1419; color: #e6edf3; }
+        header { padding: 18px 24px; border-bottom: 1px solid #21262d; display: flex; align-items: center; gap: 16px; }
+        header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+        header .muted { color: #8b949e; font-size: 13px; }
+        header .right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+        header select, header button { background: #21262d; color: #e6edf3; border: 1px solid #30363d;
+            padding: 6px 12px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+        header button:hover { background: #30363d; }
+        .tabs { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+        .tabs a { color: #8b949e; text-decoration: none; border: 1px solid #30363d; background: #161b22;
+            padding: 6px 12px; border-radius: 6px; font-size: 13px; line-height: 1; }
+        .tabs a:hover { color: #e6edf3; background: #21262d; }
+        .tabs a.active { color: #e6edf3; border-color: #58a6ff; background: rgba(88, 166, 255, 0.14); }
+        .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; padding: 20px 24px; }
+        .stat { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 14px 16px; }
+        .stat .label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .stat .value { font-size: 26px; font-weight: 600; margin-top: 6px; }
+        .stat .sub { color: #6e7681; font-size: 12px; margin-top: 4px; }
+        .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 0 24px 24px; }
+        .card { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 16px; }
+        .card h2 { margin: 0 0 12px; font-size: 14px; font-weight: 600; color: #e6edf3; }
+        .card .muted { color: #8b949e; font-size: 12px; font-weight: normal; margin-left: 8px; }
+        .table-wrap { padding: 0 24px 40px; }
+        table { width: 100%; border-collapse: collapse; background: #161b22; border: 1px solid #21262d; border-radius: 8px; overflow: hidden; }
+        th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #21262d; font-size: 13px; }
+        th { background: #0d1117; color: #8b949e; font-weight: 500; text-transform: uppercase; letter-spacing: 0.4px; font-size: 11px; }
+        tr:last-child td { border-bottom: none; }
+        td.num { text-align: right; font-variant-numeric: tabular-nums; }
+        .empty { color: #6e7681; padding: 24px; text-align: center; }
+        .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+        .dot.ok { background: #3fb950; } .dot.err { background: #f85149; }
+        .site-section { margin: 20px 24px 0; }
+        .site-heading { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+        .site-heading h2 { margin: 0; font-size: 16px; }
+        .site-heading select { margin-left: auto; background: #21262d; color: #e6edf3; border: 1px solid #30363d; padding: 6px 12px; border-radius: 6px; }
+        .site-grid { grid-template-columns: repeat(3, 1fr); padding: 16px 0; }
+        .site-note { color: #8b949e; font-size: 12px; line-height: 1.8; margin: 10px 0; }
+        .site-chart { position: relative; width: 100%; min-width: 0; height: 230px; }
+        .site-chart canvas { max-width: 100%; }
+        .site-details { margin-top: 14px; overflow-x: auto; }
+        .site-details summary { cursor: pointer; color: #8b949e; margin-bottom: 10px; font-size: 13px; }
+        #site-status { font-size: 12px; color: #8b949e; }
+        @media (max-width: 760px) {
+            header { flex-wrap: wrap; padding: 16px; }
+            header .right { margin-left: 0; flex-wrap: wrap; }
+            .grid { grid-template-columns: repeat(2, 1fr); padding: 16px; }
+            .site-section { margin: 16px 16px 0; }
+            .site-grid { grid-template-columns: 1fr; padding: 16px 0; }
+            .charts { grid-template-columns: 1fr; padding: 0 16px 16px; }
+            .table-wrap { padding: 0 16px 24px; overflow-x: auto; }
+        }
+    </style>
+</head>
+<body>
+<header>
+    <h1>TAgent · 网站统计</h1>
+    <span class="muted">仅管理员可见 · 全站访问与注册</span>
+    <nav class="tabs" aria-label="导航"><a href="/index.html">对话</a><a href="/user-agents.html">我的 Agent</a><a href="/observe.html">用量观测</a></nav>
+    <div class="right"><button id="refresh-stats" type="button">刷新</button></div>
+</header>
+<main id="admin-content" hidden>
+<section class="site-section card" aria-labelledby="site-title">
+    <div class="site-heading">
+        <h2 id="site-title">网站访问与注册</h2>
+        <span id="site-status" role="status" aria-live="polite">正在读取统计…</span>
+        <select id="site-range" aria-label="网站统计时间范围">
+            <option value="7">最近 7 天</option>
+            <option value="30">最近 30 天</option>
+        </select>
+    </div>
+    <div class="grid site-grid">
+        <div class="stat"><div class="label">今日首页浏览 · PV</div><div class="value" id="site-pv">–</div><div class="sub">首页打开或刷新产生的访问请求</div></div>
+        <div class="stat"><div class="label">今日估算访客 · UV</div><div class="value" id="site-uv">–</div><div class="sub">按当天 IP 与浏览器标识去重</div></div>
+        <div class="stat"><div class="label">今日新增注册</div><div class="value" id="site-registrations">–</div><div class="sub">按现有账户的创建时间统计</div></div>
+    </div>
+    <div class="site-chart"><canvas id="chart-site" aria-label="每日首页浏览、估算访客和新增注册趋势" role="img"></canvas></div>
+    <p class="site-note">按北京时间自然日统计，今日为截至当前的数据。访问统计约每 5 分钟更新，仅包含启用日志后的首页 GET 200／304 请求；排除接口、静态资源和已识别爬虫，包含管理员自己的访问。UV 为估算人数，不能将每日 UV 相加当成跨日独立访客。未采集日期显示“–”。</p>
+    <details class="site-details">
+        <summary>查看每日明细与统计说明</summary>
+        <p class="site-note">浏览器完全使用缓存时不会产生访问日志。注册数包含管理员创建或导入的账户，按原创建日期统计；删除账户会影响历史统计。</p>
+        <table id="tbl-site"><thead><tr><th>日期 · 北京时间</th><th>首页 PV</th><th>估算 UV</th><th>新增注册</th></tr></thead><tbody></tbody></table>
+    </details>
+</section>
+</main>
+<p id="permission-status" class="site-note" style="margin:24px" role="status">正在校验管理员权限…</p>
+<script>
+if (window.Chart) { Chart.defaults.color = '#8b949e'; Chart.defaults.borderColor = '#21262d'; }
+let chartSite, siteLoading = false;
+
+function siteNumber(value) { return value == null ? '–' : Number(value).toLocaleString(); }
+
+async function refreshSite() {
+    if (siteLoading) return;
+    siteLoading = true;
+    const requestedDays = document.getElementById('site-range').value;
+    const status = document.getElementById('site-status');
+    try {
+        const response = await fetchJson(`/api/v1/observe/site-stats?days=${requestedDays}`);
+        const d = response.data;
+        document.getElementById('site-pv').textContent = siteNumber(d.today.pv);
+        document.getElementById('site-uv').textContent = siteNumber(d.today.uv);
+        document.getElementById('site-registrations').textContent = siteNumber(d.today.registrations);
+        const messages = { MISSING: '访问统计尚未接入', INVALID: '访问统计读取失败', STALE: '访问统计已过期，显示上次结果', AVAILABLE: '访问统计已更新' };
+        const updated = d.generatedAt ? new Date(d.generatedAt).toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai', hour12: false}) : '';
+        status.textContent = `${messages[d.trafficStatus] || '访问统计状态未知'}${updated ? ' · ' + updated : ''}${d.registrationAvailable ? '' : ' · 注册统计读取失败'}`;
+        status.style.color = d.trafficStatus === 'AVAILABLE' && d.registrationAvailable ? '#8b949e' : '#d29922';
+        document.querySelector('#tbl-site tbody').innerHTML = [...d.days].reverse().map(row =>
+            `<tr><td>${escapeHtml(row.date)}</td><td class="num">${siteNumber(row.pv)}</td><td class="num">${siteNumber(row.uv)}</td><td class="num">${siteNumber(row.registrations)}</td></tr>`).join('');
+        if (chartSite) chartSite.destroy();
+        if (window.Chart) chartSite = new Chart(document.getElementById('chart-site'), {
+            type: 'line',
+            data: {
+                labels: d.days.map(row => row.date.slice(5)),
+                datasets: [
+                    {label: '首页 PV', data: d.days.map(row => row.pv), borderColor: '#58a6ff'},
+                    {label: '估算 UV', data: d.days.map(row => row.uv), borderColor: '#3fb950'},
+                    {label: '新增注册', data: d.days.map(row => row.registrations), borderColor: '#d29922'}
+                ].map(series => ({...series, backgroundColor: series.borderColor, tension: 0.15, spanGaps: false, pointRadius: 3}))
+            },
+            options: {responsive: true, maintainAspectRatio: false, interaction: {mode: 'index', intersect: false},
+                scales: {y: {beginAtZero: true, ticks: {precision: 0}}}}
+        });
+        else status.textContent += ' · 图表未加载，可查看每日明细';
+    } catch (e) {
+        status.textContent = `网站统计刷新失败：${e.message}`;
+        status.style.color = '#f85149';
+        for (const id of ['site-pv', 'site-uv', 'site-registrations']) document.getElementById(id).textContent = '–';
+        document.querySelector('#tbl-site tbody').innerHTML = '';
+        if (chartSite) { chartSite.destroy(); chartSite = null; }
+    } finally {
+        siteLoading = false;
+        if (document.getElementById('site-range').value !== requestedDays) refreshSite();
+    }
+}
+
+async function fetchJson(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`${url} ${r.status}`);
+    const result = await r.json();
+    if (result.code !== '0000') throw new Error(result.info || '请求失败');
+    if (['ES unavailable', 'search failed'].includes(result.info)) throw new Error('LLM 观测数据源不可用');
+    return result;
+}
+
+function escapeHtml(s) { return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+
+async function startStats() {
+    try {
+        await ObserveScope.initialize({adminOnly: true});
+        document.getElementById('permission-status').hidden = true;
+        document.getElementById('admin-content').hidden = false;
+        document.getElementById('site-range').addEventListener('change', refreshSite);
+        document.getElementById('refresh-stats').addEventListener('click', refreshSite);
+        await refreshSite();
+    } catch (error) {
+        document.getElementById('permission-status').textContent = error.message;
+    }
+}
+startStats();
+</script>
+</body>
+</html>

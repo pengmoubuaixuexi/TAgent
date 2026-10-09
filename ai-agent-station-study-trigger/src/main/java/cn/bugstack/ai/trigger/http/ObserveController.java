@@ -30,6 +30,12 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.security.authentication.AnonymousAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.server.ResponseStatusException;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 
@@ -64,8 +70,15 @@ public class ObserveController {
     @Autowired(required = false)
     private MeterRegistry meterRegistry;
 
+    @Autowired(required = false)
+    @org.springframework.beans.factory.annotation.Qualifier("mysqlJdbcTemplate")
+    private JdbcTemplate jdbcTemplate;
+
     @GetMapping("/token-by-model")
-    public Response<Map<String, Object>> tokenByModel(@RequestParam(value = "hours", defaultValue = "24") int hours) {
+    public Response<Map<String, Object>> tokenByModel(@RequestParam(value = "hours", defaultValue = "24") int hours,
+            @RequestParam(value = "scope", defaultValue = "mine") String requestedScope) {
+        ObservationScope scope = observationScope(requestedScope);
+        hours = Math.max(1, Math.min(hours, 24 * 30));
         if (restClient == null) return emptyResponse("ES unavailable");
         String body = "{"
                 + "\"size\":0,"
@@ -83,7 +96,7 @@ public class ObserveController {
                 + "  }"
                 + "}}"
                 + "}";
-        JSONObject root = search(body);
+        JSONObject root = search(body, scope);
         if (root == null) return emptyResponse("search failed");
 
         List<Map<String, Object>> rows = new ArrayList<>();
@@ -105,6 +118,7 @@ public class ObserveController {
         }
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("windowHours", hours);
+        data.put("dataScope", scope.all() ? "all" : "mine");
         data.put("grandTotalTokens", grandTotal);
         data.put("grandTotalCalls", grandCalls);
         data.put("items", rows);
@@ -113,8 +127,12 @@ public class ObserveController {
 
     @GetMapping("/calls-by-session-today")
     public Response<Map<String, Object>> callsBySessionToday(@RequestParam(value = "size", defaultValue = "30") int size,
-                                                             @RequestParam(value = "hours", defaultValue = "24") int hours) {
+                                                             @RequestParam(value = "hours", defaultValue = "24") int hours,
+            @RequestParam(value = "scope", defaultValue = "mine") String requestedScope) {
+        ObservationScope scope = observationScope(requestedScope);
+        hours = Math.max(1, Math.min(hours, 24 * 30));
         if (restClient == null) return emptyResponse("ES unavailable");
+        size = Math.max(1, Math.min(size, 100));
         String body = "{"
                 + "\"size\":0,"
                 + "\"query\":{\"bool\":{\"filter\":["
@@ -133,7 +151,7 @@ public class ObserveController {
                 + "  }"
                 + "}}"
                 + "}";
-        JSONObject root = search(body);
+        JSONObject root = search(body, scope);
         if (root == null) return emptyResponse("search failed");
 
         List<Map<String, Object>> rows = new ArrayList<>();
@@ -152,12 +170,16 @@ public class ObserveController {
         }
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("windowHours", hours);
+        data.put("dataScope", scope.all() ? "all" : "mine");
         data.put("items", rows);
         return success(data);
     }
 
     @GetMapping("/summary")
-    public Response<Map<String, Object>> summary(@RequestParam(value = "hours", defaultValue = "24") int hours) {
+    public Response<Map<String, Object>> summary(@RequestParam(value = "hours", defaultValue = "24") int hours,
+            @RequestParam(value = "scope", defaultValue = "mine") String requestedScope) {
+        ObservationScope scope = observationScope(requestedScope);
+        hours = Math.max(1, Math.min(hours, 24 * 30));
         if (restClient == null) return emptyResponse("ES unavailable");
         String body = "{"
                 + "\"size\":0,"
@@ -175,11 +197,12 @@ public class ObserveController {
                 + "  \"models\":{\"cardinality\":{\"field\":\"model\"}}"
                 + "}"
                 + "}";
-        JSONObject root = search(body);
+        JSONObject root = search(body, scope);
         if (root == null) return emptyResponse("search failed");
         JSONObject aggs = root.getJSONObject("aggregations");
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("windowHours", hours);
+        data.put("dataScope", scope.all() ? "all" : "mine");
         data.put("calls", aggs.getJSONObject("calls").getLongValue("value"));
         data.put("totalTokens", aggs.getJSONObject("totalTokens").getLongValue("value"));
         data.put("promptTokens", aggs.getJSONObject("promptTokens").getLongValue("value"));
@@ -192,19 +215,24 @@ public class ObserveController {
 
     /**
      * MCP 客户端健康快照：直接读 McpClientRegistry.snapshotAll() 内存态，
-     * 0 网络 IO；不依赖 ELK，单机裸跑也能用。
+     * 先过滤本人连接，再按需探活；不依赖 ELK。
      */
     @GetMapping("/mcp-client-health")
-    public Response<Map<String, Object>> mcpClientHealth() {
+    public Response<Map<String, Object>> mcpClientHealth(
+            @RequestParam(value = "scope", defaultValue = "mine") String requestedScope) {
+        ObservationScope scope = observationScope(requestedScope);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("generatedAt", System.currentTimeMillis());
+        data.put("dataScope", scope.all() ? "all" : "mine");
         if (mcpClientRegistry == null) {
             data.put("summary", Collections.emptyMap());
             data.put("clients", Collections.emptyList());
             return success(data);
         }
 
-        List<McpClientRegistry.ClientHealthSnapshot> snapshots = mcpClientRegistry.snapshotAll();
+        List<McpClientRegistry.ClientHealthSnapshot> snapshots = scope.all()
+                ? mcpClientRegistry.snapshotAll() : mcpClientRegistry.snapshotSelected(ownedMcpIds(scope.userId()));
+        Map<String, String> names = connectionNames(scope, snapshots.stream().map(McpClientRegistry.ClientHealthSnapshot::mcpId).toList());
         List<Map<String, Object>> clients = new ArrayList<>(snapshots.size());
         int alive = 0;
         int circuitOpen = 0;
@@ -212,6 +240,7 @@ public class ObserveController {
         for (McpClientRegistry.ClientHealthSnapshot s : snapshots) {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("mcpId", s.mcpId());
+            row.put("mcpName", names.get(s.mcpId()));
             row.put("status", s.status());
             row.put("consecutiveFailures", s.consecutiveFailures());
             row.put("circuitOpenUntil", s.circuitOpenUntil());
@@ -223,7 +252,7 @@ public class ObserveController {
             row.put("lastProbeOkAt", s.lastProbeOkAt());
             row.put("registeredTools", s.registeredTools());
             // 把重连/熔断的最近错误样本带过去：键约定为 "[client:<mcpId>]"，跟 McpClientRegistry.recordClientReconnectFailure 对齐
-            row.put("lastClientError", lastClientErrorView(s.mcpId()));
+            row.put("lastClientError", lastErrorView("[client:" + s.mcpId() + "]", scope, s.mcpId()));
             clients.add(row);
             if ("alive".equals(s.status())) alive++;
             if ("circuit_open".equals(s.status())) circuitOpen++;
@@ -246,13 +275,19 @@ public class ObserveController {
      * 给 observe-mcp.html 渲染表格用。
      * <p>
      * Micrometer counter 是 JVM 启动至今累计（非滑动窗口），前端要"per minute"自己做 delta 即可。
-     * windowHours 字段保留位但暂未生效（要做窗口需走 ES，性价比低）。
+     * 明确返回 PROCESS_LIFETIME；hours 仅为旧客户端兼容参数，不伪装为历史时间窗口。
      */
     @GetMapping("/mcp-tools-status")
-    public Response<Map<String, Object>> mcpToolsStatus(@RequestParam(value = "hours", defaultValue = "24") int hours) {
+    public Response<Map<String, Object>> mcpToolsStatus(@RequestParam(value = "hours", defaultValue = "24") int hours,
+            @RequestParam(value = "scope", defaultValue = "mine") String requestedScope) {
+        ObservationScope scope = observationScope(requestedScope);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("generatedAt", System.currentTimeMillis());
-        data.put("windowHours", hours);
+        data.put("windowHours", null);
+        data.put("windowApplied", false);
+        data.put("aggregation", "PROCESS_LIFETIME");
+        data.put("startedAt", java.lang.management.ManagementFactory.getRuntimeMXBean().getStartTime());
+        data.put("dataScope", scope.all() ? "all" : "mine");
 
         if (meterRegistry == null) {
             data.put("summary", Collections.emptyMap());
@@ -263,12 +298,13 @@ public class ObserveController {
         // tool → 聚合视图（按 tool 名归并 success/failure 两个 timer）
         Map<String, ToolMetricRow> rows = new TreeMap<>();
         for (Timer t : meterRegistry.find("mcp.tool.call").timers()) {
+            if (!scope.includes(t.getId().getTag("userId"))) continue;
             String tool = safeTag(t.getId().getTag("tool"));
             String outcome = safeTag(t.getId().getTag("outcome"));
-            ToolMetricRow row = rows.computeIfAbsent(tool, ToolMetricRow::new);
+            ToolMetricRow row = metricRow(rows, tool, t.getId().getTag("mcpId"));
             long count = t.count();
-            if ("success".equals(outcome)) row.success = count;
-            else if ("failure".equals(outcome)) row.failure = count;
+            if ("success".equals(outcome)) row.success += count;
+            else if ("failure".equals(outcome)) row.failure += count;
             // percentile 只取 success/failure 中较大的（实际两个 timer 各自独立分布；这里取合并视图近似值）
             HistogramSnapshot snap = t.takeSnapshot();
             for (ValueAtPercentile vp : snap.percentileValues()) {
@@ -282,20 +318,22 @@ public class ObserveController {
             }
         }
 
-        accumulate(rows, "mcp.tool.normalize.applied", "tool", (r, v) -> r.normalizeApplied += v);
-        accumulate(rows, "mcp.tool.result.truncated", "tool", (r, v) -> r.resultTruncated += v);
-        accumulate(rows, "mcp.tool.retry", "tool", (r, v) -> r.retries += v);
-        accumulate(rows, "mcp.tool.name.unknown", "tool", (r, v) -> r.unknownNameHits += v);
-        accumulate(rows, "mcp.tool.first_attempt.failure", "tool", (r, v) -> r.firstAttemptFailures += v);
-        accumulate(rows, "mcp.tool.recovered", "tool", (r, v) -> r.recovered += v);
+        accumulate(rows, scope, "mcp.tool.normalize.applied", "tool", (r, v) -> r.normalizeApplied += v);
+        accumulate(rows, scope, "mcp.tool.result.truncated", "tool", (r, v) -> r.resultTruncated += v);
+        accumulate(rows, scope, "mcp.tool.retry", "tool", (r, v) -> r.retries += v);
+        accumulate(rows, scope, "mcp.tool.name.unknown", "tool", (r, v) -> r.unknownNameHits += v);
+        accumulate(rows, scope, "mcp.tool.first_attempt.failure", "tool", (r, v) -> r.firstAttemptFailures += v);
+        accumulate(rows, scope, "mcp.tool.recovered", "tool", (r, v) -> r.recovered += v);
 
         // mcp.tool.name.normalized 没有 tool 维度（按 from→to），先汇总到一个 "global" 行不展示
         long nameNormalizedTotal = 0;
         for (Counter c : meterRegistry.find("mcp.tool.name.normalized").counters()) {
+            if (!scope.includes(c.getId().getTag("userId"))) continue;
             nameNormalizedTotal += (long) c.count();
         }
 
         // 工具 → mcpId 反查（让前端能按 mcpId group）
+        Map<String, String> names = connectionNames(scope, rows.values().stream().map(row -> row.mcpId).toList());
         List<Map<String, Object>> tools = new ArrayList<>(rows.size());
         long totalCalls = 0;
         long totalErrors = 0;
@@ -317,7 +355,8 @@ public class ObserveController {
 
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("tool", r.tool);
-            row.put("mcpId", mcpClientRegistry == null ? null : mcpClientRegistry.getMcpIdForTool(r.tool));
+            row.put("mcpId", "unknown".equals(r.mcpId) ? null : r.mcpId);
+            row.put("mcpName", names.get(r.mcpId));
             row.put("calls", calls);
             row.put("errors", errors);
             row.put("firstAttemptFailures", r.firstAttemptFailures);
@@ -331,7 +370,7 @@ public class ObserveController {
             row.put("resultTruncated", r.resultTruncated);
             row.put("retries", r.retries);
             row.put("unknownNameHits", r.unknownNameHits);
-            row.put("lastError", lastErrorView(r.tool));
+            row.put("lastError", lastErrorView(r.tool, scope, r.mcpId));
             tools.add(row);
         }
         // 按 calls 降序排，前端首屏看高频工具
@@ -353,30 +392,84 @@ public class ObserveController {
     }
 
     /** 累加 Counter 到对应 tool 行；缺 row 自动建。 */
-    private void accumulate(Map<String, ToolMetricRow> rows, String metricName, String tagName,
+    private void accumulate(Map<String, ToolMetricRow> rows, ObservationScope scope, String metricName, String tagName,
                             java.util.function.ObjLongConsumer<ToolMetricRow> setter) {
         for (Counter c : meterRegistry.find(metricName).counters()) {
+            if (!scope.includes(c.getId().getTag("userId"))) continue;
             String tool = safeTag(c.getId().getTag(tagName));
-            ToolMetricRow row = rows.computeIfAbsent(tool, ToolMetricRow::new);
+            ToolMetricRow row = metricRow(rows, tool, c.getId().getTag("mcpId"));
             setter.accept(row, (long) c.count());
         }
     }
 
-    private Map<String, Object> lastErrorView(String tool) {
+    private Map<String, Object> lastErrorView(String tool, ObservationScope scope, String mcpId) {
         if (mcpToolMetrics == null) return null;
-        List<McpToolMetrics.ErrorSample> samples = mcpToolMetrics.recentErrors(tool);
+        List<McpToolMetrics.ErrorSample> samples = mcpToolMetrics.recentErrors(tool, scope.all() ? null : scope.userId(), mcpId);
         if (samples.isEmpty()) return null;
         McpToolMetrics.ErrorSample last = samples.get(samples.size() - 1);
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("ts", last.ts());
         out.put("exception", last.exception());
-        out.put("message", last.message());
+        // Remote exception messages can include API keys, URLs or response bodies.
+        out.put("message", "工具调用失败，请检查连接配置；详细原因仅保留在服务端日志。");
         return out;
     }
 
-    /** 重连失败的错误样本：键 "[client:mcpId]"，跟 McpToolMetrics.recordClientReconnectFailure 对齐。 */
-    private Map<String, Object> lastClientErrorView(String mcpId) {
-        return lastErrorView("[client:" + mcpId + "]");
+
+    private static ToolMetricRow metricRow(Map<String, ToolMetricRow> rows, String tool, String mcpId) {
+        String id = safeTag(mcpId);
+        return rows.computeIfAbsent(id + "\u0000" + tool, key -> new ToolMetricRow(tool, id));
+    }
+
+    private Set<String> ownedMcpIds(String userId) {
+        if (jdbcTemplate == null) return Collections.emptySet();
+        return Set.copyOf(jdbcTemplate.queryForList(
+                """
+                SELECT m.mcp_id FROM ai_client_tool_mcp m WHERE m.owner_user_id=? AND m.status=1
+                AND (m.source_mcp_id IS NULL OR EXISTS
+                  (SELECT 1 FROM ai_client_tool_mcp s WHERE s.mcp_id=m.source_mcp_id AND s.status=1 AND s.is_public=1))
+                """, String.class, userId));
+    }
+
+    /** Resolve display names only for rows already in scope, without returning transport configuration. */
+    private Map<String, String> connectionNames(ObservationScope scope, List<String> mcpIds) {
+        if (jdbcTemplate == null) return Collections.emptyMap();
+        List<String> ids = mcpIds.stream().filter(id -> id != null && !id.isBlank() && !"unknown".equals(id)).distinct().toList();
+        if (ids.isEmpty()) return Collections.emptyMap();
+        List<Object> args = new ArrayList<>(ids);
+        String sql = "SELECT mcp_id,mcp_name FROM ai_client_tool_mcp WHERE mcp_id IN ("
+                + String.join(",", Collections.nCopies(ids.size(), "?")) + ")";
+        // A metric can outlive a revoked/deleted connection. Never resolve another owner's name for it.
+        if (!scope.all()) {
+            sql += " AND owner_user_id=?";
+            args.add(scope.userId());
+        }
+        Map<String, String> names = new LinkedHashMap<>();
+        for (Map<String, Object> row : jdbcTemplate.queryForList(sql, args.toArray())) {
+            Object name = row.get("mcp_name");
+            if (name != null && !name.toString().isBlank()) names.put(String.valueOf(row.get("mcp_id")), name.toString());
+        }
+        return names;
+    }
+
+    private static ObservationScope observationScope(String requestedScope) {
+        var auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null || !auth.isAuthenticated() || auth instanceof AnonymousAuthenticationToken
+                || auth.getName() == null || auth.getName().isBlank()) {
+            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED);
+        }
+        if (!"mine".equals(requestedScope) && !"all".equals(requestedScope)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Unknown observation scope");
+        }
+        boolean all = "all".equals(requestedScope);
+        if (all && auth.getAuthorities().stream().noneMatch(a -> "ROLE_ADMIN".equals(a.getAuthority()))) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN);
+        }
+        return new ObservationScope(auth.getName(), all);
+    }
+
+    private record ObservationScope(String userId, boolean all) {
+        boolean includes(String metricUserId) { return all || userId.equals(metricUserId); }
     }
 
     private static String safeTag(String tag) {
@@ -391,6 +484,7 @@ public class ObserveController {
     /** 每个工具一行聚合数据。 */
     private static final class ToolMetricRow {
         final String tool;
+        final String mcpId;
         long success;
         long failure;
         double p50Ms;
@@ -402,13 +496,21 @@ public class ObserveController {
         long unknownNameHits;
         long firstAttemptFailures;
         long recovered;
-        ToolMetricRow(String tool) { this.tool = tool; }
+        ToolMetricRow(String tool, String mcpId) { this.tool = tool; this.mcpId = mcpId; }
     }
 
-    private JSONObject search(String body) {
+    private JSONObject search(String body, ObservationScope scope) {
         try {
             Request req = new Request("POST", "/" + LOG_INDEX_PATTERN + "/_search");
-            req.setJsonEntity(body);
+            JSONObject query = JSON.parseObject(body);
+            if (!scope.all()) {
+                JSONObject term = new JSONObject();
+                term.put("userId", scope.userId());
+                JSONObject owner = new JSONObject();
+                owner.put("term", term);
+                query.getJSONObject("query").getJSONObject("bool").getJSONArray("filter").add(owner);
+            }
+            req.setJsonEntity(query.toJSONString());
             String resp = EntityUtils.toString(restClient.performRequest(req).getEntity(), "UTF-8");
             return JSON.parseObject(resp);
         } catch (org.elasticsearch.client.ResponseException e) {

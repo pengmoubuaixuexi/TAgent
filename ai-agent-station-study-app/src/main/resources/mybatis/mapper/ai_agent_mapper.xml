@@ -4,6 +4,7 @@
 
     <resultMap id="AiAgentMap" type="cn.bugstack.ai.infrastructure.dao.po.AiAgent">
         <id column="id" property="id"/>
+        <result column="owner_user_id" property="ownerUserId"/>
         <result column="agent_id" property="agentId"/>
         <result column="agent_name" property="agentName"/>
         <result column="description" property="description"/>
@@ -16,8 +17,10 @@
 
     <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiAgent" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO ai_agent (
+            owner_user_id,
             agent_id, agent_name, description, channel, strategy, status, create_time, update_time
         ) VALUES (
+            COALESCE(#{ownerUserId}, '__legacy_unowned__'),
             #{agentId}, #{agentName}, #{description}, #{channel}, #{strategy}, #{status}, now(), now()
         )
     </insert>
@@ -54,39 +57,39 @@
     </delete>
 
     <select id="queryById" parameterType="java.lang.Long" resultMap="AiAgentMap">
-        SELECT id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
+        SELECT id, owner_user_id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
         FROM ai_agent
         WHERE id = #{id}
     </select>
 
     <select id="queryByAgentId" parameterType="java.lang.String" resultMap="AiAgentMap">
-        SELECT id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
+        SELECT id, owner_user_id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
         FROM ai_agent
         WHERE agent_id = #{agentId}
     </select>
 
     <select id="queryEnabledAgents" resultMap="AiAgentMap">
-        SELECT id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
+        SELECT id, owner_user_id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
         FROM ai_agent
         WHERE status = 1
         ORDER BY create_time DESC
     </select>
 
     <select id="queryByChannel" parameterType="java.lang.String" resultMap="AiAgentMap">
-        SELECT id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
+        SELECT id, owner_user_id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
         FROM ai_agent
         WHERE channel = #{channel}
         ORDER BY create_time DESC
     </select>
 
     <select id="queryAll" resultMap="AiAgentMap">
-        SELECT id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
+        SELECT id, owner_user_id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
         FROM ai_agent
         ORDER BY create_time DESC
     </select>
 
     <select id="queryByStrategy" resultMap="AiAgentMap">
-        SELECT id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
+        SELECT id, owner_user_id, agent_id, agent_name, description, channel, strategy, status, create_time, update_time
         FROM ai_agent
         WHERE strategy = #{strategy} AND status = #{status}
         ORDER BY create_time DESC

@@ -5,6 +5,8 @@ import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 
 import java.util.List;
+import java.time.LocalDateTime;
+import cn.bugstack.ai.infrastructure.dao.po.DailyRegistrationCount;
 
 /**
  * 管理员用户表 DAO
@@ -13,6 +15,10 @@ import java.util.List;
  */
 @Mapper
 public interface IAdminUserDao {
+
+    /** Existing account creation timestamps, grouped by calendar date; no new tracking table. */
+    List<DailyRegistrationCount> countRegistrationsByDay(@Param("start") LocalDateTime start,
+                                                        @Param("end") LocalDateTime end);
 
     /**
      * 插入管理员用户

@@ -10,6 +10,7 @@ import cn.bugstack.ai.domain.agent.service.execute.common.SessionRefCounter;
 import cn.bugstack.ai.domain.agent.service.execute.event.RunEventPublisher;
 import cn.bugstack.ai.domain.agent.service.router.RouteDecision;
 import cn.bugstack.ai.domain.agent.service.router.UnifiedAgentRouter;
+import cn.bugstack.ai.domain.agent.service.workspace.WorkspaceExecutionGuard;
 import cn.bugstack.ai.types.exception.BizException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -40,6 +41,9 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
     @Resource
     private IAgentRepository repository;
 
+    @Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository workspaceAccess;
+
     @Resource
     private ThreadPoolExecutor threadPoolExecutor;
 
@@ -48,6 +52,9 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
 
     @Autowired(required = false)
     private ArmoryService armoryService;
+
+    @Autowired
+    private WorkspaceExecutionGuard workspaceExecutionGuard = new WorkspaceExecutionGuard();
 
     @Autowired(required = false)
     private SessionRefCounter sessionRefCounter;
@@ -75,6 +82,27 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
 
     @Override
     public void dispatch(ExecuteCommandEntity requestParameter, ResponseBodyEmitter emitter) throws Exception {
+        String userId = requestParameter.getUserId();
+        if (userId == null || userId.isBlank() || workspaceAccess == null) {
+            throw new BizException("缺少已认证的用户身份");
+        }
+        String agentId = requestParameter.getAiAgentId();
+        if (agentId != null && !agentId.isBlank() && !workspaceAccess.ownsAgent(userId, agentId)) {
+            throw new BizException("Agent 不存在、已停用或无权访问");
+        }
+        String oldUser = org.slf4j.MDC.get("userId");
+        String oldTenant = org.slf4j.MDC.get("tenantId");
+        try {
+            putMdc("userId", userId);
+            putMdc("tenantId", requestParameter.getTenantId());
+            dispatchOwned(requestParameter, emitter);
+        } finally {
+            restoreMdc("userId", oldUser);
+            restoreMdc("tenantId", oldTenant);
+        }
+    }
+
+    private void dispatchOwned(ExecuteCommandEntity requestParameter, ResponseBodyEmitter emitter) throws Exception {
         if (requestParameter.getRunId() == null || requestParameter.getRunId().isBlank()) {
             requestParameter.setRunId(UUID.randomUUID().toString());
         }
@@ -112,6 +140,7 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
             runSnapshotService.startRun(requestParameter, "ROUTING", null);
         }
         boolean __handedOff = false;
+        WorkspaceExecutionGuard.Lease executionLease = null;
         try {
         if (mcpToolCatalogService != null && __needSid != null && !__needSid.isBlank()) {
             mcpToolCatalogService.clearNeeds(__needSid);
@@ -122,8 +151,10 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
                 RouteDecision routeDecision = unifiedAgentRouter.routeDecision(requestParameter.getMessage());
                 agentId = routeDecision != null ? routeDecision.agentId() : null;
                 if (agentId == null) {
-                    agentId = fallbackAgentId;
-                    log.info("统一路由未命中，fallback 到 {}", fallbackAgentId);
+                    var allowed = workspaceAccess.ownedAgentIds(requestParameter.getUserId());
+                    agentId = allowed.contains(fallbackAgentId) ? fallbackAgentId
+                            : repository.queryAvailableAgents().stream()
+                                    .map(AiAgentVO::getAgentId).filter(allowed::contains).findFirst().orElse(null);
                 }
                 if (routeDecision != null) {
                     requestParameter.setRouteConfidence(routeDecision.confidence());
@@ -152,7 +183,11 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
         }
 
         // 2. 懒加载装配
-        if (armoryService != null && !armoryService.isAgentArmed(agentId)) {
+        if (agentId != null) executionLease = workspaceExecutionGuard.startRun(agentId);
+        if (agentId == null || !workspaceAccess.ownsAgent(requestParameter.getUserId(), agentId)) {
+            throw new BizException("请先创建或选用自己的 Agent");
+        }
+        if (armoryService != null) {
             armoryService.ensureArmed(agentId);
         }
 
@@ -184,6 +219,7 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
         final String finalAgentId = agentId;
         final String finalStrategy = strategy;
         final IExecuteStrategy finalStrategy1 = executeStrategy;
+        final WorkspaceExecutionGuard.Lease finalExecutionLease = executionLease;
         try {
             threadPoolExecutor.execute(() -> {
                 String sessionId = requestParameter.getSessionId();
@@ -232,6 +268,7 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
                                         "sessionId", __needSid));
                     }
                 } finally {
+                    finalExecutionLease.close();
                     if (sessionRefCounter != null) sessionRefCounter.clear(sessionId);
                     activeRunBySession.remove(sessionId, __runId);
                     runEventPublisher.finishRun(__runId);
@@ -258,6 +295,7 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
                             "sessionId", __needSid));
         }
         } finally {
+            if (!__handedOff && executionLease != null) executionLease.close();
             // 同步路径异常（armory/查 agent/策略查找抛 BizException）或线程池拒绝 → 没交给异步策略 → 策略 finally 不跑，
             // 这里兜底清掉本轮已写入的 need，避免 session 维度泄漏 + 下次同 session 读到旧 need。
             if (!__handedOff && mcpToolCatalogService != null && __needSid != null && !__needSid.isBlank()) {

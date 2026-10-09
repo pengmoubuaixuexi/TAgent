@@ -2,6 +2,7 @@ package cn.bugstack.ai.domain.agent.service.execute.common;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.stereotype.Component;
+import org.slf4j.MDC;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -63,6 +64,38 @@ public class McpToolMetrics {
 
     private final MeterRegistry registry;
 
+    /** Invocation-local attribution; never capture a user on a shared callback instance. */
+    private final ThreadLocal<Identity> identity = new ThreadLocal<>();
+
+    public Scope scope(String userId, String mcpId) {
+        Identity previous = identity.get();
+        String previousUser = MDC.get("userId");
+        identity.set(new Identity(safe(userId), safe(mcpId)));
+        if (userId == null || userId.isBlank()) MDC.remove("userId"); else MDC.put("userId", userId);
+        return () -> {
+            if (previous == null) identity.remove(); else identity.set(previous);
+            if (previousUser == null) MDC.remove("userId"); else MDC.put("userId", previousUser);
+        };
+    }
+
+    public interface Scope extends AutoCloseable { @Override void close(); }
+    private record Identity(String userId, String mcpId) {}
+
+    private Identity currentIdentity() {
+        Identity current = identity.get();
+        return current == null ? new Identity(safe(MDC.get("userId")), "unknown") : current;
+    }
+
+    private String[] tags(String... tags) {
+        Identity current = currentIdentity();
+        String[] scoped = java.util.Arrays.copyOf(tags, tags.length + 4);
+        scoped[tags.length] = "userId";
+        scoped[tags.length + 1] = current.userId();
+        scoped[tags.length + 2] = "mcpId";
+        scoped[tags.length + 3] = current.mcpId();
+        return scoped;
+    }
+
     /** tool → 最近 N 条错误样本（线程安全 deque，FIFO 截断） */
     private final Map<String, Deque<ErrorSample>> lastErrorsByTool = new ConcurrentHashMap<>();
 
@@ -73,14 +106,14 @@ public class McpToolMetrics {
     // ====== 已有 metric ======
 
     public void recordCall(String toolName, long latencyMs, boolean success) {
-        registry.timer(METRIC_CALL, "tool", safe(toolName), "outcome", success ? "success" : "failure")
+        registry.timer(METRIC_CALL, tags("tool", safe(toolName), "outcome", success ? "success" : "failure"))
                 .record(latencyMs, TimeUnit.MILLISECONDS);
     }
 
     public void recordError(String toolName, Throwable t) {
         String tool = safe(toolName);
-        registry.counter(METRIC_ERROR, "tool", tool, "exception",
-                t == null ? "unknown" : t.getClass().getSimpleName())
+        registry.counter(METRIC_ERROR, tags("tool", tool, "exception",
+                t == null ? "unknown" : t.getClass().getSimpleName()))
                 .increment();
         recordErrorSample(tool, t);
     }
@@ -89,28 +122,28 @@ public class McpToolMetrics {
 
     /** 入参 normalize 命中：kind ∈ {github_per_page, calculate_precision, aisearch_strip}。 */
     public void recordNormalizeApplied(String toolName, String kind) {
-        registry.counter(METRIC_NORMALIZE_APPLIED, "tool", safe(toolName), "kind", safe(kind)).increment();
+        registry.counter(METRIC_NORMALIZE_APPLIED, tags("tool", safe(toolName), "kind", safe(kind))).increment();
     }
 
     /** 返回值原始字符数 + 是否被截断；rawChars 进 summary，截断与否进 counter。 */
     public void recordResultSize(String toolName, int rawChars, boolean truncated) {
         String tool = safe(toolName);
         if (rawChars >= 0) {
-            registry.summary(METRIC_RESULT_RAW_CHARS, "tool", tool).record(rawChars);
+            registry.summary(METRIC_RESULT_RAW_CHARS, tags("tool", tool)).record(rawChars);
         }
         if (truncated) {
-            registry.counter(METRIC_RESULT_TRUNCATED, "tool", tool).increment();
+            registry.counter(METRIC_RESULT_TRUNCATED, tags("tool", tool)).increment();
         }
     }
 
     /** 工具名大小写校正命中。 */
     public void recordNameNormalized(String from, String to) {
-        registry.counter(METRIC_NAME_NORMALIZED, "from", safe(from), "to", safe(to)).increment();
+        registry.counter(METRIC_NAME_NORMALIZED, tags("from", safe(from), "to", safe(to))).increment();
     }
 
     /** 未知工具名命中（LLM 幻觉工具）。 */
     public void recordUnknownToolName(String toolName) {
-        registry.counter(METRIC_NAME_UNKNOWN, "tool", safe(toolName)).increment();
+        registry.counter(METRIC_NAME_UNKNOWN, tags("tool", safe(toolName))).increment();
     }
 
     /**
@@ -118,14 +151,14 @@ public class McpToolMetrics {
      * 用来衡量"第一次就成功"的工具稳定性。
      */
     public void recordFirstAttemptFailure(String toolName, String reason) {
-        registry.counter(METRIC_FIRST_ATTEMPT_FAILURE, "tool", safe(toolName), "reason", safe(reason)).increment();
+        registry.counter(METRIC_FIRST_ATTEMPT_FAILURE, tags("tool", safe(toolName), "reason", safe(reason))).increment();
     }
 
     /**
      * 首次真实 MCP 调用失败后，后续通过 retry / reconnect 等治理动作恢复成功。
      */
     public void recordRecovered(String toolName, String recovery) {
-        registry.counter(METRIC_RECOVERED, "tool", safe(toolName), "recovery", safe(recovery)).increment();
+        registry.counter(METRIC_RECOVERED, tags("tool", safe(toolName), "recovery", safe(recovery))).increment();
     }
 
     /**
@@ -133,22 +166,22 @@ public class McpToolMetrics {
      * 通过 Grafana 可看哪些工具/会话审批未通过比例最高，用于灰度策略调优。
      */
     public void recordApprovalDenied(String toolName, String reason) {
-        registry.counter(METRIC_APPROVAL_DENIED, "tool", safe(toolName), "reason", safe(reason)).increment();
+        registry.counter(METRIC_APPROVAL_DENIED, tags("tool", safe(toolName), "reason", safe(reason))).increment();
     }
 
     /** P1-A1：请求级工具 policy 的解析状态；state 仅允许 explicit/missing/invalid 三个低基数值。 */
     public void recordToolPolicyResolution(String state) {
-        registry.counter(METRIC_POLICY_RESOLUTION, "state", safe(state)).increment();
+        registry.counter(METRIC_POLICY_RESOLUTION, tags("state", safe(state))).increment();
     }
 
     /** 工具调用瞬态错误重试。 */
     public void recordRetry(String toolName, int attempt) {
-        registry.counter(METRIC_RETRY, "tool", safe(toolName), "attempt", String.valueOf(attempt)).increment();
+        registry.counter(METRIC_RETRY, tags("tool", safe(toolName), "attempt", String.valueOf(attempt))).increment();
     }
 
     /** 工具调用超时后的探活结果（alive=true 说明服务端慢，alive=false 说明连接死了）。 */
     public void recordTimeoutProbe(String toolName, boolean alive) {
-        registry.counter(METRIC_TIMEOUT_PROBE, "tool", safe(toolName), "alive", String.valueOf(alive)).increment();
+        registry.counter(METRIC_TIMEOUT_PROBE, tags("tool", safe(toolName), "alive", String.valueOf(alive))).increment();
     }
 
     /** MCP 客户端重连成功；trigger ∈ {cold, dead, force, timeout}。 */
@@ -162,7 +195,9 @@ public class McpToolMetrics {
         registry.counter(METRIC_CLIENT_RECONNECT, "mcpId", safe(mcpId), "trigger", safe(trigger),
                 "outcome", "failure").increment();
         // 用 mcpId 做 ring buffer 的 key 前缀，跟 tool 维度区分；Observe 页 latestErrorPerTool 也能扫到
-        recordErrorSample("[client:" + safe(mcpId) + "]", t);
+        try (Scope ignored = scope(currentIdentity().userId(), mcpId)) {
+            recordErrorSample("[client:" + safe(mcpId) + "]", t);
+        }
     }
 
     /** 重连冷却期命中（说明刚重连过又被触发，避免抖动）。 */
@@ -192,7 +227,7 @@ public class McpToolMetrics {
                 System.currentTimeMillis(),
                 t == null ? "unknown" : t.getClass().getSimpleName(),
                 abbreviate(t == null ? null : t.getMessage(), LAST_ERROR_MESSAGE_MAX_CHARS));
-        Deque<ErrorSample> deque = lastErrorsByTool.computeIfAbsent(tool, k -> new LinkedList<>());
+        Deque<ErrorSample> deque = lastErrorsByTool.computeIfAbsent(errorKey(currentIdentity(), tool), k -> new LinkedList<>());
         synchronized (deque) {
             deque.addLast(sample);
             while (deque.size() > LAST_ERROR_BUFFER_SIZE) {
@@ -204,7 +239,20 @@ public class McpToolMetrics {
     /** 取某工具最近 N 条错误样本（按时间升序，可能为空 list）。 */
     public List<ErrorSample> recentErrors(String toolName) {
         if (toolName == null) return Collections.emptyList();
-        Deque<ErrorSample> deque = lastErrorsByTool.get(toolName);
+        return recentErrors(toolName, currentIdentity().userId(), currentIdentity().mcpId());
+    }
+
+    public List<ErrorSample> recentErrors(String toolName, String userId, String mcpId) {
+        if (userId == null) {
+            String suffix = "\u0000" + safe(mcpId) + "\u0000" + toolName;
+            List<ErrorSample> samples = new ArrayList<>();
+            lastErrorsByTool.forEach((key, deque) -> {
+                if (key.endsWith(suffix)) synchronized (deque) { samples.addAll(deque); }
+            });
+            samples.sort(Comparator.comparingLong(ErrorSample::ts));
+            return samples;
+        }
+        Deque<ErrorSample> deque = lastErrorsByTool.get(errorKey(new Identity(safe(userId), safe(mcpId)), toolName));
         if (deque == null) return Collections.emptyList();
         synchronized (deque) {
             return new ArrayList<>(deque);
@@ -228,6 +276,10 @@ public class McpToolMetrics {
     }
 
     // ====== utility ======
+
+    private static String errorKey(Identity identity, String tool) {
+        return identity.userId() + "\u0000" + identity.mcpId() + "\u0000" + tool;
+    }
 
     private static String safe(String s) {
         return (s == null || s.isEmpty()) ? "unknown" : s;

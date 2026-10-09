@@ -1,5 +1,6 @@
 package cn.bugstack.ai.config;
 
+import cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker;
 import io.micrometer.context.ContextRegistry;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
@@ -45,6 +46,10 @@ public class ReactorContextPropagationConfig {
                     value -> MDC.put(key, value),       // setValue：恢复时写
                     () -> MDC.remove(key));             // cleanup：作用域结束清理
         }
+        registry.registerThreadLocalAccessor(StreamingActivityTracker.CONTEXT_KEY,
+                StreamingActivityTracker::current,
+                StreamingActivityTracker::restore,
+                StreamingActivityTracker::clear);
         Hooks.enableAutomaticContextPropagation();
         log.info("[ReactorCtxProp] enabled automatic context propagation for MDC keys: {}",
                 String.join(",", PROPAGATED_MDC_KEYS));

@@ -29,7 +29,9 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 
 > **🌐 在线体验：[http://49.232.209.30:8099](http://49.232.209.30:8099)**
 >
-> 当前暂时提供公网 IP 访问，后续将上线正式域名，届时会在此更新访问地址，目前暂未提供自行搭建Agent的能力，主要提供了一些配好的不同方向的测试Agent，主要提供试用，用的是mimo-v2.5以及deepseek-v4-flash。如果测试用户多会尽快上线如何自行配置Agent（包括自己的RAG知识文档，mcp，System prompt等）做用户分离的操作，并需要用户自行配置自己的API接口。
+> 当前暂时提供公网 IP 访问，后续将上线正式域名，届时会在此更新访问地址。注册后既可以体验预配置的各类 Agent，也可以进入“我的 Agent”自行搭建 Fixed、Auto、Flow 三种模式的 Agent，按节点配置 System Prompt、MCP 连接和 Advisor，并关联自己的 RAG 知识库。个人 Agent 配置、知识检索和使用观测按用户隔离。
+>
+> 目前处于试用阶段，模型暂由平台提供，主要使用 `mimo-v2.5` 和 `deepseek-v4-flash`。个人 MCP 连接受平台允许域名限制；后续计划支持用户自行配置模型 API 接口和密钥。[查看 Agent 工作区说明](docs/dev-ops/USER_AGENT_WORKSPACE.md)。
 
 ### 适合谁
 
@@ -78,6 +80,7 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 | 能力 | 实现 |
 |---|---|
 | **三种 Agent 模式** | Fixed 单步直答、Auto 分析执行闭环、Flow DAG 编排 |
+| **个人 Agent 工作区** | 按模式展示节点，独立配置模型、Prompt、MCP 与 Advisor；从公共模板创建个人配置，使用观测按用户隔离 |
 | **数据库驱动装配** | Agent、Client、Model、Prompt、Advisor、RAG、MCP 关系由数据库配置 |
 | **统一 Agent 路由** | 一次模型调用选择 Agent，并输出可能缺失的工具能力；已选 Agent 也可按配置预推断 |
 | **动态 MCP 工具** | 路由预推断与 `request_tool` 元工具并存，结合工具目录中文化、意图扩写、PgVector 语义匹配按请求临时补挂 |
@@ -414,6 +417,8 @@ TAgent 同时记录模型、工具和 Agent 步骤：
 页面：
 - 系统观测：`http://localhost:8099/observe.html`
 - MCP 观测：`http://localhost:8099/observe-mcp.html`
+- 我的 Agent：`http://localhost:8099/user-agents.html`
+- 网站访问与注册统计（管理员）：`http://localhost:8099/admin-stats.html`
 
 ---
 
@@ -450,7 +455,7 @@ TAgent 同时记录模型、工具和 Agent 步骤：
 
 ## 🚀 本地运行
 
-单机部署与数据迁移请参考 [服务器部署指南](docs/dev-ops/server/README.md)。升级 v1.27.0 前请备份数据库，并执行一次 [V061 角色与会话归属迁移](docs/dev-ops/sql-migrations/V061__user_roles_and_registration.sql)；已执行过的环境不要重复执行。
+单机部署与数据迁移请参考 [服务器部署指南](docs/dev-ops/server/README.md)。升级 v1.28.0 前请备份数据库并停止应用，确认 [V061](docs/dev-ops/sql-migrations/V061__user_roles_and_registration.sql) 已执行后，依次执行 [V062 工作区迁移](docs/dev-ops/sql-migrations/V062__user_agent_workspace.sql) 和 [V063 公共目录迁移](docs/dev-ops/sql-migrations/V063__public_workspace_catalog.sql)，再启动新版。执行前核对管理员归属与待公开的 Agent / MCP；已执行过的迁移不要重复执行。
 
 ### 外部依赖
 

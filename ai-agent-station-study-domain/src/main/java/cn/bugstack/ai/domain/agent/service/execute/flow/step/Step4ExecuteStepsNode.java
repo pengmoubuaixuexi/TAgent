@@ -642,7 +642,9 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             // 整合步(buildFinalDeliverable)不走这里，仍用 DB 的 8010_p3 产出完整交付物。
             ChatClient.ChatClientRequestSpec spec0 = executorChatClient.prompt()
                     // P2-B-1：A2 请求级 .system() 替换 defaultSystem，故公共信任边界须在此另行 prepend（否则 DAG 子步丢失）。
-                    .system(cn.bugstack.ai.domain.agent.service.prompt.SystemPolicyComposer.prepend(SUB_STEP_EXECUTOR_SYSTEM))
+                    .system(cn.bugstack.ai.domain.agent.service.prompt.SystemPolicyComposer.prepend(SUB_STEP_EXECUTOR_SYSTEM
+                            + (execConfig==null || execConfig.getTaskPrompt()==null || execConfig.getTaskPrompt().isBlank()
+                            ? "" : "\n\n本节点任务要求（仅适用于当前子任务）：\n"+execConfig.getTaskPrompt())))
                     .user(stepExecPrompt)
                     .advisors(a -> a.param(
                             cn.bugstack.ai.domain.agent.service.multimodal.MultimodalMessageAdvisor.CURRENT_IMAGES_CONTEXT_KEY,
@@ -765,7 +767,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         try {
             AutoAgentExecuteResultEntity errorResult = AutoAgentExecuteResultEntity.createExecutionResult(
                     stepNumber,
-                    stepKey + " 执行失败: " + e.getMessage(),
+                    stepKey + " 执行失败: " + errorMessage(e),
                     dynamicContext.getValue("sessionId")
             );
             sendSseResult(dynamicContext, errorResult);
@@ -798,10 +800,10 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                     snapshotExecutorToolCatalog(executorClientId, dynamicToolCallbacks, 3);
             sb.append("**【可用工具清单】**\n").append(renderToolRuntimeForPrompt(catalog, executorClientId)).append("\n\n");
             sb.append("**工具选择说明（重要）:**\n");
-            sb.append("- 【可用工具清单】是真实允许使用的工具范围；只要在清单里，就可以按本步骤目标调用。\n");
+            sb.append("- 当前已装载的工具可直接调用；绑定能力目录中的其他工具需先通过 request_tool 按确切工具名称装载，再调用。\n");
             sb.append("- 【步骤内容】里的“使用工具/首选工具”是规划阶段给出的首选建议，不是唯一允许工具。\n");
             sb.append("- 如果首选工具返回字段不足、失败、空结果，或无法完成本步骤目标，可以改用【可用工具清单】中的其他相关工具补足，这不算偏离步骤。\n");
-            sb.append("- 不要陷入反复思考；工具不足时请明确说明缺失信息，并基于已取得的数据输出本步骤的最佳结果。\n\n");
+            sb.append("- 工具不足时先检查绑定能力目录并申请对应工具；只有真实无法装载/调用时才说明缺失，并基于已取得的数据输出结果。\n\n");
         }
 
         // 1. 前置依赖步骤的真实产出（关键！下游 step 必须基于这些数据继续，不要自己编）

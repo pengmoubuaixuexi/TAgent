@@ -63,4 +63,7 @@ public class AiClientModelRequestDTO implements Serializable {
      */
     private Integer status;
 
+    /** Explicit admin opt-in: 1 makes this model selectable by personal workspaces. */
+    private Integer platformEnabled;
+
 }

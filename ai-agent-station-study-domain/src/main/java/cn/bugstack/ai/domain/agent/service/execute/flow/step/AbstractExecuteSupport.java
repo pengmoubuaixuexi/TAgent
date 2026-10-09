@@ -5,6 +5,7 @@ import cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity;
 import cn.bugstack.ai.domain.agent.model.entity.ExecuteCommandEntity;
 import cn.bugstack.ai.domain.agent.model.valobj.enums.AiAgentEnumVO;
 import cn.bugstack.ai.domain.agent.service.execute.common.ExecutorToolCatalog;
+import cn.bugstack.ai.domain.agent.service.execute.common.StreamingRetryPolicy;
 import cn.bugstack.ai.domain.agent.service.execute.common.LlmCallContext;
 import cn.bugstack.ai.domain.agent.service.execute.common.LlmCallGateway;
 import cn.bugstack.ai.domain.agent.service.execute.common.LlmObservationRecorder;
@@ -190,12 +191,14 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
 
     protected String renderToolRuntimeForPrompt(ExecutorToolCatalog catalog, String clientId) {
         String rendered = cn.bugstack.ai.domain.agent.service.prompt.RuntimeToolPromptComposer.renderToolRuntime(catalog);
-        if (rendered != null && !rendered.isBlank()) return rendered;
+        String bound = dynamicMcpToolCatalogService==null?"":dynamicMcpToolCatalogService.describeBoundMcpCapabilities(clientId);
+        if (rendered != null && !rendered.isBlank()) return rendered + (bound==null?"":bound);
         return "<tool_runtime>\n"
                 + "  <no_tools client_id=\"" + escapeXml(clientId) + "\">"
-                + "当前 Agent 没有配置任何可执行 MCP 工具；请仅基于已有上下文/模型知识作答，不要虚构工具调用过程。"
+                + "当前尚未装载业务 MCP 工具，不代表未配置或没有能力。"
+                + (requestToolEnabled ? "需要工具时先用 request_tool 申请，再使用实际返回的工具；不要虚构调用结果。" : "当前未开放动态装载，请如实说明限制，不要虚构调用结果。")
                 + "</no_tools>\n"
-                + "</tool_runtime>";
+                + "</tool_runtime>" + (bound==null?"":bound);
     }
 
     private static String escapeXml(String value) {
@@ -357,6 +360,17 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
     /**
      * V035 (2026-05-14)：构造事件日志 entry，自动从 MDC 提取 userId / tenantId / agentId / sessionId。
      */
+    private LlmCallContext buildCallContext(String stepName, String promptText, String resultText,
+            String model, DefaultFlowAgentExecuteStrategyFactory.DynamicContext context) {
+        LlmCallContext call = buildCallContext(stepName, promptText, resultText, model);
+        if (context != null) {
+            call.setUserId(context.getValue("userId"));
+            call.setTenantId(context.getValue("tenantId"));
+            call.setAgentId(context.getValue("agentId"));
+        }
+        return call;
+    }
+
     protected LlmCallContext buildCallContext(String stepName, String promptText, String resultText, String model) {
         return LlmCallContext.builder()
                 .sessionId(firstNonBlank(MDC.get("sessionId"), MDC.get("requestId")))
@@ -682,6 +696,10 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         log.info("[ToolCtxDiag][flow] step={} sessionId={} inject={}", stepId, sessionId, (sessionId != null && !sessionId.isBlank()));
         String runId = dynamicContext != null ? dynamicContext.getValue("runId") : null;
         java.util.Map<String, Object> toolContext = buildToolContext(sessionId, displayName, profile, runId);
+        String toolUserId = dynamicContext != null ? dynamicContext.getValue("userId") : null;
+        if (toolUserId != null && !toolUserId.isBlank()) toolContext.put("userId", toolUserId);
+        String toolAgentId = dynamicContext != null ? dynamicContext.getValue("agentId") : null;
+        if (toolAgentId != null && !toolAgentId.isBlank()) toolContext.put("agentId", toolAgentId);
         final ChatClient.ChatClientRequestSpec callSpec = toolContext.isEmpty() ? spec : spec.toolContext(toolContext);
         String result;
         boolean completed = false;
@@ -721,6 +739,10 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
             String runId) {
         java.util.Map<String, Object> tc = new java.util.HashMap<>();
         if (sessionId != null && !sessionId.isBlank()) tc.put("sessionId", sessionId);
+        String userId = MDC.get("userId");
+        if (userId != null && !userId.isBlank()) tc.put("userId", userId);
+        String agentId = MDC.get("agentId");
+        if (agentId != null && !agentId.isBlank()) tc.put("agentId", agentId);
         if (runId != null && !runId.isBlank()) tc.put("agent.run_id", runId);
         if (stepLabel != null && !stepLabel.isBlank()) tc.put("stepLabel", stepLabel);
         cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilities.put(tc, profile);
@@ -851,7 +873,7 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
      * Token-Level Streaming：逐 token 发送 SSE event:token 事件，同时拼接完整响应返回。
      * <p>
      * US-018：添加手动重试循环，弥补 stream() 绕过 LlmCallGateway 导致的容错空白。
-     * 每次重试重建 Flux（Spring AI 流式 spec 可复用），全量失败后返回部分响应或 null。
+     * 仅在尚未输出且未执行工具时重试瞬时错误；失败保留原因并终止当前步骤。
      * <p>
      * Claude 改进：与非流式路径对齐——补 metrics + OutputModerationFilter + PiiMasker。
      */
@@ -863,6 +885,7 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         long start = System.currentTimeMillis();
         StringBuilder fullResponse = new StringBuilder();
         final ChatResponse[] lastResponse = new ChatResponse[1];
+        Exception lastFailure = null;
         // 2026-05-28：前端只展示"给用户看的回答"，检测到 === 执行结果 === 块后停止向前端推 token
         //（内部 fullResponse 仍累积完整文本，供 extractStepOutputData 抠"输出数据"传下游）。
         final String RESULT_BLOCK_MARKER = "=== 执行结果 ===";
@@ -901,10 +924,12 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
             lastResponse[0] = null;
             displaySentLen[0] = 0;
             resultBlockCut[0] = false;
+            cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.Activity __activity =
+                    cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.start(
+                            stepName + "#attempt-" + attempt);
             try {
-                cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.Activity __activity =
-                        cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.start(
-                                stepName + "#attempt-" + attempt);
+                spec = spec.toolContext(java.util.Map.of(
+                        cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.CONTEXT_KEY, __activity));
                 try (AutoCloseable __activityScope =
                              cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.scope(__activity)) {
                 Flux<ChatClientResponse> flux = spec.stream().chatClientResponse()
@@ -1014,55 +1039,45 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
                         stepName, model, promptTokens, completionTokens, latency);
                 // 立即回答可观测：把本步（含被截断步）的 token 累加进本轮上下文，供 finalize marker 报告叠加值
                 dynamicContext.addTokens(promptTokens, completionTokens);
-                llmObservationRecorder.record(buildCallContext(stepName, promptText, result, model), lastResponse[0], latency,
-                        result.isEmpty() ? new IllegalStateException("empty streaming response") : null);
 
+
+                if (result.isBlank() && !dynamicContext.isFinalizeRequested() && !dynamicContext.hasSteerIdea()) {
+                    throw new IllegalStateException("LLM stream completed without an answer");
+                }
+                llmObservationRecorder.record(buildCallContext(stepName, promptText, result, model, dynamicContext),
+                        lastResponse[0], latency, null);
                 result = OutputModerationFilter.check(result);
                 return result;
             } catch (Exception e) {
-                // 诊断：记录 gateway 返回的错误详情（400/429/500 等）
-                if (e instanceof org.springframework.web.reactive.function.client.WebClientResponseException wcre) {
-                    String body = wcre.getResponseBodyAsString();
-                    if (body.length() > 2000) body = body.substring(0, 2000) + "...(truncated)";
-                    log.error("[Streaming] step={} HTTP {} gateway error: body={}", stepName, wcre.getStatusCode(), body);
+                __activity.cancel();
+                CancellationException cancellation = StreamingRetryPolicy.cancellation(e);
+                if (cancellation != null) throw cancellation;
+                lastFailure = e;
+                if (!StreamingRetryPolicy.canRetry(e, __activity.hasToolActivity(), fullResponse.length(),
+                        attempt, streamingRetryMaxAttempts)) {
+                    log.warn("[Streaming] step={} failed; full request will not be replayed, toolStarted={} chars={} error={}",
+                            stepName, __activity.hasToolActivity(), fullResponse.length(), e.toString());
+                    break;
                 }
-                if (isStreamingTimeout(e)) {
-                    if (fullResponse.length() > 200) {
-                        log.warn("[Streaming] step={} idle timeout with {} chars, returning partial result",
-                                stepName, fullResponse.length());
-                        sendTokenEvent(dynamicContext, "[DONE]", stepName, MDC.get("requestId"));
-                        break;
-                    }
-                    log.warn("[Streaming] step={} idle timeout with only {} chars, retrying",
-                            stepName, fullResponse.length());
-                    if (attempt >= streamingRetryMaxAttempts) {
-                        break;
-                    }
-                    sleepBeforeStreamingRetry(stepName, attempt);
-                    continue;
-                }
-                if (attempt < streamingRetryMaxAttempts) {
-                    log.warn("[Streaming] step={} attempt {}/{} failed: {}, retrying...",
-                            stepName, attempt, streamingRetryMaxAttempts, e.getMessage());
-                    sleepBeforeStreamingRetry(stepName, attempt);
-                } else {
-                    log.warn("[Streaming] step={} all {} attempts failed: {}",
-                            stepName, streamingRetryMaxAttempts, e.getMessage());
-                }
+                log.warn("[Streaming] step={} attempt {}/{} failed before output or tools; retrying: {}",
+                        stepName, attempt, streamingRetryMaxAttempts, e.toString());
+                sleepBeforeStreamingRetry(stepName, attempt);
+            } finally {
+                __activity.cancel();
             }
         }
 
         // 保底：异常/超时路径也要收尾，让前端卡片结束，DAG future 返回后依赖步骤才能继续进入错误兜底。
         sendTokenEvent(dynamicContext, "[DONE]", stepName, MDC.get("requestId"));
 
-        // 全部重试耗尽
-        llmObservationRecorder.record(buildCallContext(stepName, promptText, fullResponse.toString(), "unknown"),
-                null, System.currentTimeMillis() - start, new IllegalStateException("streaming failed"));
-        String partial = fullResponse.length() > 0 ? fullResponse.toString() : null;
-        if (partial == null) return null;
-        return OutputModerationFilter.check(partial);
+        // A partial answer is not a completed step. Preserve the original cause for
+        // the step card and observation record, and stop dependent DAG steps.
+        llmObservationRecorder.record(buildCallContext(stepName, promptText, fullResponse.toString(), "unknown", dynamicContext),
+                lastResponse[0], System.currentTimeMillis() - start, lastFailure);
+        throw StreamingRetryPolicy.failed(stepName, lastFailure);
         } catch (Exception scopeEx) {
-            throw new RuntimeException("streaming wrapper failed: " + scopeEx.getMessage(), scopeEx);
+            if (scopeEx instanceof RuntimeException runtime) throw runtime;
+            throw StreamingRetryPolicy.failed(stepName, scopeEx);
         } finally {
             dynamicContext.unregisterCancelTrigger(__cancelTrigger);
         }

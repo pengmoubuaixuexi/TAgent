@@ -4,6 +4,7 @@
 
     <resultMap id="AiClientToolMcpMap" type="cn.bugstack.ai.infrastructure.dao.po.AiClientToolMcp">
         <id column="id" property="id"/>
+        <result column="owner_user_id" property="ownerUserId"/>
         <result column="mcp_id" property="mcpId"/>
         <result column="mcp_name" property="mcpName"/>
         <result column="transport_type" property="transportType"/>
@@ -16,8 +17,10 @@
 
     <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientToolMcp" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO ai_client_tool_mcp (
+            owner_user_id,
             mcp_id, mcp_name, transport_type, transport_config, request_timeout, status, create_time, update_time
         ) VALUES (
+            COALESCE(#{ownerUserId}, '__legacy_unowned__'),
             #{mcpId}, #{mcpName}, #{transportType}, #{transportConfig}, #{requestTimeout}, #{status}, #{createTime}, #{updateTime}
         )
     </insert>
@@ -54,39 +57,39 @@
     </delete>
 
     <select id="queryById" parameterType="java.lang.Long" resultMap="AiClientToolMcpMap">
-        SELECT id, mcp_id, mcp_name, transport_type, transport_config, request_timeout, status, create_time, update_time
+        SELECT id, owner_user_id, mcp_id, mcp_name, transport_type, transport_config, request_timeout, status, create_time, update_time
         FROM ai_client_tool_mcp
         WHERE id = #{id}
     </select>
 
     <select id="queryByMcpId" parameterType="java.lang.String" resultMap="AiClientToolMcpMap">
-        SELECT id, mcp_id, mcp_name, transport_type, transport_config, request_timeout, status, create_time, update_time
+        SELECT id, owner_user_id, mcp_id, mcp_name, transport_type, transport_config, request_timeout, status, create_time, update_time
         FROM ai_client_tool_mcp
         WHERE mcp_id = #{mcpId}
     </select>
 
     <select id="queryAll" resultMap="AiClientToolMcpMap">
-        SELECT id, mcp_id, mcp_name, transport_type, transport_config, request_timeout, status, create_time, update_time
+        SELECT id, owner_user_id, mcp_id, mcp_name, transport_type, transport_config, request_timeout, status, create_time, update_time
         FROM ai_client_tool_mcp
         ORDER BY create_time DESC
     </select>
 
     <select id="queryByStatus" parameterType="java.lang.Integer" resultMap="AiClientToolMcpMap">
-        SELECT id, mcp_id, mcp_name, transport_type, transport_config, request_timeout, status, create_time, update_time
+        SELECT id, owner_user_id, mcp_id, mcp_name, transport_type, transport_config, request_timeout, status, create_time, update_time
         FROM ai_client_tool_mcp
         WHERE status = #{status}
         ORDER BY create_time DESC
     </select>
 
     <select id="queryByTransportType" parameterType="java.lang.String" resultMap="AiClientToolMcpMap">
-        SELECT id, mcp_id, mcp_name, transport_type, transport_config, request_timeout, status, create_time, update_time
+        SELECT id, owner_user_id, mcp_id, mcp_name, transport_type, transport_config, request_timeout, status, create_time, update_time
         FROM ai_client_tool_mcp
         WHERE transport_type = #{transportType}
         ORDER BY create_time DESC
     </select>
 
     <select id="queryEnabledMcps" resultMap="AiClientToolMcpMap">
-        SELECT id, mcp_id, mcp_name, transport_type, transport_config, request_timeout, status, create_time, update_time
+        SELECT id, owner_user_id, mcp_id, mcp_name, transport_type, transport_config, request_timeout, status, create_time, update_time
         FROM ai_client_tool_mcp
         WHERE status = 1
         ORDER BY create_time DESC

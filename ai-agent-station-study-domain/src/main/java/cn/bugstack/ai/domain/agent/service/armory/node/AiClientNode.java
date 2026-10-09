@@ -21,7 +21,6 @@ import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.api.Advisor;
-import org.springframework.ai.mcp.SyncMcpToolCallbackProvider;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.beans.factory.annotation.Value;
@@ -65,6 +64,9 @@ public class AiClientNode extends AbstractArmorySupport {
     /** P0（Codex #2）工具调用实证台账，装配时 setter 注入到 MeteredToolCallback，供 Step3 质检取证 */
     @Resource
     private cn.bugstack.ai.domain.agent.service.execute.common.ToolCallLedger toolCallLedger;
+
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.prompt.RunUserInputAdvisor runUserInputAdvisor;
 
     @Value("${agent.mcp.return-error-on-failure:true}")
     private boolean returnToolErrorOnFailure;
@@ -110,7 +112,12 @@ public class AiClientNode extends AbstractArmorySupport {
                         model);
             }
         }
-        List<String> agentMemoryAdvisorBeanNames = collectAgentMemoryAdvisorBeanNames(aiClientList);
+        // Even a bulk armory request must not export a private node's memory advisors to legacy clients.
+        List<String> agentMemoryAdvisorBeanNames = collectAgentMemoryAdvisorBeanNames(aiClientList.stream().filter(client -> {
+            var model=modelByBeanName.get(client.getModelBeanName());
+            return model==null || cn.bugstack.ai.domain.agent.model.valobj.WorkspaceNodePolicy
+                    .fromCapabilities(model.getCapabilitiesJson())==null;
+        }).toList());
         if (!agentMemoryAdvisorBeanNames.isEmpty()) {
             log.info("[AiClientNode] agent memory advisors propagated to all clients: {}", agentMemoryAdvisorBeanNames);
         }
@@ -131,8 +138,9 @@ public class AiClientNode extends AbstractArmorySupport {
             OpenAiChatModel chatModel = getBean(aiClientVO.getModelBeanName());
 
             // 3. MCP 服务（个别 MCP 初始化失败时已被 AiClientToolMcpNode 跳过，这里做容错查找）
-            List<McpSyncClient> mcpSyncClients = new ArrayList<>();
             List<ToolCallback> rawToolList = new ArrayList<>();
+            var toolBindings = new ArrayList<cn.bugstack.ai.domain.agent.service.execute.common.McpToolNameGuard.Binding>();
+            java.util.Map<ToolCallback, String> callbackOwners = new java.util.IdentityHashMap<>();
             List<String> mcpBeanNameList = aiClientVO.getMcpBeanNameList();
             for (String mcpBeanName : mcpBeanNameList) {
                 try {
@@ -142,8 +150,13 @@ public class AiClientNode extends AbstractArmorySupport {
                         ToolCallback[] callbacks = mcpClientRegistry.getToolCallbacksForAssembly(mcpId, client);
                         mcpClientRegistry.registerCallbacks(mcpId, callbacks);
                         rawToolList.addAll(java.util.Arrays.asList(callbacks));
+                        for (ToolCallback callback : callbacks) {
+                            callbackOwners.put(callback, mcpId);
+                            toolBindings.add(new cn.bugstack.ai.domain.agent.service.execute.common.McpToolNameGuard.Binding(
+                                    mcpId, callback.getToolDefinition().name()));
+                        }
                     } else {
-                        mcpSyncClients.add(client);
+                        throw new IllegalStateException("MCP bean lacks an explicit connection identity");
                     }
                 } catch (org.springframework.beans.factory.NoSuchBeanDefinitionException ex) {
                     log.warn("[AiClientNode] MCP bean {} 缺失，跳过：{}", mcpBeanName, ex.getMessage());
@@ -153,18 +166,23 @@ public class AiClientNode extends AbstractArmorySupport {
                 }
             }
 
+            cn.bugstack.ai.domain.agent.service.execute.common.McpToolNameGuard.requireUnique(toolBindings);
+
             // 4. advisor 顾问角色
             List<Advisor> advisors = new ArrayList<>();
             // P2.5 14.2 PII 脱敏：已改为按需通过 ai_client_advisor 表配置（type=PiiMask），不再全局硬编码
+            AiClientModelVO configuredModel = modelByBeanName.get(aiClientVO.getModelBeanName());
+            boolean nodeScoped = configuredModel!=null && cn.bugstack.ai.domain.agent.model.valobj.WorkspaceNodePolicy
+                    .fromCapabilities(configuredModel.getCapabilitiesJson())!=null;
             List<String> advisorBeanNameList = mergeAdvisorBeanNames(
-                    aiClientVO.getAdvisorBeanNameList(), agentMemoryAdvisorBeanNames);
+                    aiClientVO.getAdvisorBeanNameList(), nodeScoped ? List.of() : agentMemoryAdvisorBeanNames);
             for (String advisorBeanName : advisorBeanNameList) {
                 advisors.add(getBean(advisorBeanName));
             }
             // P2-B-2：LTM/Episodic 只采集 section 到 request.context，统一由 render advisor 渲染单个 envelope。
             // 无 ctx.envelope.* 时 no-op；不需要改 DB advisor 配置。
             advisors.add(new ContextEnvelopeRenderAdvisor());
-            AiClientModelVO configuredModel = modelByBeanName.get(aiClientVO.getModelBeanName());
+            advisors.add(runUserInputAdvisor);
             boolean imageInputSupported = configuredModel != null && configuredModel.supportsImageInput();
             advisors.add(new cn.bugstack.ai.domain.agent.service.multimodal.MultimodalMessageAdvisor(
                     imageInputSupported));
@@ -179,11 +197,6 @@ public class AiClientNode extends AbstractArmorySupport {
             // P1.5.1：从 MCP provider 拿到原始 ToolCallback 后逐一装饰，metric 才能采到
             // 2026-05-07 #1 Prompt Cache：MCP server 注册顺序不稳定 → 工具按 toolDefinition.name() 排序
             // 排序后工具 schema 在 prompt 中的位置 byte 稳定，OpenAI/Anthropic 能命中前缀 cache
-            if (!mcpSyncClients.isEmpty()) {
-                ToolCallback[] rawTools = new SyncMcpToolCallbackProvider(
-                        mcpSyncClients.toArray(new McpSyncClient[]{})).getToolCallbacks();
-                rawToolList.addAll(java.util.Arrays.asList(rawTools));
-            }
             List<ToolCallback> sortedRaw = new ArrayList<>(rawToolList);
             sortedRaw.sort(java.util.Comparator.comparing(t ->
                     t.getToolDefinition() == null ? "" : t.getToolDefinition().name()));
@@ -198,7 +211,8 @@ public class AiClientNode extends AbstractArmorySupport {
                         returnToolErrorOnFailure, githubWriteEnabled,
                         githubSearchMaxPerPage, githubSearchMaxResultChars,
                         githubSearchCompactResultEnabled, aiSearchStripServerLlm,
-                        mcpToolCallMaxAttempts, mcpToolCallRetryDelayMs);
+                        mcpToolCallMaxAttempts, mcpToolCallRetryDelayMs,
+                        mcpClientRegistry, callbackOwners.get(rawTool));
                 metered.setHumanApprovalGate(humanApprovalGate); // G1-C
                 metered.setToolCallProgressEmitter(toolCallProgressEmitter); // H3-A
                 metered.setToolCallLedger(toolCallLedger); // P0 Codex#2：工具调用实证台账

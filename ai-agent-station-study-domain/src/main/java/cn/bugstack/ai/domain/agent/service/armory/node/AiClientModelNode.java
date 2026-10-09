@@ -122,6 +122,7 @@ public class AiClientModelNode extends AbstractArmorySupport {
         }
 
         for (AiClientModelVO modelVO : aiClientModelList) {
+            var nodePolicy=cn.bugstack.ai.domain.agent.model.valobj.WorkspaceNodePolicy.fromCapabilities(modelVO.getCapabilitiesJson());
 
             // 获取当前模型关联的 API Bean 对象
             OpenAiApi openAiApi = getBean(AiAgentEnumVO.AI_CLIENT_API.getBeanName(modelVO.getApiId()));
@@ -132,7 +133,10 @@ public class AiClientModelNode extends AbstractArmorySupport {
             // 获取当前模型关联的 Tool MCP Bean 对象（个别 MCP 初始化失败已被前置节点跳过，这里做容错）
             // 按 mcpId 分别获取回调，建立 toolName → mcpId 映射，注册到 McpClientRegistry
             List<ToolCallback> allRawCallbacks = new ArrayList<>();
+            var toolBindings = new ArrayList<cn.bugstack.ai.domain.agent.service.execute.common.McpToolNameGuard.Binding>();
+            java.util.Map<ToolCallback, String> callbackOwners = new java.util.IdentityHashMap<>();
             for (String toolMcpId : modelVO.getToolMcpIds()) {
+                if (nodePolicy!=null && !nodePolicy.eager(toolMcpId)) continue;
                 try {
                     McpSyncClient mcpSyncClient = mcpClientRegistry.getClient(toolMcpId);
                     if (mcpSyncClient == null) {
@@ -140,7 +144,13 @@ public class AiClientModelNode extends AbstractArmorySupport {
                     }
                     ToolCallback[] mcpCallbacks = mcpClientRegistry.getToolCallbacksForAssembly(toolMcpId, mcpSyncClient);
                     mcpClientRegistry.registerCallbacks(toolMcpId, mcpCallbacks);
-                    allRawCallbacks.addAll(java.util.Arrays.asList(mcpCallbacks));
+                    for (ToolCallback callback : mcpCallbacks) {
+                        if (nodePolicy!=null && !nodePolicy.allows(toolMcpId,callback.getToolDefinition().name())) continue;
+                        allRawCallbacks.add(callback);
+                        callbackOwners.put(callback, toolMcpId);
+                        toolBindings.add(new cn.bugstack.ai.domain.agent.service.execute.common.McpToolNameGuard.Binding(
+                                toolMcpId, callback.getToolDefinition().name()));
+                    }
                 } catch (org.springframework.beans.factory.NoSuchBeanDefinitionException ex) {
                     log.warn("[AiClientModelNode] MCP {} 缺失，跳过: {}", toolMcpId, ex.getMessage());
                 } catch (Exception ex) {
@@ -148,6 +158,8 @@ public class AiClientModelNode extends AbstractArmorySupport {
                             toolMcpId, ex.toString());
                 }
             }
+
+            cn.bugstack.ai.domain.agent.service.execute.common.McpToolNameGuard.requireUnique(toolBindings);
 
             // P1.5.1：原 ToolCallback 数组逐一包成 MeteredToolCallback，让 mcp.tool.call metric 生效
             // 2026-05-07 #1 Prompt Cache：按 toolDefinition.name() 字典序排序后再装配，
@@ -158,7 +170,7 @@ public class AiClientModelNode extends AbstractArmorySupport {
             ToolCallback[] meteredCallbacks = new ToolCallback[rawCallbacks.length];
             for (int i = 0; i < rawCallbacks.length; i++) {
                 String toolName = rawCallbacks[i].getToolDefinition() != null ? rawCallbacks[i].getToolDefinition().name() : "";
-                String toolMcpId = mcpClientRegistry.getMcpIdForTool(toolName);
+                String toolMcpId = callbackOwners.get(rawCallbacks[i]);
                 // T10：先包一层 HintedToolCallback 把 prompt hint 拼进 description，再交给 MeteredToolCallback
                 // 顺序固定：raw -> hinted -> metered。hint 命中才 wrap，命不中零开销跳过。
                 String hint = toolPromptHintRegistry != null ? toolPromptHintRegistry.getHint(toolName) : null;
@@ -203,6 +215,7 @@ public class AiClientModelNode extends AbstractArmorySupport {
             robustMgr.setUserInputGate(userInputGate);
             // reactive 动态补工具：注入 request_tool 依赖（开关关 / 服务缺失时 manager 不广播/不拦截，零影响）
             robustMgr.setMcpToolCatalogService(mcpToolCatalogService);
+            robustMgr.setWorkspaceNodePolicy(nodePolicy);
             robustMgr.setRequestToolEnabled(requestToolEnabled);
             robustMgr.setRequestToolMaxCalls(requestToolMaxCalls);
             // 元工具(ask_user / request_tool)观察卡片：它们不走 MeteredToolCallback，进度事件由 manager 直接发

@@ -2,7 +2,6 @@ package cn.bugstack.ai.domain.agent.service.armory.node.factory.element;
 
 import cn.bugstack.ai.domain.agent.service.memory.episodic.IEpisodicMemoryService;
 import lombok.extern.slf4j.Slf4j;
-import org.slf4j.MDC;
 import org.springframework.ai.chat.client.ChatClientRequest;
 import org.springframework.ai.chat.client.ChatClientResponse;
 import org.springframework.ai.chat.client.advisor.api.AdvisorChain;
@@ -61,13 +60,7 @@ public class EpisodicMemoryAdvisor implements BaseAdvisor {
         if (episodic == null) return request;
 
         Map<String, Object> ctx = request.context();
-        String userId = MDC.get("userId");
-        if (userId == null || userId.isBlank()) {
-            // H2-A：userId fallback 对齐 LongTermMemoryAdvisor —— conversationId 可能是
-            // tenant:user:session 复合键，要提取 user 段，不能整串当 userId
-            Object sidObj = ctx == null ? null : ctx.get(SESSION_CONTEXT_KEY);
-            userId = extractUserIdFromConversationId(sidObj == null ? null : sidObj.toString());
-        }
+        String userId = TrustedAdvisorIdentity.userId(ctx);
         if (userId == null || userId.isBlank()) {
             return request;
         }
@@ -77,8 +70,7 @@ public class EpisodicMemoryAdvisor implements BaseAdvisor {
         String userText = userMsg.getText();
         if (userText == null || userText.isBlank()) return request;
 
-        // 当前 sessionId：优先从 MDC 取；MDC 缺失时从 conversationId 最后一段还原，和 RAG evidence 对齐
-        String sessionId = resolveSessionIdForEvidence(ctx);
+        String sessionId = TrustedAdvisorIdentity.sessionId(ctx);
 
         // ① 当前会话的摘要（按 user 维度查，防 sessionId 跨用户复用串台）
         String currentSessionSummary = null;
@@ -170,33 +162,4 @@ public class EpisodicMemoryAdvisor implements BaseAdvisor {
         return getClass().getSimpleName();
     }
 
-    /**
-     * H2-A：跟 LongTermMemoryAdvisor 同款 userId 提取 —— conversationId 形如
-     * {@code tenant:user:session} 取 user 段，{@code user:session} 取第一段，单段原样返回。
-     */
-    private String extractUserIdFromConversationId(String conversationId) {
-        if (conversationId == null || conversationId.isBlank()) return null;
-        String[] parts = conversationId.split(":");
-        if (parts.length >= 3) return parts[1];
-        if (parts.length == 2) return parts[0];
-        return null;
-    }
-
-    private String resolveSessionIdForEvidence(Map<String, Object> context) {
-        String mdcSid = MDC.get("sessionId");
-        if (mdcSid != null && !mdcSid.isBlank()) return mdcSid;
-        if (context != null) {
-            Object sid = context.get(SESSION_CONTEXT_KEY);
-            String sessionId = extractSessionIdFromConversationId(sid == null ? null : String.valueOf(sid));
-            if (sessionId != null && !sessionId.isBlank()) return sessionId;
-        }
-        return null;
-    }
-
-    private String extractSessionIdFromConversationId(String conversationId) {
-        if (conversationId == null || conversationId.isBlank()) return null;
-        String trimmed = conversationId.trim();
-        int idx = trimmed.lastIndexOf(':');
-        return idx >= 0 && idx + 1 < trimmed.length() ? trimmed.substring(idx + 1) : trimmed;
-    }
 }

@@ -23,6 +23,9 @@ public class AiClientAdvisor {
      */
     private Long id;
 
+    /** Set by the server on creation; never transferred through an update DTO. */
+    private String ownerUserId;
+
     /**
      * 顾问ID
      */

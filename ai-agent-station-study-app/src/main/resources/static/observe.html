@@ -2,12 +2,15 @@
 <html lang="zh-CN">
 <head>
 <script src="/auth.js"></script>
+<script src="/observe-scope.js"></script>
     <meta charset="utf-8"/>
-    <title>AI Agent Station · 观测面板</title>
+    <title>TAgent · 用量观测</title>
     <meta name="viewport" content="width=device-width,initial-scale=1"/>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <style>
         * { box-sizing: border-box; }
+        [hidden] { display: none !important; }
+        header { flex-wrap: wrap; }
         body { margin: 0; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
                background: #0f1419; color: #e6edf3; }
         header { padding: 18px 24px; border-bottom: 1px solid #21262d; display: flex; align-items: center; gap: 16px; }
@@ -17,7 +20,7 @@
         header select, header button { background: #21262d; color: #e6edf3; border: 1px solid #30363d;
             padding: 6px 12px; border-radius: 6px; font-size: 13px; cursor: pointer; }
         header button:hover { background: #30363d; }
-        .tabs { display: flex; gap: 6px; align-items: center; }
+        .tabs { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
         .tabs a { color: #8b949e; text-decoration: none; border: 1px solid #30363d; background: #161b22;
             padding: 6px 12px; border-radius: 6px; font-size: 13px; line-height: 1; }
         .tabs a:hover { color: #e6edf3; background: #21262d; }
@@ -40,17 +43,41 @@
         .empty { color: #6e7681; padding: 24px; text-align: center; }
         .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
         .dot.ok { background: #3fb950; } .dot.err { background: #f85149; }
+        .site-section { margin: 20px 24px 0; }
+        .site-heading { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+        .site-heading h2 { margin: 0; font-size: 16px; }
+        .site-heading select { margin-left: auto; background: #21262d; color: #e6edf3; border: 1px solid #30363d; padding: 6px 12px; border-radius: 6px; }
+        .site-grid { grid-template-columns: repeat(3, 1fr); padding: 16px 0; }
+        .site-note { color: #8b949e; font-size: 12px; line-height: 1.8; margin: 10px 0; }
+        .site-chart { position: relative; width: 100%; min-width: 0; height: 230px; }
+        .site-chart canvas { max-width: 100%; }
+        .site-details { margin-top: 14px; overflow-x: auto; }
+        .site-details summary { cursor: pointer; color: #8b949e; margin-bottom: 10px; font-size: 13px; }
+        #site-status { font-size: 12px; color: #8b949e; }
+        @media (max-width: 760px) {
+            header { flex-wrap: wrap; padding: 16px; }
+            header .right { margin-left: 0; flex-wrap: wrap; }
+            .grid { grid-template-columns: repeat(2, 1fr); padding: 16px; }
+            .site-section { margin: 16px 16px 0; }
+            .site-grid { grid-template-columns: 1fr; padding: 16px 0; }
+            .charts { grid-template-columns: 1fr; padding: 0 16px 16px; }
+            .table-wrap { padding: 0 16px 24px; overflow-x: auto; }
+        }
     </style>
 </head>
 <body>
 <header>
-    <h1>AI Agent Station · 观测面板</h1>
+    <h1>TAgent · 用量观测</h1>
     <span class="muted" id="status"><span class="dot ok"></span>就绪</span>
     <nav class="tabs" aria-label="观测视图">
-        <a class="active" href="/observe.html">LLM 观测</a>
-        <a href="/observe-mcp.html">MCP 工具治理</a>
+        <a href="/index.html">对话</a>
+        <a href="/user-agents.html">我的 Agent</a>
+        <a class="active" href="/observe.html">用量观测</a>
+        <a href="/observe-mcp.html">MCP 连接与工具</a>
+        <a data-admin-only hidden href="/admin-stats.html">网站统计</a>
     </nav>
     <div class="right">
+        <label id="scope-control" hidden>范围 <select id="observation-scope"><option value="mine">仅本人</option><option value="all">全站（管理员）</option></select></label>
         <span class="muted">时间窗口</span>
         <select id="range">
             <option value="1">最近 1h</option>
@@ -63,6 +90,9 @@
         <button onclick="toggleAuto()" id="autoBtn">自动刷新：关</button>
     </div>
 </header>
+<p id="scope-note" class="muted" style="margin:16px 24px;color:#8b949e;font-size:13px">仅展示归属于当前账户的模型调用与会话；全站访问与注册统计由管理员单独查看。</p>
+
+
 
 <div class="grid">
     <div class="stat"><div class="label">LLM 调用数</div><div class="value" id="s-calls">–</div><div class="sub" id="s-calls-sub">&nbsp;</div></div>
@@ -77,7 +107,7 @@
         <canvas id="chart-model" height="220"></canvas>
     </div>
     <div class="card">
-        <h2>会话 / 系统 LLM 调用 Top 15<span class="muted">当前时间窗口 · sessionId 或 system:* 维度</span></h2>
+        <h2>LLM 调用 Top 15<span class="muted">当前时间窗口 · sessionId 或 system:* 维度</span></h2>
         <canvas id="chart-session" height="220"></canvas>
     </div>
 </div>
@@ -107,12 +137,13 @@
 </div>
 
 <script>
-Chart.defaults.color = '#8b949e';
-Chart.defaults.borderColor = '#21262d';
+if (window.Chart) {
+    Chart.defaults.color = '#8b949e';
+    Chart.defaults.borderColor = '#21262d';
+}
 
 const PALETTE = ['#58a6ff', '#3fb950', '#d29922', '#f778ba', '#a371f7', '#ff7b72', '#39c5cf', '#e3b341'];
 let chartModel, chartSession, autoTimer = null;
-
 function setStatus(ok, msg) {
     const el = document.getElementById('status');
     el.innerHTML = `<span class="dot ${ok ? 'ok' : 'err'}"></span>${msg}`;
@@ -122,12 +153,17 @@ function fmtNum(n) { return (n || 0).toLocaleString(); }
 function fmtFloat(n) { return n == null ? '–' : (+n).toFixed(1); }
 
 async function fetchJson(url) {
-    const r = await fetch(url);
+    const r = await fetch(ObserveScope.url(url), {headers: {Accept: 'application/json'}});
     if (!r.ok) throw new Error(`${url} ${r.status}`);
-    return r.json();
+    const result = await r.json();
+    if (result.code !== '0000') throw new Error(result.info || '请求失败');
+    if (['ES unavailable', 'search failed'].includes(result.info)) throw new Error('LLM 观测数据源不可用');
+    return result;
 }
 
 async function refresh() {
+    if (!ObserveScope.ready) return;
+    const version = ObserveScope.version;
     const hours = +document.getElementById('range').value;
     try {
         const [sum, byModel, bySession] = await Promise.all([
@@ -135,6 +171,7 @@ async function refresh() {
             fetchJson(`/api/v1/observe/token-by-model?hours=${hours}`),
             fetchJson(`/api/v1/observe/calls-by-session-today?size=15&hours=${hours}`)
         ]);
+        if (version !== ObserveScope.version) return;
         renderSummary(sum.data, hours);
         renderModel(byModel.data);
         renderSession(bySession.data);
@@ -156,6 +193,7 @@ function renderSummary(d, hours) {
 }
 
 function renderModel(d) {
+    if (!window.Chart) throw new Error('图表组件未加载');
     const items = (d && d.items) || [];
     document.getElementById('h1-sub').textContent = items.length ? `共 ${items.length} 个模型` : '';
     const labels = items.map(x => x.model || '(unknown)');
@@ -246,7 +284,14 @@ function toggleAuto() {
 }
 
 document.getElementById('range').addEventListener('change', refresh);
-refresh();
+window.addEventListener('observation-scope-change', () => {
+    for (const id of ['s-calls','s-total','s-latency','s-sessions']) document.getElementById(id).textContent = '–';
+    document.querySelector('#tbl-model tbody').innerHTML = '';
+    document.querySelector('#tbl-session tbody').innerHTML = '';
+    if (chartModel) { chartModel.destroy(); chartModel = null; }
+    if (chartSession) { chartSession.destroy(); chartSession = null; }
+});
+ObserveScope.initialize().then(refresh).catch(error => setStatus(false, error.message));
 </script>
 </body>
 </html>

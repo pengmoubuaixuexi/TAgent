@@ -4,9 +4,11 @@ import cn.bugstack.ai.domain.agent.service.armory.node.factory.element.EpisodicM
 import cn.bugstack.ai.domain.agent.service.armory.node.factory.element.LongTermMemoryAdvisor;
 import cn.bugstack.ai.domain.agent.service.memory.episodic.IEpisodicMemoryService;
 import cn.bugstack.ai.domain.agent.service.memory.longterm.ILongTermMemoryService;
+import cn.bugstack.ai.domain.agent.service.memory.longterm.LongTermMemoryRecall;
 import cn.bugstack.ai.domain.agent.service.prompt.ContextEnvelopeComposer;
 import cn.bugstack.ai.domain.agent.service.prompt.ContextEnvelopeRenderAdvisor;
 import org.junit.After;
+import org.junit.Before;
 import org.junit.Test;
 import org.slf4j.MDC;
 import org.springframework.ai.chat.client.ChatClientRequest;
@@ -25,6 +27,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -35,7 +38,7 @@ import static org.mockito.Mockito.when;
  */
 public class ContextEnvelopeAdvisorIntegrationTest {
 
-    @After
+    @Before @After
     public void clearMdc() {
         MDC.clear();
     }
@@ -80,8 +83,8 @@ public class ContextEnvelopeAdvisorIntegrationTest {
     @Test
     public void longTermMemoryBeforeWritesEnvelopeContext_keepsOriginalPromptAndOptions() {
         ILongTermMemoryService ltm = mock(ILongTermMemoryService.class);
-        when(ltm.retrieveForInjection("u1", "原始问题", 30, 5))
-                .thenReturn(List.of("[偏好:回答风格] 喜欢简洁", "[画像:职业] Java 后端工程师"));
+        when(ltm.retrieveForInjectionDetailed("u1", "原始问题", 30, 4))
+                .thenReturn(List.of(recall("偏好:回答风格", "喜欢简洁"), recall("画像:职业", "Java 后端工程师")));
         LongTermMemoryAdvisor advisor = new LongTermMemoryAdvisor(ltm, 4);
         OpenAiChatOptions options = options();
         Map<String, Object> ctx = new LinkedHashMap<>();
@@ -95,6 +98,8 @@ public class ContextEnvelopeAdvisorIntegrationTest {
         assertEquals("原始问题", out.prompt().getUserMessage().getText());
         assertTrue(String.valueOf(out.context().get(ContextEnvelopeComposer.CTX_LTM)).contains("[偏好:回答风格] 喜欢简洁"));
         assertFalse(out.prompt().getUserMessage().getText().contains("关于用户的已知信息"));
+        assertEquals("tenant:u1:s1", out.context().get(LongTermMemoryAdvisor.SESSION_CONTEXT_KEY));
+        verify(ltm).retrieveForInjectionDetailed("u1", "原始问题", 30, 4);
     }
 
     @Test
@@ -122,8 +127,8 @@ public class ContextEnvelopeAdvisorIntegrationTest {
     @Test
     public void ltmThenEpisodicThenRender_producesOneCanonicalEnvelope() {
         ILongTermMemoryService ltm = mock(ILongTermMemoryService.class);
-        when(ltm.retrieveForInjection("u1", "帮我继续规划", 30, 5))
-                .thenReturn(List.of("[偏好:回答风格] 喜欢简洁"));
+        when(ltm.retrieveForInjectionDetailed("u1", "帮我继续规划", 30, 4))
+                .thenReturn(List.of(recall("偏好:回答风格", "喜欢简洁")));
         IEpisodicMemoryService episodic = mock(IEpisodicMemoryService.class);
         when(episodic.findBySessionIdForUser("u1", "s1")).thenReturn("当前会话在做旅行计划");
         when(episodic.getOtherSessions("u1", "s1", 5, 5)).thenReturn(List.of("历史会话提到预算 3000"));
@@ -145,6 +150,8 @@ public class ContextEnvelopeAdvisorIntegrationTest {
         assertTrue(user.contains("<task>帮我继续规划</task>"));
         assertFalse(out.context().containsKey(ContextEnvelopeComposer.CTX_LTM));
         assertFalse(out.context().containsKey(ContextEnvelopeComposer.CTX_EPISODIC));
+        assertEquals("tenant:u1:s1", out.context().get(LongTermMemoryAdvisor.SESSION_CONTEXT_KEY));
+        verify(ltm).retrieveForInjectionDetailed("u1", "帮我继续规划", 30, 4);
     }
 
     @Test
@@ -161,6 +168,10 @@ public class ContextEnvelopeAdvisorIntegrationTest {
                 .maxTokens(321)
                 .toolContext(Map.of("agent.run_id", "run-1"))
                 .build();
+    }
+
+    private static LongTermMemoryRecall recall(String topic, String content) {
+        return LongTermMemoryRecall.builder().topic(topic).content(content).kind(LongTermMemoryRecall.KIND_CORE).build();
     }
 
     private static ChatClientRequest request(String system, String user, OpenAiChatOptions options, Map<String, Object> context) {

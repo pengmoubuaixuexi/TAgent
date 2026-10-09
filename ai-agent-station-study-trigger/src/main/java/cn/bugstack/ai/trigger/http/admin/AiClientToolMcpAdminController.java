@@ -9,6 +9,7 @@ import cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService;
 import cn.bugstack.ai.infrastructure.dao.IAiClientToolMcpDao;
 import cn.bugstack.ai.infrastructure.dao.po.AiClientToolMcp;
 import cn.bugstack.ai.types.enums.ResponseCode;
+import cn.bugstack.ai.trigger.http.admin.util.AdminConfigurationOwnership;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.BeanUtils;
 import org.springframework.util.StringUtils;
@@ -40,11 +41,13 @@ public class AiClientToolMcpAdminController implements IAiClientToolMcpAdminServ
     @Override
     @PostMapping("/create")
     public Response<Boolean> createAiClientToolMcp(@RequestBody AiClientToolMcpRequestDTO request) {
+        String owner = AdminConfigurationOwnership.currentOwner();
         try {
             log.info("创建MCP客户端配置请求：{}", request);
             
             // DTO转PO
             AiClientToolMcp aiClientToolMcp = convertToAiClientToolMcp(request);
+            aiClientToolMcp.setOwnerUserId(owner);
             aiClientToolMcp.setCreateTime(LocalDateTime.now());
             aiClientToolMcp.setUpdateTime(LocalDateTime.now());
             

@@ -42,6 +42,9 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
     @Resource
     private McpClientRegistry mcpClientRegistry;
 
+    @org.springframework.beans.factory.annotation.Autowired
+    private cn.bugstack.ai.domain.agent.service.security.WorkspaceMcpPolicy workspaceMcpPolicy;
+
     @Override
     protected String doApply(ArmoryCommandEntity requestParameter, DefaultArmoryStrategyFactory.DynamicContext dynamicContext) throws Exception {
         log.info("Ai Agent 构建节点，Tool MCP 工具配置{}", JSON.toJSONString(requestParameter));
@@ -54,6 +57,9 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
         }
 
         for (AiClientToolMcpVO mcpVO : aiClientToolMcpList) {
+            List<cn.bugstack.ai.domain.agent.model.valobj.AiClientModelVO> models =
+                    dynamicContext.getValue(AiAgentEnumVO.AI_CLIENT_MODEL.getDataName());
+            if (!requiresEagerConnection(mcpVO.getMcpId(),models)) continue;
             try {
                 // 治本：装配复用。该 mcpId 已被其它 agent 装配过且连接仍在册 → 直接复用，
                 // 不再 createMcpSyncClient + registerBean。删旧建新会 close 旧连接，孤儿化
@@ -82,6 +88,19 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
         return router(requestParameter, dynamicContext);
     }
 
+    /** Keep dependency edges for authorization/invalidation, but connect lazy bindings only on request_tool. */
+    public static boolean requiresEagerConnection(String mcpId,List<cn.bugstack.ai.domain.agent.model.valobj.AiClientModelVO> models) {
+        if (models==null || models.isEmpty()) return true;
+        boolean referenced=false;
+        for (var model:models) {
+            if (model.getToolMcpIds()==null || !model.getToolMcpIds().contains(mcpId)) continue;
+            referenced=true;
+            var policy=cn.bugstack.ai.domain.agent.model.valobj.WorkspaceNodePolicy.fromCapabilities(model.getCapabilitiesJson());
+            if (policy==null || policy.eager(mcpId)) return true;
+        }
+        return !referenced;
+    }
+
     @Override
     public StrategyHandler<ArmoryCommandEntity, DefaultArmoryStrategyFactory.DynamicContext, String> get(ArmoryCommandEntity requestParameter, DefaultArmoryStrategyFactory.DynamicContext dynamicContext) throws Exception {
         return aiClientModelNode;
@@ -102,6 +121,7 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
     }
 
     public McpSyncClient createMcpSyncClient(AiClientToolMcpVO aiClientToolMcpVO) {
+        workspaceMcpPolicy.validate(aiClientToolMcpVO);
         String transportType = aiClientToolMcpVO.getTransportType();
 
         switch (transportType) {
@@ -112,10 +132,12 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
                 String baseUri;
                 String sseEndpoint;
 
-                int queryParamStartIndex = originalBaseUri.indexOf("sse");
-                if (queryParamStartIndex != -1) {
-                    baseUri = originalBaseUri.substring(0, queryParamStartIndex - 1);
-                    sseEndpoint = originalBaseUri.substring(queryParamStartIndex - 1);
+                java.net.URI originalUri = java.net.URI.create(originalBaseUri);
+                if (originalUri.getRawPath() != null && !originalUri.getRawPath().isBlank()
+                        && !"/".equals(originalUri.getRawPath())) {
+                    baseUri = originalUri.getScheme() + "://" + originalUri.getRawAuthority();
+                    sseEndpoint = originalUri.getRawPath();
+                    if (originalUri.getRawQuery() != null) sseEndpoint += "?" + originalUri.getRawQuery();
                 } else {
                     baseUri = originalBaseUri;
                     sseEndpoint = transportConfigSse.getSseEndpoint();
@@ -123,10 +145,27 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
 
                 sseEndpoint = StringUtils.isBlank(sseEndpoint) ? "/sse" : sseEndpoint;
 
-                HttpClientSseClientTransport sseClientTransport = HttpClientSseClientTransport
+                java.net.http.HttpRequest.Builder headers = java.net.http.HttpRequest.newBuilder();
+                if (transportConfigSse.getHeaders() != null) transportConfigSse.getHeaders().forEach(headers::header);
+                var sseBuilder = HttpClientSseClientTransport
                         .builder(baseUri) // 使用截取后的 baseUri
                         .sseEndpoint(sseEndpoint) // 使用截取或默认的 sseEndpoint
-                        .build();
+                        .requestBuilder(headers)
+                        .clientBuilder(java.net.http.HttpClient.newBuilder()
+                                .followRedirects(java.net.http.HttpClient.Redirect.NEVER));
+                if (transportConfigSse.isWorkspaceOwned()) {
+                    sseBuilder.messageEndpointValidator((base, endpointValue) -> {
+                        java.net.URI endpointUri = base.resolve(endpointValue);
+                        if (!java.util.Objects.equals(base.getScheme(), endpointUri.getScheme())
+                                || !java.util.Objects.equals(base.getHost(), endpointUri.getHost())
+                                || base.getPort() != endpointUri.getPort()
+                                || endpointUri.getUserInfo() != null || endpointUri.getFragment() != null) {
+                            throw new io.modelcontextprotocol.client.transport.InvalidSseMessageEndpointException(
+                                    "SSE message endpoint must stay on its approved origin", endpointValue);
+                        }
+                    });
+                }
+                HttpClientSseClientTransport sseClientTransport = sseBuilder.build();
 
                 McpSyncClient mcpSyncClient = McpClient.sync(sseClientTransport).requestTimeout(Duration.ofSeconds(aiClientToolMcpVO.getRequestTimeout())).build();
                 var init_sse = mcpSyncClient.initialize();

@@ -125,8 +125,16 @@ public class UserInputGate {
      */
     public Result requestUserInput(String sessionId, String argsJson, String stepLabel) {
         if (!enabled) return new Result(Status.UNAVAILABLE, null);
+        return requestUserInput(sessionId, argsJson, stepLabel,
+                runEventPublisher.currentRunId(sessionId), org.slf4j.MDC.get("userId"));
+    }
 
-        if (runEventPublisher.currentRunId(sessionId) == null) {
+    /** Explicit identity survives Reactor/DAG thread changes; capture it before waiting for a reply. */
+    public Result requestUserInput(String sessionId, String argsJson, String stepLabel,
+                                   String runId, String userId) {
+        if (!enabled) return new Result(Status.UNAVAILABLE, null);
+
+        if (runId == null || !runId.equals(runEventPublisher.currentRunId(sessionId))) {
             log.warn("[UserInput] active run missing sessionId={}, returning UNAVAILABLE", sessionId);
             return new Result(Status.UNAVAILABLE, null);
         }
@@ -142,20 +150,27 @@ public class UserInputGate {
         String inputId = sessionId + ":ask_user:" + System.currentTimeMillis() + ":" + inputSeq.incrementAndGet();
         CompletableFuture<String> future = new CompletableFuture<>();
         pendingInputs.put(inputId, future);
+        String questionPayload = buildPayload(inputId, argsJson, stepLabel);
 
         try {
-            runEventPublisher.publishCurrent(sessionId, "user_input_required",
-                    buildPayload(inputId, argsJson, stepLabel));
+            runEventPublisher.publish(runId, sessionId, "user_input_required", questionPayload);
             log.info("[UserInput] requested inputId={} step={}", inputId, stepLabel);
             String answer = future.get(timeoutSeconds, TimeUnit.SECONDS);
             log.info("[UserInput] answered inputId={} len={}", inputId, answer != null ? answer.length() : 0);
-            publishResult(sessionId, inputId, "ANSWERED", answer);
+            // Do not attach a late answer to a new run that reused this session.
+            if (!runId.equals(runEventPublisher.currentRunId(sessionId))) {
+                return new Result(Status.UNAVAILABLE, null);
+            }
+            publishResult(runId, sessionId, userId, inputId, "ANSWERED", answer, questionPayload);
             return new Result(Status.ANSWERED, answer);
         } catch (TimeoutException e) {
             log.warn("[UserInput] timeout inputId={}", inputId);
-            publishResult(sessionId, inputId, "TIMEOUT", null);
+            if (runId.equals(runEventPublisher.currentRunId(sessionId))) {
+                publishResult(runId, sessionId, userId, inputId, "TIMEOUT", null, questionPayload);
+            }
             return new Result(Status.TIMEOUT, null);
         } catch (Exception e) {
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
             log.warn("[UserInput] failed inputId={}: {}", inputId, e.toString());
             return new Result(Status.UNAVAILABLE, null);
         } finally {
@@ -163,14 +178,26 @@ public class UserInputGate {
         }
     }
 
-    private void publishResult(String sessionId, String inputId, String status, String answer) {
+    private void publishResult(String runId, String sessionId, String userId, String inputId,
+                               String status, String answer, String questionPayload) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("inputId", inputId);
         payload.put("status", status);
         if ("ANSWERED".equals(status) && answer != null) {
             payload.put("answer", sanitizeTimelineAnswer(answer));
+            // Only authenticated identity from ToolContext may scope shared facts. Never infer it from answers.
+            if (userId != null && !userId.isBlank()) payload.put("userId", userId);
+            try {
+                Map<String, Object> question = MAPPER.readValue(questionPayload, Map.class);
+                for (String key : List.of("context", "questions", "step")) {
+                    if (question.get(key) != null) payload.put(key, question.get(key));
+                }
+            } catch (JsonProcessingException ignored) {
+                // The answer is still valid, but malformed question metadata is not propagated.
+            }
         }
-        runEventPublisher.publishCurrent(sessionId, "user_input_result", payload);
+        runEventPublisher.publish(runId, sessionId, "user_input_result", payload);
+        if ("ANSWERED".equals(status)) runEventPublisher.checkpoint(runId);
     }
 
     private String sanitizeTimelineAnswer(String answer) {

@@ -4,6 +4,7 @@
 
     <resultMap id="AiClientApiMap" type="cn.bugstack.ai.infrastructure.dao.po.AiClientApi">
         <id column="id" property="id"/>
+        <result column="owner_user_id" property="ownerUserId"/>
         <result column="api_id" property="apiId"/>
         <result column="base_url" property="baseUrl"/>
         <result column="api_key" property="apiKey"/>
@@ -16,8 +17,10 @@
 
     <insert id="insert" parameterType="cn.bugstack.ai.infrastructure.dao.po.AiClientApi" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO ai_client_api (
+            owner_user_id,
             api_id, base_url, api_key, completions_path, embeddings_path, status, create_time, update_time
         ) VALUES (
+            COALESCE(#{ownerUserId}, '__legacy_unowned__'),
             #{apiId}, #{baseUrl}, #{apiKey}, #{completionsPath}, #{embeddingsPath}, #{status}, #{createTime}, #{updateTime}
         )
     </insert>
@@ -54,26 +57,26 @@
     </delete>
 
     <select id="queryById" parameterType="java.lang.Long" resultMap="AiClientApiMap">
-        SELECT id, api_id, base_url, api_key, completions_path, embeddings_path, status, create_time, update_time
+        SELECT id, owner_user_id, api_id, base_url, api_key, completions_path, embeddings_path, status, create_time, update_time
         FROM ai_client_api
         WHERE id = #{id}
     </select>
 
     <select id="queryByApiId" parameterType="java.lang.String" resultMap="AiClientApiMap">
-        SELECT id, api_id, base_url, api_key, completions_path, embeddings_path, status, create_time, update_time
+        SELECT id, owner_user_id, api_id, base_url, api_key, completions_path, embeddings_path, status, create_time, update_time
         FROM ai_client_api
         WHERE api_id = #{apiId}
     </select>
 
     <select id="queryEnabledApis" resultMap="AiClientApiMap">
-        SELECT id, api_id, base_url, api_key, completions_path, embeddings_path, status, create_time, update_time
+        SELECT id, owner_user_id, api_id, base_url, api_key, completions_path, embeddings_path, status, create_time, update_time
         FROM ai_client_api
         WHERE status = 1
         ORDER BY create_time DESC
     </select>
 
     <select id="queryAll" resultMap="AiClientApiMap">
-        SELECT id, api_id, base_url, api_key, completions_path, embeddings_path, status, create_time, update_time
+        SELECT id, owner_user_id, api_id, base_url, api_key, completions_path, embeddings_path, status, create_time, update_time
         FROM ai_client_api
         ORDER BY create_time DESC
     </select>
