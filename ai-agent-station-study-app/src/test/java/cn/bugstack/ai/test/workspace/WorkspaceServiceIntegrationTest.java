@@ -80,7 +80,9 @@ public class WorkspaceServiceIntegrationTest {
                 return new InetAddress[]{InetAddress.getByAddress(new byte[]{1, 1, 1, 1})};
             }
         });
-        context.register(Transactions.class, WorkspaceService.class);
+        context.register(Transactions.class, WorkspaceService.class,
+                cn.bugstack.ai.trigger.workspace.WorkspaceVersionStore.class,
+                cn.bugstack.ai.trigger.workspace.WorkspaceVersionService.class);
         context.refresh();
         service = context.getBean(WorkspaceService.class);
         prefix = "workspace_test_" + UUID.randomUUID().toString().substring(0, 8);
@@ -132,6 +134,8 @@ public class WorkspaceServiceIntegrationTest {
         try {
             if (db != null && prefix != null) {
                 Object[] owners = {alice, bob, admin};
+                db.update("DELETE FROM ai_agent_draft WHERE owner_user_id IN (?,?,?)",owners);
+                db.update("DELETE FROM ai_agent_version WHERE owner_user_id IN (?,?,?)",owners);
                 // Relations have no owner column, so derive their source IDs from exact fixture owners.
                 db.update("""
                         DELETE FROM ai_client_config WHERE
@@ -148,6 +152,25 @@ public class WorkspaceServiceIntegrationTest {
         } finally {
             if (context != null) context.close();
         }
+    }
+
+    @Test
+    public void activationPersistsVersionAndRollbackFailureKeepsDraftAndGraph() {
+        var saved=service.saveAgent(alice,null,agentConfig("fixed"));
+        String id=(String)saved.get("agentId");
+        var versions=context.getBean(cn.bugstack.ai.trigger.workspace.WorkspaceVersionService.class);
+        var changed=agentConfig("fixed").put("name","Revised name").put("version",1);
+        versions.saveDraft(alice,id,changed);
+        assertNotEquals("Revised name",service.agent(alice,id).get("name"));
+        var published=versions.publish(alice,id,json.createObjectNode().put("baseVersion",1).put("draftRevision",1));
+        assertEquals(2,((Number)published.get("version")).intValue());
+        assertEquals(2,((List<?>)versions.versions(alice,id)).size());
+        versions.restore(alice,id,1,json.createObjectNode().put("baseVersion",2));
+        db.update("UPDATE ai_client_model SET platform_enabled=0 WHERE model_id=?",platformModel);
+        assertThrows(ResponseStatusException.class,()->versions.publish(alice,id,json.createObjectNode().put("baseVersion",2).put("draftRevision",1)));
+        assertEquals(1,versions.draft(alice,id).get("revision"));
+        assertEquals(2,((Number)service.agent(alice,id).get("version")).intValue());
+        assertThrows(ResponseStatusException.class,()->versions.versions(bob,id));
     }
 
     @Test

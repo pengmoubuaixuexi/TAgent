@@ -89,6 +89,7 @@ public class FlowPlanReviewService {
                 .runId(runId)
                 .sessionId(request.getSessionId())
                 .agentId(request.getAiAgentId())
+                .agentVersion(request.getAgentVersion())
                 .userId(request.getUserId())
                 .tenantId(request.getTenantId())
                 .originalMessage(request.getMessage())
@@ -101,6 +102,7 @@ public class FlowPlanReviewService {
                 .mcpNeeds(mcpToolCatalogService != null ? mcpToolCatalogService.needsFor(request.getSessionId()) : null)
                 .steps(reviewSteps)
                 .status(STATUS_PENDING)
+                .initialPhaseReleased(false)
                 .attemptCount(0)
                 .createdAt(now)
                 .updatedAt(now)
@@ -115,6 +117,8 @@ public class FlowPlanReviewService {
         }
         publishPlanReviewNotification(state);
         dynamicContext.setValue("planReviewPaused", Boolean.TRUE);
+        var budget = cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.find(request.getRunId());
+        if (budget != null) budget.awaitReview();
         sendPlanReviewRequired(emitter, state, validation, effectiveTtlSeconds);
         log.info("[FlowPlanReview] paused runId={} sessionId={} steps={} ttl={}s",
                 runId, request.getSessionId(), state.getSteps().size(), effectiveTtlSeconds);
@@ -157,6 +161,9 @@ public class FlowPlanReviewService {
             if (STATUS_EXPIRED.equals(status)) {
                 return failedWithState("plan_expired", List.of("The pending plan has expired; please generate a fresh plan"), state, null);
             }
+            if (!Boolean.TRUE.equals(state.getInitialPhaseReleased())) {
+                return failedWithState("plan_finalizing", List.of("计划生成阶段正在收尾，请稍后再次确认。"), state, null);
+            }
 
             List<FlowPlanReviewStep> normalizedSteps = normalizeSubmittedSteps(submittedSteps);
             FlowPlanReviewValidationResult validation = validateSteps(normalizedSteps);
@@ -185,6 +192,18 @@ public class FlowPlanReviewService {
     public void deletePendingPlan(String runId) {
         if (stateStore != null) {
             stateStore.delete(runId);
+        }
+    }
+
+    /** Called by the dispatcher only after releasing the initial phase's lease, subscribers and tool state. */
+    public void releaseInitialPhase(String runId) {
+        if (stateStore == null || runId == null || runId.isBlank()) return;
+        synchronized (stateTransitionLock) {
+            FlowPlanReviewState state = stateStore.find(runId).orElse(null);
+            if (state == null || !STATUS_PENDING.equals(normalizeStatus(state.getStatus()))) return;
+            state.setInitialPhaseReleased(true);
+            state.setUpdatedAt(System.currentTimeMillis());
+            stateStore.update(state);
         }
     }
 

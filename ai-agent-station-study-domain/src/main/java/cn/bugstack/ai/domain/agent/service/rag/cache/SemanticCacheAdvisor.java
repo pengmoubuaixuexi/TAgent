@@ -19,18 +19,16 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * P2.4 13.1 Semantic Cache Advisor：query embedding 相似度 > 阈值直接返回历史答案。
- * <p>
- * adviseCall() 里先查缓存：命中直接返回（跳过 LLM 调用）；未命中正常走链并异步存缓存。
- * <p>
- * <b>Order 设计</b>：默认 -200，**所有 advisor 中最早执行**——
- * Spring AI advisor 链按 order 升序触发 before / adviseCall。SemanticCache 设计目的是
- * 命中即省掉整条下游链路（LTM/Episodic/RAG/Rerank/AgenticRag/LLM）。
- * 原版 order=100 让它落在 RAG/Rerank 之后才跑，命中也省不到 RAG 检索的钱——本末倒置。
- * 修正后命中场景下：LTM 不查、RAG 不检索、Rerank 不调、LLM 不调——真省到了。
+ * Optional answer reuse for server-verified stateless clients. The final complete prompt fingerprint,
+ * trusted owner, agent version and model partition every lookup; dynamic advisors/tools bypass it.
+ * Runs after normal prompt rendering, so cache hits cannot skip ownership-sensitive context assembly.
  */
 @Slf4j
 public class SemanticCacheAdvisor implements BaseAdvisor {
+
+    public static final String STATELESS = "semantic_cache.stateless";
+    public static final String MODEL_ID = "semantic_cache.model_id";
+    private static final com.fasterxml.jackson.databind.ObjectMapper JSON = new com.fasterxml.jackson.databind.ObjectMapper();
 
     private final ISemanticCacheService cacheService;
     private final double minSimilarity;
@@ -55,7 +53,8 @@ public class SemanticCacheAdvisor implements BaseAdvisor {
     public SemanticCacheAdvisor(ISemanticCacheService cacheService, double minSimilarity, int order, int ttlMinutes, MeterRegistry meterRegistry) {
         this.cacheService = cacheService;
         this.minSimilarity = minSimilarity;
-        this.order = order;
+        // Shared-user-input and multimodal renderers run before this final-input fingerprint.
+        this.order = Math.max(order, 1100);
         this.ttlMinutes = ttlMinutes > 0 ? ttlMinutes : 10;
         this.meterRegistry = meterRegistry;
     }
@@ -94,7 +93,8 @@ public class SemanticCacheAdvisor implements BaseAdvisor {
         // 只有 qa / chat 类知识问答才适合语义缓存命中直接返回。
         // intentCategory 由 AgentDispatchDispatchService 在 dispatch 层写入 MDC。
         String intentCategory = org.slf4j.MDC.get("intentCategory");
-        if (intentCategory == null || "plan".equals(intentCategory) || "action".equals(intentCategory)) {
+        ISemanticCacheService.Scope scope = scope(request);
+        if (scope == null || !("qa".equals(intentCategory) || "chat".equals(intentCategory))) {
             recordOutcome("bypass");
             log.info("[SemanticCache] BYPASS intentCategory={}", intentCategory);
             return chain.nextCall(request);
@@ -108,7 +108,7 @@ public class SemanticCacheAdvisor implements BaseAdvisor {
         }
 
         // 查缓存：命中直接返回，跳过 LLM 调用（仅命中 ttlMinutes 内的记录）
-        String cached = cacheService.lookup(userText, minSimilarity, ttlMinutes);
+        String cached = cacheService.lookup(userText, minSimilarity, ttlMinutes, scope);
         if (cached != null) {
             recordOutcome("hit");
             log.info("[SemanticCache] HIT queryLen={} ttl={}min intentCategory={}", userText.length(), ttlMinutes, intentCategory);
@@ -145,7 +145,7 @@ public class SemanticCacheAdvisor implements BaseAdvisor {
                     ? (String) response.chatResponse().getMetadata().get("model")
                     : null;
             if (userText != null && answer != null && !answer.isBlank()) {
-                cacheService.store(userText, answer, model != null ? model : "unknown");
+                cacheService.store(userText, answer, scope);
                 log.info("[SemanticCache] STORED queryLen={} model={}", userText.length(), model);
             }
         } catch (Exception e) {
@@ -165,5 +165,39 @@ public class SemanticCacheAdvisor implements BaseAdvisor {
             }
         }
         return null;
+    }
+
+    private ISemanticCacheService.Scope scope(ChatClientRequest request) {
+        // Only assembly-verified stateless clients may skip the downstream advisor chain.
+        if (!Boolean.TRUE.equals(request.context().get(STATELESS))
+                || "workspace_node_debug".equals(org.slf4j.MDC.get("step"))) return null;
+        var budget = cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.find(Map.of());
+        if (budget == null) return null;
+        budget.checkActive();
+        var messages = request.prompt().getInstructions();
+        if (messages.stream().filter(m -> m.getMessageType() == MessageType.USER).count() != 1
+                || messages.stream().anyMatch(m -> m.getMessageType() != MessageType.USER
+                    && m.getMessageType() != MessageType.SYSTEM)
+                || messages.stream().anyMatch(m -> m instanceof org.springframework.ai.chat.messages.UserMessage u
+                    && !u.getMedia().isEmpty())) return null;
+        if (request.prompt().getOptions() instanceof org.springframework.ai.model.tool.ToolCallingChatOptions tools
+                && ((tools.getToolCallbacks() != null && !tools.getToolCallbacks().isEmpty())
+                    || (tools.getToolNames() != null && !tools.getToolNames().isEmpty()))) return null;
+        try {
+            // Include complete input/options, not only query similarity. Histories, options and prompts
+            // must never reuse another answer even inside the same user/agent/model/version boundary.
+            var input = Map.of("messages", messages.stream().map(m -> Map.of(
+                    "type", m.getMessageType().name(), "text", m.getText() == null ? "" : m.getText(),
+                    "metadata", m.getMetadata())).toList(),
+                    "options", request.prompt().getOptions() == null ? Map.of() : request.prompt().getOptions());
+            String hash = java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(JSON.writeValueAsBytes(input)));
+            Object model = request.context().get(MODEL_ID);
+            var result = new ISemanticCacheService.Scope(budget.ownerUserId(), org.slf4j.MDC.get("agentId"),
+                    org.slf4j.MDC.get("agentVersion"), model instanceof String s ? s : null, hash);
+            return result.valid() ? result : null;
+        } catch (Exception cannotFingerprint) {
+            return null;
+        }
     }
 }

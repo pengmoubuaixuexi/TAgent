@@ -24,6 +24,81 @@ import static org.junit.Assert.assertTrue;
 public class RunEventPublisherTest {
 
     @Test
+    public void preparationProgressIsTransientAndNeverBecomesReplayedHistory() {
+        MemoryStore store = new MemoryStore();
+        RunEventPublisher publisher = new RunEventPublisher();
+        ReflectionTestUtils.setField(publisher, "eventStore", store);
+        CapturingEmitter live = new CapturingEmitter();
+        publisher.attach("preparing-run", "session", live, null);
+        publisher.publish("preparing-run", "session", "run_progress",
+                java.util.Map.of("runId", "preparing-run", "phase", "mcp_connecting", "resourceName", "天气服务"));
+        assertEquals(1, live.frames.size());
+        assertTrue(live.frames.get(0).startsWith("event: run_progress\n"));
+        assertTrue(store.records.isEmpty());
+        assertTrue(((java.util.Map<?, ?>) ReflectionTestUtils.getField(publisher, "timelines")).isEmpty());
+        CapturingEmitter reconnect = new CapturingEmitter();
+        publisher.attach("preparing-run", "session", reconnect, null);
+        assertTrue(reconnect.frames.isEmpty());
+        publisher.finishRun("preparing-run");
+    }
+
+    @Test
+    public void stepProgressIsLiveOnlyAndDoesNotAdvanceReplayCursorOrPersistHistory() throws Exception {
+        MemoryStore store = new MemoryStore();
+        RunEventPublisher publisher = new RunEventPublisher();
+        ReflectionTestUtils.setField(publisher, "eventStore", store);
+        var snapshots = org.mockito.Mockito.mock(cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.class);
+        var notifications = org.mockito.Mockito.mock(cn.bugstack.ai.domain.agent.service.notification.RunNotificationProjector.class);
+        ReflectionTestUtils.setField(publisher, "runSnapshotService", snapshots);
+        ReflectionTestUtils.setField(publisher, "notificationProjector", notifications);
+        CapturingEmitter live = new CapturingEmitter();
+        publisher.attach("progress-run", "session", live, null);
+        var bridge = new RunAwareResponseBodyEmitter(Long.MAX_VALUE, "progress-run", "session", publisher);
+        bridge.send("event: step_progress\ndata: {\"stepId\":\"step-1\",\"phase\":\"awaiting_model\",\"waitSeconds\":10}\n\n");
+        assertEquals(1, live.frames.size());
+        assertTrue(live.frames.get(0).startsWith("event: step_progress\n"));
+        assertTrue(store.records.isEmpty());
+        assertTrue(((java.util.Map<?, ?>) ReflectionTestUtils.getField(publisher, "timelines")).isEmpty());
+        org.mockito.Mockito.verifyNoInteractions(snapshots, notifications);
+        CapturingEmitter reconnect = new CapturingEmitter();
+        publisher.attach("progress-run", "session", reconnect, null);
+        assertTrue(reconnect.frames.isEmpty());
+        publisher.finishRun("progress-run");
+        bridge.send("event: step_progress\ndata: {\"stepId\":\"step-1\"}\n\n");
+        assertEquals(1, live.frames.size());
+        assertTrue(store.records.isEmpty());
+    }
+
+    @Test
+    public void failedTerminalDiagnosticsStillCloseSubscribersAndBudget() {
+        String run = java.util.UUID.randomUUID().toString();
+        var budget = cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.start(run, "owner",
+                new cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.Limits(
+                        java.time.Duration.ofSeconds(30), 5, 5, 1000));
+        RunEventPublisher publisher = new RunEventPublisher();
+        CapturingEmitter emitter = new CapturingEmitter();
+        publisher.attach(run, "diagnostic-session", emitter, null);
+        var snapshots = org.mockito.Mockito.mock(cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.class);
+        org.mockito.Mockito.doThrow(new IllegalStateException("storage down")).when(snapshots)
+                .recordTimeline(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyList(), org.mockito.ArgumentMatchers.anyString());
+        ReflectionTestUtils.setField(publisher, "runSnapshotService", snapshots);
+        publisher.publish(run, "diagnostic-session", "token", java.util.Map.of("stepId", "s1", "token", "answer"));
+        assertEquals(1, emitter.frames.size());
+        var projector = org.mockito.Mockito.mock(cn.bugstack.ai.domain.agent.service.notification.RunNotificationProjector.class);
+        org.mockito.Mockito.doThrow(new IllegalStateException("projector down")).when(projector)
+                .project(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString(),
+                        org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString());
+        ReflectionTestUtils.setField(publisher, "notificationProjector", projector);
+        publisher.finishRun(run);
+        assertTrue(emitter.completed);
+        assertNull(publisher.currentRunId("diagnostic-session"));
+        org.junit.Assert.assertThrows(cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetExceededException.class,
+                budget::reserveTool);
+        assertTrue(((java.util.Map<?, ?>) ReflectionTestUtils.getField(publisher, "subscribers")).isEmpty());
+        assertTrue(((java.util.Map<?, ?>) ReflectionTestUtils.getField(publisher, "timelines")).isEmpty());
+    }
+
+    @Test
     public void shouldPersistBeforeFanoutAndReplayAfterCursor() {
         MemoryStore store = new MemoryStore();
         RunEventPublisher publisher = new RunEventPublisher();
@@ -161,6 +236,9 @@ public class RunEventPublisherTest {
 
     private static class CapturingEmitter extends ResponseBodyEmitter {
         protected final List<String> frames = new ArrayList<>();
+        protected boolean completed;
+
+        @Override public synchronized void complete() { completed = true; super.complete(); }
 
         @Override
         public synchronized void send(Object object) throws IOException {

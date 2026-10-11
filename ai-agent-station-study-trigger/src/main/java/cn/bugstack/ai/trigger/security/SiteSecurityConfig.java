@@ -32,7 +32,9 @@ public class SiteSecurityConfig {
                         .requestMatchers(r -> managementPort > 0 && r.getLocalPort() == managementPort
                                 && (r.getRequestURI().equals("/actuator/prometheus") || r.getRequestURI().equals("/actuator/health")))
                         .permitAll()
-                        .requestMatchers("/", "/index.html", "/auth.js", "/favicon.ico", "/error").permitAll()
+                        .requestMatchers("/", "/index.html", "/auth.js", "/favicon.ico", "/error",
+                                "/workspace-nav.js", "/workspace-nav.css", "/workspace-inbox.js", "/workspace-inbox.css",
+                                "/run-artifacts.js", "/run-artifacts.css").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/v1/auth/csrf").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/v1/auth/login", "/api/v1/auth/register").permitAll()
                         .requestMatchers("/admin-stats.html", "/api/v1/observe/site-stats", "/agent-config.html",

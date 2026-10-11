@@ -44,6 +44,20 @@ public class NotificationController {
         }
     }
 
+    @PostMapping("/ack-all")
+    public Response<Integer> acknowledgeAll(
+            @RequestHeader(value = USER_HEADER, required = false) String userId,
+            @RequestParam long before) {
+        try {
+            return success(notificationService.acknowledgeAll(userId, before));
+        } catch (IllegalArgumentException e) {
+            return illegal(e.getMessage());
+        } catch (Exception e) {
+            log.error("Acknowledge all notifications failed", e);
+            return failure("Failed to acknowledge notifications");
+        }
+    }
+
     @PostMapping("/{notificationId}/ack")
     public Response<AgentNotification> acknowledge(
             @RequestHeader(value = USER_HEADER, required = false) String userId,
@@ -55,6 +69,21 @@ public class NotificationController {
         } catch (Exception e) {
             log.error("Acknowledge notification failed notificationId={}", notificationId, e);
             return failure("Failed to acknowledge notification");
+        }
+    }
+
+    @GetMapping("/{notificationId}")
+    public Response<AgentNotification> find(
+            @RequestHeader(value = USER_HEADER, required = false) String userId,
+            @PathVariable String notificationId) {
+        try {
+            return success(notificationService.find(userId, notificationId)
+                    .orElseThrow(() -> new IllegalArgumentException("通知不存在或已过期")));
+        } catch (IllegalArgumentException e) {
+            return illegal(e.getMessage());
+        } catch (Exception e) {
+            log.error("Read notification failed notificationId={}", notificationId, e);
+            return failure("Failed to read notification");
         }
     }
 

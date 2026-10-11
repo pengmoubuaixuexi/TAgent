@@ -1,16 +1,23 @@
 package cn.bugstack.ai.domain.agent.service.rag.hybrid;
 
 import jakarta.annotation.Resource;
+import jakarta.annotation.PreDestroy;
+import cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.context.ContextSnapshot;
+import io.micrometer.context.ContextSnapshotFactory;
 import lombok.extern.slf4j.Slf4j;
-import org.slf4j.MDC;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.ai.vectorstore.filter.Filter;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 /**
@@ -24,7 +31,7 @@ import java.util.stream.Collectors;
  */
 @Slf4j
 @Service
-public class HybridRetriever {
+public class HybridRetriever implements AutoCloseable {
 
     private static final int RRF_K = 60;
 
@@ -34,48 +41,130 @@ public class HybridRetriever {
     @Resource
     private BM25SearchService bm25SearchService;
 
+    @Value("${agent.rag.retrieval-timeout-ms:5000}")
+    private long retrievalTimeoutMs = 5000;
+
+    @Value("${agent.rag.retrieval-workers:4}")
+    private int retrievalWorkers = 4;
+
+    @Value("${agent.rag.retrieval-queue-capacity:64}")
+    private int retrievalQueueCapacity = 64;
+
+    @Autowired(required = false)
+    private MeterRegistry meterRegistry;
+
+    private volatile ExecutorService retrievalExecutor;
+    private static final ContextSnapshotFactory SNAPSHOTS = ContextSnapshotFactory.builder().build();
+
+    /** Explicitly distinguishes an empty search from a backend that did not answer. */
+    public record RetrievalResult(List<Document> documents, Map<String, String> branches, long latencyMs) {
+        public boolean degraded() { return branches.values().stream().anyMatch(state -> !"success".equals(state)); }
+        public boolean available() { return branches.containsValue("success"); }
+    }
+
+    private record BranchResult(String name, List<Document> documents, String state) { }
+
     public List<Document> retrieve(String query, SearchRequest vectorSearchRequest, String knowledgeTag, int topK) {
-        long start = System.currentTimeMillis();
-
-        CompletableFuture<List<Document>> vectorFuture = CompletableFuture.supplyAsync(() -> {
-            try {
-                SearchRequest req = SearchRequest.from(vectorSearchRequest).query(query).build();
-                return vectorStore.similaritySearch(req);
-            } catch (Exception e) {
-                log.warn("Vector similarity search failed: {}", e.getMessage());
-                return Collections.emptyList();
-            }
-        });
-        // 把 SearchRequest 的 filterExpression 里的等值条件平铺给 BM25——保持两路 filter 行为一致，
-        // 否则 PgVector 端按 user_id 过滤、BM25 端却跨用户召回，融合后多租户隔离破洞。
-        Map<String, String> bm25ExtraFilters = extractEqualityFilters(
-                vectorSearchRequest != null ? vectorSearchRequest.getFilterExpression() : null);
-        // knowledgeTag 已单独传 BM25，bm25ExtraFilters 里若也有 knowledge 让它跟 knowledgeTag 重复也无害（term 等值幂等）
-        CompletableFuture<List<Document>> bm25Future = CompletableFuture.supplyAsync(
-                () -> bm25SearchService.search(query, knowledgeTag, bm25ExtraFilters, topK));
-
-        List<Document> vectorDocs = vectorFuture.join();
-        List<Document> bm25Docs = bm25Future.join();
-
-        List<Document> fused = rrfFuse(List.of(vectorDocs, bm25Docs), topK);
-
-        long latency = System.currentTimeMillis() - start;
-        MDC.put("retrieval", "hybrid");
-        MDC.put("vectorHits", String.valueOf(vectorDocs.size()));
-        MDC.put("bm25Hits", String.valueOf(bm25Docs.size()));
-        MDC.put("fusedHits", String.valueOf(fused.size()));
-        MDC.put("latencyMs", String.valueOf(latency));
-        try {
-            log.info("Hybrid retrieval done: vector={} bm25={} fused={} latencyMs={}",
-                    vectorDocs.size(), bm25Docs.size(), fused.size(), latency);
-        } finally {
-            MDC.remove("retrieval");
-            MDC.remove("vectorHits");
-            MDC.remove("bm25Hits");
-            MDC.remove("fusedHits");
-            MDC.remove("latencyMs");
+        RetrievalResult result = retrieveDetailed(query, vectorSearchRequest, knowledgeTag, topK);
+        if (!result.available()) {
+            throw new IllegalStateException("知识库检索暂不可用，请稍后重试（向量和关键词索引均未返回有效结果）。");
         }
-        return fused;
+        return result.documents();
+    }
+
+    public RetrievalResult retrieveDetailed(String query, SearchRequest vectorSearchRequest, String knowledgeTag, int topK) {
+        if (vectorSearchRequest == null || topK < 1) throw new IllegalArgumentException("Search request and positive topK required");
+        long start = System.nanoTime();
+        long deadline = start + TimeUnit.MILLISECONDS.toNanos(Math.max(1, Math.min(retrievalTimeoutMs, 120_000)));
+        StreamingActivityTracker.Activity activity = StreamingActivityTracker.current();
+        StreamingActivityTracker.checkActive(activity);
+        ContextSnapshot context = SNAPSHOTS.captureAll();
+        CompletionService<BranchResult> completed = new ExecutorCompletionService<>(executor());
+        Map<String, Future<BranchResult>> pending = new LinkedHashMap<>();
+        Map<String, String> states = new LinkedHashMap<>();
+        Map<String, List<Document>> documents = new LinkedHashMap<>();
+        try {
+            submit(completed, pending, states, "vector", context, activity, () ->
+                    vectorStore.similaritySearch(SearchRequest.from(vectorSearchRequest).query(query).build()));
+            try {
+                Map<String, String> filters = extractEqualityFilters(vectorSearchRequest.getFilterExpression());
+                submit(completed, pending, states, "bm25", context, activity,
+                        () -> bm25SearchService.search(query, knowledgeTag, filters, topK));
+            } catch (IllegalArgumentException unsupportedFilter) {
+                // Never weaken OR/IN/NOT or contradictory filters merely to make BM25 work.
+                states.put("bm25", "unsupported_filter");
+            }
+            while (states.size() < 2) {
+                if (Thread.currentThread().isInterrupted()) throw new CancellationException("RAG retrieval interrupted");
+                StreamingActivityTracker.checkActive(activity);
+                long remaining = deadline - System.nanoTime();
+                Future<BranchResult> next = remaining <= 0 ? completed.poll()
+                        : completed.poll(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(25)), TimeUnit.NANOSECONDS);
+                if (next != null) {
+                    BranchResult branch = next.get();
+                    states.put(branch.name(), branch.state());
+                    documents.put(branch.name(), branch.documents());
+                } else if (remaining <= 0) {
+                    break;
+                }
+            }
+            for (String backend : List.of("vector", "bm25")) states.putIfAbsent(backend, "timeout");
+            List<Document> fused = rrfFuse(List.of(documents.getOrDefault("vector", List.of()),
+                    documents.getOrDefault("bm25", List.of())), topK);
+            long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            states.forEach((backend, state) -> {
+                if (meterRegistry != null) meterRegistry.counter("agent.rag.retrieval.branch",
+                        "backend", backend, "outcome", state).increment();
+            });
+            log.info("Hybrid retrieval completed branches={} fused={} latencyMs={}", states, fused.size(), elapsed);
+            return new RetrievalResult(List.copyOf(fused), Map.copyOf(states), elapsed);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new CancellationException("RAG retrieval interrupted");
+        } catch (ExecutionException error) {
+            StreamingActivityTracker.rethrowCancellation(error);
+            throw new IllegalStateException("RAG worker failed", error.getCause());
+        } finally {
+            pending.values().forEach(future -> { if (!future.isDone()) future.cancel(true); });
+        }
+    }
+
+    private void submit(CompletionService<BranchResult> completed, Map<String, Future<BranchResult>> pending,
+                        Map<String, String> states, String backend, ContextSnapshot context,
+                        StreamingActivityTracker.Activity activity, Callable<List<Document>> search) {
+        try {
+            pending.put(backend, completed.submit(() -> {
+                try (var ignored = context.setThreadLocals(); var scope = StreamingActivityTracker.scope(activity)) {
+                    StreamingActivityTracker.checkActive(activity);
+                    List<Document> found = search.call();
+                    return new BranchResult(backend, found == null ? List.of() : found, "success");
+                } catch (Exception error) {
+                    StreamingActivityTracker.rethrowCancellation(error);
+                    log.warn("RAG backend {} failed: {}", backend, error.getClass().getSimpleName());
+                    return new BranchResult(backend, List.of(), "failed");
+                }
+            }));
+        } catch (RejectedExecutionException saturated) {
+            states.put(backend, "rejected");
+        }
+    }
+
+    private synchronized ExecutorService executor() {
+        if (retrievalExecutor == null) {
+            AtomicInteger sequence = new AtomicInteger();
+            int workers = Math.max(1, Math.min(retrievalWorkers, 32));
+            retrievalExecutor = new ThreadPoolExecutor(workers, workers, 30, TimeUnit.SECONDS,
+                    new ArrayBlockingQueue<>(Math.max(1, Math.min(retrievalQueueCapacity, 1024))), runnable -> {
+                        Thread thread = new Thread(runnable, "rag-retrieval-" + sequence.incrementAndGet());
+                        thread.setDaemon(true);
+                        return thread;
+                    }, new ThreadPoolExecutor.AbortPolicy());
+        }
+        return retrievalExecutor;
+    }
+
+    @Override @PreDestroy public synchronized void close() {
+        if (retrievalExecutor != null) retrievalExecutor.shutdownNow();
     }
 
     private List<Document> rrfFuse(List<List<Document>> rankedLists, int topK) {
@@ -104,7 +193,7 @@ public class HybridRetriever {
 
     /**
      * 从 Spring AI 的 {@link Filter.Expression} 树里抽出所有 EQ 等值条件 → flat map。
-     * 给 BM25 端做 term filter；忽略非 EQ 节点（IN / GT / LT 等 BM25 这边不支持，不做错误降级）。
+     * 仅接受 AND + EQ；不能等价表达的条件必须拒绝，避免放宽用户或知识库过滤范围。
      */
     public static Map<String, String> extractEqualityFilters(Filter.Expression expr) {
         if (expr == null) return Collections.emptyMap();
@@ -114,23 +203,32 @@ public class HybridRetriever {
     }
 
     private static void collectEq(Filter.Operand operand, Map<String, String> out) {
+        if (operand instanceof Filter.Group group) {
+            collectEq(group.content(), out);
+            return;
+        }
         if (operand instanceof Filter.Expression e) {
             switch (e.type()) {
-                case AND, OR -> {
+                case AND -> {
                     collectEq(e.left(), out);
                     collectEq(e.right(), out);
                 }
                 case EQ -> {
                     if (e.left() instanceof Filter.Key k && e.right() instanceof Filter.Value v) {
                         Object val = v.value();
-                        if (val != null) out.put(k.key(), String.valueOf(val));
+                        if (val == null) throw new IllegalArgumentException("Null filter unsupported by BM25");
+                        String prior = out.putIfAbsent(k.key(), String.valueOf(val));
+                        if (prior != null && !prior.equals(String.valueOf(val))) {
+                            throw new IllegalArgumentException("Contradictory filters unsupported by BM25");
+                        }
+                    } else {
+                        throw new IllegalArgumentException("Unsupported equality filter");
                     }
                 }
                 default -> {
-                    // 其它操作符（NE / GT / GTE / LT / LTE / IN / NIN / NOT）BM25 这边不展开，
-                    // 让 PgVector 一侧承载即可
+                    throw new IllegalArgumentException("Unsupported BM25 filter: " + e.type());
                 }
             }
-        }
+        } else throw new IllegalArgumentException("Unsupported BM25 filter operand");
     }
 }

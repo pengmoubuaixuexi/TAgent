@@ -13,4 +13,7 @@ public interface INotificationStore {
     Optional<AgentNotification> findByReference(String userId, String referenceId);
 
     List<AgentNotification> list(String userId, int limit);
+
+    /** Atomically acknowledge unread items last updated at/before the caller's inbox snapshot. */
+    int acknowledgeAll(String userId, long before, long acknowledgedAt);
 }

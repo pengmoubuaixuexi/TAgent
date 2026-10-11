@@ -30,6 +30,8 @@ public class WorkspaceService {
     private final WorkspaceMcpPolicy policy;
     private final WorkspaceExecutionGuard executions;
     private final IWorkspaceAccessRepository access;
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private WorkspaceVersionStore versionStore;
     public WorkspaceService(@org.springframework.beans.factory.annotation.Qualifier("mysqlJdbcTemplate") JdbcTemplate db, ObjectMapper json, IArmoryService armory,
                             McpClientRegistry registry, McpToolCatalogService catalog, WorkspaceMcpPolicy policy,
                             WorkspaceExecutionGuard executions, IWorkspaceAccessRepository access) {
@@ -38,18 +40,25 @@ public class WorkspaceService {
         this.access=access;
     }
     public Map<String,Object> options(String user) {
-        return Map.of("models", models(), "templates", WorkspaceTemplates.templates(),
+        return Map.of("models", models(user), "templates", WorkspaceTemplates.templates(),
                 "advisors", WorkspaceTemplates.advisors(), "knowledge", db.queryForList("""
                     SELECT knowledge_tag AS knowledgeTag, MAX(rag_name) AS name FROM ai_client_rag_order
                     WHERE user_id=? AND status=1 GROUP BY knowledge_tag ORDER BY knowledge_tag
                     """, user), "mcpAllowedHosts", policy.allowedHosts());
     }
     public List<Map<String,Object>> models() {
+        return models(null);
+    }
+    public List<Map<String,Object>> models(String user) {
         return db.queryForList("""
-                SELECT m.model_id AS modelId,m.model_name AS modelName,m.model_type AS modelType,m.tier
+                SELECT m.model_id AS modelId,m.model_name AS modelName,m.model_type AS modelType,m.tier,
+                       CASE WHEN a.secret_ref IS NULL THEN 'PLATFORM' ELSE 'USER_BYOK' END AS providerSource
                 FROM ai_client_model m JOIN ai_client_api a ON a.api_id=m.api_id
-                WHERE m.platform_enabled=1 AND m.status=1 AND a.status=1 ORDER BY m.model_id
-                """);
+                WHERE m.status=1 AND a.status=1 AND
+                  ((m.platform_enabled=1 AND a.secret_ref IS NULL) OR
+                   (m.owner_user_id=? AND a.owner_user_id=? AND a.secret_ref IS NOT NULL AND m.source_model_id IS NULL))
+                ORDER BY m.model_id
+                """,user,user);
     }
     public List<Map<String,Object>> agents(String user) {
         return db.queryForList("""
@@ -104,6 +113,7 @@ public class WorkspaceService {
                     WorkspaceTemplates.strategyBean(clean.path("strategy").asText()),clean.path("status").asInt(),user,clean.toString());
         } else {
             holdUpdate(Set.of(id));
+            if(versionStore!=null) versionStore.record(user,id,((Number)existing.get("workspace_version")).intValue(),existing.get("workspace_config").toString(),"Previous active configuration");
             int version = requiredInt(input,"version",1,Integer.MAX_VALUE);
             int changed = db.update("""
                 UPDATE ai_agent SET agent_name=?,description=?,strategy=?,status=?,workspace_config=?,
@@ -115,6 +125,7 @@ public class WorkspaceService {
             previousResources = removePrivateGraph(id,user);
         }
         buildGraph(user,id,clean);
+        if(versionStore!=null) versionStore.record(user,id,existing==null?1:((Number)existing.get("workspace_version")).intValue()+1,clean.toString(),"Activated configuration");
         String agentId=id;
         Map<String,Set<String>> obsolete = previousResources;
         afterCommit(() -> armory.invalidateAgent(agentId,obsolete));
@@ -129,7 +140,7 @@ public class WorkspaceService {
         // Accept previous clients without making their previously shared resources mutable in place.
         if (!input.has("nodes")) {
             // Validate legacy selections before the adapter drops non-executable role bindings.
-            validateNodeResources(user, input, models());
+            validateNodeResources(user, input, models(user));
             input = WorkspaceTemplates.upgrade(input,json);
         }
         var supplied=input.path("nodes");
@@ -139,7 +150,7 @@ public class WorkspaceService {
         clean.put("schemaVersion",2);
         var nodes=clean.putArray("nodes");
         Set<String> ids=new HashSet<>();
-        var availableModels=models();
+        var availableModels=models(user);
         for (int i=0;i<supplied.size();i++) {
             JsonNode n=supplied.get(i);
             String role=text(n,"role",1,40);

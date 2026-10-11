@@ -205,20 +205,8 @@ public class AgentRepository implements IAgentRepository {
 
                             // 3. 通过mcpId查询ai_client_tool_mcp表获取MCP工具配置
                             AiClientToolMcp toolMcp = aiClientToolMcpDao.queryByMcpId(mcpId);
-                            if (toolMcp != null && toolMcp.getStatus() == 1) {
-                                // 4. 转换为VO对象
-                                AiClientToolMcpVO mcpVO = AiClientToolMcpVO.builder()
-                                        .mcpId(toolMcp.getMcpId())
-                                        .mcpName(toolMcp.getMcpName())
-                                        .transportType(toolMcp.getTransportType())
-                                        .transportConfig(toolMcp.getTransportConfig())
-                                        .requestTimeout(toolMcp.getRequestTimeout())
-                                        .build();
-
-                                // 复用 parseMcpTransportConfig 解析 sse/stdio；保持原语义：无论解析成功与否都加入结果
-                                parseMcpTransportConfig(toolMcp, mcpVO);
-                                result.add(mcpVO);
-                            }
+                            AiClientToolMcpVO mcpVO = toMcpVO(toolMcp);
+                            if (mcpVO != null) result.add(mcpVO);
                         }
                     }
                 }
@@ -823,35 +811,9 @@ public class AgentRepository implements IAgentRepository {
 
     @Override
     public int countChatMemoryByConversationId(String conversationId) {
-        // 1) 旧 msg_count 缓存：仍保留作为 Step4 episodic 节流的最快路径
-        String redisKey = "episodic:msg_count:" + conversationId;
-        try {
-            String cached = stringRedisTemplate.opsForValue().get(redisKey);
-            if (cached != null) {
-                stringRedisTemplate.expire(redisKey, java.time.Duration.ofHours(1));
-                return Integer.parseInt(cached);
-            }
-        } catch (Exception e) {
-            log.debug("Redis get failed for {}, fallback to list cache: {}", redisKey, e.getMessage());
-        }
-        // 2) chat_memory 列表缓存：能复用就别再查 DB
-        List<AiChatMemory> cachedList = memoryCache.getChatList(conversationId);
-        int count;
-        if (cachedList != null) {
-            count = cachedList.size();
-        } else {
-            List<AiChatMemory> rows = aiChatMemoryDao.findByConversationId(conversationId);
-            count = rows == null ? 0 : rows.size();
-            if (rows != null && !rows.isEmpty()) {
-                memoryCache.putChatList(conversationId, rows);
-            }
-        }
-        try {
-            stringRedisTemplate.opsForValue().set(redisKey, String.valueOf(count), java.time.Duration.ofHours(1));
-        } catch (Exception e) {
-            log.debug("Redis set failed for {}: {}", redisKey, e.getMessage());
-        }
-        return count;
+        // The old Redis counter could survive failed invalidation; count committed rows without loading bodies.
+        if (conversationId == null || conversationId.isBlank()) return 0;
+        return aiChatMemoryDao.findRevision(conversationId).getMessageCount();
     }
 
     @Override
@@ -885,14 +847,25 @@ public class AgentRepository implements IAgentRepository {
     }
 
     private AiClientToolMcpVO toMcpVO(AiClientToolMcp toolMcp) {
+        if (toolMcp == null || !Integer.valueOf(1).equals(toolMcp.getStatus())) return null;
+        AiClientToolMcp transport = toolMcp;
+        if (toolMcp.getSourceMcpId() != null) {
+            // Source revocation fails closed. Never follow a clone chain or fall back to the
+            // credentials copied when a user first adopted this public connection.
+            transport = aiClientToolMcpDao.queryByMcpId(toolMcp.getSourceMcpId());
+            if (transport == null || !Integer.valueOf(1).equals(transport.getStatus())
+                    || !Integer.valueOf(1).equals(transport.getIsPublic())
+                    || transport.getSourceMcpId() != null) return null;
+        }
         AiClientToolMcpVO mcpVO = AiClientToolMcpVO.builder()
                 .mcpId(toolMcp.getMcpId())
-                .mcpName(toolMcp.getMcpName())
-                .transportType(toolMcp.getTransportType())
-                .transportConfig(toolMcp.getTransportConfig())
-                .requestTimeout(toolMcp.getRequestTimeout())
+                // stdio configurations are keyed by this name; it must rotate with the source.
+                .mcpName(transport.getMcpName())
+                .transportType(transport.getTransportType())
+                .transportConfig(transport.getTransportConfig())
+                .requestTimeout(transport.getRequestTimeout())
                 .build();
-        return parseMcpTransportConfig(toolMcp, mcpVO) ? mcpVO : null;
+        return parseMcpTransportConfig(transport, mcpVO) ? mcpVO : null;
     }
 
     private boolean parseMcpTransportConfig(AiClientToolMcp toolMcp, AiClientToolMcpVO mcpVO) {
@@ -926,7 +899,7 @@ public class AgentRepository implements IAgentRepository {
             return false;
         } catch (Exception e) {
             log.warn("skip mcp config: parse transport config failed mcpId={} name={} type={} error={}",
-                    toolMcp.getMcpId(), toolMcp.getMcpName(), toolMcp.getTransportType(), e.getMessage());
+                    toolMcp.getMcpId(), toolMcp.getMcpName(), toolMcp.getTransportType(), e.getClass().getSimpleName());
             return false;
         }
     }

@@ -63,6 +63,13 @@ public class AiClientModelNode extends AbstractArmorySupport {
     @Resource
     private cn.bugstack.ai.domain.agent.service.execute.common.ToolCallLedger toolCallLedger;
 
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.execute.common.ToolResultReferenceService toolResultReferenceService;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    @org.springframework.context.annotation.Lazy
+    private cn.bugstack.ai.domain.agent.service.execute.common.RunArtifactService runArtifactService;
+
     @Value("${agent.mcp.return-error-on-failure:true}")
     private boolean returnToolErrorOnFailure;
 
@@ -145,7 +152,7 @@ public class AiClientModelNode extends AbstractArmorySupport {
                     ToolCallback[] mcpCallbacks = mcpClientRegistry.getToolCallbacksForAssembly(toolMcpId, mcpSyncClient);
                     mcpClientRegistry.registerCallbacks(toolMcpId, mcpCallbacks);
                     for (ToolCallback callback : mcpCallbacks) {
-                        if (nodePolicy!=null && !nodePolicy.allows(toolMcpId,callback.getToolDefinition().name())) continue;
+                        if (nodePolicy!=null && !nodePolicy.allows(toolMcpId,callback)) continue;
                         allRawCallbacks.add(callback);
                         callbackOwners.put(callback, toolMcpId);
                         toolBindings.add(new cn.bugstack.ai.domain.agent.service.execute.common.McpToolNameGuard.Binding(
@@ -186,6 +193,7 @@ public class AiClientModelNode extends AbstractArmorySupport {
                 metered.setHumanApprovalGate(humanApprovalGate); // G1-C
                 metered.setToolCallProgressEmitter(toolCallProgressEmitter); // H3-A
                 metered.setToolCallLedger(toolCallLedger); // P0 Codex#2：工具调用实证台账
+                metered.setToolResultReferenceService(toolResultReferenceService);
                 meteredCallbacks[i] = metered;
                 if (hint != null && !hint.isBlank()) {
                     log.debug("[AiClientModelNode] applied prompt hint to tool {}: {}", toolName, hint);
@@ -220,6 +228,8 @@ public class AiClientModelNode extends AbstractArmorySupport {
             robustMgr.setRequestToolMaxCalls(requestToolMaxCalls);
             // 元工具(ask_user / request_tool)观察卡片：它们不走 MeteredToolCallback，进度事件由 manager 直接发
             robustMgr.setToolCallProgressEmitter(toolCallProgressEmitter);
+            robustMgr.setToolResultReferenceService(toolResultReferenceService);
+            robustMgr.setRunArtifactService(runArtifactService);
 
             OpenAiChatModel chatModel = OpenAiChatModel.builder()
                     .openAiApi(openAiApi)

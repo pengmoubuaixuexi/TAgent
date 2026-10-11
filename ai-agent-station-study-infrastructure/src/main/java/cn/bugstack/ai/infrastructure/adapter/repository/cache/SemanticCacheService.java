@@ -5,7 +5,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Service;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.sql.Timestamp;
 import java.time.Instant;
@@ -18,8 +18,12 @@ import java.util.stream.Collectors;
  * 命中的话跳过 LLM 调用直接返回历史答案。
  */
 @Slf4j
-@Service("semanticCacheService")
 public class SemanticCacheService implements ISemanticCacheService {
+
+    private static final ObjectMapper JSON = new ObjectMapper();
+    private static final String SCOPE_FILTER = " AND metadata->>'owner_user_id' = ?"
+            + " AND metadata->>'agent_id' = ? AND metadata->>'agent_version' = ?"
+            + " AND metadata->>'model_id' = ? AND metadata->>'input_hash' = ?";
 
     private final JdbcTemplate pgVectorJdbcTemplate;
     private final EmbeddingModel embeddingModel;
@@ -32,6 +36,12 @@ public class SemanticCacheService implements ISemanticCacheService {
 
     @Override
     public String lookup(String query, double minSimilarity, int ttlMinutes) {
+        return null; // Calls without trusted ownership must never read the legacy shared pool.
+    }
+
+    @Override
+    public String lookup(String query, double minSimilarity, int ttlMinutes, Scope scope) {
+        if (scope == null || !scope.valid()) return null;
         try {
             float[] embedding = embeddingModel.embed(query);
             String vectorStr = "[" + java.util.Arrays.stream(toDoubleArray(embedding))
@@ -45,12 +55,11 @@ public class SemanticCacheService implements ISemanticCacheService {
                     FROM semantic_cache
                     WHERE 1 - (embedding <=> ?::vector) > ?
                       AND created_at >= NOW() - (? || ' minutes')::INTERVAL
-                    ORDER BY similarity DESC
-                    LIMIT 1
-                    """;
+                    """ + SCOPE_FILTER + " ORDER BY similarity DESC LIMIT 1";
 
             List<Map<String, Object>> rows = pgVectorJdbcTemplate.queryForList(
-                    sql, vectorStr, vectorStr, minSimilarity, String.valueOf(ttlMinutes));
+                    sql, vectorStr, vectorStr, minSimilarity, String.valueOf(ttlMinutes),
+                    scope.ownerUserId(), scope.agentId(), scope.agentVersion(), scope.modelId(), scope.inputHash());
 
             if (!rows.isEmpty()) {
                 Map<String, Object> row = rows.get(0);
@@ -60,11 +69,11 @@ public class SemanticCacheService implements ISemanticCacheService {
 
                 // touch last_accessed
                 pgVectorJdbcTemplate.update(
-                        "UPDATE semantic_cache SET last_accessed = ? WHERE content = ?",
-                        Timestamp.from(Instant.now()), cachedQuery);
+                        "UPDATE semantic_cache SET last_accessed = ? WHERE content = ?" + SCOPE_FILTER,
+                        Timestamp.from(Instant.now()), cachedQuery, scope.ownerUserId(), scope.agentId(),
+                        scope.agentVersion(), scope.modelId(), scope.inputHash());
 
-                log.info("[SemanticCache] HIT similarity={} ttl={}min query={}", String.format("%.4f", similarity), ttlMinutes,
-                        query.length() > 60 ? query.substring(0, 60) + "..." : query);
+                log.info("[SemanticCache] HIT similarity={} ttl={}min", similarity, ttlMinutes);
                 return cachedResponse;
             }
         } catch (Exception e) {
@@ -91,21 +100,28 @@ public class SemanticCacheService implements ISemanticCacheService {
 
     @Override
     public void store(String query, String response, String model) {
+        // The old API cannot establish ownership. Do not create new unscoped entries.
+    }
+
+    @Override
+    public void store(String query, String response, Scope scope) {
+        if (scope == null || !scope.valid()) return;
         try {
             float[] embedding = embeddingModel.embed(query);
             String vectorStr = "[" + java.util.Arrays.stream(toDoubleArray(embedding))
                     .mapToObj(d -> String.format("%.8f", d))
                     .collect(Collectors.joining(",")) + "]";
 
-            String metadata = String.format(
-                    "{\"response\": %s, \"model\": \"%s\", \"hit_count\": 0}",
-                    escapeJson(response), model);
+            String metadata = JSON.writeValueAsString(Map.of("response", response,
+                    "owner_user_id", scope.ownerUserId(), "agent_id", scope.agentId(),
+                    "agent_version", scope.agentVersion(), "model_id", scope.modelId(),
+                    "input_hash", scope.inputHash()));
 
             pgVectorJdbcTemplate.update(
                     "INSERT INTO semantic_cache (content, metadata, embedding) VALUES (?, ?::jsonb, ?::vector)",
                     query, metadata, vectorStr);
 
-            log.debug("[SemanticCache] stored query len={} model={}", query.length(), model);
+            log.debug("[SemanticCache] stored query len={}", query.length());
         } catch (Exception e) {
             log.debug("[SemanticCache] store failed: {}", e.getMessage());
         }

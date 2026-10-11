@@ -34,6 +34,14 @@ import java.util.concurrent.ThreadPoolExecutor;
 @Slf4j
 @Service("flowAgentExecuteStrategy")
 public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanReviewResumeService {
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private cn.bugstack.ai.domain.agent.adapter.repository.IRunHistoryRepository runHistory;
+    @Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry runBudgets;
+    @Autowired(required=false)
+    private cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository workspaceAccess;
+    @Autowired(required=false)
+    private cn.bugstack.ai.domain.agent.service.workspace.WorkspaceExecutionGuard workspaceGuard = new cn.bugstack.ai.domain.agent.service.workspace.WorkspaceExecutionGuard();
 
     @Resource
     private DefaultFlowAgentExecuteStrategyFactory defaultFlowAgentExecuteStrategyFactory;
@@ -110,6 +118,7 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
         try {
             String apply = executeHandler.apply(executeCommandEntity, dynamicContext);
             log.info("流程执行结果:{}", apply);
+            if (Boolean.TRUE.equals(dynamicContext.getValue("planReviewPaused"))) return;
 
             // 发送完成标识
             try {
@@ -124,11 +133,11 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
             longTermMemoryTurnSnapshot.clearSession(sessionId);
             boolean removedActiveContext = sessionId != null && activeContexts.remove(sessionId, dynamicContext);
             if (sessionId != null && mcpToolCatalogService != null && removedActiveContext) mcpToolCatalogService.clearNeeds(sessionId);
-            if (runId != null && mcpToolCatalogService != null) mcpToolCatalogService.cleanupRun(runId);
+            if (removedActiveContext && runId != null && mcpToolCatalogService != null) mcpToolCatalogService.cleanupRun(runId);
             // 2026-06-23：清掉本次 runId 的 reasoning_content 注入缓存（按 runId 隔离后只增不减，须在此清理防泄漏）
-            cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearRun(runId);
+            if (removedActiveContext) cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearRun(runId);
             // P0（Codex #2）：清掉本次 runId 的工具调用实证台账（按 runId 隔离，须在此清理防泄漏）
-            if (runId != null && toolCallLedger != null) toolCallLedger.clear(runId);
+            if (removedActiveContext && runId != null && toolCallLedger != null) toolCallLedger.clear(runId);
         }
     }
 
@@ -149,6 +158,7 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
         threadPoolExecutor.execute(() -> {
             ExecuteCommandEntity request = ExecuteCommandEntity.builder()
                     .aiAgentId(state.getAgentId())
+                    .agentVersion(state.getAgentVersion())
                     .message(state.getOriginalMessage())
                     .sessionId(state.getSessionId())
                     .runId(state.getRunId())
@@ -178,7 +188,6 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
             dynamicContext.setValue("stepDependencies", approvedPlan.getStepDependencies());
             dynamicContext.setValue("planReviewResumed", Boolean.TRUE);
             dynamicContext.setValue("planReviewAttemptCount", planReviewAttemptCount);
-            dynamicContext.setAiAgentClientFlowConfigVOMap(repository.queryAiAgentClientFlowConfig(state.getAgentId()));
 
             String sessionId = state.getSessionId();
             String runId = state.getRunId();
@@ -191,14 +200,26 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
             boolean[] completed = {false};
             boolean[] cancelled = {false};
             String[] failureMessage = {null};
+            cn.bugstack.ai.domain.agent.service.workspace.WorkspaceExecutionGuard.Lease versionLease = null;
 
             try {
+                versionLease = workspaceGuard.startRun(state.getAgentId());
+                if(workspaceAccess!=null && (!workspaceAccess.ownsAgent(state.getUserId(),state.getAgentId())
+                        || state.getAgentVersion()==null
+                        || !state.getAgentVersion().equals(workspaceAccess.activeAgentVersion(state.getUserId(),state.getAgentId()))))
+                    throw new IllegalStateException("Agent 的已启用版本或访问权限已变化，请重新生成计划");
+                dynamicContext.setAiAgentClientFlowConfigVOMap(repository.queryAiAgentClientFlowConfig(state.getAgentId()));
                 putMdc("agentId", state.getAgentId());
+                putMdc("agentVersion",state.getAgentVersion()==null?null:state.getAgentVersion().toString());
                 putMdc("sessionId", state.getSessionId());
                 putMdc("runId", runId);
                 putMdc("agent.run_id", runId);
                 putMdc("userId", state.getUserId());
                 putMdc("tenantId", state.getTenantId());
+                var budget = cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.find(runId);
+                if (runBudgets != null && budget == null)
+                    throw new IllegalStateException("运行预算状态已失效，请重新发起任务，避免恢复时重置已消耗的额度");
+                if (budget != null) budget.resumeReview();
                 ensureAgentArmedForPlanResume(state.getAgentId(), runId, sessionId);
                 if (mcpToolCatalogService != null) {
                     mcpToolCatalogService.setNeeds(sessionId, state.getMcpNeeds());
@@ -211,6 +232,7 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
                 payload.put("stepCount", approvedPlan.getStepsMap() != null ? approvedPlan.getStepsMap().size() : 0);
                 sendSseObject(emitter, "plan_review_resumed", payload);
 
+                if(runHistory!=null) runHistory.status(runId,"RUNNING",null);
                 String apply = step4ExecuteStepsNode.apply(request, dynamicContext);
                 log.info("[FlowPlanReview] resumed Step4 result runId={} result={}", runId, apply);
                 if (dynamicContext.isCancelled()) {
@@ -232,7 +254,14 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
                 log.error("[FlowPlanReview] resume failed runId={} sessionId={}", runId, sessionId, e);
                 sendSseObject(emitter, "message", AutoAgentExecuteResultEntity.createErrorResult(e.getMessage(), sessionId));
             } finally {
-                if (flowPlanReviewService != null) {
+                try {
+                if(versionLease!=null) versionLease.close();
+                if(runHistory!=null) {
+                    try {runHistory.status(runId,completed[0]?"COMPLETED":cancelled[0]||dynamicContext.isCancelled()?"CANCELLED":"FAILED",failureMessage[0]);}
+                    catch(RuntimeException e){log.warn("[RunHistory] resume status persistence unavailable runId={}",runId);}
+                }
+                cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.finish(runId);
+                if (flowPlanReviewService != null) try {
                     if (completed[0]) {
                         flowPlanReviewService.markExecutionCompleted(runId, planReviewAttemptCount);
                         sendPlanReviewStatus(emitter, runId, sessionId, FlowPlanReviewService.STATUS_COMPLETED, null);
@@ -243,22 +272,31 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
                         flowPlanReviewService.markExecutionFailed(runId, failureMessage[0], planReviewAttemptCount);
                         sendPlanReviewStatus(emitter, runId, sessionId, FlowPlanReviewService.STATUS_FAILED, failureMessage[0]);
                     }
+                } catch (RuntimeException error) {
+                    log.warn("[FlowPlanReview] final review status unavailable runId={}",runId);
                 }
-                longTermMemoryTurnSnapshot.clearSession(sessionId);
-                boolean removedActiveContext = sessionId != null && activeContexts.remove(sessionId, dynamicContext);
-                if (sessionId != null && mcpToolCatalogService != null && removedActiveContext) mcpToolCatalogService.clearNeeds(sessionId);
-                if (removedActiveContext) {
-                    if (runId != null && mcpToolCatalogService != null) mcpToolCatalogService.cleanupRun(runId);
-                    cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearRun(runId);
-                    if (runId != null && toolCallLedger != null) toolCallLedger.clear(runId);
-                }
-                clearMdc("agentId", "sessionId", "runId", "agent.run_id", "userId", "tenantId");
-                try {
-                    emitter.complete();
-                } catch (Exception ignored) {
+                } finally {
+                    boolean removedActiveContext = sessionId != null && activeContexts.remove(sessionId, dynamicContext);
+                    try {
+                        if (removedActiveContext) {
+                            cleanupResume("memory",runId,()->longTermMemoryTurnSnapshot.clearSession(sessionId));
+                            if (sessionId != null && mcpToolCatalogService != null) cleanupResume("needs",runId,()->mcpToolCatalogService.clearNeeds(sessionId));
+                            if (runId != null && mcpToolCatalogService != null) cleanupResume("tools",runId,()->mcpToolCatalogService.cleanupRun(runId));
+                            cleanupResume("reasoning",runId,()->cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearRun(runId));
+                            if (runId != null && toolCallLedger != null) cleanupResume("evidence",runId,()->toolCallLedger.clear(runId));
+                        }
+                    } finally {
+                        clearMdc("agentId", "agentVersion", "sessionId", "runId", "agent.run_id", "userId", "tenantId");
+                        try { emitter.complete(); } catch (Exception ignored) { }
+                    }
                 }
             }
         });
+    }
+
+    private void cleanupResume(String resource,String runId,Runnable cleanup) {
+        try {cleanup.run();}
+        catch(RuntimeException error){log.warn("[FlowPlanReview] cleanup unavailable resource={} runId={}",resource,runId);}
     }
 
     private void sendPlanReviewStatus(ResponseBodyEmitter emitter,

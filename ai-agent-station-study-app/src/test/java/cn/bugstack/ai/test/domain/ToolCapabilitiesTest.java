@@ -14,13 +14,15 @@ import static org.junit.Assert.*;
 public class ToolCapabilitiesTest {
 
     @Test
-    public void fiveProfilesHaveFrozenCapabilitySets() {
+    public void profilesHaveFrozenCapabilitySets() {
         assertTrue(ToolCapabilityProfile.NONE.capabilities().isEmpty());
         assertEquals(java.util.Set.of(ToolCapability.REQUEST_TOOL), ToolCapabilityProfile.DISCOVERY_ONLY.capabilities());
+        assertEquals(java.util.Set.of(ToolCapability.ASK_USER), ToolCapabilityProfile.CLARIFICATION_ONLY.capabilities());
         assertEquals(java.util.Set.of(ToolCapability.ASK_USER, ToolCapability.REQUEST_TOOL),
                 ToolCapabilityProfile.INTERACTIVE_META.capabilities());
         assertEquals(java.util.Set.of(ToolCapability.BUSINESS_TOOL), ToolCapabilityProfile.BUSINESS_ONLY.capabilities());
-        assertEquals(java.util.Set.of(ToolCapability.BUSINESS_TOOL, ToolCapability.ASK_USER, ToolCapability.REQUEST_TOOL),
+        assertEquals(java.util.Set.of(ToolCapability.CREATE_ARTIFACT), ToolCapabilityProfile.ARTIFACT_ONLY.capabilities());
+        assertEquals(java.util.Set.of(ToolCapability.BUSINESS_TOOL, ToolCapability.ASK_USER, ToolCapability.REQUEST_TOOL, ToolCapability.CREATE_ARTIFACT),
                 ToolCapabilityProfile.ALL.capabilities());
     }
 
@@ -29,8 +31,8 @@ public class ToolCapabilitiesTest {
         // 2026-06-22 用户启用：分析/规划阶段允许 ask_user（EARLY_STAGE_DEFAULT 提升为 INTERACTIVE_META）
         assertSame(ToolCapabilityProfile.INTERACTIVE_META, ToolCapabilityProfile.EARLY_STAGE_DEFAULT);
         assertSame(ToolCapabilityProfile.INTERACTIVE_META, ToolCapabilityPolicies.AUTO_STEP1_ANALYSIS);
-        assertSame(ToolCapabilityProfile.INTERACTIVE_META, ToolCapabilityPolicies.FLOW_STEP1_TOOL_ANALYSIS);
-        assertSame(ToolCapabilityProfile.INTERACTIVE_META, ToolCapabilityPolicies.FLOW_STEP2_PLANNING);
+        assertSame(ToolCapabilityProfile.CLARIFICATION_ONLY, ToolCapabilityPolicies.FLOW_STEP1_TOOL_ANALYSIS);
+        assertSame(ToolCapabilityProfile.CLARIFICATION_ONLY, ToolCapabilityPolicies.FLOW_STEP2_PLANNING);
         // 质检步显式 DISCOVERY_ONLY —— 自评不阻塞问用户（不引用 EARLY_STAGE_DEFAULT）
         assertSame(ToolCapabilityProfile.DISCOVERY_ONLY, ToolCapabilityPolicies.AUTO_STEP3_QUALITY);
     }
@@ -40,9 +42,9 @@ public class ToolCapabilitiesTest {
         assertSame(ToolCapabilityProfile.ALL, ToolCapabilityPolicies.FIXED_NORMAL);
         assertSame(ToolCapabilityProfile.ALL, ToolCapabilityPolicies.FIXED_STEER);
         assertSame(ToolCapabilityProfile.ALL, ToolCapabilityPolicies.AUTO_STEP2_EXECUTION);
-        assertSame(ToolCapabilityProfile.NONE, ToolCapabilityPolicies.AUTO_STEP4_SUMMARY);
+        assertSame(ToolCapabilityProfile.ARTIFACT_ONLY, ToolCapabilityPolicies.AUTO_STEP4_SUMMARY);
         assertSame(ToolCapabilityProfile.ALL, ToolCapabilityPolicies.FLOW_DAG_EXECUTION);
-        assertSame(ToolCapabilityProfile.NONE, ToolCapabilityPolicies.FLOW_FINAL_SYNTHESIS);
+        assertSame(ToolCapabilityProfile.ARTIFACT_ONLY, ToolCapabilityPolicies.FLOW_FINAL_SYNTHESIS);
         assertSame(ToolCapabilityProfile.NONE, ToolCapabilityPolicies.answerNow(false));
         assertSame(ToolCapabilityProfile.BUSINESS_ONLY, ToolCapabilityPolicies.answerNow(true));
     }

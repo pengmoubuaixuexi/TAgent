@@ -89,6 +89,7 @@ public class LlmRerankService implements IRerankService {
         try {
             content = chatClient.prompt(prompt).call().content();
         } catch (Exception e) {
+            cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.rethrowCancellation(e);
             log.warn("LLM rerank call failed, fallback to hybrid order: {}", e.getMessage());
             return candidates.subList(0, Math.min(topN, candidates.size()));
         }

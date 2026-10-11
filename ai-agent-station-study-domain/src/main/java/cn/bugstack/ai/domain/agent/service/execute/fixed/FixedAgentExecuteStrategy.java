@@ -119,6 +119,12 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
     @Value("${agent.streaming.idle-timeout-seconds:120}")
     private int streamingIdleTimeoutSeconds;
 
+    @Value("${agent.streaming.first-response-timeout-seconds:300}")
+    private int streamingFirstResponseTimeoutSeconds = 300;
+
+    @Value("${agent.streaming.tool-timeout-seconds:300}")
+    private int streamingToolTimeoutSeconds = 300;
+
     @Value("${agent.streaming.retry-max-attempts:3}")
     private int streamingRetryMaxAttempts;
 
@@ -251,7 +257,9 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
                     cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.Activity __activity =
                             cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.start(
                                     stepId + "#attempt-" + attempt);
-                    try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(sessionId, runId);
+                    cn.bugstack.ai.domain.agent.service.execute.common.StreamingProgressEmitter.attach(
+                            __activity, emitter, stepId, sessionId, runId);
+                    try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeCall(sessionId, runId);
                          AutoCloseable __activityScope = cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.scope(__activity)) {
                         // 立即回答 mid-stream 截断触发器：answer_now emit 它 → takeUntilOther 优雅完成 → 拿到半截
                         reactor.core.publisher.Sinks.One<Object> __trigger = reactor.core.publisher.Sinks.one();
@@ -261,7 +269,8 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
                             .stream().chatClientResponse()
                                 .doOnNext(__activity::markDecodedResponse);
                         cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker
-                        .timeoutOnInactivity(flux, __activity, Duration.ofSeconds(streamingIdleTimeoutSeconds))
+                        .timeoutOnInactivity(flux, __activity, Duration.ofSeconds(streamingIdleTimeoutSeconds),
+                                Duration.ofSeconds(streamingFirstResponseTimeoutSeconds), Duration.ofSeconds(streamingToolTimeoutSeconds))
                         .map(cr -> {
                             if (cr.chatResponse() != null) last[0] = cr.chatResponse();
                             // 2026-05-07 修：getText() 在 tool_use / metadata-only 末帧会返回 null，
@@ -284,6 +293,10 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
                         if (__fin0 != null && __fin0.get()) {
                             sendTokenEvent(emitter, "[DONE]", stepId, sessionId);
                         }
+                        boolean steeringNow = sessionId != null && steerInbox.containsKey(sessionId);
+                        if (buf.toString().isBlank() && !cancelled.get() && !(__fin0 != null && __fin0.get()) && !steeringNow) {
+                            throw cn.bugstack.ai.domain.agent.service.execute.common.ModelStreamException.emptyAnswer();
+                        }
                         break;
                     } catch (Exception e) {
                         __activity.cancel();
@@ -303,11 +316,6 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
                     }
                     stepResult = buf.toString();
                     lastResponse = last[0];
-                    AtomicBoolean finalizing = sessionId == null ? null : finalizeFlags.get(sessionId);
-                    boolean steering = sessionId != null && steerInbox.containsKey(sessionId);
-                    if (stepResult.isBlank() && !cancelled.get() && !(finalizing != null && finalizing.get()) && !steering) {
-                        throw new IllegalStateException("LLM stream completed without an answer");
-                    }
                 } else {
                     lastResponse = spec.call().chatResponse();
                     stepResult = lastResponse != null && lastResponse.getResult() != null && lastResponse.getResult().getOutput() != null
@@ -583,13 +591,22 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             }
         };
 
-        if (threadPoolExecutor != null) {
-            threadPoolExecutor.execute(task);
-            log.info("[FixedSTM] task submitted to threadPoolExecutor, pool activeCount={} queueSize={}",
-                    threadPoolExecutor.getActiveCount(), threadPoolExecutor.getQueue().size());
-        } else {
-            java.util.concurrent.CompletableFuture.runAsync(task);
-            log.info("[FixedSTM] task submitted to CompletableFuture.runAsync (fallback)");
+        try {
+            Runnable maintenance = cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.captureMaintenance(task);
+            Runnable queued = () -> {
+                try { maintenance.run(); }
+                catch (RuntimeException e) { log.debug("[FixedSTM] queued episodic task no longer permitted: {}", e.getMessage()); }
+            };
+            if (threadPoolExecutor != null) {
+                threadPoolExecutor.execute(queued);
+                log.info("[FixedSTM] task submitted to threadPoolExecutor, pool activeCount={} queueSize={}",
+                        threadPoolExecutor.getActiveCount(), threadPoolExecutor.getQueue().size());
+            } else {
+                java.util.concurrent.CompletableFuture.runAsync(queued);
+                log.info("[FixedSTM] task submitted to CompletableFuture.runAsync (fallback)");
+            }
+        } catch (RuntimeException e) {
+            log.warn("[FixedSTM] episodic scheduling failed: {}", e.getMessage());
         }
     }
 
@@ -818,9 +835,11 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         final ChatResponse[] last = new ChatResponse[1];
         cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.Activity __activity =
                 cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.start(fStepId);
+        cn.bugstack.ai.domain.agent.service.execute.common.StreamingProgressEmitter.attach(
+                __activity, emitter, fStepId, sessionId, req.getRunId());
         // 立即回答 finalize：流式逐 token 推（与正常路径同协议）+ 真·关思考（reasoning_effort 设到 options）。
         // 思考已关、答案短，体验是"半截 → 无缝接着流出收尾"，不再是 .call() 卡几十秒后整段蹦出。
-        try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(sessionId, req.getRunId());
+        try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeCall(sessionId, req.getRunId());
              AutoCloseable __noThink = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeNoThinking(sessionId);
              AutoCloseable __activityScope = cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.scope(__activity)) {
             Flux<ChatClientResponse> flux = spec.toolContext(java.util.Map.of(
@@ -828,7 +847,8 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
                             .stream().chatClientResponse()
                     .doOnNext(__activity::markDecodedResponse);
             cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker
-                .timeoutOnInactivity(flux, __activity, Duration.ofSeconds(streamingIdleTimeoutSeconds))
+                .timeoutOnInactivity(flux, __activity, Duration.ofSeconds(streamingIdleTimeoutSeconds),
+                        Duration.ofSeconds(streamingFirstResponseTimeoutSeconds), Duration.ofSeconds(streamingToolTimeoutSeconds))
                 .map(cr -> {
                     if (cr.chatResponse() != null) last[0] = cr.chatResponse();
                     String raw = cr.chatResponse() != null && cr.chatResponse().getResult() != null
@@ -930,15 +950,18 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         final ChatResponse[] last = new ChatResponse[1];
         cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.Activity __activity =
                 cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.start(fStepId);
+        cn.bugstack.ai.domain.agent.service.execute.common.StreamingProgressEmitter.attach(
+                __activity, emitter, fStepId, sessionId, req.getRunId());
         // 引导重做：流式逐 token 推；思考不关（与设计一致，引导要让模型重新想）。
-        try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(sessionId, req.getRunId());
+        try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeCall(sessionId, req.getRunId());
              AutoCloseable __activityScope = cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.scope(__activity)) {
             Flux<ChatClientResponse> flux = spec.toolContext(java.util.Map.of(
                             cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.CONTEXT_KEY, __activity))
                             .stream().chatClientResponse()
                     .doOnNext(__activity::markDecodedResponse);
             cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker
-                .timeoutOnInactivity(flux, __activity, Duration.ofSeconds(streamingIdleTimeoutSeconds))
+                .timeoutOnInactivity(flux, __activity, Duration.ofSeconds(streamingIdleTimeoutSeconds),
+                        Duration.ofSeconds(streamingFirstResponseTimeoutSeconds), Duration.ofSeconds(streamingToolTimeoutSeconds))
                 .map(cr -> {
                     if (cr.chatResponse() != null) last[0] = cr.chatResponse();
                     String raw = cr.chatResponse() != null && cr.chatResponse().getResult() != null

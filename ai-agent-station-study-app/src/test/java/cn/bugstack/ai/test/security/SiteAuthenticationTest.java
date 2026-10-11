@@ -59,13 +59,24 @@ public class SiteAuthenticationTest {
     @Autowired cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository workspaceAccess;
     @Autowired org.springframework.security.crypto.password.PasswordEncoder passwords;
     MockMvc mvc;
+    @Test public void sharedWorkspaceAssetsLoadBeforeLoginButArtifactApiRemainsProtected() throws Exception {
+        for(String path:java.util.List.of("/workspace-nav.js","/workspace-nav.css","/workspace-inbox.js",
+                "/workspace-inbox.css","/run-artifacts.js","/run-artifacts.css")) {
+            mvc.perform(get(path)).andExpect(result -> assertNotEquals(401,result.getResponse().getStatus(),path));
+        }
+        mvc.perform(get("/api/v1/workspace/outcomes/artifacts")).andExpect(status().isUnauthorized());
+    }
     @Before public void setup() {
         reset(users, access, workspaceAccess);
         mvc = org.springframework.test.web.servlet.setup.MockMvcBuilders.webAppContextSetup(context)
-                .defaultRequest(get("/").accept("application/json"))
+                .defaultRequest(get("/").accept("application/json").with(request->{
+                    if(request.getSession(false)==null)request.getSession().setAttribute("credentialRevision",AccountService.credentialRevision("legacy-password"));
+                    return request;
+                }))
                 .apply(springSecurity()).addFilters(new AuthenticatedUserFilter(users, access)).build();
         when(users.queryByUserId("u1")).thenReturn(account("u1", "tester", "USER"));
         when(users.queryByUserId("10001")).thenReturn(account("10001", "admin", "ADMIN"));
+        when(users.updatePasswordIfCurrent(anyString(),anyString(),anyString())).thenReturn(1);
     }
     private AdminUser account(String id, String name, String role) {
         return AdminUser.builder().id(1L).userId(id).username(name).role(role).password("legacy-password").status(1).build();
@@ -111,6 +122,7 @@ public class SiteAuthenticationTest {
     @Test public void loginUpgradesLegacyPasswordRotatesSessionAndLogoutRevokesIt() throws Exception {
         AdminUser owner = account("10001", "admin", "ADMIN");
         when(users.queryByUsername("admin")).thenReturn(owner);
+        when(users.queryByUserId("10001")).thenReturn(owner);
         MockHttpSession session = new MockHttpSession(); String oldId = session.getId();
         mvc.perform(post("/api/v1/auth/login").session(session).with(csrf()).contentType("application/json")
                 .content("{\"username\":\"admin\",\"password\":\"legacy-password\"}"))
@@ -119,7 +131,7 @@ public class SiteAuthenticationTest {
         assertEquals("10001", session.getAttribute("userId"));
         assertEquals("ADMIN", session.getAttribute("role"));
         assertEquals(true, session.getAttribute("isAdmin"));
-        verify(users).updateById(owner);
+        verify(users).updatePasswordIfCurrent(eq("10001"),eq("legacy-password"),anyString());
         assertTrue(passwords.matches("legacy-password", owner.getPassword()));
         mvc.perform(get("/api/v1/observe/test").session(session)).andExpect(status().isOk());
         mvc.perform(post("/api/v1/auth/logout").session(session).with(csrf())).andExpect(status().isNoContent());
@@ -170,5 +182,26 @@ public class SiteAuthenticationTest {
         when(users.queryByUserId("10001")).thenReturn(account("10001", "admin", "USER"));
         mvc.perform(get("/api/v1/observe/test").with(user("10001").roles("ADMIN")))
                 .andExpect(status().isUnauthorized());
+    }
+    @Test public void changedPasswordAndPreUpgradeSessionsAreRevoked() throws Exception {
+        MockHttpSession old=new MockHttpSession();old.setAttribute("credentialRevision",AccountService.credentialRevision("old"));
+        mvc.perform(get("/api/v1/observe/test").session(old).with(user("u1"))).andExpect(status().isUnauthorized());
+        assertTrue(old.isInvalid());
+        mvc.perform(get("/api/v1/observe/test").session(new MockHttpSession()).with(user("u1"))).andExpect(status().isUnauthorized());
+    }
+    @Test public void changePasswordRequiresCurrentPasswordAndCsrfAndInvalidatesSession() throws Exception {
+        mvc.perform(post("/api/v1/auth/password").with(user("u1")).contentType("application/json").content("{}"))
+                .andExpect(status().isForbidden());
+        mvc.perform(post("/api/v1/auth/password").with(user("u1")).with(csrf()).contentType("application/json")
+                .content("{\"currentPassword\":\"bad\",\"newPassword\":\"new-long-password\"}")).andExpect(status().isUnauthorized());
+        MockHttpSession session=new MockHttpSession();session.setAttribute("credentialRevision",AccountService.credentialRevision("legacy-password"));
+        mvc.perform(post("/api/v1/auth/password").session(session).with(user("u1")).with(csrf()).contentType("application/json")
+                .content("{\"currentPassword\":\"legacy-password\",\"newPassword\":\"new-long-password\",\"userId\":\"10001\"}"))
+                .andExpect(status().isOk());
+        assertTrue(session.isInvalid());
+        var encoded=org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(users).updatePasswordIfCurrent(eq("u1"),eq("legacy-password"),encoded.capture());
+        assertTrue(passwords.matches("new-long-password",encoded.getValue()));
+        assertFalse(new AccountController.PasswordChange("secret","secret").toString().contains("secret"));
     }
 }

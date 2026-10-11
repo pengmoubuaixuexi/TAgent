@@ -12,6 +12,11 @@ import java.util.UUID;
 @Service
 public class NotificationService {
 
+    public static String terminalId(String userId, String runId) {
+        return "ntf-" + UUID.nameUUIDFromBytes((userId + "\nrun-terminal\n" + runId)
+                .getBytes(StandardCharsets.UTF_8));
+    }
+
     private final INotificationStore store;
 
     public NotificationService(INotificationStore store) {
@@ -30,6 +35,9 @@ public class NotificationService {
         long now = System.currentTimeMillis();
         String notificationId = firstNonBlank(command.getNotificationId(), stableId(userId, type, command.getReferenceId()));
         AgentNotification existing = store.find(userId, notificationId).orElse(null);
+        boolean terminalChanged = existing != null && existing.getType() != type
+                && (type == AgentNotification.Type.TASK_COMPLETED || type == AgentNotification.Type.TASK_FAILED)
+                && (existing.getType() == AgentNotification.Type.TASK_COMPLETED || existing.getType() == AgentNotification.Type.TASK_FAILED);
 
         AgentNotification notification = AgentNotification.builder()
                 .notificationId(notificationId)
@@ -41,15 +49,15 @@ public class NotificationService {
                 .type(type)
                 .referenceId(trim(command.getReferenceId()))
                 .status(command.getStatus() == null ? defaultStatus(type) : command.getStatus())
-                .readStatus(existing == null || existing.getReadStatus() == null
+                .readStatus(existing == null || existing.getReadStatus() == null || terminalChanged
                         ? AgentNotification.ReadStatus.UNREAD : existing.getReadStatus())
                 .title(required(command.getTitle(), "title"))
                 .summary(trim(command.getSummary()))
                 .createdAt(existing == null || existing.getCreatedAt() == null ? now : existing.getCreatedAt())
                 .updatedAt(now)
                 .expiresAt(command.getExpiresAt())
-                .acknowledgedAt(existing == null ? null : existing.getAcknowledgedAt())
-                .archivedAt(existing == null ? null : existing.getArchivedAt())
+                .acknowledgedAt(existing == null || terminalChanged ? null : existing.getAcknowledgedAt())
+                .archivedAt(existing == null || terminalChanged ? null : existing.getArchivedAt())
                 .metadata(command.getMetadata() == null ? new LinkedHashMap<>() : new LinkedHashMap<>(command.getMetadata()))
                 .build();
         store.save(notification);
@@ -81,6 +89,14 @@ public class NotificationService {
             store.save(notification);
         }
         return notification;
+    }
+
+    /** Read state only: pending questions, approvals and plans still require their own actions. */
+    public int acknowledgeAll(String userId, long before) {
+        String owner = required(userId, "userId");
+        if (before <= 0) throw new IllegalArgumentException("notification snapshot time is required");
+        long now = System.currentTimeMillis();
+        return store.acknowledgeAll(owner, Math.min(before, now), now);
     }
 
     public AgentNotification archive(String userId, String notificationId) {

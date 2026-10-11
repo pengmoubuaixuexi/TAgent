@@ -87,6 +87,29 @@ spring:
 #     false（默认）= shadow 模式，异步分类只打点不影响 dispatch
 #     true         = 同步分类 + StrategyRouter 改写 strategy，敏感意图直接 reject
 agent:
+  # v2 个人模型凭据：固定的 Base64 32 字节主密钥；通过环境注入并单独备份，不能随重启重新生成。
+  # 留空时平台模型仍可用，但不能保存/使用个人模型密钥。迁移顺序见 docs/dev-ops/MODEL_CONNECTIONS.md。
+  model-secrets:
+    master-key: ${MODEL_SECRET_MASTER_KEY:}
+  model-connections:
+    # 仅允许管理员信任的精确域名，个人连接使用 HTTPS:443；不要填写 URL、通配符或内网地址。
+    allowed-hosts: ${MODEL_CONNECTION_ALLOWED_HOSTS:api.openai.com,api.deepseek.com,api.siliconflow.cn}
+  # 平台额度按每用户、UTC 自然日统计；个人主模型用量会记录，但不扣平台额度。
+  usage:
+    platform-daily-tokens: ${AGENT_USAGE_PLATFORM_DAILY_TOKENS:500000}
+    platform-daily-calls: ${AGENT_USAGE_PLATFORM_DAILY_CALLS:200}
+    max-concurrent-runs: ${AGENT_USAGE_MAX_CONCURRENT_RUNS:3}
+  # 单次任务预算独立于每日额度；所有节点、辅助模型和重试共享该 run 的预算。
+  run-budget:
+    max-seconds: ${AGENT_RUN_BUDGET_MAX_SECONDS:1800}
+    max-model-calls: ${AGENT_RUN_BUDGET_MAX_MODEL_CALLS:60}
+    max-tool-calls: ${AGENT_RUN_BUDGET_MAX_TOOL_CALLS:100}
+    max-tokens: ${AGENT_RUN_BUDGET_MAX_TOKENS:500000}
+  context:
+    max-input-tokens: ${AGENT_CONTEXT_MAX_INPUT_TOKENS:128000}
+    default-output-limit: ${AGENT_CONTEXT_DEFAULT_OUTPUT_LIMIT:8192}
+    # 可按供应商的精确模型名配置已核实的总上下文窗口（输入 + 输出）；空表只使用应用输入上限。
+    model-context-windows: {}
   llm:
     base-url: ${LLM_BASE_URL:https://token-plan-sgp.xiaomimimo.com/v1}
     api-key: ${LLM_API_KEY:}
@@ -95,7 +118,8 @@ agent:
     embeddings-path: ${LLM_EMBEDDINGS_PATH:/embeddings}
   mcp:
     return-error-on-failure: true
-    disable-tools-on-nonexec-steps: ${MCP_DISABLE_TOOLS_ON_NONEXEC_STEPS:true}
+    # 分析/规划节点可读已授权工具目录；业务工具能否执行由各阶段的服务端能力策略决定。
+    # 旧 disable-tools-on-nonexec-steps 开关已不参与权限判断，不能用它放开业务工具执行。
     github:
       write-enabled: ${GITHUB_MCP_WRITE_ENABLED:false}
     tool-call:
@@ -135,10 +159,13 @@ agent:
     reasoning-effort: ${AGENT_NO_THINK_REASONING_EFFORT:}
     body-params: ${AGENT_NO_THINK_BODY_PARAMS:}
   dynamic-tools:
-    infer-on-selected-agent: ${AGENT_DYNAMIC_TOOLS_INFER:true}
+    # 路由时主动推断工具的独立开关；request_tool 和工作台 MCP 绑定仍分别遵守节点授权。
+    enabled: ${AGENT_DYNAMIC_TOOLS_ENABLED:false}
     per-need-top-k: ${AGENT_DYNAMIC_TOOLS_TOP_K:2}
     max-extra-tools-per-request: ${AGENT_DYNAMIC_TOOLS_MAX_EXTRA:6}
     match-cache-ttl-ms: ${AGENT_DYNAMIC_TOOLS_CACHE_TTL_MS:600000}
+    embedding:
+      uncorroborated-min-similarity: ${AGENT_DYNAMIC_TOOLS_UNCORROBORATED_MIN_SIMILARITY:0.65}
     catalog:
       auto-refresh-enabled: ${AGENT_TOOL_CATALOG_AUTO_REFRESH:false}
       warmup-on-startup: ${AGENT_TOOL_CATALOG_WARMUP:false}
@@ -234,9 +261,11 @@ agent:
   # 2026-05-07：默认启用；配合 step_start / step_end 实现"步骤折叠"流式 UX
   token-streaming:
     enabled: true
-  # 流式调用容错：无 token 空闲超时 + 重试
+  # 流式等待分别约束首个有效响应、后续输出空闲和工具阶段；不会自动重放已执行的工具。
   streaming:
+    first-response-timeout-seconds: ${AGENT_STREAMING_FIRST_RESPONSE_TIMEOUT_SECONDS:300}
     idle-timeout-seconds: 120
+    tool-timeout-seconds: ${AGENT_STREAMING_TOOL_TIMEOUT_SECONDS:300}
     retry-max-attempts: 3
   # P2.7 16.2 Thinking Visualization：SSE event:thinking 中间推理可视化
   thinking-vis:

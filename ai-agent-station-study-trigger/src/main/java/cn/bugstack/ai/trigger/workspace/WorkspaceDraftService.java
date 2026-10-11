@@ -27,12 +27,21 @@ public class WorkspaceDraftService {
     private final JdbcTemplate db;
     private final ObjectMapper json;
     private final LlmObservationRecorder observations;
+    @org.springframework.beans.factory.annotation.Autowired
+    private cn.bugstack.ai.domain.agent.service.model.ModelCredentialRequestAuthorizer credentialRequests;
+    @org.springframework.beans.factory.annotation.Autowired
+    private cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry runBudgets;
     private final Cache<String,AtomicInteger> attempts=Caffeine.newBuilder().maximumSize(10000)
             .expireAfterWrite(Duration.ofMinutes(10)).build();
     public WorkspaceDraftService(WorkspaceService workspace,@org.springframework.beans.factory.annotation.Qualifier("mysqlJdbcTemplate") JdbcTemplate db,ObjectMapper json,LlmObservationRecorder observations) {
         this.workspace=workspace;this.db=db;this.json=json;this.observations=observations;
     }
     public ObjectNode draft(String user,JsonNode input) {
+        try(var ignored=cn.bugstack.ai.domain.agent.service.model.ModelInvocationScope.open(runBudgets,user,"WORKSPACE_DRAFT")) {
+            return draftInScope(user,input);
+        }
+    }
+    private ObjectNode draftInScope(String user,JsonNode input) {
         if(attempts.get(user,k->new AtomicInteger()).incrementAndGet()>10)
             throw new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS,"草稿生成过于频繁，请稍后重试");
         String requirement=WorkspaceService.text(input,"requirement",5,4000);
@@ -40,17 +49,20 @@ public class WorkspaceDraftService {
         String strategy=input.hasNonNull("strategy")&&!input.path("strategy").asText().isBlank()?input.path("strategy").asText():"fixed";
         WorkspaceTemplates.strategyBean(strategy);
         var rows=db.queryForList("""
-                SELECT a.base_url,a.api_key,a.completions_path,a.embeddings_path,m.model_name
+                SELECT a.api_id,a.base_url,a.completions_path,a.embeddings_path,m.model_name
                 FROM ai_client_model m JOIN ai_client_api a ON a.api_id=m.api_id
-                WHERE m.model_id=? AND m.platform_enabled=1 AND m.status=1 AND a.status=1
-                """,modelId);
+                WHERE m.model_id=? AND m.status=1 AND a.status=1 AND
+                  ((m.platform_enabled=1 AND a.secret_ref IS NULL) OR
+                   (m.owner_user_id=? AND a.owner_user_id=? AND a.secret_ref IS NOT NULL AND m.source_model_id IS NULL))
+                """,modelId,user,user);
         if(rows.size()!=1) throw WorkspaceService.bad("模型不可用");
         var row=rows.get(0); String base=(String)row.get("base_url");
-        var http = java.net.http.HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
-        var requests = new org.springframework.http.client.JdkClientHttpRequestFactory(http);
-        requests.setReadTimeout(Duration.ofSeconds(90));
-        var api=OpenAiApi.builder().baseUrl(base).apiKey((String)row.get("api_key"))
-                .restClientBuilder(org.springframework.web.client.RestClient.builder().requestFactory(requests))
+        var api=OpenAiApi.builder().baseUrl(base).apiKey("managed-at-request-boundary")
+                .restClientBuilder(org.springframework.web.client.RestClient.builder()
+                        .requestFactory(cn.bugstack.ai.domain.agent.service.execute.common.ModelRequestGuard.requestFactory())
+                        .requestInterceptor(credentialRequests.synchronous((String)row.get("api_id")))
+                        .requestInterceptor(cn.bugstack.ai.domain.agent.service.execute.common.ModelRequestGuard.synchronous(
+                                cn.bugstack.ai.domain.agent.service.model.ModelUsageContext.api((String)row.get("api_id"),"WORKSPACE_DRAFT",base))))
                 .completionsPath(OpenAiCompatibleApiSupport.chatCompletionsPath(base,(String)row.get("completions_path")))
                 .embeddingsPath(OpenAiCompatibleApiSupport.embeddingsPath(base,(String)row.get("embeddings_path"))).build();
         ChatClient client=ChatClient.builder(OpenAiChatModel.builder().openAiApi(api)
@@ -72,6 +84,7 @@ public class WorkspaceDraftService {
             validated.put("explanations","已生成未保存的骨架。请核对提示词，并选择自己的工具和 Advisor 后保存。");
             return validated;
         } catch(ResponseStatusException e) {failure=e;throw e;}
+        catch(cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetExceededException e) {failure=e;throw e;}
         catch(Exception e) {failure=e;throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,"草稿生成失败，未保存任何配置；可重试或直接使用模板");}
         finally { observations.record(LlmCallContext.builder().stepName("workspace_draft").userId(user)
                 .model((String)row.get("model_name")).billingScope(LlmObservationRecorder.BILLING_SCOPE_USER_CHARGEABLE)

@@ -66,7 +66,25 @@ public class StreamingFailurePropagationTest {
             CancellationException cancel = new CancellationException("user cancelled");
             assertSame(cancel, assertThrows(CancellationException.class, () -> invoke(flow, Flux.error(cancel))));
             RuntimeException error = assertThrows(RuntimeException.class, () -> invoke(flow, Flux.empty()));
-            assertTrue(error.getMessage().contains("without an answer"));
+            assertTrue(error.getMessage().contains("没有生成回答正文"));
+        }
+    }
+
+    @Test public void emptyResponseCanRecoverOnceWithoutRepeatingToolsInBothModes() {
+        for (boolean flow : List.of(true, false)) {
+            AtomicInteger subscriptions = new AtomicInteger();
+            ChatClientResponse answer = new ChatClientResponse(new ChatResponse(List.of(
+                    new Generation(new AssistantMessage("recovered answer")))), java.util.Map.of());
+            Object result = invoke(flow, Flux.defer(() -> subscriptions.incrementAndGet() == 1 ? Flux.empty() : Flux.just(answer)));
+            assertEquals("recovered answer", result);
+            assertEquals(2, subscriptions.get());
+            AtomicInteger withTools = new AtomicInteger();
+            assertThrows(RuntimeException.class, () -> invoke(flow, Flux.deferContextual(context -> {
+                withTools.incrementAndGet();
+                ((StreamingActivityTracker.Activity) context.get(StreamingActivityTracker.CONTEXT_KEY)).markToolActivity();
+                return Flux.empty();
+            })));
+            assertEquals(1, withTools.get());
         }
     }
 

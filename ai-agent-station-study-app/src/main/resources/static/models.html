@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>模型连接 · TAgent</title><link rel="stylesheet" href="/models.css"><script src="/auth.js"></script><script defer src="/models.js"></script><link rel="stylesheet" href="/workspace-nav.css"><script defer src="/workspace-nav.js"></script>
+</head>
+<body>
+<div data-workspace-nav hidden></div><main>
+<h1>模型连接</h1><p class="intro">使用自己的 OpenAI 兼容模型。密钥加密保存，页面不会显示原文。连接可用于个人 Agent 和草稿生成。</p>
+<div id="message" role="status" aria-live="polite"></div><div id="availability" class="notice" hidden></div>
+<section><h2>辅助服务与费用来源</h2><p>个人主模型的请求由你的提供商账号计费。路由、规划辅助、记忆摘要、知识索引与检索向量、重排使用平台模型和平台密钥，不会使用你的主模型密钥。</p>
+<label class="check"><input id="platformAuxiliaries" type="checkbox">允许平台辅助模型服务</label><p class="muted">关闭后，需要这些服务的操作会被拒绝；不会自动改用其他账号的密钥。已有的平台主模型仍可显式选择。</p><button id="savePolicy" type="button">保存辅助服务设置</button></section>
+<section><h2>添加个人连接</h2><form id="connectionForm"><div class="grid"><label>连接名称<input name="name" required maxlength="100" placeholder="我的模型服务"></label><label>提供商模型名称<input name="modelName" required maxlength="128" placeholder="提供商返回的模型 ID"></label><label class="wide">API 基础地址<input name="baseUrl" type="url" required maxlength="500" placeholder="https://api.openai.com/v1"></label><label class="wide">API 密钥<input name="apiKey" type="password" required maxlength="4096" autocomplete="new-password" spellcheck="false"></label></div><p id="allowedHosts" class="muted"></p><label class="check"><input id="createAuxiliaries" type="checkbox">同时允许账号使用平台辅助模型服务</label><p class="muted">保存时按此选项更新上方账号设置；默认关闭，需要辅助服务时请明确勾选。</p><button id="createConnection" type="submit">加密保存连接</button></form></section>
+<section><div class="section-heading"><h2>我的连接</h2><button id="refresh" type="button" class="secondary">刷新</button></div><div id="connections" class="connections"></div></section>
+<dialog id="rotateDialog"><form id="rotateForm"><h2>轮换密钥</h2><p>保存后，后续请求立即使用新密钥；已撤销的连接会重新启用。正在发送的请求无法撤回。</p><label>新 API 密钥<input id="newKey" type="password" required maxlength="4096" autocomplete="new-password" spellcheck="false"></label><div class="actions"><button type="button" id="cancelRotate" class="secondary">取消</button><button type="submit">保存新密钥</button></div></form></dialog>
+</main></body></html>

@@ -21,7 +21,7 @@ TAgent is an enterprise-level AI Agent implementation project built with **Java 
 
 It is not another one-call model wrapper. TAgent makes the complete Agent-request lifecycle concrete and inspectable: ingestion, routing, runtime assembly, planning and execution, RAG, memory, MCP tool governance, human approval, in-execution intervention, SSE streaming, recovery, and end-to-end observability.
 
-[![TAgent architecture preview — click to watch the Dynamic MCP demo](docs/images/social-preview.jpg)](./docs/demo-videos/03-%E6%89%A7%E8%A1%8C%E6%9C%9F%E5%8A%A8%E6%80%81%E8%A1%A5%E6%8C%82%E5%B7%A5%E5%85%B7.webm)
+[Watch the Dynamic MCP demo](./docs/demo-videos/03-%E6%89%A7%E8%A1%8C%E6%9C%9F%E5%8A%A8%E6%80%81%E8%A1%A5%E6%8C%82%E5%B7%A5%E5%85%B7.webm). The current v2.0 architecture is shown below.
 
 **What you can verify in the demo:** the model detects a missing capability during execution, calls `request_tool`, matches a real MCP tool through PgVector, and continues the same run with the newly attached tool. See the [full demo catalogue](./docs/demo-videos/README.md) for planning review, human approval, step-level redo, resilient runs, multimodal input, and background tasks.
 
@@ -31,7 +31,18 @@ It is not another one-call model wrapper. TAgent makes the complete Agent-reques
 >
 > Access is temporarily provided through the public IP address; this link will be updated when the domain is available. After registering, you can try preconfigured Agents or open “My Agents” to build Fixed, Auto, and Flow Agents. Configure System Prompts, MCP connections, and Advisors per node, and connect your own RAG knowledge base. Personal Agent configuration, knowledge retrieval, and usage observations are scoped to each user.
 >
-> The service is currently a trial. Models are provided by the platform, primarily `mimo-v2.5` and `deepseek-v4-flash`. Personal MCP connections are subject to the platform's domain allowlist. Support for user-supplied model API endpoints and keys is planned. See the [Agent workspace guide (Chinese)](docs/dev-ops/USER_AGENT_WORKSPACE.md).
+> The service is currently a trial, with platform-provided models primarily `mimo-v2.5` and `deepseek-v4-flash`, subject to platform allowances. **v2.0.0 supports personal OpenAI-compatible model connections** with encrypted API keys. Platform helpers such as routing, memory summaries, and embeddings require separate consent and do not reuse a personal chat-model key. Personal model and MCP endpoints follow the operator's domain allowlists. See [Agent workspaces (Chinese)](docs/dev-ops/USER_AGENT_WORKSPACE.md) and [model connections](docs/dev-ops/MODEL_CONNECTIONS.md).
+
+## 🆕 v2.0.0: Configure, Run, and Keep the Result
+
+- **Personal Agents and models:** configure mode-specific nodes from public Agents, keep drafts separate from enabled versions, compare versions, restore to a draft, and debug individual nodes. Personal model credentials are encrypted and owner-scoped.
+- **Maintainable knowledge bases:** inspect ingestion stages, failures, and chunks; retry, cancel, delete, and test retrieval. Normal retrieval includes only successfully published files.
+- **Traceable execution:** durable history records questions, answers, configuration versions, status, and bounded diagnostics. Reconnect restores dependencies and tool cards; completion/failure notifications work away from the active conversation, with mark-all-read in the inbox.
+- **Downloadable artifacts:** built-in `create_artifact` creates Markdown, CSV tables, and individual source-code files with previews, downloads, immutable revisions, and explicit version reuse. Code is saved, not executed.
+- **Feedback into evaluation:** opt in to converting feedback into an EvalOps draft, review and enable it, then compare rule scores and LLM Judge results. A model's original answer does not automatically become the reference answer.
+- **Runtime and usage control:** shared run budgets, context shaping, selective tool-result reads, MCP capacity/idle reclamation, and a persistent per-user allowance/usage ledger. Unknown monetary pricing is not presented as an actual bill.
+
+Shared navigation connects models, Agents, knowledge, history, artifacts/feedback, usage, and MCP observability. See the [v2.0.0 upgrade and feature guide](docs/dev-ops/V2_UPGRADE.md).
 
 ### Who Is This For?
 
@@ -43,18 +54,20 @@ It is not another one-call model wrapper. TAgent makes the complete Agent-reques
 
 ## 🎯 System Overview
 
-![TAgent End-to-End Architecture](docs/images/tagent-end-to-end-architecture-2026-07-v15.png)
+![TAgent 2.0 End-to-End Architecture](docs/images/tagent-end-to-end-architecture-v2.0-2026-10.png)
+
+[Full-resolution image](docs/images/tagent-end-to-end-architecture-v2.0-2026-10.png) · [Editable SVG](docs/images/tagent-end-to-end-architecture-v2.0-2026-10.svg)
 
 ## 🎬 Feature Demos
 
-The repository includes focused recordings for the features below, so a visitor can verify a behavior instead of only reading about it:
+The repository includes focused recordings for the features below. Some were recorded on earlier releases; v2.0.0 interfaces and stage permissions have since changed:
 
 - [Fixed / Auto / Flow execution modes](./docs/demo-videos/01-%E4%B8%89%E7%A7%8D%E7%AD%96%E7%95%A5%E5%9F%BA%E7%A1%80%E9%97%AE%E7%AD%94.mp4)
 - [Dynamic MCP tool attachment during execution](./docs/demo-videos/03-%E6%89%A7%E8%A1%8C%E6%9C%9F%E5%8A%A8%E6%80%81%E8%A1%A5%E6%8C%82%E5%B7%A5%E5%85%B7.webm)
 - [Flow plan review and editing](./docs/demo-videos/05-%E6%B5%81%E7%A8%8B%E8%AE%A1%E5%88%92%E7%A1%AE%E8%AE%A4%E7%BC%96%E8%BE%91.webm)
 - [Human approval for high-risk tools](./docs/demo-videos/08-%E9%AB%98%E5%8D%B1%E5%B7%A5%E5%85%B7%E4%BA%BA%E5%B7%A5%E5%AE%A1%E6%89%B9.mp4)
 - [Step-level redo by run ID](./docs/demo-videos/09-%E8%BF%90%E8%A1%8C%E7%BC%96%E5%8F%B7%E6%AD%A5%E9%AA%A4%E9%87%8D%E5%81%9A.mp4)
-- [Disconnect, reconnect, and continue in the background](./docs/demo-videos/12-%E6%96%AD%E7%BA%BF%E9%87%8D%E8%BF%9E%E5%90%8E%E5%8F%B0%E7%BB%A7%E4%BD%9C.mp4)
+- [Disconnect, reconnect, and continue in the background](./docs/demo-videos/12-%E6%96%AD%E7%BA%BF%E9%87%8D%E8%BF%9E%E5%90%8E%E5%8F%B0%E7%BB%AD%E4%BD%9C.mp4)
 - [Multimodal image understanding](./docs/demo-videos/13-%E5%9B%BE%E7%89%87%E7%90%86%E8%A7%A3%E8%83%BD%E5%8A%9B.mp4)
 - [Scheduled tasks and file-change monitoring](./docs/demo-videos/14-%E5%AE%9A%E6%97%B6%E4%BB%BB%E5%8A%A1%E5%92%8C%E5%AF%B9%E8%B1%A1%E7%9B%91%E8%A7%86%E5%99%A8%E5%8A%9F%E8%83%BD.mp4)
 
@@ -86,13 +99,16 @@ User Request
 
 | Capability | Implementation |
 |---|---|
-| **Three Agent Modes** | Fixed (single-step Q&A), Auto (analyze-execute loop), Flow (DAG orchestration) |
-| **Personal Agent Workspace** | Mode-specific nodes with independent model, Prompt, MCP, and Advisor settings; personal configurations from public templates and user-scoped observations |
+| **Three Agent Modes** | Fixed (configured sequential Client chain), Auto (analyze-execute loop), Flow (DAG orchestration) |
+| **Personal Agent Workspace** | Mode-specific nodes, model/Prompt/MCP/Advisor settings, drafts, enabled versions, comparisons, and node debugging |
+| **Personal Models and Allowances** | Encrypted OpenAI-compatible API keys, separate platform-helper consent, persistent allowances and known/unknown usage |
+| **Knowledge Management** | Ingestion progress, retry, chunk previews, retrieval tests, owner and publication filtering |
+| **Artifacts and Feedback** | Versioned Markdown, CSV, and code downloads; opt-in feedback-to-evaluation drafts |
 | **Database-Driven Assembly** | Agent, Client, Model, Prompt, Advisor, RAG, MCP relationships configured via DB |
 | **Unified Agent Router** | Single LLM call to select Agent and infer missing tool capabilities |
 | **Dynamic MCP Tools** | Tool catalog localization, intent expansion, PgVector semantic matching, on-demand attachment |
 | **MCP Self-Healing** | Lazy probing, failure retry, timeout reconnect, dead-client rebuild, cooldown & circuit breaker |
-| **Tool Governance** | Disable tools in non-execution steps, correct unknown tools, parameter hints, round budget, parallel execution |
+| **Tool Governance** | Separate catalog access, meta-tools, and business calls by stage; relevance filters, context/run budgets, side-effect-aware retries |
 | **Flow Plan Review** | Pause after DAG parsing; users can inspect, edit, and confirm the plan before it runs |
 | **Run Snapshots & Step-level Redo** | Redis TTL snapshots, `/run` history, and `/runId-stepN` targeted redo |
 | **Resilient Runs & Timeline Reconnect** | Snapshot-first recovery, Redis Stream catch-up, then live SSE subscription |
@@ -104,7 +120,8 @@ User Request
 | **Proactive Q&A** | `ask_user` requests supplementary info via SSE (disabled by default, per-session limit & timeout) |
 | **Human-in-the-Loop** | High-risk tool calls request manual approval/rejection via SSE |
 | **Explainable Output** | Tool progress, RAG evidence, Memory evidence, step status |
-| **Full-Chain Observability** | Prometheus, ELK, Jaeger, event_log, LLM cost & MCP health dashboard |
+| **Full-Chain Observability** | Prometheus, ELK, Jaeger, event_log, personal model usage and MCP health; site statistics remain admin-only |
+| **Notification Inbox** | Clarifications, approvals, plan review, completion/failure alerts, and mark-all-read; reading does not approve an action |
 
 ---
 
@@ -137,12 +154,12 @@ Assembly relationships sourced from:
 - `ai_agent`, `ai_client`, `ai_client_model`, `ai_client_api`
 - `ai_client_system_prompt`, `ai_client_advisor`, `ai_client_tool_mcp`, `ai_client_rag_order`
 
-DB config is cached in Beans after Armory assembly. Recommend re-assembly or restart after updating core model/prompt/tool relationships.
+Armory caches assembled runtime components. Workspace updates use drafts and enabled versions, invalidate affected components, and bind each run to its configuration version; editing a draft does not silently replace an active run's configuration.
 
 ### 3. Three Execution Modes
 
 #### Fixed Mode
-Direct Q&A or single-turn tool task:
+Runs the configured Client chain sequentially; a single-node setup suits direct Q&A or tool tasks:
 ```text
 Prepare Context -> Inject Advisor -> Merge Tools -> LLM Stream -> Save Memory -> Output
 ```
@@ -151,7 +168,7 @@ Also supports MCP calls, RAG, long-term memory, `steer` re-generation, and `answ
 #### Auto Mode
 Self-driven analysis, execution, and verification loop:
 
-| Step | Responsibility | Tool Enabled |
+| Step | Responsibility | Business MCP Calls |
 |---|---|---|
 | Step1 | Analyze task, judge completion | ❌ |
 | Step2 | Execute specific task | ✅ |
@@ -163,12 +180,14 @@ Loops until task complete or `maxStep` reached. Step3 can return structured crit
 #### Flow Mode
 Decompose complex tasks into dependency-aware steps:
 
-| Step | Responsibility | Tool Enabled |
+| Step | Responsibility | Business MCP Calls |
 |---|---|---|
-| Step1 | Analyze required tool capabilities | ❌ |
+| Step1 | Read the execution nodes' authorized catalog and analyze capabilities | ❌ |
 | Step2 | Generate step plan with `DEPENDS_ON` | ❌ |
 | Step3 | Parse plan into DAG | - |
 | Step4 | Execute in parallel respecting dependencies | ✅ |
+
+Analysis and planning read names and descriptions from the execution nodes' authorized MCP catalog without connecting or loading every tool. `request_tool` and business calls are deferred to execution. `ask_user` follows stage permissions; Auto final summaries and Flow final synthesis may use built-in `create_artifact` without enabling business MCP calls.
 
 Parallel boundaries:
 - Steps with satisfied dependencies can run concurrently
@@ -186,7 +205,7 @@ Every Agent run has a `runId` that connects its SSE events, chat memory, event l
 - **Snapshot scope:** Fixed saves the response; Auto saves Step1–Step4; Flow saves planning and Step4 DAG execution steps.
 - **History entry point:** `/run` lists recent run summaries for the current session.
 - **Targeted redo:** `/runId-stepN correction` reuses the source Agent and prior steps, then regenerates from the requested step.
-- **Retention boundary:** snapshots are Redis records with TTL. After expiry, start a new run instead of reusing old plans or tool results.
+- **Retention boundary:** redo depends on a valid Redis snapshot. Durable MySQL `ai_run_history` independently preserves the owner's question, answer, Agent version, status, and bounded diagnostics, including failed/cancelled evaluation sessions. Process interruption does not automatically replay external actions.
 
 ---
 
@@ -219,10 +238,11 @@ UnifiedAgentRouter
   -> missing_tool_descs (router-stage inference)
   or Advisor / LLM
   -> request_tool(needs) (execution-stage attachment)
-  -> Generate embedding per capability
+  -> Prefer explicit tool names in the authorized catalog
+  -> Generate embedding for remaining capabilities
   -> PgVector query mcp_tool_vector
   -> Top-K per capability
-  -> Relative distance threshold filter
+  -> Similarity and name/description checks; do not fill Top-K with weak matches
   -> Union & deduplicate results
   -> Lazy-create or reuse MCP callback
   -> Resident tools + Dynamic tools
@@ -233,9 +253,9 @@ Tool assets:
 - MySQL `ai_mcp_tool_catalog`: Real tool name, MCP, original desc, Chinese desc, Chinese intent
 - PgVector `mcp_tool_vector`: Embedding for semantic retrieval
 
-Current matching uses embedding-only (no BM25 or LLM rerank fallback). When vector service is unavailable, skip dynamic attachment rather than force bad matches.
+Users bind **MCP connections** in the workspace; concrete tools are loaded as execution needs them. Flow analysis/planning read the execution nodes' authorized capability catalog and distinguish bound, loaded, and executed tools. These stages do not expose `request_tool`.
 
-`request_tool` is a meta-tool, not a business tool. In Flow it can be called during tool analysis or planning to prepare capabilities for later DAG execution. Router inference is better suited to clear capability gaps that can be identified before the run starts.
+During execution, explicit tool names take priority, followed by vector similarity corroborated by names/descriptions. Weak candidates do not fill a quota. If vector search is unavailable, matching may fall back to names/descriptions within the authorized catalog; no suitable match is reported explicitly. MCP bindings and public-catalog permissions still constrain the search. Seeing a catalog entry does not prove connectivity or execution.
 
 ---
 
@@ -256,7 +276,7 @@ Self-healing paths:
 6. 10-second cooldown per MCP to avoid retry storms
 7. Circuit open when consecutive failures accumulate
 
-Reconnected state keeps `ToolDefinition` stable to frontend, so parameter hints don't disappear on callback switch.
+Reconnected state keeps `ToolDefinition` stable, preserving parameter hints. The pool also enforces global/per-owner capacity, active leases, and idle reclamation. Retry decisions account for side effects and outcome certainty; uncertain writes are not automatically replayed.
 
 ### MeteredToolCallback
 
@@ -265,7 +285,7 @@ Each tool call handles:
 - First-failure, retry, recovery, final-failure stats
 - Timeout probing & reconnection
 - High-risk tool approval
-- Result cleansing & length truncation
+- Result cleansing/compression with owner/run-scoped `resultRef` storage and selective `inspect_tool_result` reads
 - `tool_call_start`/`tool_call_end`/`tool_call_error` SSE events
 - Process-level send lock per MCP Server
 
@@ -305,7 +325,7 @@ Advisors are DB-configured and participate in request chain by `order`:
 | Chat Memory | Read-only history context; full response written by application layer |
 | CoVe | Retrieve-augmented verification & observability on response claims |
 
-Custom Advisors preserve request options during Prompt rebuild to avoid losing dynamic tools, maxTokens, toolContext.
+Custom Advisors preserve request options during Prompt rebuild and propagate trusted run context across reactive threads. Final input shaping preserves user constraints, source references, and complete assistant/tool pairs while respecting the shared run budget.
 
 ---
 
@@ -333,7 +353,7 @@ Query Planning
 ```
 
 Dynamic tool matching and RAG document retrieval are separate pipelines:
-- Dynamic tools: PgVector embedding-only
+- Dynamic tools: authorized exact-name matching, PgVector candidates with relevance checks, and bounded name/description fallback
 - RAG documents: PgVector + BM25 + RRF + rerank
 
 ---
@@ -442,7 +462,7 @@ Advisor + LLM
   -> ask_user tool_call
   -> user_input_required SSE
   -> User provides supplementary input
-  -> ask_user tool result
+  -> ask_user result + shared context for the current user/run
   -> Continue next reasoning round
 ```
 
@@ -450,7 +470,8 @@ Design boundaries:
 - `agent.user-input.enabled=false` completely suppresses `ask_user` broadcast (default preserves original flow)
 - `UserInputGate` limits asks per `sessionId` & supports auto-release on timeout
 - `ask_user` and human approval use separate ID channels (approval gates tool usage, ask_user gates requirement clarification)
-- V048 migration limits `ask_user` to analysis steps only, preventing non-execution steps from wrongly calling real tools
+- Clarification answers enter the current user/run's shared context for later nodes; they do not automatically become global or cross-run long-term memory
+- Stage permissions distinguish clarification from real business tool execution
 
 ---
 
@@ -491,6 +512,16 @@ Content-Type: application/json
 
 ---
 
+## 📦 Files and Feedback
+
+Ask, for example: “Save this itinerary as a downloadable Markdown document and create a CSV budget table; mark information we could not verify.” Built-in `create_artifact` accepts complete Markdown, structured table columns/rows, or a single source-code file without a filesystem MCP. After a successful database save, the chat card offers preview/download and the artifacts page exposes revisions for explicit reuse.
+
+Supported outputs are `.md`, `.csv`, and individual code files downloaded with their filenames. Code is stored and previewed as text, not executed or claimed to be compiled. Word, PDF, Excel workbooks, and multi-file ZIP output are not supported. Invalid arguments receive one repair opportunity; persistent failure falls back to visible text and explicitly reports that no file was saved.
+
+Feedback is tied to a specific run and Agent version. Users can opt in to creating a disabled EvalOps draft, review it, and enable it for evaluation. LLM Judge may use a different model the user is authorized to access; provider permissions, auxiliary-service consent, and budgets still apply.
+
+---
+
 ## 📊 Observability
 
 TAgent records model, tool, and Agent step metrics:
@@ -503,7 +534,12 @@ TAgent records model, tool, and Agent step metrics:
 - `WireTraceRecorder`: Stream wire info without consuming response body
 
 Dashboard pages:
-- System Observability: `http://localhost:8099/observe.html`
+- LLM Observability: `http://localhost:8099/observe.html`
+- Personal Usage and Allowances: `http://localhost:8099/usage.html`
+- Model Connections: `http://localhost:8099/models.html`
+- Knowledge: `http://localhost:8099/knowledge.html`
+- Run History: `http://localhost:8099/history.html`
+- Artifacts and Feedback: `http://localhost:8099/outcomes.html`
 - MCP Observability: `http://localhost:8099/observe-mcp.html`
 - My Agents: `http://localhost:8099/user-agents.html`
 - Website Traffic and Registrations (admin): `http://localhost:8099/admin-stats.html`
@@ -543,7 +579,9 @@ Dashboard pages:
 
 ## 🚀 Quick Start
 
-See the [single-host deployment guide (Chinese)](docs/dev-ops/server/README.md). Before upgrading to v1.28.0, back up MySQL and stop the application. Confirm [V061](docs/dev-ops/sql-migrations/V061__user_roles_and_registration.sql) is already applied, then apply [V062](docs/dev-ops/sql-migrations/V062__user_agent_workspace.sql) and [V063](docs/dev-ops/sql-migrations/V063__public_workspace_catalog.sql) in order before starting the new version. Review administrator ownership and the Agent / MCP sharing scope first. Do not rerun migrations that are already applied.
+See the [single-host deployment guide (Chinese)](docs/dev-ops/server/README.md) and [v2.0.0 upgrade guide](docs/dev-ops/V2_UPGRADE.md). **Upgrading from a V063 database to v2.0.0 requires V064–V069 in order**: personal models, Agent versions, knowledge ingestion, durable history, usage accounting, and artifacts/feedback. Earlier installations must first verify V061–V063, administrator ownership, and sharing scope. Do not rerun applied migrations.
+
+Back up the old JAR/image, configuration, MySQL, existing vector/search data, and application file volumes; follow the deployment guide's maintenance procedure before migrating and starting the new version. Keep `MODEL_SECRET_MASTER_KEY` stable: it is a Base64-encoded random 32-byte encryption key, backed up separately from the database and never regenerated on restart/upgrade. Without it, platform models remain available but personal credentials are disabled. See [model connections](docs/dev-ops/MODEL_CONNECTIONS.md), [usage rules](docs/dev-ops/MODEL_USAGE.md), [knowledge ingestion (Chinese)](docs/dev-ops/KNOWLEDGE_INGESTION.md), and [run history (Chinese)](docs/dev-ops/RUN_HISTORY.md).
 
 ### Prerequisites
 
@@ -602,7 +640,7 @@ Incremental scripts located in:
 docs/dev-ops/sql-migrations
 ```
 
-Execute in version order for a new environment. Dynamic tool features require at least `V041`, `V046`, and `V047`; the background task center requires `V058__create_background_task_center.sql`.
+Initialize a new database from the baseline described in the deployment guide, then inspect and apply only missing incremental migrations through `V069`. Do not blindly replay every script on existing tables; MySQL DDL cannot roll back a whole migration transactionally.
 
 ### Build
 

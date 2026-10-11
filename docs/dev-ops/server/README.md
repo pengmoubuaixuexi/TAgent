@@ -26,6 +26,15 @@
 4. 检查 `import/mcp-migration-report.json`，修复阻塞项后重新运行 `prepare_mcp.py`。转换 `cmd /c`、Windows 脚本路径、容器内服务地址，移除本机回环代理。filesystem MCP 只允许 `/app/data/workspace`。生成的是服务器 SQL，不修改开发机 MCP 配置。
 5. 将 JAR、构建所需的项目文件、本目录及私有导出通过 SSH 传到服务器。若有本地图片/附件，另外迁移项目 `data/` 中对应目录到 `app-data` 卷；OSS 资源则保留原配置和访问凭证。Redis 中旧运行快照不默认搬迁，用户重新登录。
 
+## 已有服务器升级到 v2 的审查项
+
+以下是上线前核对项，不会自动执行部署；已有环境不要重新导入开发库或覆盖服务器现有 `.env`、Compose、云配置。
+
+- 在 V062/V063 基础结构上核对 V064–V069，按版本顺序**仅执行尚未应用的脚本**。V065、V069 含非幂等建表语句；已有结构、部分执行或历史不明时先检查，不要整份重跑。文件清单与校验和命令见 [迁移记录](../V2_LOCAL_OPERATIONS.md#迁移记录)。其中 `v2_ops.py` 的迁移、备份和恢复命令只允许专用隔离测试库，**不是生产迁移命令**。
+- 个人模型连接需要固定保存的 `MODEL_SECRET_MASTER_KEY`，为随机 32 字节的 Base64；重启不得重新生成。未配置时个人密钥功能不可用。配置、备份及轮换边界见 [模型连接说明](../MODEL_CONNECTIONS.md)。
+- 在同一停写点准备 MySQL、PostgreSQL、Elasticsearch、应用 `/app/data`、旧镜像/JAR及配置的备份，并单独妥善保管主密钥。仅有 MySQL 备份不等于完整回退；新版本已经写入数据后，不能假定旧 JAR 可直接继续运行。参见 [备份及隔离恢复说明](../V2_LOCAL_OPERATIONS.md#mysql-备份及隔离恢复)。
+- 普通 Maven JAR 会包含私有 dev/test/prod 配置，应按私有文件管理，不能作为公开附件。此目录 Dockerfile 在多阶段构建中剔除这些配置；核验对象应是**最终镜像内提取出的 JAR**，按 [HTTPS 与密钥预检](../V2_LOCAL_OPERATIONS.md#https-与密钥预检) 的只读命令追加 `--sanitized-jar`，确认私有配置已被移除。通过预检后仍需实际环境的登录、SSE、取消/重连、MCP及模型连通性验收。
+
 ## 迁移任务与可选 MCP
 
 导入后、启动应用前，检查 `ai_background_task` 和 `ai_agent_task_schedule`：先暂停不准备在新环境执行的任务，避免复制的定时任务自动触发。确认每项任务及其凭证后再启用。

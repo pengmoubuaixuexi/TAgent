@@ -150,6 +150,7 @@ public class LlmRagRouter implements IRagRouter {
                     decision.getReason());
             return decision;
         } catch (Exception e) {
+            cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.rethrowCancellation(e);
             log.warn("rag-router llm failed, fallback to retrieve: {}", e.getMessage());
             return RagRouterDecision.retrieve();
         }

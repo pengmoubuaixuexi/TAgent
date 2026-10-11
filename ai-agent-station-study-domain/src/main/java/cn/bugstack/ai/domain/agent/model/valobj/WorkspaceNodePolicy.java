@@ -48,9 +48,17 @@ public record WorkspaceNodePolicy(String agentId, String clientId, String taskPr
         // An explicit selection narrows even a connection in the public pool.
         return tools.containsKey(mcpId) ? allTools.contains(mcpId) || tools.get(mcpId).contains(name) : publicMcpIds.contains(mcpId);
     }
+    /** Match only names proven by this callback, never a guessed normalization from another connection. */
+    public boolean allows(String mcpId,ToolCallback callback) {
+        if (callback==null || callback.getToolDefinition()==null) return false;
+        if (callback instanceof MeteredToolCallback metered && !Objects.equals(mcpId,metered.getMcpId())) return false;
+        String original=callback instanceof MeteredToolCallback metered ? metered.getOriginalToolName()
+                : cn.bugstack.ai.domain.agent.service.execute.common.McpClientRegistry.originalToolName(callback);
+        return allows(mcpId,callback.getToolDefinition().name()) || original!=null && allows(mcpId,original);
+    }
     public boolean allows(ToolCallback callback) {
         return callback instanceof MeteredToolCallback metered && callback.getToolDefinition()!=null
-                && allows(metered.getMcpId(),callback.getToolDefinition().name());
+                && allows(metered.getMcpId(),callback);
     }
     public List<ToolCallback> filter(List<ToolCallback> callbacks) {
         return callbacks==null ? List.of() : callbacks.stream().filter(this::allows).toList();

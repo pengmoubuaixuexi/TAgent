@@ -12,6 +12,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
@@ -56,6 +57,33 @@ public class RedisRunSnapshotService implements RunSnapshotService {
     @Value("${agent.run-snapshot.user-index-size:50}")
     private int userIndexSize;
 
+    @Value("${agent.tool-results.max-stored-chars:262144}")
+    private int maxToolResultChars = 262144;
+    @Value("${agent.tool-results.max-evidence-per-run:100}")
+    private int maxToolEvidencePerRun = 100;
+    @Value("${agent.tool-results.max-stored-bytes-per-run:8388608}")
+    private int maxToolEvidenceBytesPerRun = 8388608;
+
+    private static final DefaultRedisScript<Long> SAVE_TOOL_EVIDENCE = new DefaultRedisScript<>("""
+        local raw = redis.call('GET', KEYS[1])
+        if not raw then return 0 end
+        local ok, metadata = pcall(cjson.decode, raw)
+        if not ok or metadata.userId ~= ARGV[1] then return 0 end
+        local previous = redis.call('HGET', KEYS[2], ARGV[2])
+        if not previous and redis.call('HLEN', KEYS[2]) >= tonumber(ARGV[5]) then return 0 end
+        local total = tonumber(redis.call('GET', KEYS[3]))
+        if not total then
+          total = 0
+          for _, value in ipairs(redis.call('HVALS', KEYS[2])) do total = total + string.len(value) end
+        end
+        local nextTotal = total - (previous and string.len(previous) or 0) + string.len(ARGV[3])
+        if nextTotal > tonumber(ARGV[6]) then return 0 end
+        redis.call('HSET', KEYS[2], ARGV[2], ARGV[3])
+        redis.call('EXPIRE', KEYS[2], ARGV[4])
+        redis.call('SET', KEYS[3], tostring(nextTotal), 'EX', ARGV[4])
+        return 1
+        """, Long.class);
+
     @Override
     public void startRun(ExecuteCommandEntity request, String agentType, String agentName) {
         if (request == null || blank(request.getRunId())) {
@@ -72,6 +100,7 @@ public class RedisRunSnapshotService implements RunSnapshotService {
             snapshot.setSessionId(request.getSessionId());
             snapshot.setUserId(request.getUserId());
             snapshot.setAgentId(request.getAiAgentId());
+            snapshot.setAgentVersion(request.getAgentVersion());
             snapshot.setAgentName(agentName);
             snapshot.setAgentType(agentType);
             snapshot.setOriginalMessage(request.getMessage());
@@ -318,15 +347,44 @@ public class RedisRunSnapshotService implements RunSnapshotService {
         try {
             RunSnapshot snapshot = findMetadata(runId).orElse(null);
             if (snapshot == null) return;
-            String evidenceKey = toolEvidenceKey(runId);
-            stringRedisTemplate.opsForHash().put(
-                    evidenceKey, evidence.getEvidenceId(), JSON.toJSONString(evidence));
-            Duration ttl = runTtl();
-            snapshot.setExpiresAt(System.currentTimeMillis() + ttl.toMillis());
-            stringRedisTemplate.expire(evidenceKey, ttl);
+            saveToolEvidence(runId, snapshot.getUserId(), evidence);
         } catch (Exception error) {
             log.warn("[RunSnapshot] recordToolEvidence failed runId={} evidenceId={} err={}",
                     runId, evidence.getEvidenceId(), error.getMessage());
+        }
+    }
+
+    @Override
+    public boolean saveToolEvidence(String runId, String userId, ToolEvidenceRecord evidence) {
+        if (blank(runId) || blank(userId) || evidence == null || blank(evidence.getEvidenceId())
+                || evidence.getOutput() == null || evidence.getOutput().length() > Math.max(1024, Math.min(2_000_000, maxToolResultChars))) return false;
+        try {
+            Long result = stringRedisTemplate.execute(SAVE_TOOL_EVIDENCE,
+                    List.of(key(runId), toolEvidenceKey(runId), toolEvidenceSizeKey(runId)), userId,
+                    evidence.getEvidenceId(), JSON.toJSONString(evidence), String.valueOf(runTtl().toSeconds()),
+                    String.valueOf(Math.max(1, Math.min(1000, maxToolEvidencePerRun))),
+                    String.valueOf(Math.max(1024, Math.min(64 * 1024 * 1024, maxToolEvidenceBytesPerRun))));
+            return Long.valueOf(1L).equals(result);
+        } catch (Exception error) {
+            log.warn("[RunSnapshot] acknowledged evidence write failed runId={} evidenceId={}", runId, evidence.getEvidenceId());
+            return false;
+        }
+    }
+
+    @Override
+    public Optional<ToolEvidenceRecord> findToolEvidence(String runId, String userId, String evidenceId) {
+        if (blank(runId) || blank(userId) || blank(evidenceId)) return Optional.empty();
+        try {
+            String raw = stringRedisTemplate.opsForValue().get(key(runId));
+            if (blank(raw)) return Optional.empty();
+            RunSnapshot metadata = JSON.parseObject(raw, RunSnapshot.class);
+            if (metadata == null || !userId.equals(metadata.getUserId())) return Optional.empty();
+            Object stored = stringRedisTemplate.opsForHash().get(toolEvidenceKey(runId), evidenceId);
+            if (stored == null) return Optional.empty();
+            return Optional.ofNullable(JSON.parseObject(String.valueOf(stored), ToolEvidenceRecord.class));
+        } catch (Exception error) {
+            log.debug("[RunSnapshot] evidence read unavailable runId={} evidenceId={}", runId, evidenceId);
+            return Optional.empty();
         }
     }
 
@@ -713,6 +771,7 @@ public class RedisRunSnapshotService implements RunSnapshotService {
         if (snapshot == null || blank(snapshot.getRunId())) return;
         stringRedisTemplate.expire(timelineKey(snapshot.getRunId()), ttl);
         stringRedisTemplate.expire(toolEvidenceKey(snapshot.getRunId()), ttl);
+        stringRedisTemplate.expire(toolEvidenceSizeKey(snapshot.getRunId()), ttl);
         if (!blank(snapshot.getSessionId())) {
             stringRedisTemplate.expire(sessionIndexKey(snapshot.getSessionId()), ttl);
         }
@@ -969,6 +1028,8 @@ public class RedisRunSnapshotService implements RunSnapshotService {
     private String toolEvidenceKey(String runId) {
         return keyPrefix + "tool-evidence:" + runId;
     }
+
+    private String toolEvidenceSizeKey(String runId) { return keyPrefix + "tool-evidence-size:" + runId; }
 
     private String evidenceMapKey(String runId) {
         return keyPrefix + "evidence-map:" + runId;

@@ -29,6 +29,8 @@ import java.util.concurrent.atomic.AtomicLong;
 @Slf4j
 @Component
 public class RunEventPublisher {
+    @Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.adapter.repository.IRunHistoryRepository runHistory;
 
     @Autowired(required = false)
     private IRunEventStore eventStore;
@@ -83,6 +85,19 @@ public class RunEventPublisher {
     public String publish(String runId, String sessionId, String eventType, Object payload) {
         if (blank(runId) || blank(eventType) || payload == null) return null;
         String payloadJson = payload instanceof String value ? value : JSON.toJSONString(payload);
+        // Waiting feedback is transient: no durable history, notification, snapshot or reconnect cursor.
+        // Keep the normal subscriber queue so progress cannot overtake replay/start/end frames.
+        if ("step_progress".equals(eventType) || "run_progress".equals(eventType)) {
+            List<Subscriber> current = subscribers.get(runId);
+            if (current != null) {
+                RunEventRecord progress = RunEventRecord.builder().runId(runId).sessionId(sessionId)
+                        .eventType(eventType).payloadJson(payloadJson).createdAt(System.currentTimeMillis()).build();
+                for (Subscriber subscriber : current) {
+                    if (!subscriber.accept(progress)) detach(runId, subscriber);
+                }
+            }
+            return null;
+        }
         RunEventRecord record = null;
         if (eventStore != null) {
             try {
@@ -127,13 +142,36 @@ public class RunEventPublisher {
     }
 
     public void finishRun(String runId) {
-        TimelineAccumulator timeline = timelines.remove(runId);
-        if (timeline != null) timeline.checkpoint(true);
-        CopyOnWriteArrayList<Subscriber> current = subscribers.remove(runId);
-        if (current != null) {
-            for (Subscriber subscriber : current) subscriber.complete();
+        if (blank(runId)) return;
+        cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.State budget =
+                cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.find(runId);
+        try {
+            if (budget != null) {
+                String sessionId = sessionRunIds.entrySet().stream().filter(e -> runId.equals(e.getValue()))
+                        .map(Map.Entry::getKey).findFirst().orElse(null);
+                if (sessionId != null) publish(runId, sessionId, "run_budget", budget.snapshot());
+            }
+        } catch (RuntimeException error) {
+            log.warn("[RunEvent] terminal diagnostics unavailable runId={}", runId);
+        } finally {
+            try {
+                cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.finish(runId);
+            } finally {
+                // A failed persistence/projection must not retain browser subscribers or a session lock.
+                TimelineAccumulator timeline = timelines.remove(runId);
+                try {
+                    if (timeline != null) timeline.checkpoint(true);
+                } catch (RuntimeException error) {
+                    log.warn("[RunEvent] terminal checkpoint unavailable runId={}", runId);
+                } finally {
+                    CopyOnWriteArrayList<Subscriber> current = subscribers.remove(runId);
+                    if (current != null) {
+                        for (Subscriber subscriber : current) subscriber.complete();
+                    }
+                    sessionRunIds.entrySet().removeIf(entry -> runId.equals(entry.getValue()));
+                }
+            }
         }
-        sessionRunIds.entrySet().removeIf(entry -> runId.equals(entry.getValue()));
     }
 
     private TimelineAccumulator timeline(String runId) {
@@ -171,6 +209,7 @@ public class RunEventPublisher {
         private final List<RunEventRecord> compactEvents = new ArrayList<>();
         private String lastEventId;
         private long lastCheckpointAt;
+        private long lastHistoryCheckpointAt;
 
         private TimelineAccumulator(String runId, List<RunEventRecord> seed, String lastEventId) {
             this.runId = runId;
@@ -243,10 +282,17 @@ public class RunEventPublisher {
         }
 
         private synchronized void checkpoint(boolean force) {
-            if (runSnapshotService == null || compactEvents.isEmpty()) return;
+            if (compactEvents.isEmpty()) return;
             long now = System.currentTimeMillis();
             if (!force && now - lastCheckpointAt < 250L) return;
-            runSnapshotService.recordTimeline(runId, new ArrayList<>(compactEvents), lastEventId);
+            if(runSnapshotService!=null) {
+                try { runSnapshotService.recordTimeline(runId, new ArrayList<>(compactEvents), lastEventId); }
+                catch(RuntimeException error) {log.warn("[RunEvent] snapshot checkpoint unavailable runId={}",runId);}
+            }
+            if(runHistory!=null && (force||now-lastHistoryCheckpointAt>=1000L)) {
+                try { runHistory.checkpoint(runId,new ArrayList<>(compactEvents));lastHistoryCheckpointAt=now; }
+                catch(RuntimeException error) {log.warn("[RunHistory] diagnostic checkpoint unavailable runId={}",runId);}
+            }
             lastCheckpointAt = now;
         }
 

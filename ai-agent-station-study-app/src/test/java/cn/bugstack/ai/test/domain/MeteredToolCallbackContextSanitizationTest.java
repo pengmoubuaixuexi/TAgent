@@ -20,6 +20,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotSame;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 public class MeteredToolCallbackContextSanitizationTest {
@@ -73,5 +74,25 @@ public class MeteredToolCallbackContextSanitizationTest {
         assertTrue(original.getContext().containsKey(ToolContext.TOOL_CALL_HISTORY));
         assertEquals(1, original.getToolCallHistory().get(0) instanceof UserMessage user
                 ? user.getMedia().size() : 0);
+    }
+
+    @Test
+    public void stripsArtifactRecoveryStateEvenWithoutHistoryAndPreservesOriginalState() throws Exception {
+        AtomicReference<ToolContext> received=new AtomicReference<>();
+        ToolCallback delegate=new ToolCallback() {
+            @Override public ToolDefinition getToolDefinition(){return ToolDefinition.builder().name("webSearch").description("test").inputSchema("{\"type\":\"object\"}").build();}
+            @Override public String call(String input){return "unexpected";}
+            @Override public String call(String input,ToolContext context){received.set(context);return "ok";}
+        };
+        // Deliberately non-serializable runtime state; it must never reach MCP's JSON-RPC metadata.
+        Object privateState=new Object();
+        ToolContext original=new ToolContext(Map.of("agent.artifact_recovery",privateState,"sessionId","session-1","agent.run_id","run-1"));
+        var callback=new MeteredToolCallback(delegate,new McpToolMetrics(new SimpleMeterRegistry()));
+        assertEquals("ok",callback.call("{}",original));
+        ToolContext sanitized=received.get();assertNotSame(original,sanitized);
+        assertFalse(sanitized.getContext().containsKey("agent.artifact_recovery"));
+        assertSame(privateState,original.getContext().get("agent.artifact_recovery"));
+        assertEquals("session-1",sanitized.getContext().get("sessionId"));assertEquals("run-1",sanitized.getContext().get("agent.run_id"));
+        assertFalse(new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(sanitized.getContext()).contains("artifact_recovery"));
     }
 }

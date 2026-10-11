@@ -127,10 +127,10 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
 
             // 获取规划客户端
             ChatClient executorChatClient = getChatClientByClientId(aiAgentClientFlowConfigVO.getClientId());
-            List<ToolCallback> step4DynamicToolCallbacks = resolveAgentDynamicToolCallbacks(request, aiAgentClientFlowConfigVO.getClientId());
+            // Each child loads its own execution needs; entry only records already mounted metadata.
             cn.bugstack.ai.domain.agent.service.execute.common.ExecutorToolCatalog v3Catalog =
                     storeExecutorToolCatalogSnapshot(dynamicContext, FLOW_TOOL_CATALOG_V3_KEY,
-                            aiAgentClientFlowConfigVO.getClientId(), step4DynamicToolCallbacks, 3);
+                            aiAgentClientFlowConfigVO.getClientId(), List.of(), 3);
             List<String> v2ToV3Drift = compareExecutorToolCatalogLineage(dynamicContext, FLOW_TOOL_CATALOG_V2_KEY, v3Catalog);
             if (!v2ToV3Drift.isEmpty()) {
                 log.warn("[ExecutorToolCatalog] V2->V3 lineage drift: {}", v2ToV3Drift);
@@ -1110,7 +1110,8 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             }
             ChatClient client = getChatClientByClientId(execConfig.getClientId());
             String clientId = execConfig.getClientId();
-            List<ToolCallback> dynamicToolCallbacks = resolveAgentDynamicToolCallbacks(request, clientId);
+            List<ToolCallback> dynamicToolCallbacks = answerNowFinalizeTools
+                    ? resolveAgentDynamicToolCallbacks(request, clientId) : List.of();
             boolean attachTools = !dynamicToolCallbacks.isEmpty() && answerNowFinalizeTools;
             String prompt = buildFlowAnswerNowPrompt(dynamicContext, request) + "\n\n" + answerNowNoThinkDirective;
             // 立即回答且挂工具：把常驻+补充工具清单注入 prompt（与正常执行步一致，帮模型选对工具、防幻觉）
@@ -1319,7 +1320,6 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         }
 
         String prompt = appendCurrentTimeContext(buildFinalSynthesisPrompt(dynamicContext, request, stepResults));
-        List<ToolCallback> dynamicToolCallbacks = resolveAgentDynamicToolCallbacks(request, finalWriterClientId);
         // 2026-05-07 流式 UX：最终合成步骤独立 step_start/end，折叠为"最终合成 已完成"
         ChatClient.ChatClientRequestSpec specFinal = finalWriterChatClient.prompt()
                 .user(prompt)
@@ -1330,11 +1330,6 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                         .param(LTM_RETRIEVAL_QUERY_KEY, buildLtmRetrievalQuery(request, "flow-final-synthesis"))
                         .param("memory_persist_final_turn", true)
                         .param(CHAT_MEMORY_RETRIEVE_SIZE_KEY, 50));
-        if (!dynamicToolCallbacks.isEmpty()) {
-            specFinal = specFinal.options(org.springframework.ai.openai.OpenAiChatOptions.builder()
-                    .toolCallbacks(toRequestToolCallbacks(finalWriterClientId, dynamicToolCallbacks))
-                    .build());
-        }
         String finalAnswer = callStepWithStreaming(
                 specFinal, dynamicContext, "flow_step4_final_synthesis", "最终合成",
                 cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_FINAL_SYNTHESIS,
@@ -1372,7 +1367,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                 1. 直接回答用户原始问题，输出用户真正想要的成品答案。
                 2. 如果步骤中包含验证、审核、风险检查，只吸收其中有用改进点，不要把“验证报告/执行状态/工具缺失说明”作为主体。
                 3. 不要输出“状态: 成功”“结果描述”“输出数据”“执行过程记录”“Step 1/Step 2”等流程化内容。
-                4. 不要再调用任何工具。
+                4. 不再搜索或调用业务工具。若用户要求生成文档、表格或下载文件，使用 create_artifact 保存完整成品；已保存的同一产物不要重复创建。不要求用户复制粘贴，不编造下载链接。
                 5. 如果步骤里有对用户有价值的图片路径或链接，可以自然保留；否则不要为了展示工具过程而保留。
                 6. 用清晰的 Markdown 输出，内容要完整、自然、可直接交付。
                 """.formatted(

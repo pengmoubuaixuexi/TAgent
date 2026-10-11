@@ -31,6 +31,7 @@ public class LongTermMemoryControllerTest {
         controller = new LongTermMemoryController();
         service = mock(ILongTermMemoryService.class);
         ReflectionTestUtils.setField(controller, "longTermMemoryService", service);
+        ReflectionTestUtils.setField(controller, "runBudgets", new cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry());
     }
 
     @Test
@@ -40,6 +41,20 @@ public class LongTermMemoryControllerTest {
         assertEquals("0002", response.getCode());
         assertNull(response.getData());
         verify(service, never()).listForManagement(null, 1, 20, null, null, null);
+    }
+
+    @Test
+    public void semanticManagementUsesTrustedBudgetAndRestoresThreadContext() {
+        org.slf4j.MDC.clear();
+        when(service.searchForManagement("user-1", "query", 20)).thenAnswer(invocation -> {
+            var state = cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.find(java.util.Map.of());
+            assertEquals("user-1", state.ownerUserId());
+            assertEquals("MEMORY_MANAGEMENT", org.slf4j.MDC.get("modelPurpose"));
+            return List.of();
+        });
+        assertEquals("0000", controller.semanticSearch("user-1", "query", 20).getCode());
+        assertNull(org.slf4j.MDC.get("runId"));
+        assertNull(org.slf4j.MDC.get("modelPurpose"));
     }
 
     @Test

@@ -431,8 +431,12 @@
         SELECT * FROM ai_eval_judge_job WHERE judge_job_id=#{judgeJobId} LIMIT 1
     </select>
 
+    <select id="lockRunForJudge" resultType="java.lang.String">
+        SELECT eval_run_id FROM ai_eval_run WHERE eval_run_id=#{evalRunId} FOR UPDATE
+    </select>
+
     <select id="listJudgeJobs" resultMap="JudgeJobMap">
-        SELECT * FROM ai_eval_judge_job WHERE eval_run_id=#{evalRunId} ORDER BY created_at DESC
+        SELECT * FROM ai_eval_judge_job WHERE eval_run_id=#{evalRunId} ORDER BY created_at DESC, id DESC
     </select>
 
     <update id="markJudgeJobStarted">

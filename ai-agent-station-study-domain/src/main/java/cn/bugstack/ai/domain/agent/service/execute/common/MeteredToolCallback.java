@@ -23,12 +23,17 @@ import java.util.concurrent.atomic.AtomicReference;
  * Tool callback decorator for MCP metrics, logging and guardrails.
  */
 @Slf4j
-public class MeteredToolCallback implements ToolCallback {
+public class MeteredToolCallback implements ToolCallback, McpClientRegistry.OriginalToolName {
+
+    /** Server-authored request scope used by the isolated node debugger. */
+    public static final String DEBUG_READ_ONLY_KEY = "agent.debug_read_only";
 
     private static final int GITHUB_SEARCH_DEFAULT_PAGE = 1;
     private static final int DEFAULT_GITHUB_SEARCH_MAX_PER_PAGE = 10;
     private static final int DEFAULT_GITHUB_SEARCH_MAX_RESULT_CHARS = 20_000;
     private static final int GITHUB_SEARCH_MAX_DESCRIPTION_CHARS = 320;
+    private static final String SESSION_REJECTION_PREFIX = "Sending message failed with a non-OK HTTP code: 400 - ";
+    private static final String SESSION_REJECTION_MESSAGE = "Session ID not found, Please reconnect";
 
     private final AtomicReference<ToolCallback> delegate;
     /**
@@ -40,6 +45,7 @@ public class MeteredToolCallback implements ToolCallback {
      * 「执行用哪条连接（可切换）」解耦。
      */
     private final ToolDefinition cachedDefinition;
+    private final String originalToolName;
     private final McpToolMetrics metrics;
     private final boolean returnErrorOnFailure;
     private final boolean githubWriteEnabled;
@@ -52,6 +58,11 @@ public class MeteredToolCallback implements ToolCallback {
     private final McpClientRegistry registry;
     private final String mcpId;
     public String getMcpId() { return mcpId; }
+
+    @Override
+    public String getOriginalToolName() {
+        return McpClientRegistry.originalToolName(delegate.get());
+    }
 
     /**
      * G1-C：Human Approval Gate（可选）。用 setter 注入避免改 6 层构造函数链。
@@ -84,6 +95,12 @@ public class MeteredToolCallback implements ToolCallback {
 
     public void setToolCallLedger(ToolCallLedger ledger) {
         this.toolCallLedger = ledger;
+    }
+
+    private volatile ToolResultReferenceService toolResultReferenceService;
+
+    public void setToolResultReferenceService(ToolResultReferenceService service) {
+        this.toolResultReferenceService = service;
     }
 
     /** H3-A：工具调用进度 SSE 的 status 枚举。 */
@@ -155,6 +172,7 @@ public class MeteredToolCallback implements ToolCallback {
                                McpClientRegistry registry, String mcpId) {
         this.delegate = new AtomicReference<>(delegate);
         this.cachedDefinition = captureDefinition(delegate);
+        this.originalToolName = McpClientRegistry.originalToolName(delegate);
         this.metrics = metrics;
         this.returnErrorOnFailure = returnErrorOnFailure;
         this.githubWriteEnabled = githubWriteEnabled;
@@ -184,7 +202,12 @@ public class MeteredToolCallback implements ToolCallback {
 
     @Override
     public ToolMetadata getToolMetadata() {
-        return delegate.get().getToolMetadata();
+        ToolMetadata metadata = delegate.get().getToolMetadata();
+        if (mcpId == null || mcpId.isBlank()) return metadata;
+        if (metadata instanceof McpToolCallMetadata mcp) {
+            return new McpToolCallMetadata(mcpId, mcp.readOnlyHint(), mcp.destructiveHint(), mcp.idempotentHint(), mcp.returnDirect());
+        }
+        return McpToolCallMetadata.from(mcpId, null, metadata.returnDirect());
     }
 
     @Override
@@ -195,7 +218,7 @@ public class MeteredToolCallback implements ToolCallback {
             String name = safeName();
             String effectiveInput = normalizeToolInput(name, toolInput);
             return invoke(name, toolInput, effectiveInput, resolveSessionId(null), resolveStepLabel(null),
-                    null, () -> delegate.get().call(effectiveInput));
+                    null, java.util.Map.of(), RunBudgetRegistry.find(java.util.Map.of()), target -> target.call(effectiveInput));
         }
     }
 
@@ -220,7 +243,9 @@ public class MeteredToolCallback implements ToolCallback {
             String ledgerRunId = ledgerOn ? readContext(toolContext, "agent.run_id") : null;
             ToolContext mcpSafeContext = withoutToolCallHistory(toolContext);
             return invoke(name, toolInput, effectiveInput, resolveSessionId(toolContext), resolveStepLabel(toolContext),
-                    ledgerRunId, () -> delegate.get().call(effectiveInput, mcpSafeContext));
+                    ledgerRunId, toolContext == null ? java.util.Map.of() : toolContext.getContext(),
+                    RunBudgetRegistry.find(toolContext == null ? java.util.Map.of() : toolContext.getContext()),
+                    target -> target.call(effectiveInput, mcpSafeContext));
         }
     }
 
@@ -231,20 +256,22 @@ public class MeteredToolCallback implements ToolCallback {
      * byte array, so Jackson fails on Media#getDataAsByteArray before the MCP
      * server sees the request. Binary media would also make every call huge.
      *
-     * Remove only framework-generated history from the MCP-bound copy.
+     * Remove framework-generated history and private runtime state from the MCP-bound copy.
      * Session, step, approval and ledger context stay intact; the original
      * prompt and ChatMemory are not changed.
      */
     private ToolContext withoutToolCallHistory(ToolContext toolContext) {
         if (toolContext == null || toolContext.getContext() == null
                 || (!toolContext.getContext().containsKey(ToolContext.TOOL_CALL_HISTORY)
-                && !toolContext.getContext().containsKey(StreamingActivityTracker.CONTEXT_KEY))) {
+                && !toolContext.getContext().containsKey(StreamingActivityTracker.CONTEXT_KEY)
+                && !toolContext.getContext().containsKey(ArtifactToolRecovery.CONTEXT_KEY))) {
             return toolContext;
         }
         LinkedHashMap<String, Object> safe = new LinkedHashMap<>(toolContext.getContext());
         safe.remove(ToolContext.TOOL_CALL_HISTORY);
         safe.remove(StreamingActivityTracker.CONTEXT_KEY);
-        log.debug("[MeteredToolCallback] stripped TOOL_CALL_HISTORY from MCP metadata tool={}", safeName());
+        safe.remove(ArtifactToolRecovery.CONTEXT_KEY);
+        log.debug("[MeteredToolCallback] stripped private runtime context from MCP metadata tool={}", safeName());
         return new ToolContext(safe);
     }
 
@@ -294,8 +321,10 @@ public class MeteredToolCallback implements ToolCallback {
     }
 
     private String invoke(String name, String originalInput, String effectiveInput,
-                          String sessionId, String stepLabel, String runId, Invocation inv) {
+                          String sessionId, String stepLabel, String runId, java.util.Map<String, Object> resultScope,
+                          RunBudgetRegistry.State budget, Invocation inv) {
         StreamingActivityTracker.Activity activity = StreamingActivityTracker.current();
+        if (budget != null) budget.checkActive();
         if (activity != null) activity.markToolActivity();
         long start = System.currentTimeMillis();
         boolean success = false;
@@ -323,6 +352,7 @@ public class MeteredToolCallback implements ToolCallback {
         String rawResultForTrace = null;
         // Evidence Map stores exactly what the model received after normalization, not the provider's raw envelope.
         String returnedResultForEvidence = null;
+        boolean originalEvidenceHandled = false;
         try {
             if (isBlockedGithubWriteTool(name)) {
                 if (progress != null) {
@@ -337,6 +367,14 @@ public class MeteredToolCallback implements ToolCallback {
                 returnedResultForEvidence = result;
                 success = true;
                 progressStatus = STATUS_BLOCKED;
+                return result;
+            }
+
+            if (resultScope != null && Boolean.TRUE.equals(resultScope.get(DEBUG_READ_ONLY_KEY)) && !debugReadOnlyAllowed(name, delegate.get())) {
+                String result = debugBlockedResult();
+                rawResultChars = returnedResultChars = result.length();
+                rawResultForTrace = returnedResultForEvidence = result;
+                success = true; progressStatus = STATUS_BLOCKED;
                 return result;
             }
 
@@ -377,21 +415,32 @@ public class MeteredToolCallback implements ToolCallback {
 
             // 方案A：同 mcpId 串行，防并行 step 并发写同一条 MCP 连接（高德 400 "Sending message failed"）
             String rawResult;
-            java.util.concurrent.locks.ReentrantLock sendLock =
-                    (mcpId != null && !mcpId.isBlank()) ? mcpSendLock(mcpId) : null;
-            if (sendLock != null) acquireSendLock(sendLock, activity);
-            try {
-                StreamingActivityTracker.checkActive(activity);
-                refreshDelegateFromRegistry(name);
-                rawResult = runInvocation(name, inv);
-            } finally {
-                if (sendLock != null) sendLock.unlock();
+            // Real tool work has a finite deadline of its own. Neither connection queueing
+            // nor a slow MCP response is a silent model; no synthetic heartbeats are emitted.
+            try (StreamingActivityTracker.Scope toolPhase = activity == null ? () -> {} : activity.executingTool(name)) {
+                java.util.concurrent.locks.ReentrantLock sendLock =
+                        (mcpId != null && !mcpId.isBlank()) ? mcpSendLock(mcpId) : null;
+                if (sendLock != null) acquireSendLock(sendLock, activity, budget);
+                try {
+                    StreamingActivityTracker.checkActive(activity);
+                    rawResult = runInvocation(name, budget, resultScope != null && Boolean.TRUE.equals(resultScope.get(DEBUG_READ_ONLY_KEY)), inv);
+                } finally {
+                    if (sendLock != null) sendLock.unlock();
+                }
             }
             rawResultChars = rawResult == null ? 0 : rawResult.length();
             rawResultForTrace = rawResult;
+            ToolResultReferenceService resultService = this.toolResultReferenceService;
+            ToolResultReferenceService.StoredResult stored = null;
+            if (resultService != null) {
+                originalEvidenceHandled = true;
+                stored = resultService.store(resultScope, callId, name, effectiveInput, rawResult,
+                        stepLabel, System.currentTimeMillis() - progressStartedAt);
+            }
             String routeSummary = AmapRouteResultCompactor.compact(name, rawResult);
             boolean routeCompacted = !stringEquals(routeSummary, rawResult);
             String result = normalizeToolResult(name, routeSummary);
+            if (resultService != null) result = resultService.project(name, rawResult, result, stored);
             returnedResultChars = result == null ? 0 : result.length();
             // Route summaries drop geometry/intermediate stops only from the model context.
             // Preserve the full source result in the existing evidence/resultRef store.
@@ -401,6 +450,13 @@ public class MeteredToolCallback implements ToolCallback {
             progressStatus = STATUS_SUCCESS;
             return result;
         } catch (RuntimeException e) {
+            if (e instanceof DebugToolBlockedException) {
+                String result = debugBlockedResult();
+                rawResultChars = returnedResultChars = result.length();
+                rawResultForTrace = returnedResultForEvidence = result;
+                success = true; progressStatus = STATUS_BLOCKED;
+                return result;
+            }
             failure = e;
             progressStatus = STATUS_ERROR;
             StreamingActivityTracker.rethrowCancellation(e);
@@ -468,8 +524,11 @@ public class MeteredToolCallback implements ToolCallback {
                     progress.emitEnd(sessionId, name, progressStatus, progressLatency,
                             returnedResultChars >= 0 ? returnedResultChars : 0, stepLabel, callId, rawResultForTrace);
                 }
-                progress.recordEvidence(sessionId, name, effectiveInput, returnedResultForEvidence,
-                        progressStatus, progressLatency, rawResultChars, stepLabel, callId);
+                // Never overwrite the original with the model's projection, or bypass a storage limit.
+                if (!originalEvidenceHandled) {
+                    progress.recordEvidence(sessionId, name, effectiveInput, returnedResultForEvidence,
+                            progressStatus, progressLatency, rawResultChars, stepLabel, callId);
+                }
             }
             // P0（Codex #2）工具调用事实摘要台账：记本轮真实调用（工具名/状态/返回字符数/形态，不含返回内容），
             // 供 Auto Step3 质检确认"确实调过工具/有返回"，消除"查无工具记录→反咬编造"。
@@ -497,10 +556,11 @@ public class MeteredToolCallback implements ToolCallback {
     }
 
     private static void acquireSendLock(java.util.concurrent.locks.ReentrantLock lock,
-                                        StreamingActivityTracker.Activity activity) {
+                                        StreamingActivityTracker.Activity activity, RunBudgetRegistry.State budget) {
         try {
             while (true) {
                 StreamingActivityTracker.checkActive(activity);
+                if (budget != null) budget.checkActive();
                 if (lock.tryLock(100, java.util.concurrent.TimeUnit.MILLISECONDS)) return;
             }
         } catch (InterruptedException interrupted) {
@@ -518,29 +578,52 @@ public class MeteredToolCallback implements ToolCallback {
             throw new IllegalStateException("MCP tool is no longer available; reload the Agent configuration");
         }
         if (current != null && current != delegate.get()) {
-            delegate.set(current);
+            replaceDelegate(current);
             log.debug("mcp.tool.call REFRESH_DELEGATE tool={} mcpId={}", name, mcpId);
         }
     }
 
-    private String runInvocation(String name, Invocation inv) {
+    private static String debugBlockedResult() {
+        return "{\"ok\":false,\"error\":\"DEBUG_TOOL_BLOCKED\",\"message\":\"节点调试仅允许明确声明只读且不需审批的工具；该工具未执行\"}";
+    }
+
+    /** Reconnection may replace a transport, but must preserve the contract shown to the model. */
+    private void replaceDelegate(ToolCallback current) {
+        ToolDefinition definition = captureDefinition(current);
+        if (cachedDefinition == null || definition == null
+                || !java.util.Objects.equals(originalToolName, McpClientRegistry.originalToolName(current))
+                || !java.util.Objects.equals(cachedDefinition.inputSchema(), definition.inputSchema())) {
+            throw new IllegalStateException("MCP tool definition changed; reload its capabilities before calling");
+        }
+        delegate.set(current);
+    }
+
+    private static final class DebugToolBlockedException extends IllegalStateException {}
+
+    private boolean debugReadOnlyAllowed(String name, ToolCallback target) {
+        HumanApprovalGate gate = humanApprovalGate;
+        if (gate == null || gate.getHighRiskToolRegistry() == null || gate.getHighRiskToolRegistry().isHighRisk(name)) return false;
+        return target.getToolMetadata() instanceof McpToolCallMetadata metadata
+                && Boolean.TRUE.equals(metadata.readOnlyHint()) && !Boolean.TRUE.equals(metadata.destructiveHint());
+    }
+
+    private String runInvocation(String name, RunBudgetRegistry.State budget, boolean debugReadOnly, Invocation inv) {
         StreamingActivityTracker.Activity activity = StreamingActivityTracker.current();
-        Invocation original = inv;
-        inv = () -> {
-            StreamingActivityTracker.checkActive(activity);
-            String result = original.run();
-            StreamingActivityTracker.checkActive(activity);
-            return result;
-        };
         int maxAttempts = mcpToolCallMaxAttempts;
-        boolean firstAttemptFailed = false;
+        String recovery = "retry";
+        boolean retriedAfterLiveProbe = false;
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-            try {
-                String result = inv.run();
-                if (firstAttemptFailed) {
-                    metrics.recordRecovered(name, "retry");
-                }
-                // 调用成功，记录时间戳（用于冷连接探活判断）
+            StreamingActivityTracker.checkActive(activity);
+            ToolCallback target = delegate.get();
+            try (McpClientRegistry.CallLease ignored=registry==null||mcpId==null?null:registry.borrowCall(mcpId)) {
+                if(ignored!=null||attempt==1)refreshDelegateFromRegistry(name);
+                target=delegate.get();
+                if (debugReadOnly && !debugReadOnlyAllowed(name, target)) throw new DebugToolBlockedException();
+                if (budget != null) budget.reserveTool();
+                String result = inv.run(target);
+                StreamingActivityTracker.checkActive(activity);
+                if (budget != null) budget.checkActive();
+                if (attempt > 1) metrics.recordRecovered(name, recovery);
                 if (registry != null && mcpId != null) {
                     registry.recordSuccess(mcpId);
                 }
@@ -548,116 +631,87 @@ public class MeteredToolCallback implements ToolCallback {
             } catch (RuntimeException e) {
                 StreamingActivityTracker.rethrowCancellation(e);
                 StreamingActivityTracker.checkActive(activity);
-                if (attempt == 1 && !firstAttemptFailed) {
-                    firstAttemptFailed = true;
+                if (attempt == 1) {
                     metrics.recordFirstAttemptFailure(name, classifyInitialFailure(e));
                 }
-                // 超时 → 探活判断：连接活着先重试，连接死了才重建。
-                // 历史背景：MCP SDK 0.10.0 时 sendMessage 收到 400「只打日志不抛异常」，message endpoint
-                // 失效但 SSE 流仍活着，只能靠「下一次调用超时 + 探活」间接发现——这套探活兜底就是为它写的。
-                // 1.1.0(mcp 0.16.0)起 400 会直接抛 ToolExecutionException（已在 isDeadClientError 归类重建），
-                // 所以本超时分支现在主要兜「工具真的慢」的 TimeoutException：探活活着=慢服务先重试，探活死了才重建。
-                if (isTimeoutError(e) && registry != null) {
-                    boolean alive = (mcpId == null ? registry.probeAfterTimeout(name) : registry.probeAfterTimeout(mcpId, name));
-                    metrics.recordTimeoutProbe(name, alive);
-                    if (alive) {
-                        // 连接活着（可能是工具确实慢），先用当前连接重试一次
-                        log.info("mcp.tool.call TIMEOUT_BUT_ALIVE tool={} attempt={}/{}, retrying with current connection", name, attempt, maxAttempts);
-                        try {
-                            String result = inv.run();
-                            metrics.recordRecovered(name, "timeout_probe_alive_retry");
-                            if (mcpId != null) {
-                                registry.recordSuccess(mcpId);
-                            }
-                            return result;
-                        } catch (RuntimeException retryEx) {
-                            StreamingActivityTracker.rethrowCancellation(retryEx);
-                            StreamingActivityTracker.checkActive(activity);
-                            // 重试也失败了，需要按 timeout 自愈路径重建连接
-                            log.warn("mcp.tool.call RETRY_FAILED_AFTER_PROBE_ALIVE tool={}, will reconnect after timeout", name);
-                            ToolCallback fresh = (mcpId == null ? registry.reconnectAfterTimeout(name) : registry.reconnectAfterTimeout(mcpId, name));
-                            if (fresh != null) {
-                                delegate.set(fresh);
-                                log.info("mcp.tool.call RECONNECTED_AFTER_TIMEOUT tool={}", name);
-                                try {
-                                    String result = inv.run();
-                                    metrics.recordRecovered(name, "timeout_probe_alive_reconnect");
-                                    if (mcpId != null) {
-                                        registry.recordSuccess(mcpId);
-                                    }
-                                    return result;
-                                } catch (RuntimeException e3) {
-                                    StreamingActivityTracker.rethrowCancellation(e3);
-                                    StreamingActivityTracker.checkActive(activity);
-                                    log.warn("mcp.tool.call RETRY_AFTER_RECONNECT tool={} error={}", name, summarizeFailure(e3));
-                                    throw e3;
-                                }
-                            }
-                            throw e;
-                        }
-                    } else {
-                        // 连接已死，直接重建
-                        log.warn("mcp.tool.call TIMEOUT_DEAD tool={} attempt={}/{}", name, attempt, maxAttempts);
-                        ToolCallback fresh = (mcpId == null ? registry.reconnectAfterTimeout(name) : registry.reconnectAfterTimeout(mcpId, name));
-                        if (fresh != null) {
-                            delegate.set(fresh);
-                            log.info("mcp.tool.call RECONNECTED_AFTER_TIMEOUT tool={}", name);
-                            try {
-                                String result = inv.run();
-                                metrics.recordRecovered(name, "timeout_probe_dead_reconnect");
-                                if (mcpId != null) {
-                                    registry.recordSuccess(mcpId);
-                                }
-                                return result;
-                            } catch (RuntimeException e2) {
-                                StreamingActivityTracker.rethrowCancellation(e2);
-                                StreamingActivityTracker.checkActive(activity);
-                                log.warn("mcp.tool.call RETRY_AFTER_RECONNECT tool={} error={}", name, summarizeFailure(e2));
-                                throw e2;
-                            }
-                        }
-                        throw e;
-                    }
-                }
-                // 死客户端（非超时类，如 Connection reset / 400 发送失败） → 直接重建当前 mcpId，并用新 callback 重试一次。
-                if (isDeadClientError(e) && registry != null) {
-                    log.warn("mcp.tool.call DEAD_CLIENT tool={} attempt={}/{} error={}",
-                            name, attempt, maxAttempts, summarizeFailure(e));
+                boolean sessionRejected = isConfirmedSessionRejection(e);
+                boolean transientFailure = sessionRejected || isTimeoutError(e) || isDeadClientError(e) || isRetryableMcpError(e);
+                if (!transientFailure) throw e;
+                // A lost response does not prove that a write was not committed. Approval of the
+                // original call also does not authorize an automatic duplicate of an unknown operation.
+                // A structured invalid-session rejection is different: the server did not accept
+                // this request. This exception applies only to that response, never to a later timeout.
+                if (!sessionRejected && !retrySafe(target)) throw new ToolOutcomeUnknownException(name, e);
+                // Every inv.run(), including calls after reconnect, consumes the same attempt budget.
+                if (attempt >= maxAttempts) throw e;
+
+                if (sessionRejected) {
+                    // Re-sending to the rejected session cannot recover it. Do not retry without a registry.
+                    if (registry == null) throw e;
                     ToolCallback fresh = mcpId == null ? registry.forceReconnect(name) : registry.forceReconnect(mcpId, name);
-                    if (fresh != null) {
-                        delegate.set(fresh);
-                        log.info("mcp.tool.call RECONNECTED tool={}, retrying with fresh delegate", name);
-                        try {
-                            String result = inv.run();
-                            metrics.recordRecovered(name, "dead_client_reconnect");
-                            if (mcpId != null) {
-                                registry.recordSuccess(mcpId);
-                            }
-                            return result;
-                        } catch (RuntimeException e2) {
-                            StreamingActivityTracker.rethrowCancellation(e2);
-                            StreamingActivityTracker.checkActive(activity);
-                            log.warn("mcp.tool.call RETRY_AFTER_RECONNECT tool={} error={}", name, summarizeFailure(e2));
-                            throw e2;
-                        }
+                    if (fresh == null) throw e;
+                    replaceDelegate(fresh);
+                    recovery = "session_rejected_reconnect";
+                } else if (isTimeoutError(e) && registry != null) {
+                    boolean alive = false;
+                    if (!retriedAfterLiveProbe) {
+                        alive = mcpId == null ? registry.probeAfterTimeout(name) : registry.probeAfterTimeout(mcpId, name);
+                        metrics.recordTimeoutProbe(name, alive);
                     }
-                    throw e;
-                }
-                // 瞬态错误 → 同客户端重试
-                if (attempt < maxAttempts && isRetryableMcpError(e)) {
-                    log.warn("mcp.tool.call RETRY tool={} attempt={}/{} error={}",
-                            name, attempt, maxAttempts, summarizeFailure(e));
-                    metrics.recordRetry(name, attempt);
-                    try { Thread.sleep(mcpToolCallRetryDelayMs * attempt); } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        throw new java.util.concurrent.CancellationException("Interrupted during MCP retry backoff");
+                    StreamingActivityTracker.checkActive(activity);
+                    if (alive) {
+                        retriedAfterLiveProbe = true;
+                        recovery = "timeout_probe_alive_retry";
+                    } else {
+                        ToolCallback fresh = mcpId == null ? registry.reconnectAfterTimeout(name)
+                                : registry.reconnectAfterTimeout(mcpId, name);
+                        if (fresh == null) throw e;
+                        replaceDelegate(fresh);
+                        recovery = retriedAfterLiveProbe ? "timeout_probe_alive_reconnect" : "timeout_probe_dead_reconnect";
                     }
-                    continue;
+                } else if (isDeadClientError(e) && registry != null) {
+                    ToolCallback fresh = mcpId == null ? registry.forceReconnect(name) : registry.forceReconnect(mcpId, name);
+                    if (fresh == null) throw e;
+                    replaceDelegate(fresh);
+                    recovery = "dead_client_reconnect";
+                } else {
+                    retryBackoff(activity, budget, mcpToolCallRetryDelayMs * attempt);
+                    recovery = "retry";
                 }
-                throw e;
+                StreamingActivityTracker.checkActive(activity);
+                // Reconnection may expose different annotations; never retry through weaker metadata.
+                if (!sessionRejected && !retrySafe(delegate.get())) throw new ToolOutcomeUnknownException(name, e);
+                log.info("mcp.tool.call RETRY tool={} completedAttempts={} maxAttempts={} recovery={}",
+                        name, attempt, maxAttempts, recovery);
+                metrics.recordRetry(name, attempt);
             }
         }
         throw new IllegalStateException("unreachable");
+    }
+
+    private boolean retrySafe(ToolCallback target) {
+        return target.getToolMetadata() instanceof McpToolCallMetadata metadata && metadata.retrySafe();
+    }
+
+    private static void retryBackoff(StreamingActivityTracker.Activity activity, RunBudgetRegistry.State budget, long delayMs) {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(delayMs);
+        try {
+            while (System.nanoTime() < deadline) {
+                StreamingActivityTracker.checkActive(activity);
+                if (budget != null) budget.checkActive();
+                long remaining = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+                Thread.sleep(Math.max(1, Math.min(100, remaining)));
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new java.util.concurrent.CancellationException("Interrupted during MCP retry backoff");
+        }
+    }
+
+    public static final class ToolOutcomeUnknownException extends IllegalStateException {
+        public ToolOutcomeUnknownException(String toolName, RuntimeException cause) {
+            super("工具 " + toolName + " 的执行结果未确认，无法确认重复调用安全，已停止自动重试。请先核对外部状态，勿重复提交。", cause);
+        }
     }
 
     private String normalizeToolInput(String name, String toolInput) {
@@ -962,11 +1016,73 @@ public class MeteredToolCallback implements ToolCallback {
         if (e == null) {
             return "unknown";
         }
-        String message = e.getMessage();
-        if (message == null || message.isBlank()) {
-            message = e.getClass().getSimpleName();
+        String cause = safeFailureCause(e);
+        return e instanceof ToolOutcomeUnknownException
+                ? e.getClass().getSimpleName() + ": " + e.getMessage() + " 原因：" + cause
+                : e.getClass().getSimpleName() + ": " + cause;
+    }
+
+    /** Match the observed transport rejection, not a tool name, a bare HTTP 400, or text in a stack trace. */
+    private boolean isConfirmedSessionRejection(Throwable failure) {
+        Set<Throwable> seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        for (Throwable current = failure; current != null && seen.size() < 16 && seen.add(current); current = current.getCause()) {
+            String message = current.getMessage();
+            if (message == null || !message.startsWith(SESSION_REJECTION_PREFIX)) continue;
+            JSONObject body = transportErrorBody(message.substring(SESSION_REJECTION_PREFIX.length()));
+            if (body != null && SESSION_REJECTION_MESSAGE.equals(body.get("message"))
+                    && body.get("jsonRpcError") == null) return true;
         }
-        return e.getClass().getSimpleName() + ": " + message;
+        return false;
+    }
+
+    private JSONObject transportErrorBody(String text) {
+        if (text == null || text.length() > 64_000) return null;
+        String body = text.trim();
+        if (!body.startsWith("{") || !body.endsWith("}")) return null;
+        try {
+            // Provider error envelopes are data; never process Fastjson special keys such as @type.
+            return JSON.parseObject(body, com.alibaba.fastjson.parser.Feature.DisableSpecialKeyDetect);
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    /** Keep the underlying reason in model/SSE/log diagnostics, without transport envelopes or credentials. */
+    private String safeFailureCause(RuntimeException failure) {
+        if (isConfirmedSessionRejection(failure)) {
+            return "MCP 会话已失效，服务器拒绝了本次请求（HTTP 400；" + SESSION_REJECTION_MESSAGE + "）";
+        }
+        Throwable cause = failure;
+        Set<Throwable> seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        while (cause.getCause() != null && seen.size() < 16 && seen.add(cause) && !seen.contains(cause.getCause())) {
+            cause = cause.getCause();
+        }
+        String message = cause.getMessage();
+        if (message == null || message.isBlank()) return cause.getClass().getSimpleName();
+        String transportPrefix = "Sending message failed with a non-OK HTTP code: ";
+        if (message.startsWith(transportPrefix)) {
+            String response = message.substring(transportPrefix.length());
+            int separator = response.indexOf(" - ");
+            String status = separator < 0 ? response : response.substring(0, separator);
+            // Never expose the server's serialized stackTrace/cause/request from an error envelope.
+            if (status.matches("[1-5][0-9]{2}")) {
+                JSONObject body = separator < 0 ? null : transportErrorBody(response.substring(separator + 3));
+                Object reason = body == null ? null : body.get("message");
+                message = "MCP HTTP " + status + (reason instanceof String text ? ": " + text : " 请求失败");
+            } else {
+                message = "MCP 传输请求失败";
+            }
+        }
+        return cause.getClass().getSimpleName() + ": " + sanitizeFailureMessage(message);
+    }
+
+    private String sanitizeFailureMessage(String message) {
+        String safe = message
+                .replaceAll("(?i)https?://[^\\s\\\"'<>]+", "[redacted-url]")
+                .replaceAll("(?i)\\b(Bearer|Basic)\\s+[^\\s,;\\\"']+", "$1 [redacted]")
+                .replaceAll("(?i)([\\\"']?(?:authorization|proxy-authorization|api[-_]?key|access[-_]?token|refresh[-_]?token|token|password|passwd|secret|client[-_]?secret|session[-_]?id|cookie|set-cookie)[\\\"']?\\s*[:=]\\s*)(?:\\\"(?:\\\\.|[^\\\"\\\\])*\\\"|'(?:\\\\.|[^'\\\\])*'|[^\\s,;&}]+)", "$1[redacted]")
+                .replaceAll("[\\p{Cntrl}]", " ");
+        return safe.length() <= 500 ? safe : safe.substring(0, 500) + "...";
     }
 
     private String classifyInitialFailure(RuntimeException e) {
@@ -986,7 +1102,7 @@ public class MeteredToolCallback implements ToolCallback {
     private boolean isTimeoutError(RuntimeException e) {
         Throwable t = e;
         while (t != null) {
-            if (t instanceof java.util.concurrent.TimeoutException) {
+            if (t instanceof java.util.concurrent.TimeoutException || t instanceof SocketTimeoutException) {
                 return true;
             }
             t = t.getCause();
@@ -1098,12 +1214,14 @@ public class MeteredToolCallback implements ToolCallback {
     }
 
     private String toolErrorResult(String name, RuntimeException e) {
-        String message = e.getMessage();
-        if (message == null || message.isBlank()) {
-            message = e.getClass().getSimpleName();
+        String cause = safeFailureCause(e);
+        if (e instanceof ToolOutcomeUnknownException) {
+            return "{\"ok\":false,\"tool\":\"" + jsonEscape(name)
+                    + "\",\"outcome\":\"unknown\",\"retryAllowed\":false,\"error\":\"" + jsonEscape(cause)
+                    + "\",\"message\":\"" + jsonEscape(e.getMessage()) + "\"}";
         }
         return "{\"ok\":false,\"tool\":\"" + jsonEscape(name)
-                + "\",\"error\":\"" + jsonEscape(message)
+                + "\",\"error\":\"" + jsonEscape(cause)
                 + "\",\"message\":\"工具调用失败。请不要卡在该工具上，可基于已有信息继续回答，或尝试其它真实可用路径。\"}";
     }
 
@@ -1125,6 +1243,6 @@ public class MeteredToolCallback implements ToolCallback {
 
     @FunctionalInterface
     private interface Invocation {
-        String run();
+        String run(ToolCallback target);
     }
 }

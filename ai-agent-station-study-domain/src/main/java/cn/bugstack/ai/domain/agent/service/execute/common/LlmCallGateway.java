@@ -49,6 +49,7 @@ public class LlmCallGateway {
      */
     @SuppressWarnings("unused")
     public ChatResponse fallback(Supplier<ChatClient.CallResponseSpec> specSupplier, Throwable t) {
+        StreamingActivityTracker.rethrowCancellation(t);
         if (t instanceof CallNotPermittedException) {
             log.warn("LLM 调用被熔断器拒绝(CB OPEN)，进入降级；cause={}", t.getMessage());
         } else {

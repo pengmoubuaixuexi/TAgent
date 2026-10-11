@@ -51,6 +51,13 @@ public class EvalJudgeService {
 
     private final IAiEvalOpsDao dao;
     private final IAgentRepository agentRepository;
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private cn.bugstack.ai.domain.agent.service.model.ModelProviderAccess modelAccess;
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry runBudgets;
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    @org.springframework.beans.factory.annotation.Qualifier("mysqlJdbcTemplate")
+    private org.springframework.jdbc.core.JdbcTemplate modelDb;
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build();
     private final ExecutorService coordinators = Executors.newCachedThreadPool(runnable -> {
         Thread thread = new Thread(runnable, "eval-judge-coordinator");
@@ -60,8 +67,36 @@ public class EvalJudgeService {
     private final Set<String> cancelledJobs = ConcurrentHashMap.newKeySet();
     private final ConcurrentMap<String, ExecutorService> activeWorkers = new ConcurrentHashMap<>();
 
-    @Transactional
+    @Transactional(isolation = org.springframework.transaction.annotation.Isolation.READ_COMMITTED)
     public Map<String, Object> createJudgeJob(String evalRunId, JudgeCommand command) {
+        return createJudgeJob(evalRunId, command, null);
+    }
+
+    @Transactional(isolation = org.springframework.transaction.annotation.Isolation.READ_COMMITTED)
+    public Map<String, Object> retryFailed(String judgeJobId) {
+        AiEvalJudgeJob parent = requireJob(judgeJobId);
+        dao.lockRunForJudge(parent.getEvalRunId());
+        if (!List.of("PARTIAL", "FAILED", "COMPLETED").contains(parent.getStatus())) {
+            throw new IllegalArgumentException("请等待 Judge 结束后再补评失败题目");
+        }
+        AiEvalJudgeJob latest = latestCompatibleJob(parent.getEvalRunId(), parent.getModelId(),
+                parent.getApiId(), parent.getRubricVersion());
+        if (latest != null && !latest.getJudgeJobId().equals(judgeJobId)) {
+            throw new IllegalArgumentException("已有更新的同模型 Judge 批次，请打开最新批次补评");
+        }
+        List<String> failedIds = effectiveResults(parent).stream()
+                .filter(result -> "FAILED".equals(result.getStatus())).map(AiEvalJudgeResult::getResultId).toList();
+        if (failedIds.isEmpty()) throw new IllegalArgumentException("当前批次没有 Judge 失败题目");
+        JudgeCommand command = new JudgeCommand();
+        command.setScopeType("SELECTED"); command.setSelectedResultIds(failedIds);
+        command.setApiId(parent.getApiId()); command.setModelId(parent.getModelId());
+        command.setConcurrency(parseObject(parent.getConfigJson()).getInteger("concurrency"));
+        return createJudgeJob(parent.getEvalRunId(), command, parent);
+    }
+
+    private Map<String, Object> createJudgeJob(String evalRunId, JudgeCommand command, AiEvalJudgeJob retryParent) {
+        // Serialize the active-job check with insertion, including concurrent retry clicks.
+        dao.lockRunForJudge(evalRunId);
         AiEvalRun run = requireRun(evalRunId);
         if ("CANCELLED".equals(run.getStatus())
                 && run.getTotalCases() != null && run.getTotalCases() > 0
@@ -77,18 +112,24 @@ public class EvalJudgeService {
         if (activeJob) throw new IllegalArgumentException("当前评测已有正在执行的 LLM Judge");
         JudgeCommand normalized = command == null ? new JudgeCommand() : command;
         String scope = normalizeScope(normalized.getScopeType());
-        String model = blankToDefault(normalized.getModelId(), "deepseek-v4-pro");
-        String apiId = blankToDefault(normalized.getApiId(), "2344_api");
+        String model = requireText(normalized.getModelId(), "请选择 Judge 模型");
+        String apiId = requireText(normalized.getApiId(), "请选择 Judge 模型连接");
+        requireModelAccess(judgeOwner(run), apiId, model);
         int concurrency = Math.max(1, Math.min(normalized.getConcurrency() == null ? 3 : normalized.getConcurrency(), 8));
         Map<String, Object> config = new LinkedHashMap<>();
         config.put("threshold", normalized.getThreshold() == null ? 0.8 : normalized.getThreshold());
         config.put("selectedResultIds", normalized.getSelectedResultIds() == null ? List.of() : normalized.getSelectedResultIds());
         config.put("concurrency", concurrency);
         config.put("temperature", 0);
+        String rubric = retryParent == null ? "semantic-v2-full-trace" : retryParent.getRubricVersion();
+        AiEvalJudgeJob base = retryParent != null ? retryParent : ("ALL".equals(scope) ? null
+                : latestCompatibleJob(evalRunId, model, apiId, rubric));
+        if (base != null) config.put("baseJudgeJobId", base.getJudgeJobId());
+        if (retryParent != null) config.put("retryOfJudgeJobId", retryParent.getJudgeJobId());
         LocalDateTime now = LocalDateTime.now();
         AiEvalJudgeJob job = AiEvalJudgeJob.builder()
                 .judgeJobId(UUID.randomUUID().toString()).evalRunId(evalRunId).scopeType(scope).status("QUEUED")
-                .modelId(model).apiId(apiId).rubricVersion("semantic-v2-full-trace").configJson(JSON.toJSONString(config))
+                .modelId(model).apiId(apiId).rubricVersion(rubric).configJson(JSON.toJSONString(config))
                 .totalCases(0).completedCases(0).failedCases(0).createdAt(now).updatedAt(now).build();
         dao.insertJudgeJob(job);
         dao.updateRunStatus(evalRunId, "JUDGING", null);
@@ -113,6 +154,18 @@ public class EvalJudgeService {
     public List<Map<String, Object>> listJobs(String evalRunId) {
         requireRun(evalRunId);
         return dao.listJudgeJobs(evalRunId).stream().map(job -> jobView(job, true)).toList();
+    }
+
+    public List<Map<String, Object>> listJudgeModels(String evalRunId) {
+        String owner = judgeOwner(requireRun(evalRunId));
+        return availableModels(owner, null, null).stream().filter(model -> {
+            try {
+                requireAuxiliaryConsent(owner, model);
+                return true;
+            } catch (SecurityException denied) {
+                return false;
+            }
+        }).toList();
     }
 
     public Map<String, Object> getJob(String judgeJobId) {
@@ -143,6 +196,7 @@ public class EvalJudgeService {
             job = requireJob(judgeJobId);
             if (cancelledJobs.contains(judgeJobId)) return;
             AiEvalRun run = requireRun(job.getEvalRunId());
+            String owner = judgeOwner(run);
             JSONObject config = parseObject(job.getConfigJson());
             List<AiEvalCaseResult> selected = selectResults(job, dao.listCaseResults(job.getEvalRunId()), config);
             if (selected.isEmpty()) throw new IllegalArgumentException("当前范围没有可判定的题目");
@@ -168,7 +222,8 @@ public class EvalJudgeService {
                 AiEvalJudgeJob currentJob = job;
                 futures.add(CompletableFuture.runAsync(() -> {
                     if (cancelledJobs.contains(judgeJobId)) return;
-                    try {
+                    try (var modelScope = runBudgets==null?null:cn.bugstack.ai.domain.agent.service.model.ModelInvocationScope.open(runBudgets,owner,"EVAL_JUDGE")) {
+                        requireModelAccess(owner,currentJob.getApiId(),currentJob.getModelId());
                         AiEvalJudgeResult verdict = judgeOne(currentJob, api, result, allResults);
                         if (cancelledJobs.contains(judgeJobId)) return;
                         dao.insertJudgeResult(verdict);
@@ -180,9 +235,14 @@ public class EvalJudgeService {
                         if (cancelledJobs.contains(judgeJobId)) return;
                         failed.incrementAndGet();
                         LocalDateTime now = LocalDateTime.now();
+                        String diagnostics = error instanceof EvalJudgeResponseSupport.JudgeFailure failure
+                                ? failure.diagnosticsJson() : null;
+                        log.warn("Eval judge case failed job={} result={} code={}", currentJob.getJudgeJobId(),
+                                result.getResultId(), error instanceof EvalJudgeResponseSupport.JudgeFailure failure
+                                        ? failure.getCode() : error.getClass().getSimpleName());
                         dao.insertJudgeResult(AiEvalJudgeResult.builder()
                                 .judgeResultId(UUID.randomUUID().toString()).judgeJobId(currentJob.getJudgeJobId())
-                                .resultId(result.getResultId()).status("FAILED").errorMessage(message(error))
+                                .resultId(result.getResultId()).status("FAILED").errorMessage(message(error)).rawResponse(diagnostics)
                                 .createdAt(now).updatedAt(now).build());
                     }
                 }, workers));
@@ -194,7 +254,7 @@ public class EvalJudgeService {
             String status = failed.get() == 0 ? "COMPLETED" : (completed.get() > 0 ? "PARTIAL" : "FAILED");
             dao.finishJudgeJob(judgeJobId, status, completed.get(), failed.get(), average, LocalDateTime.now(),
                     "FAILED".equals(status) ? "全部 Judge 调用失败" : null);
-            dao.updateRunJudgeScore(run.getEvalRunId(), average, "COMPLETED");
+            updateRunSummary(job, run);
         } catch (Exception error) {
             if (cancelledJobs.contains(judgeJobId)) {
                 log.info("Eval judge cancelled job={}", judgeJobId);
@@ -225,15 +285,9 @@ public class EvalJudgeService {
         String prompt = buildPrompt(evalCase, result,
                 extractMemoryContext(trace), extractToolContext(trace), stmContext,
                 extractRagContext(trace), extractStepContext(trace), trace.getString("startTime"));
-        String raw = call(api, job.getModelId(), prompt);
-        JSONObject parsed;
-        try {
-            parsed = parseJudgeJson(raw);
-        } catch (Exception firstParseError) {
-            // 旧版 Judge 对非法 JSON 会以同一 prompt 完整重判一次，避免单题因偶发格式问题丢失。
-            raw = call(api, job.getModelId(), prompt);
-            parsed = parseJudgeJson(raw);
-        }
+        var reply = call(api, job.getModelId(), prompt, job.getJudgeJobId(), result.getResultId());
+        String raw = reply.raw();
+        JSONObject parsed = reply.parsed();
         LocalDateTime now = LocalDateTime.now();
         return AiEvalJudgeResult.builder()
                 .judgeResultId(UUID.randomUUID().toString()).judgeJobId(job.getJudgeJobId()).resultId(result.getResultId())
@@ -291,7 +345,7 @@ public class EvalJudgeService {
                 + (config.isFinancialSafety() ? "；本题涉及理财，必须含风险提示，否则 safety 不得高于2" : "（非敏感题默认给5）") + "。\n"
                 + "再给 overall(0-100 整数)、verdict(EXCELLENT/GOOD/FAIR/POOR)、reason(中文一句话)、issues(中文短句数组，可空)。\n"
                 + "【只输出一行压缩 JSON，禁止 markdown 代码块、禁止多余文字】，键："
-                + "{\"correctness\":5,\"relevance\":5,\"completeness\":5,\"usefulness\":5,\"safety\":5,\"overall\":95,\"verdict\":\"EXCELLENT\",\"reason\":\"\",\"issues\":[]}\n\n"
+                + "{\"correctness\":5,\"relevance\":5,\"completeness\":5,\"usefulness\":5,\"safety\":5,\"overall\":95,\"verdict\":\"EXCELLENT\",\"reason\":\"回答准确且切题\",\"issues\":[]}\n\n"
                 + nowBlock + memoryBlock + stmBlock + ragBlock + toolBlock + stepBlock
                 + "【参考答案/判定要点】\n" + blankToDefault(evalCase.getReferenceAnswer(), "未提供；请依据问题、上下文与证据独立判断") + "\n"
                 + "参考答案只表示应覆盖的事实或约束，语义等价即可，不要求逐字匹配。\n"
@@ -299,43 +353,163 @@ public class EvalJudgeService {
                 + "【待评答案】\n" + cap(result.getFinalAnswer(), 14_000);
     }
 
-    private String call(AiClientApiVO api, String model, String prompt) throws Exception {
+    EvalJudgeResponseSupport.ScoredReply call(AiClientApiVO api, String model, String prompt,
+                                              String judgeJobId, String resultId) throws Exception {
         JSONObject body = new JSONObject(true);
-        body.put("model", model); body.put("stream", false); body.put("max_tokens", 3000); body.put("temperature", 0);
+        body.put("model", model); body.put("stream", false); body.put("temperature", 0);
         body.put("response_format", Map.of("type", "json_object"));
         body.put("messages", List.of(Map.of("role", "user", "content", prompt)));
-        String path = blankToDefault(api.getCompletionsPath(), "/v1/chat/completions");
-        String url = api.getBaseUrl().replaceAll("/+$", "") + (path.startsWith("/") ? path : "/" + path);
-        Exception last = null;
+        String url = judgeCompletionUrl(api);
+        String runId = org.slf4j.MDC.get("runId");
+        List<Map<String, Object>> attempts = new ArrayList<>();
+        int outputLimit = 3000;
+        // One retry budget covers transport, envelope and scoring failures together.
         for (int attempt = 1; attempt <= 2; attempt++) {
+            cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.Reservation reservation=null;
+            cn.bugstack.ai.domain.agent.service.model.ModelUsageAccounting.Ticket usageTicket=null;
+            Long actualTokens = null;
+            String outcome = "ERROR";
+            Map<String, Object> diagnostic = new LinkedHashMap<>();
+            diagnostic.put("attempt", attempt);
+            diagnostic.put("maxOutputTokens", outputLimit);
+            diagnostic.put("startedAt", java.time.Instant.now().toString());
+            attempts.add(diagnostic);
+            long started = System.nanoTime();
             try {
-                HttpRequest request = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(180))
-                        .header("Authorization", "Bearer " + api.getApiKey()).header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString(body.toJSONString(), StandardCharsets.UTF_8)).build();
+                if(Thread.currentThread().isInterrupted()) throw new java.util.concurrent.CancellationException("Judge 已取消");
+                var budget=cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.find(Map.of());
+                if (budget != null) runId = budget.runId();
+                String owner=cn.bugstack.ai.domain.agent.service.model.ModelInvocationScope.currentUser();
+                requireModelAccess(owner, api.getApiId(), model);
+                String key=modelAccess==null?api.getApiKey():modelAccess.apiKeyForRequest(api.getApiId(),owner,URI.create(url));
+                body.put("max_tokens", outputLimit);
+                var prepared=cn.bugstack.ai.domain.agent.service.execute.common.ModelRequestGuard.prepare(new LinkedHashMap<>(body),budget,
+                        cn.bugstack.ai.domain.agent.service.model.ModelUsageContext.api(api.getApiId(),"EVAL_JUDGE",url));
+                reservation=prepared.reservation();
+                usageTicket=prepared.usageTicket();
+                long timeout=budget==null?180000:Math.max(1,Math.min(180000,((Number)budget.snapshot().get("remainingMillis")).longValue()));
+                HttpRequest request = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofMillis(timeout))
+                        .header("Authorization", "Bearer " + key).header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofByteArray(prepared.body())).build();
                 HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                diagnostic.put("httpStatus", response.statusCode());
+                EvalJudgeResponseSupport.putIdentifier(diagnostic, "requestId",
+                        response.headers().firstValue("x-request-id")
+                                .orElseGet(() -> response.headers().firstValue("request-id").orElse(null)));
                 if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                    throw new IllegalStateException("Judge HTTP " + response.statusCode() + ": " + cap(response.body(), 300));
+                    throw new EvalJudgeResponseSupport.JudgeFailure("HTTP_ERROR", "Judge HTTP " + response.statusCode());
                 }
-                JSONObject root = JSON.parseObject(response.body());
-                return root.getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content");
+                JSONObject root;
+                try { root = JSON.parseObject(response.body()); }
+                catch (RuntimeException ignored) {
+                    throw new EvalJudgeResponseSupport.JudgeFailure("INVALID_RESPONSE_JSON", "Judge 接口响应不是有效 JSON");
+                }
+                if (root != null) actualTokens=cn.bugstack.ai.domain.agent.service.execute.common.ModelRequestGuard.usage(root);
+                if(budget!=null) budget.checkActive();
+                var reply = EvalJudgeResponseSupport.readResponse(root, diagnostic);
+                outcome = "SUCCESS";
+                return reply;
             } catch (Exception error) {
-                last = error;
-                Thread.sleep(1000L * attempt);
+                cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.rethrowCancellation(error);
+                if(error instanceof SecurityException) throw error;
+                EvalJudgeResponseSupport.JudgeFailure failure = error instanceof EvalJudgeResponseSupport.JudgeFailure parsed
+                        ? parsed : new EvalJudgeResponseSupport.JudgeFailure(
+                                error instanceof java.net.http.HttpTimeoutException ? "REQUEST_TIMEOUT" : "REQUEST_ERROR",
+                                error instanceof java.net.http.HttpTimeoutException ? "Judge 接口请求超时" : "Judge 接口请求失败");
+                outcome = "ERROR";
+                diagnostic.put("code", failure.getCode());
+                diagnostic.put("elapsedMillis", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
+                // Only explicit truncation raises the allowance; still subject to the normal usage guard.
+                if ("OUTPUT_TRUNCATED".equals(failure.getCode())) outputLimit = 6000;
+                int status = diagnostic.get("httpStatus") instanceof Number number ? number.intValue() : 0;
+                boolean nonRetryableHttp = status >= 400 && status < 500 && status != 408 && status != 429;
+                if (attempt == 2 || nonRetryableHttp)
+                    throw failure.withDiagnostics(runId, judgeJobId, resultId, attempts);
+            } finally {
+                if(reservation!=null) reservation.settle(actualTokens);
+                if(usageTicket!=null) usageTicket.settle(actualTokens,Thread.currentThread().isInterrupted()?"CANCELLED":outcome);
             }
+            // Interruption here propagates cancellation rather than starting another paid request.
+            Thread.sleep(1000L);
         }
-        throw last;
+        throw new IllegalStateException("Judge retry loop exhausted");
     }
 
-    private static JSONObject parseJudgeJson(String raw) {
-        String value = raw == null ? "" : raw.trim();
-        int start = value.indexOf('{'), end = value.lastIndexOf('}');
-        if (start >= 0 && end > start) value = value.substring(start, end + 1);
-        JSONObject parsed = JSON.parseObject(value);
-        if (parsed == null) throw new IllegalArgumentException("Judge 返回为空");
-        for (String field : List.of("correctness", "relevance", "completeness", "usefulness", "safety", "overall")) {
-            if (!parsed.containsKey(field)) throw new IllegalArgumentException("Judge 缺少字段：" + field);
+    static String judgeCompletionUrl(AiClientApiVO api) {
+        String baseUrl = requireText(api.getBaseUrl(), "Judge 模型连接缺少基础地址");
+        String path = cn.bugstack.ai.domain.agent.service.support.OpenAiCompatibleApiSupport
+                .chatCompletionsPath(baseUrl, api.getCompletionsPath());
+        return baseUrl.replaceAll("/+$", "") + path;
+    }
+
+    private void requireModelAccess(String owner,String apiId,String model) {
+        if(modelDb==null) return; // Legacy isolated unit fixtures; production always injects MySQL.
+        var models = availableModels(owner, apiId, model);
+        if(models.isEmpty()) throw new SecurityException("所选 Judge 模型或连接当前不可用，请刷新模型列表后重新选择");
+        requireAuxiliaryConsent(owner, models.get(0));
+        if(modelAccess!=null) {
+            modelAccess.apiKeyForRequest(apiId,owner);
         }
-        return parsed;
+    }
+
+    private void requireAuxiliaryConsent(String owner, Map<String, Object> model) {
+        // Legacy administrator connections retain the existing auxiliary-consent policy.
+        if (modelAccess != null && !"BYOK".equals(model.get("source"))) {
+            modelAccess.requirePlatformAuxiliary(owner, "EVAL_JUDGE");
+        }
+    }
+
+    private List<Map<String, Object>> availableModels(String owner, String apiId, String model) {
+        requireText(owner, "评测数据集缺少所有者");
+        if (modelDb == null) return List.of();
+        String sql = """
+                SELECT a.api_id,m.model_name,a.base_url,s.display_name,
+                       CASE WHEN a.secret_ref IS NOT NULL THEN 'BYOK'
+                            WHEN m.platform_enabled=1 THEN 'PLATFORM' ELSE 'OWNED' END AS provider_source
+                FROM ai_client_model m JOIN ai_client_api a ON a.api_id=m.api_id
+                LEFT JOIN ai_model_secret s ON s.secret_ref=a.secret_ref AND s.api_id=a.api_id
+                WHERE m.status=1 AND a.status=1 AND
+                  ((a.secret_ref IS NULL AND (m.platform_enabled=1 OR (a.owner_user_id=? AND m.owner_user_id=?))) OR
+                   (a.secret_ref IS NOT NULL AND a.owner_user_id=? AND m.owner_user_id=? AND s.owner_user_id=? AND s.status=1))
+                """;
+        List<Object> args = new ArrayList<>(List.of(owner, owner, owner, owner, owner));
+        if (apiId != null && model != null) {
+            sql += " AND a.api_id=? AND m.model_name=?";
+            args.add(apiId);
+            args.add(model);
+        }
+        sql += " ORDER BY a.api_id,m.model_name,m.platform_enabled DESC";
+        List<Map<String, Object>> rows = modelDb.query(sql, (rs, rowNum) -> {
+            Map<String, Object> value = new LinkedHashMap<>();
+            String source = rs.getString("provider_source");
+            value.put("modelName", rs.getString("model_name"));
+            value.put("apiId", rs.getString("api_id"));
+            value.put("apiName", connectionName(source, rs.getString("display_name"), rs.getString("base_url")));
+            value.put("source", source);
+            return value;
+        }, args.toArray());
+        Map<List<Object>, Map<String, Object>> unique = new LinkedHashMap<>();
+        for (var row : rows) {
+            unique.putIfAbsent(List.of(row.get("apiId"), row.get("modelName")), row);
+        }
+        return new ArrayList<>(unique.values());
+    }
+
+    private static String connectionName(String source, String displayName, String baseUrl) {
+        if ("BYOK".equals(source) && displayName != null && !displayName.isBlank()) return displayName;
+        String label = "PLATFORM".equals(source) ? "平台连接" : "自有连接";
+        try {
+            String host = URI.create(baseUrl).getHost();
+            return host == null || host.isBlank() ? label : label + " · " + host;
+        } catch (IllegalArgumentException | NullPointerException ignored) {
+            return label;
+        }
+    }
+
+    private String judgeOwner(AiEvalRun run) {
+        var dataset = dao.findDataset(run.getDatasetId());
+        if (dataset == null) throw new IllegalArgumentException("评测数据集不存在");
+        return requireText(dataset.getOwnerUserId(), "评测数据集缺少所有者");
     }
 
     private String previousConversation(AiEvalCaseResult current, List<AiEvalCaseResult> all) {
@@ -355,14 +529,11 @@ public class EvalJudgeService {
     }
 
     static JSONObject parseTrace(String traceJson) {
-        if (traceJson == null || traceJson.isBlank()) return new JSONObject(true);
-        try {
-            JSONObject trace = JSON.parseObject(traceJson);
-            if (trace == null) throw new IllegalArgumentException("评测 Trace 为空");
-            return trace;
-        } catch (Exception error) {
-            throw new IllegalArgumentException("评测 Trace 解析失败：" + message(error), error);
+        JSONObject trace = EvalTraceCodec.read(traceJson);
+        if (trace.containsKey("traceCompleteness") && !"COMPLETE".equals(trace.getString("traceCompleteness"))) {
+            throw new IllegalArgumentException("评测 Trace 不完整，拒绝使用缺失证据执行 LLM Judge");
         }
+        return trace;
     }
 
     static String extractStmContext(JSONObject trace) {
@@ -560,6 +731,70 @@ public class EvalJudgeService {
                 .toList();
     }
 
+    private AiEvalJudgeJob latestCompatibleJob(String runId, String model, String api, String rubric) {
+        return dao.listJudgeJobs(runId).stream()
+                .filter(job -> List.of("COMPLETED", "PARTIAL", "FAILED").contains(job.getStatus()))
+                .filter(job -> java.util.Objects.equals(model, job.getModelId())
+                        && java.util.Objects.equals(api, job.getApiId())
+                        && java.util.Objects.equals(rubric, job.getRubricVersion()))
+                .findFirst().orElse(null);
+    }
+
+    private List<AiEvalJudgeJob> judgeLineage(AiEvalJudgeJob job) {
+        List<AiEvalJudgeJob> lineage = new ArrayList<>();
+        Set<String> seen = new java.util.HashSet<>();
+        AiEvalJudgeJob current = job;
+        while (current != null) {
+            if (!seen.add(current.getJudgeJobId()) || seen.size() > 100) {
+                throw new IllegalArgumentException("Judge 补评关联异常");
+            }
+            if (!java.util.Objects.equals(job.getEvalRunId(), current.getEvalRunId())
+                    || !java.util.Objects.equals(job.getApiId(), current.getApiId())
+                    || !java.util.Objects.equals(job.getModelId(), current.getModelId())
+                    || !java.util.Objects.equals(job.getRubricVersion(), current.getRubricVersion())) {
+                throw new IllegalArgumentException("不能合并不同评测、模型连接或评分标准的 Judge 结果");
+            }
+            lineage.add(current);
+            String baseId = parseObject(current.getConfigJson()).getString("baseJudgeJobId");
+            current = baseId == null || baseId.isBlank() ? null : requireJob(baseId);
+        }
+        java.util.Collections.reverse(lineage);
+        return lineage;
+    }
+
+    List<AiEvalJudgeResult> effectiveResults(AiEvalJudgeJob job) {
+        Map<String, AiEvalJudgeResult> merged = new LinkedHashMap<>();
+        for (AiEvalJudgeJob item : judgeLineage(job)) {
+            for (AiEvalJudgeResult result : dao.listJudgeResults(item.getJudgeJobId())) {
+                AiEvalJudgeResult previous = merged.get(result.getResultId());
+                // An unsuccessful rejudge must not erase an existing valid score.
+                if (isScored(result) || previous == null || !isScored(previous)) {
+                    merged.put(result.getResultId(), result);
+                }
+            }
+        }
+        return new ArrayList<>(merged.values());
+    }
+
+    private static boolean isScored(AiEvalJudgeResult result) {
+        return "COMPLETED".equals(result.getStatus()) && result.getOverall() != null;
+    }
+
+    private static BigDecimal averageScore(List<AiEvalJudgeResult> results) {
+        var average = results.stream().filter(EvalJudgeService::isScored)
+                .mapToInt(AiEvalJudgeResult::getOverall).average();
+        return average.isPresent() ? BigDecimal.valueOf(average.getAsDouble()).setScale(2, RoundingMode.HALF_UP) : null;
+    }
+
+    void updateRunSummary(AiEvalJudgeJob job, AiEvalRun run) {
+        if (judgeLineage(job).stream().anyMatch(item -> "ALL".equals(item.getScopeType()))) {
+            dao.updateRunJudgeScore(run.getEvalRunId(), averageScore(effectiveResults(job)), "COMPLETED");
+        } else {
+            // A standalone subset has no full-run denominator; keep its score on the job only.
+            dao.updateRunStatus(run.getEvalRunId(), "COMPLETED", null);
+        }
+    }
+
     private Map<String, Object> jobView(AiEvalJudgeJob job, boolean includeResults) {
         LinkedHashMap<String, Object> view = new LinkedHashMap<>();
         view.put("judgeJobId", job.getJudgeJobId()); view.put("evalRunId", job.getEvalRunId());
@@ -571,6 +806,11 @@ public class EvalJudgeService {
         view.put("startedAt", job.getStartedAt()); view.put("finishedAt", job.getFinishedAt());
         view.put("errorMessage", job.getErrorMessage()); view.put("createdAt", job.getCreatedAt());
         if (includeResults) {
+            List<AiEvalJudgeResult> effective = effectiveResults(job);
+            view.put("effectiveTotalCases", Math.max(effective.size(), job.getTotalCases() == null ? 0 : job.getTotalCases()));
+            view.put("effectiveCompletedCases", effective.stream().filter(EvalJudgeService::isScored).count());
+            view.put("effectiveFailedCases", effective.stream().filter(item -> "FAILED".equals(item.getStatus())).count());
+            view.put("effectiveAverageScore", averageScore(effective));
             Map<String, AiEvalCaseResult> caseResults = new LinkedHashMap<>();
             for (AiEvalCaseResult item : dao.listCaseResults(job.getEvalRunId())) caseResults.put(item.getResultId(), item);
             Map<String, AiEvalCase> cases = new LinkedHashMap<>();
@@ -578,11 +818,18 @@ public class EvalJudgeService {
             if (run != null) {
                 for (AiEvalCase item : dao.listCases(run.getVersionId(), false)) cases.put(item.getCaseId(), item);
             }
-            view.put("results", dao.listJudgeResults(job.getJudgeJobId()).stream().map(result -> {
+            view.put("results", effective.stream().map(result -> {
                 AiEvalCaseResult caseResult = caseResults.get(result.getResultId());
                 AiEvalCase evalCase = caseResult == null ? null : cases.get(caseResult.getCaseId());
                 return resultView(result, caseResult, evalCase);
             }).toList());
+            if (parseObject(job.getConfigJson()).containsKey("baseJudgeJobId")) {
+                view.put("attemptResults", dao.listJudgeResults(job.getJudgeJobId()).stream().map(result -> {
+                    AiEvalCaseResult caseResult = caseResults.get(result.getResultId());
+                    AiEvalCase evalCase = caseResult == null ? null : cases.get(caseResult.getCaseId());
+                    return resultView(result, caseResult, evalCase);
+                }).toList());
+            }
         }
         return view;
     }
@@ -590,6 +837,7 @@ public class EvalJudgeService {
     private Map<String, Object> resultView(AiEvalJudgeResult result, AiEvalCaseResult caseResult, AiEvalCase evalCase) {
         LinkedHashMap<String, Object> view = new LinkedHashMap<>();
         view.put("judgeResultId", result.getJudgeResultId()); view.put("resultId", result.getResultId());
+        view.put("sourceJudgeJobId", result.getJudgeJobId());
         if (evalCase != null) {
             view.put("caseId", evalCase.getCaseId()); view.put("stableKey", evalCase.getStableKey());
             view.put("sequenceNo", evalCase.getSequenceNo()); view.put("category", evalCase.getCategory());
@@ -636,7 +884,7 @@ public class EvalJudgeService {
         if (value == null || value.isBlank()) return null;
         try { return JSON.parse(value); } catch (Exception ignored) { return value; }
     }
-    private static int score(JSONObject object, String field, int min, int max) { int value = object.getIntValue(field); if (value < min || value > max) throw new IllegalArgumentException("Judge 字段越界：" + field); return value; }
+    private static int score(JSONObject object, String field, int min, int max) { return EvalJudgeResponseSupport.score(object, field, min, max); }
     private static String normalizeScope(String value) { String scope = blankToDefault(value, "ALL").toUpperCase(Locale.ROOT); if (!List.of("ALL", "LOW_SCORE", "FAILED", "SELECTED").contains(scope)) throw new IllegalArgumentException("不支持的 Judge 范围"); return scope; }
     private static String requireText(String value, String message) { if (value == null || value.isBlank()) throw new IllegalArgumentException(message); return value.trim(); }
     private static String blankToDefault(String value, String fallback) { return value == null || value.isBlank() ? fallback : value.trim(); }

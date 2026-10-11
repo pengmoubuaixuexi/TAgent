@@ -91,6 +91,7 @@ public class LlmParentTitleGenerator implements IParentTitleGenerator {
                     fail++;
                 }
             } catch (Exception e) {
+                cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.rethrowCancellation(e);
                 log.debug("parent-title generation failed for parent {} err={}", i, e.getMessage());
                 titles.add(null);
                 fail++;

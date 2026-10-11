@@ -62,6 +62,16 @@ public interface IAiClientRagOrderDao {
      */
     AiClientRagOrder queryByRagId(String ragId);
 
+    AiClientRagOrder lockById(Long id);
+
+    AiClientRagOrder lockByRagId(String ragId);
+
+    int countLegacyFileCandidates(@org.apache.ibatis.annotations.Param("scope")
+                                  cn.bugstack.ai.domain.agent.service.rag.RagFileScope scope);
+
+    int deleteOwned(@org.apache.ibatis.annotations.Param("scope")
+                    cn.bugstack.ai.domain.agent.service.rag.RagFileScope scope);
+
     /**
      * 查询启用的知识库配置
      * @return 知识库配置列表

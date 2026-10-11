@@ -74,6 +74,23 @@ public interface RunSnapshotService {
     default void recordToolEvidence(String runId, ToolEvidenceRecord evidence) {
     }
 
+    /** An acknowledged, owner-scoped write used before exposing a model-readable result reference. */
+    default boolean saveToolEvidence(String runId, String userId, ToolEvidenceRecord evidence) {
+        if (userId == null || evidence == null || find(runId).filter(s -> userId.equals(s.getUserId())).isEmpty()) return false;
+        recordToolEvidence(runId, evidence);
+        return findToolEvidence(runId, userId, evidence.getEvidenceId())
+                .filter(saved -> java.util.Objects.equals(saved.getOutput(), evidence.getOutput())).isPresent();
+    }
+
+    /** Reads are confined to the caller's current run; implementations may fetch one hash field. */
+    default Optional<ToolEvidenceRecord> findToolEvidence(String runId, String userId, String evidenceId) {
+        if (userId == null || evidenceId == null) return Optional.empty();
+        return find(runId).filter(s -> userId.equals(s.getUserId()))
+                .filter(s -> s.getExpiresAt() == null || s.getExpiresAt() > System.currentTimeMillis())
+                .flatMap(s -> s.getToolEvidences() == null ? Optional.empty() : s.getToolEvidences().stream()
+                        .filter(e -> evidenceId.equals(e.getEvidenceId())).findFirst());
+    }
+
     /** Load a previously generated Evidence Map when its input signature still matches. */
     default Optional<Map<String, Object>> findEvidenceMap(String runId, String signature) {
         return Optional.empty();

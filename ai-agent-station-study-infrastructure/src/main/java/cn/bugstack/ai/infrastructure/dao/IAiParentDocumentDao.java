@@ -16,4 +16,6 @@ public interface IAiParentDocumentDao {
     List<AiParentDocument> findByParentIds(@Param("parentIds") List<String> parentIds);
 
     int deleteByKnowledgeTag(@Param("knowledgeTag") String knowledgeTag);
+
+    int deleteByFileScope(@Param("scope") cn.bugstack.ai.domain.agent.service.rag.RagFileScope scope);
 }

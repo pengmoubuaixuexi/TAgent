@@ -3,15 +3,19 @@ package cn.bugstack.ai.domain.agent.service.rag.hybrid;
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
+import cn.bugstack.ai.domain.agent.service.rag.RagFileScope;
+import cn.bugstack.ai.domain.agent.service.rag.RagStorageException;
+import cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.http.HttpEntity;
 import org.apache.http.entity.ContentType;
 import org.apache.http.nio.entity.NStringEntity;
 import org.elasticsearch.client.Request;
 import org.elasticsearch.client.Response;
 import org.elasticsearch.client.RestClient;
+import org.elasticsearch.client.ResponseListener;
+import org.elasticsearch.client.Cancellable;
 import org.springframework.ai.document.Document;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -20,6 +24,9 @@ import org.springframework.util.StreamUtils;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.CancellationException;
 import java.util.stream.Collectors;
 
 /**
@@ -35,6 +42,9 @@ public class BM25SearchService {
 
     @Resource
     private RestClient restClient;
+
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.rag.RagDocumentVisibility visibility;
 
     @Value("${elasticsearch.rag-index:ai-agent-rag}")
     private String ragIndex;
@@ -70,6 +80,7 @@ public class BM25SearchService {
                           "content": {"type": "text", "analyzer": "standard"},
                           "knowledge": {"type": "keyword"},
                           "user_id": {"type": "keyword"},
+                          "rag_file_id": {"type": "keyword"},
                           "source_id": {"type": "keyword"}
                         }
                       }
@@ -91,7 +102,7 @@ public class BM25SearchService {
         try {
             Request put = new Request("PUT", "/" + ragIndex + "/_mapping");
             put.setEntity(new NStringEntity(
-                    "{\"properties\":{\"user_id\":{\"type\":\"keyword\"}}}",
+                    "{\"properties\":{\"user_id\":{\"type\":\"keyword\"},\"rag_file_id\":{\"type\":\"keyword\"},\"parent_id\":{\"type\":\"keyword\"}}}",
                     ContentType.APPLICATION_JSON));
             restClient.performRequest(put);
         } catch (Exception ignored) {
@@ -131,6 +142,10 @@ public class BM25SearchService {
             // 多租户隔离：把上传时记录的 user_id 一并写入 ES，让 BM25 召回也能按用户过滤
             Object userId = doc.getMetadata().get("user_id");
             if (userId != null) payload.put("user_id", userId);
+            for (String key : List.of(RagFileScope.FILE_ID_KEY, "parent_id")) {
+                Object value = doc.getMetadata().get(key);
+                if (value != null) payload.put(key, value);
+            }
             payload.put("source_id", doc.getId());
             bulkBody.append(payload.toJSONString()).append("\n");
         }
@@ -142,12 +157,108 @@ public class BM25SearchService {
             Response resp = restClient.performRequest(bulk);
             int code = resp.getStatusLine().getStatusCode();
             if (code >= 300) {
-                log.warn("ES bulk index returned non-2xx: {}", code);
-            } else {
-                log.info("ES bulk indexed {} documents to {}", documents.size(), ragIndex);
+                throw new RagStorageException("关键词索引写入失败，上传未完成；请恢复索引后重试。");
             }
+            JSONObject result = readJson(resp);
+            JSONArray items = result.getJSONArray("items");
+            int failed = 0;
+            if (items == null || items.size() != documents.size()) {
+                throw new RagStorageException("关键词索引返回的处理数量不完整，上传未完成；可以重试。");
+            }
+            for (int i = 0; i < items.size(); i++) {
+                JSONObject operation = items.getJSONObject(i).getJSONObject("index");
+                if (operation == null || operation.getInteger("status") == null
+                        || operation.getIntValue("status") < 200 || operation.getIntValue("status") >= 300
+                        || operation.containsKey("error")) failed++;
+            }
+            if (!result.containsKey("errors") || result.getBooleanValue("errors") || failed > 0) {
+                throw new RagStorageException("关键词索引未完整写入（失败 " + Math.max(1, failed)
+                        + "/" + documents.size() + " 个片段），上传未完成；可以重试。");
+            }
+            log.info("ES bulk indexed {} documents to {}", documents.size(), ragIndex);
         } catch (IOException e) {
-            log.error("ES bulk index failed: {}", e.getMessage(), e);
+            throw new RagStorageException("关键词索引写入失败，上传未完成；请恢复存储后重试。", e);
+        } catch (RagStorageException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            throw new RagStorageException("关键词索引响应无法校验，上传未完成；可以重试。", e);
+        }
+    }
+
+    /** Exact owner/file cleanup. Missing legacy ownership is rejected by RagFileScope. */
+    public void deleteFile(RagFileScope scope) {
+        Objects.requireNonNull(scope, "scope");
+        JSONObject bool = new JSONObject();
+        JSONArray filters = new JSONArray();
+        filters.add(Map.of("term", Map.of("user_id", scope.userId())));
+        filters.add(Map.of("term", Map.of("knowledge", scope.knowledgeTag())));
+        if (scope.legacy()) {
+            // A term query on an analyzed source field is NOT an exact filename match.
+            // Resolve the keyword mapping first instead of risking another similarly named file.
+            String exactField = exactSourceField(scope.source());
+            filters.add(Map.of("term", Map.of(exactField, scope.source())));
+            bool.put("must_not", List.of(Map.of("exists", Map.of("field", RagFileScope.FILE_ID_KEY))));
+        } else {
+            filters.add(Map.of("bool", Map.of("minimum_should_match", 1, "should", List.of(
+                    Map.of("term", Map.of(RagFileScope.FILE_ID_KEY, scope.fileId())),
+                    Map.of("term", Map.of(RagFileScope.FILE_ID_KEY + ".keyword", scope.fileId()))))));
+        }
+        bool.put("filter", filters);
+        Request delete = new Request("POST", "/" + ragIndex + "/_delete_by_query");
+        delete.addParameter("refresh", "true");
+        delete.addParameter("timeout", "15s");
+        delete.setJsonEntity(JSON.toJSONString(Map.of("query", Map.of("bool", bool))));
+        try {
+            Response response = restClient.performRequest(delete);
+            JSONObject result = readJson(response);
+            JSONArray failures = result.getJSONArray("failures");
+            if (response.getStatusLine().getStatusCode() >= 300 || result.getBooleanValue("timed_out")
+                    || result.getLongValue("version_conflicts") > 0 || failures == null || !failures.isEmpty()
+                    || !result.containsKey("deleted")) {
+                throw new RagStorageException("关键词索引未完整删除，文件目录保留；请重试。");
+            }
+        } catch (RagStorageException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new RagStorageException("关键词索引删除失败，文件目录保留；请恢复索引后重试。", e);
+        }
+    }
+
+    private String exactSourceField(String source) {
+        Request mapping = new Request("GET", "/" + ragIndex + "/_mapping/field/source,source.keyword");
+        try {
+            JSONObject indices = readJson(restClient.performRequest(mapping));
+            for (String key : List.of("source.keyword", "source")) {
+                boolean exactForEveryIndex = !indices.isEmpty();
+                for (String index : indices.keySet()) {
+                    JSONObject fields = indices.getJSONObject(index).getJSONObject("mappings");
+                    JSONObject field = fields == null ? null : fields.getJSONObject(key);
+                    JSONObject details = field == null ? null : field.getJSONObject("mapping");
+                    JSONObject definition = details == null ? null
+                            : details.getJSONObject(key.substring(key.lastIndexOf('.') + 1));
+                    if (definition == null || !"keyword".equals(definition.getString("type"))
+                            || definition.containsKey("normalizer") || Boolean.FALSE.equals(definition.getBoolean("index"))
+                            || (definition.getInteger("ignore_above") != null && source.length() > definition.getIntValue("ignore_above"))) {
+                        exactForEveryIndex = false;
+                        break;
+                    }
+                }
+                if (exactForEveryIndex) return key;
+            }
+            throw new RagStorageException("旧文件缺少可精确匹配的关键词索引字段，未删除索引；请先补齐文件标识。");
+        } catch (RagStorageException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new RagStorageException("无法确认旧文件的索引匹配方式，未删除索引；请恢复索引后重试。", e);
+        }
+    }
+
+    private static JSONObject readJson(Response response) throws IOException {
+        if (response.getEntity() == null) throw new IOException("Empty Elasticsearch response");
+        try (var stream = response.getEntity().getContent()) {
+            JSONObject result = JSON.parseObject(StreamUtils.copyToString(stream, StandardCharsets.UTF_8));
+            if (result == null) throw new IOException("Empty Elasticsearch JSON");
+            return result;
         }
     }
 
@@ -172,7 +283,7 @@ public class BM25SearchService {
         try {
             Request search = new Request("GET", "/" + ragIndex + "/_search");
             JSONObject q = new JSONObject();
-            q.put("size", topK);
+            q.put("size", Math.max(topK, Math.min(1000, topK * 4)));
             JSONObject bool = new JSONObject();
             JSONArray must = new JSONArray();
             JSONObject matchWrap = new JSONObject();
@@ -208,13 +319,15 @@ public class BM25SearchService {
             q.put("query", queryObj);
 
             search.setEntity(new NStringEntity(q.toJSONString(), ContentType.APPLICATION_JSON));
-            Response resp = restClient.performRequest(search);
-            HttpEntity entity = resp.getEntity();
-            String json = StreamUtils.copyToString(entity.getContent(), StandardCharsets.UTF_8);
-            JSONObject parsed = JSON.parseObject(json);
+            Response resp = performSearch(search);
+            JSONObject parsed = readJson(resp);
+            if (resp.getStatusLine().getStatusCode() >= 300 || parsed.getBooleanValue("timed_out")
+                    || (parsed.getJSONObject("_shards") != null && parsed.getJSONObject("_shards").getIntValue("failed") > 0)) {
+                throw new IOException("Elasticsearch search returned incomplete results");
+            }
             JSONArray hits = parsed.getJSONObject("hits").getJSONArray("hits");
             if (hits == null || hits.isEmpty()) return Collections.emptyList();
-            return hits.stream().map(h -> {
+            List<Document> candidates = hits.stream().map(h -> {
                 JSONObject hit = (JSONObject) h;
                 JSONObject src = hit.getJSONObject("_source");
                 String id = hit.getString("_id");
@@ -227,12 +340,34 @@ public class BM25SearchService {
                 if (src.containsKey("source")) md.put("source", src.getString("source"));
                 // 第 61 轮 Phase 2：透传 title（LLM 生成的精炼小标题），前端 source 优先级最高
                 if (src.containsKey("title")) md.put("title", src.getString("title"));
+                for (String key : List.of("user_id", "parent_id", RagFileScope.FILE_ID_KEY)) {
+                    if (src.containsKey(key)) md.put(key, src.getString(key));
+                }
                 md.put("bm25_score", score);
                 return new Document(id, content, md);
             }).collect(Collectors.toList());
+            return visibility.published(candidates).stream().limit(topK).toList();
         } catch (Exception e) {
-            log.warn("BM25 search failed, fallback to empty result: {}", e.getMessage());
-            return Collections.emptyList();
+            StreamingActivityTracker.rethrowCancellation(e);
+            throw new IllegalStateException("BM25 retrieval unavailable", e);
+        }
+    }
+
+    /** A cancelled retrieval worker must also abort its Elasticsearch HTTP request. */
+    private Response performSearch(Request request) throws IOException {
+        CompletableFuture<Response> result = new CompletableFuture<>();
+        Cancellable pending = restClient.performRequestAsync(request, new ResponseListener() {
+            @Override public void onSuccess(Response response) { result.complete(response); }
+            @Override public void onFailure(Exception exception) { result.completeExceptionally(exception); }
+        });
+        try {
+            return result.get();
+        } catch (InterruptedException e) {
+            pending.cancel();
+            Thread.currentThread().interrupt();
+            throw new CancellationException("BM25 retrieval cancelled");
+        } catch (ExecutionException e) {
+            throw new IOException("BM25 request failed", e.getCause());
         }
     }
 }

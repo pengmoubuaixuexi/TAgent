@@ -25,6 +25,8 @@ import java.util.List;
 @Slf4j
 @Service
 public class AiClientApiNode extends AbstractArmorySupport {
+    @org.springframework.beans.factory.annotation.Autowired
+    private cn.bugstack.ai.domain.agent.service.model.ModelCredentialRequestAuthorizer credentialRequests;
 
     @Resource
     private AiClientToolMcpNode aiClientToolMcpNode;
@@ -47,26 +49,31 @@ public class AiClientApiNode extends AbstractArmorySupport {
         for (AiClientApiVO aiClientApiVO : aiClientApiList) {
             // 2026-05-29：连接全部来自 DB ai_client_api（已去掉 agent.llm.* 全局覆盖）
             String effectiveBaseUrl = aiClientApiVO.getBaseUrl();
-            String effectiveApiKey = aiClientApiVO.getApiKey();
             String completionsPath = OpenAiCompatibleApiSupport.chatCompletionsPath(effectiveBaseUrl, aiClientApiVO.getCompletionsPath());
             String embeddingsPath = OpenAiCompatibleApiSupport.embeddingsPath(effectiveBaseUrl, aiClientApiVO.getEmbeddingsPath());
             // 构建 OpenAiApi（WebClient 注入两个 filter）：
             //   1. ReasoningContentFilter：回传 mimo thinking mode 的 reasoning_content
             //   2. WireTraceRecorder：抓取 advisor 注入后的最终请求体 + 原始响应体到 ES（logger=llm.wire）
             // 顺序很重要：reasoning 先注入 → wire 再 log，看到的就是真正发出去的 body
-            ReasoningContentFilter reasoningFilter = new ReasoningContentFilter(noThinkBodyParams);
+            var usageContext=cn.bugstack.ai.domain.agent.service.model.ModelUsageContext.api(aiClientApiVO.getApiId(),null,effectiveBaseUrl);
+            ReasoningContentFilter reasoningFilter = new ReasoningContentFilter(noThinkBodyParams).withUsageContext(usageContext);
             cn.bugstack.ai.domain.agent.service.execute.common.WireTraceRecorder wireTraceRecorder =
                     new cn.bugstack.ai.domain.agent.service.execute.common.WireTraceRecorder();
             WebClient.Builder webClientBuilder = WebClient.builder()
                     .filter(reasoningFilter)
+                    .filter(credentialRequests.streaming(aiClientApiVO.getApiId()))
                     .filter(wireTraceRecorder);
-            log.info("[AiClientApiNode] building OpenAiApi apiId={} baseUrl={} filterCount=2 (ReasoningContentFilter, WireTraceRecorder)",
+            log.info("[AiClientApiNode] building OpenAiApi apiId={} baseUrl={} filterCount=3 (ReasoningContentFilter, Credentials, WireTraceRecorder)",
                     aiClientApiVO.getApiId(), effectiveBaseUrl);
             OpenAiApi openAiApi = OpenAiApi.builder()
                     .baseUrl(effectiveBaseUrl)
-                    .apiKey(effectiveApiKey)
+                    .apiKey("managed-at-request-boundary")
                     .completionsPath(completionsPath)
                     .embeddingsPath(embeddingsPath)
+                    .restClientBuilder(org.springframework.web.client.RestClient.builder()
+                            .requestInterceptor(credentialRequests.synchronous(aiClientApiVO.getApiId()))
+                            .requestFactory(cn.bugstack.ai.domain.agent.service.execute.common.ModelRequestGuard.requestFactory()).requestInterceptor(
+                            cn.bugstack.ai.domain.agent.service.execute.common.ModelRequestGuard.synchronous(usageContext)))
                     .webClientBuilder(webClientBuilder)
                     .build();
 

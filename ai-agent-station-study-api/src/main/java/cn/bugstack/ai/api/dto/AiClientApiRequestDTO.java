@@ -41,6 +41,7 @@ public class AiClientApiRequestDTO implements Serializable {
     /**
      * API密钥
      */
+    @lombok.ToString.Exclude
     private String apiKey;
 
     /**

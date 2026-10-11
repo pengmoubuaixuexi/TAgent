@@ -4,6 +4,7 @@ import cn.bugstack.ai.domain.agent.service.execute.common.HintedToolCallback;
 import cn.bugstack.ai.domain.agent.service.execute.common.McpClientRegistry;
 import cn.bugstack.ai.domain.agent.service.execute.common.McpToolMetrics;
 import cn.bugstack.ai.domain.agent.service.execute.common.MeteredToolCallback;
+import cn.bugstack.ai.domain.agent.service.execute.common.McpToolCallMetadata;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.Test;
 import org.springframework.ai.tool.ToolCallback;
@@ -15,6 +16,7 @@ import java.util.concurrent.TimeoutException;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertThrows;
 
 public class MeteredToolCallbackDelegateRefreshTest {
     @org.junit.Before public void bindOwner() {
@@ -25,6 +27,7 @@ public class MeteredToolCallbackDelegateRefreshTest {
     private static <T extends McpClientRegistry> T authorize(T registry) {
         var access = org.mockito.Mockito.mock(cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository.class);
         org.mockito.Mockito.when(access.ownsMcp(org.mockito.ArgumentMatchers.eq("alice"), org.mockito.ArgumentMatchers.anyString())).thenReturn(true);
+        org.mockito.Mockito.when(access.mcpCapacityOwner(org.mockito.ArgumentMatchers.anyString())).thenReturn("alice");
         org.mockito.Mockito.when(access.agentMcpIds("alice", "agent-a")).thenReturn(java.util.Set.of("amap", "calc-mcp", "search-mcp"));
         org.springframework.test.util.ReflectionTestUtils.setField(registry, "workspaceAccess", access);
         return registry;
@@ -135,6 +138,70 @@ public class MeteredToolCallbackDelegateRefreshTest {
         assertEquals("重建由 reconnectAfterTimeout 承担", 1, registry.timeoutReconnects.get());
     }
 
+    @Test
+    public void changedSchemaAfterIdleRecoveryNeverReceivesOldArguments() {
+        McpClientRegistry registry = authorize(new McpClientRegistry());
+        CountingToolCallback stale = new CountingToolCallback("calculate", "STALE");
+        CountingToolCallback changed = changedSchema("calculate");
+        registry.registerCallbacks("calc-mcp", new ToolCallback[]{changed});
+        MeteredToolCallback callback = guarded(stale, registry, "calc-mcp");
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () -> callback.call("{}"));
+
+        assertTrue(failure.getMessage().contains("definition changed"));
+        assertEquals(0, stale.calls.get());
+        assertEquals(0, changed.calls.get());
+        assertEquals("{}", callback.getToolDefinition().inputSchema());
+    }
+
+    @Test
+    public void reconnectWithChangedSchemaDoesNotReplayReadOnlyCall() {
+        TimeoutThenFailToolCallback stale = new TimeoutThenFailToolCallback("AIsearch");
+        CountingToolCallback changed = changedSchema("AIsearch");
+        TimeoutProbeRegistry registry = authorize(new TimeoutProbeRegistry(stale, changed));
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> guarded(stale, registry, "search-mcp").call("{}"));
+
+        assertTrue(failure.getMessage().contains("definition changed"));
+        assertEquals(1, stale.calls.get());
+        assertEquals(0, changed.calls.get());
+        assertEquals(1, registry.timeoutReconnects.get());
+    }
+
+    @Test
+    public void sameDisplayedNameCannotSwapOriginalWireTool() {
+        McpClientRegistry registry = authorize(new McpClientRegistry());
+        CountingToolCallback stale = new NamedToolCallback("maps_geo", "maps-geo");
+        CountingToolCallback changed = new NamedToolCallback("maps_geo", "maps_geo");
+        registry.registerCallbacks("amap", new ToolCallback[]{changed});
+
+        assertThrows(IllegalStateException.class, () -> guarded(stale, registry, "amap").call("{}"));
+
+        assertEquals(0, stale.calls.get());
+        assertEquals(0, changed.calls.get());
+    }
+
+    private static MeteredToolCallback guarded(ToolCallback callback, McpClientRegistry registry, String id) {
+        return new MeteredToolCallback(callback, new McpToolMetrics(new SimpleMeterRegistry()),
+                false, false, 10, 20_000, false, true, 2, 1, registry, id);
+    }
+
+    private static CountingToolCallback changedSchema(String name) {
+        return new CountingToolCallback(name, "MUST_NOT_EXECUTE") {
+            @Override public ToolDefinition getToolDefinition() {
+                return ToolDefinition.builder().name(name).description("changed")
+                        .inputSchema("{\"type\":\"object\",\"required\":[\"newField\"]}").build();
+            }
+        };
+    }
+
+    private static class NamedToolCallback extends CountingToolCallback implements McpClientRegistry.OriginalToolName {
+        private final String original;
+        NamedToolCallback(String name, String original) { super(name, "MUST_NOT_EXECUTE"); this.original = original; }
+        @Override public String getOriginalToolName() { return original; }
+    }
+
     static class CountingToolCallback implements ToolCallback {
         final String name;
         final String result;
@@ -152,7 +219,7 @@ public class MeteredToolCallbackDelegateRefreshTest {
 
         @Override
         public ToolMetadata getToolMetadata() {
-            return ToolMetadata.builder().build();
+            return new McpToolCallMetadata("search-mcp", true, false, null, false);
         }
 
         @Override

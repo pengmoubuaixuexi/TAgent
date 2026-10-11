@@ -62,6 +62,9 @@ public class RouterPoolConfig implements ApplicationListener<ApplicationReadyEve
     @Resource
     private cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository workspaceAccess;
 
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.model.ModelCredentialRequestAuthorizer credentialRequests;
+
     @Override
     public void onApplicationEvent(ApplicationReadyEvent event) {
         if (!props.isEnabled()) {
@@ -123,10 +126,19 @@ public class RouterPoolConfig implements ApplicationListener<ApplicationReadyEve
         }
         AiClientApiVO api = apis.get(0);
         String baseUrl = api.getBaseUrl();
+        var usageContext=cn.bugstack.ai.domain.agent.service.model.ModelUsageContext.api(api.getApiId(),"CHAT_HELPER",baseUrl);
 
         OpenAiApi openAiApi = OpenAiApi.builder()
+                .restClientBuilder(org.springframework.web.client.RestClient.builder()
+                        .requestInterceptor(credentialRequests.platformAuxiliary("CHAT_HELPER"))
+                        .requestInterceptor(credentialRequests.synchronous(api.getApiId()))
+                        .requestFactory(cn.bugstack.ai.domain.agent.service.execute.common.ModelRequestGuard.requestFactory()).requestInterceptor(
+                        cn.bugstack.ai.domain.agent.service.execute.common.ModelRequestGuard.synchronous(usageContext)))
                 .baseUrl(baseUrl)
-                .apiKey(api.getApiKey())
+                .apiKey("managed-at-request-boundary")
+                .webClientBuilder(org.springframework.web.reactive.function.client.WebClient.builder()
+                        .filter(new cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter(null).withUsageContext(usageContext))
+                        .filter(credentialRequests.streaming(api.getApiId(),"CHAT_HELPER")))
                 .completionsPath(OpenAiCompatibleApiSupport.chatCompletionsPath(baseUrl, api.getCompletionsPath()))
                 .embeddingsPath(OpenAiCompatibleApiSupport.embeddingsPath(baseUrl, api.getEmbeddingsPath()))
                 .build();
@@ -138,7 +150,7 @@ public class RouterPoolConfig implements ApplicationListener<ApplicationReadyEve
                         .build())
                 .build();
 
-        // Credentials/base URL are an assembly snapshot; changing them requires rebuilding/restarting the pool.
+        // Base URL is an assembly snapshot; credentials and revocation are resolved at every request.
         // Authorization is live: disabled platform models or API connections cannot use an already cached client.
         ChatClient chatClient = ChatClient.builder(
                 new cn.bugstack.ai.domain.agent.service.support.PlatformAuthorizedChatModel(

@@ -1,0 +1,33 @@
+# Durable model usage and trial quotas
+
+Apply V068 after V064 in the database selected by the migration runner. No migration hard-codes a database name. All records use authenticated run ownership; user APIs do not accept another user's ID as a query parameter.
+
+The final model HTTP boundary records each attempt, including retries, helper chat, embeddings, reranking and evaluation calls. Records contain run/user/model/provider/purpose and `PERSONAL`, `PLATFORM` or `SYSTEM` funding source; they do not contain prompts, responses or keys. The existing event/metrics history remains separate from the authoritative quota ledger.
+
+Configuration defaults:
+
+| Property | Default | Meaning |
+|---|---:|---|
+| `agent.usage.platform-daily-tokens` | 500000 | Platform Token allowance per authenticated account and UTC day |
+| `agent.usage.platform-daily-calls` | 200 | Platform model attempts per account and UTC day |
+| `agent.usage.max-concurrent-runs` | 3 | Concurrent foreground runs, including pending human review |
+
+Admission locks the user's MySQL account row and atomically reserves the estimated input plus maximum output. Known provider usage replaces the reserved amount. Missing usage, failed/partial streams and timeouts keep `actual_tokens=NULL` and retain the reservation. Calls are never refunded as free retries. A process crash leaves the reservation intact; after the original run deadline the incomplete record becomes `UNKNOWN / ABANDONED`. A new process or service instance sees the same daily consumption. The UTC reservation day remains authoritative when a call settles after midnight.
+
+Run IDs and owners are immutable. Repeated registration does not extend the original deadline. Review waits retain their concurrency slot; completion/cancellation/exhaustion release it. A crashed active run retains its slot until its original deadline. Already-captured maintenance tasks after foreground completion share the original run budget and daily ledger but do not occupy a foreground concurrency slot. Run budget restoration after a restart remains subject to the runtime's resume policy; this migration persists quota consumption, not the full in-memory execution state.
+
+Personal-key requests are recorded but do not consume platform trial Tokens. Platform auxiliaries require the account's explicit policy when a personal connection is saved. Server lifecycle work uses a server-created system scope and is recorded as `SYSTEM`, outside individual trial quotas. Only configured platform API models can be charged to a user; a personal connection cannot be published as a platform source.
+
+The per-run budget is separate from the daily allowance: `agent.run-budget.max-tokens` defaults to 500000, shared by all stages, recursive model requests and helpers in the same run. Every request includes its input context again. Admission reserves a conservative input estimate plus the output limit, so a run can stop before confirmed usage reaches the limit if the next request cannot fit. The failure message reports the limit, confirmed usage, held reservations and the next requested reservation. Successful streaming usage settles before completion is passed to a recursive tool loop; missing usage remains conservatively reserved. Increasing the daily allowance does not change the per-run limit.
+
+Input admission now uses the existing CL100K BPE tokenizer with a 20% margin, message framing and a separate image allowance, rather than treating UTF-8 bytes as Tokens. This is an estimate for compatible providers, not their exact billing tokenizer; actual reported usage still settles the ledger. `agent.context.max-input-tokens` defaults to 128000 (the legacy `max-input-estimate` is accepted when the new key is absent). `agent.context.model-context-windows` optionally maps exact model names to operator-verified total context capacities. A configured model's available input is the smaller of the global input cap and its context window minus this request's output reservation. Unknown models use the application input cap; this is not a claim that every provider supports that capacity.
+
+Before rejecting an oversized chat request, the outgoing copy reduces already-referenced tool summaries, keeping authorized `resultRef` access and whole structured identifiers. It then removes complete old conversation turns when safe. It retains the latest two user messages, system/developer constraints and tool-call/result pairs; unreferenced current evidence is not silently dropped. A request that still cannot fit reports estimated Tokens and the effective input cap. Persisted messages and stored tool evidence remain unchanged.
+
+Model waits are distinct from budgets: `agent.streaming.first-response-timeout-seconds` defaults to 300 for each model exchange, `idle-timeout-seconds` remains 120 between meaningful output chunks, and `tool-timeout-seconds` defaults to 300 for tool execution/connection queueing. Processing/keepalive frames do not extend these deadlines indefinitely. Human waits follow their own gate deadline, and all phases remain subject to the run's absolute deadline. A timeout after tool execution never automatically replays the whole model/tool sequence.
+
+`/usage.html` shows the signed-in user's UTC-day allowance, foreground concurrency and latest 100 attempts. `?runId=...` filters attempts to that user's selected run and summarizes all attempts for the run; daily allowance remains account-wide. Another user's run returns no attempts or statistics. `actual_tokens=NULL` displays as unknown. Monetary cost remains `NULL / pricing_status=UNKNOWN` in this release; pricing and monetary settlement are not implemented, and the older approximate static price table is not used to claim a charge.
+
+If the ledger is unavailable during termination, the local run still finishes or cancels and rejects new foreground calls. A later terminal call retries the persistent status. Until a successful retry or the original deadline, the durable concurrency slot stays conservatively occupied; admission and review transitions continue to fail closed.
+
+`ModelUsageAccountingTest` checks in-memory transaction/concurrency semantics with two independent service instances and synthetic records. `ModelUsageMySqlIntegrationTest` is opt-in via `TAGENT_TEST_DB_URL`, `TAGENT_TEST_DB_USER`, `TAGENT_TEST_DB_PASSWORD`; it accepts only a loopback database named `tagent_workspace_isolation_test`. It neither migrates nor truncates a database and deletes only its own synthetic owner fixtures. Apply migrations to that isolated database before running it. No test invokes a real model provider.

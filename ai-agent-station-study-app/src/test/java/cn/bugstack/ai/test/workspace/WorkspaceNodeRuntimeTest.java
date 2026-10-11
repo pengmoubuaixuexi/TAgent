@@ -75,6 +75,31 @@ public class WorkspaceNodeRuntimeTest {
         assertNull(WorkspaceNodePolicy.fromCapabilities("{\"imageInput\":true}"));
         assertThrows(IllegalStateException.class,()->WorkspaceNodePolicy.fromCapabilities("{\"workspaceNode\":{}}"));
     }
+    @Test public void originalToolSelectionAcceptsItsCanonicalCallbackOnlyOnTheSelectedConnection() {
+        var selected=new WorkspaceNodePolicy("a1","c1","",Map.of("mine",Set.of("get-tickets")),Set.of());
+        var own=callback("mine","get_tickets");when(own.getOriginalToolName()).thenReturn("get-tickets");
+        var another=callback("other-owner","get_tickets");when(another.getOriginalToolName()).thenReturn("get-tickets");
+        var unproven=callback("mine","get_tickets");
+        assertTrue(selected.allows(own));assertFalse(selected.allows(another));assertFalse(selected.allows(unproven));
+        assertFalse(selected.allows("mine",another));
+        assertEquals(List.of(own),selected.filter(List.of(own,another,unproven)));
+    }
+    @Test public void hintAndMeterWrappersPreserveTheSdkOriginalNameForSavedSelections() {
+        var raw=mock(org.springframework.ai.mcp.SyncMcpToolCallback.class);
+        when(raw.getOriginalToolName()).thenReturn("get-tickets");
+        when(raw.getToolDefinition()).thenReturn(ToolDefinition.builder().name("get_tickets")
+                .description("查询车票").inputSchema("{}").build());
+        var hint=new cn.bugstack.ai.domain.agent.service.execute.common.HintedToolCallback(raw,"优先查询余票");
+        var metered=new MeteredToolCallback(hint,
+                mock(cn.bugstack.ai.domain.agent.service.execute.common.McpToolMetrics.class),
+                false,false,10,10000,true,true,1,1,null,"mine");
+        var selected=new WorkspaceNodePolicy("a1","c1","",Map.of("mine",Set.of("get-tickets")),Set.of());
+        assertEquals("get-tickets",metered.getOriginalToolName());
+        assertTrue(selected.allows(metered));
+        assertTrue(selected.allows("mine",hint));
+        assertEquals("get_tickets",metered.getToolDefinition().name());
+        verify(raw,never()).call(anyString());
+    }
     @Test public void emptyNodeCannotBorrowAnotherNodesDynamicLeaseOrCatalog() {
         var repository=mock(IAgentRepository.class);var access=mock(IWorkspaceAccessRepository.class);
         when(repository.queryWorkspaceNodePolicy("c1")).thenReturn(new WorkspaceNodePolicy("a1","c1","",Map.of(),Set.of()));
@@ -85,6 +110,43 @@ public class WorkspaceNodeRuntimeTest {
             assertTrue(service.resolveDynamicToolCallbacks("run1","session1","c1","need search","query",List.of()).isEmpty());
             verify(repository,never()).queryEnabledMcpToolCatalog();verify(repository,never()).queryEnabledAiClientToolMcpVOList();
             verifyNoInteractions(access);
+        } finally {MDC.clear();}
+    }
+
+    @Test public void analysisAndPlanningMaySeeExecutorMetadataButNeverAdvertiseOrInvokeBusinessTools() {
+        var business=callback("mine","maps_weather");
+        var delegate=mock(ToolCallingManager.class);
+        var manager=new RobustToolCallingManager(delegate);
+        manager.setWorkspaceNodePolicy(new WorkspaceNodePolicy("a1","analysis","",Map.of(),Set.of()));
+        manager.setRequestToolEnabled(true);
+        var catalog=mock(McpToolCatalogService.class);
+        manager.setMcpToolCatalogService(catalog);
+        var gate=mock(cn.bugstack.ai.domain.agent.service.security.UserInputGate.class);
+        when(gate.isEnabled()).thenReturn(true);when(gate.remainingFor("session")).thenReturn(1);
+        manager.setUserInputGate(gate);
+        try {
+            MDC.put("sessionId","session");
+            for (var profile:List.of(
+                    cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_STEP1_TOOL_ANALYSIS,
+                    cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_STEP2_PLANNING,
+                    cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.AUTO_STEP1_ANALYSIS)) {
+                var options=OpenAiChatOptions.builder().toolCallbacks(business)
+                        .toolContext(Map.of("agent.tool_capabilities",profile.name())).build();
+                assertEquals(profile == cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.AUTO_STEP1_ANALYSIS
+                                ? List.of("ask_user","request_tool") : List.of("ask_user"), manager.resolveToolDefinitions(options)
+                        .stream().map(ToolDefinition::name).toList());
+                var response=new ChatResponse(List.of(new Generation(AssistantMessage.builder().content("")
+                        .toolCalls(List.of(new AssistantMessage.ToolCall("call-1","function","maps_weather","{}"))).build())));
+                assertNotNull(manager.executeToolCalls(new Prompt("Executor capability: maps_weather",options),response));
+                if (!profile.allows(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapability.REQUEST_TOOL)) {
+                    var discoveryResponse=new ChatResponse(List.of(new Generation(AssistantMessage.builder().content("")
+                            .toolCalls(List.of(new AssistantMessage.ToolCall("discovery-1","function","request_tool",
+                                    "{\"needs\":\"maps_weather\"}"))).build())));
+                    assertNotNull(manager.executeToolCalls(new Prompt("Executor capability: maps_weather",options),discoveryResponse));
+                }
+            }
+            verify(delegate,never()).executeToolCalls(any(),any());verify(business,never()).call(anyString());
+            verifyNoInteractions(catalog);
         } finally {MDC.clear();}
     }
 }

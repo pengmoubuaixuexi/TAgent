@@ -2,6 +2,7 @@ package cn.bugstack.ai.infrastructure.adapter.repository.cache;
 
 import cn.bugstack.ai.domain.agent.model.valobj.AiMcpToolCatalogVO;
 import cn.bugstack.ai.domain.agent.service.router.IToolVectorStore;
+import cn.bugstack.ai.domain.agent.service.router.ToolCatalogRelevance;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -35,18 +36,20 @@ public class ToolVectorStore implements IToolVectorStore {
     private final EmbeddingModel embeddingModel;
 
     /**
-     * 命中所需的最低 cosine 相似度，低于此分视为无关、不返回。{@code <=0} 表示不设下限只按 topN 取。
-     * embedding 即便 top-N 也基本相关，这里只挡"全场没一个沾边"的离谱命中；设高会误杀跨同义词的正确命中。
+     * 候选所需的最低 cosine 相似度。{@code <=0} 只关闭此召回下限，能力佐证规则仍适用。
+     * This is a recall floor, not proof that a candidate implements the requested capability.
      */
     private final double minSimilarity;
 
     /**
      * 相对阈值（gap）：top-N 候选里只保留与 top1 相差在此范围内的（默认 0.1）。{@code <=0} 关闭。
-     * <p>绝对下限({@link #minSimilarity})挡"全场没一个沾边"；这个相对窗口挡"top1 明显更贴、后面凑数"——
-     * 如 top1=0.69、第二名 0.58（差 0.11 > 0.1）就把凑数的第二名甩掉，只补真正贴题的；
-     * 但若 top1=0.61、第二名 0.60（差 0.01）说明俩都贴题，都留。
+     * <p>窗口仅在通过能力佐证的候选中应用。两个工具分数接近，并不证明它们都支持所需能力。
      */
     private final double relativeGap;
+
+    /** Moderate cosine similarity needs independent capability evidence; top-N is not a quota. */
+    @Value("${agent.dynamic-tools.embedding.uncorroborated-min-similarity:0.65}")
+    private double uncorroboratedMinSimilarity = 0.65;
 
     public ToolVectorStore(@Qualifier("pgVectorJdbcTemplate") JdbcTemplate pgVectorJdbcTemplate,
                            EmbeddingModel embeddingModel,
@@ -131,8 +134,9 @@ public class ToolVectorStore implements IToolVectorStore {
         try {
             String vectorStr = toVectorLiteral(embeddingModel.embed(need));
             Set<String> exclude = excludeNames == null ? Set.of() : excludeNames;
-            // 多取一些(topN + 排除数)再在内存里过滤排除项，保证过滤后仍有 topN
-            int fetch = topN + exclude.size();
+            // Oversample before relevance filtering. Otherwise one unrelated top-1 can hide
+            // a relevant lower-ranked candidate. It is valid to return fewer than topN.
+            int fetch = Math.min(256, Math.max(32, topN * 8 + exclude.size()));
             String sql = """
                     SELECT mcp_id, tool_name, mcp_name, description_zh, intent_zh,
                            1 - (embedding <=> ?::vector) AS similarity
@@ -150,6 +154,9 @@ public class ToolVectorStore implements IToolVectorStore {
             args.add(vectorStr);
             args.add(fetch);
             List<Map<String, Object>> rows = pgVectorJdbcTemplate.queryForList(sql, args.toArray());
+            // No indexed rows for this authorized scope: permit local catalog fallback. An
+            // indexed scope whose candidates fail relevance below returns empty, not null.
+            if (rows.isEmpty()) return null;
 
             // 通过 排除 + 绝对下限 的候选（已按相似度降序），最多 topN 个；并记下各自相似度供相对阈值用
             List<AiMcpToolCatalogVO> survivors = new ArrayList<>();
@@ -160,14 +167,16 @@ public class ToolVectorStore implements IToolVectorStore {
                 double sim = ((Number) row.get("similarity")).doubleValue();
                 diag.add(String.format(java.util.Locale.ROOT, "%s=%.3f", toolName, sim));
                 if (toolName != null && exclude.contains(toolName)) continue;
-                if (minSimilarity > 0 && sim < minSimilarity) continue;
-                survivors.add(AiMcpToolCatalogVO.builder()
+                if (!Double.isFinite(sim) || minSimilarity > 0 && sim < minSimilarity) continue;
+                AiMcpToolCatalogVO candidate = AiMcpToolCatalogVO.builder()
                         .mcpId((String) row.get("mcp_id"))
                         .mcpName((String) row.get("mcp_name"))
                         .toolName(toolName)
                         .toolDescriptionZh((String) row.get("description_zh"))
                         .toolIntentZh((String) row.get("intent_zh"))
-                        .build());
+                        .build();
+                if (sim < uncorroboratedMinSimilarity && ToolCatalogRelevance.score(need, candidate) <= 0) continue;
+                survivors.add(candidate);
                 sims.add(sim);
                 if (survivors.size() >= topN) break;
             }
@@ -186,6 +195,7 @@ public class ToolVectorStore implements IToolVectorStore {
                     need, minSimilarity, relativeGap, diag, result.stream().map(AiMcpToolCatalogVO::getToolName).toList());
             return result;
         } catch (Exception e) {
+            cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.rethrowCancellation(e);
             log.warn("[ToolVector] search failed, signaling fallback: {}", e.toString());
             return null; // null = 向量库出错 → 调用方回退 BM25
         }

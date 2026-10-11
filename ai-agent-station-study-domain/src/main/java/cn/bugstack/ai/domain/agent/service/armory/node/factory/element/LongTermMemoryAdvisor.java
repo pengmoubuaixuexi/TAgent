@@ -1,6 +1,7 @@
 package cn.bugstack.ai.domain.agent.service.armory.node.factory.element;
 
 import cn.bugstack.ai.domain.agent.service.execute.common.LongTermMemoryTurnSnapshot;
+import cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker;
 import cn.bugstack.ai.domain.agent.service.memory.longterm.ILongTermMemoryService;
 import cn.bugstack.ai.domain.agent.service.memory.longterm.LongTermMemoryRecall;
 import lombok.extern.slf4j.Slf4j;
@@ -174,7 +175,10 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
 
         // 混合检索：核心记忆（高频+近期）+ 语义相关记忆（向量相似度）
         String evidenceSessionId = TrustedAdvisorIdentity.sessionId(ctx);
-        List<LongTermMemoryRecall> recalls = loadTurnMemorySnapshot(evidenceSessionId, userId, retrievalQuery);
+        List<LongTermMemoryRecall> recalls;
+        try (var ignored = StreamingActivityTracker.advisorPhase(StreamingActivityTracker.AdvisorPhase.MEMORY_RETRIEVAL)) {
+            recalls = loadTurnMemorySnapshot(evidenceSessionId, userId, retrievalQuery);
+        }
         List<String> profileLines = recalls.stream().map(LongTermMemoryRecall::toPromptLine).toList();
         if (profileLines == null || profileLines.isEmpty()) return request;
 
@@ -337,7 +341,7 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
         final String finalSessionId = sessionId;
         final String finalAgentId = agentId;
 
-        CompletableFuture.runAsync(() -> {
+        Runnable extraction = () -> {
             if (mdcSnapshot != null) MDC.setContextMap(mdcSnapshot);
             try {
                 String prompt = String.format(EXTRACTION_PROMPT,
@@ -412,7 +416,16 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
             } finally {
                 MDC.clear();
             }
-        });
+        };
+        try {
+            Runnable maintenance = cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.captureMaintenance(extraction);
+            CompletableFuture.runAsync(() -> {
+                try { maintenance.run(); }
+                catch (RuntimeException e) { log.debug("[LTM] queued extraction no longer permitted: {}", e.getMessage()); }
+            });
+        } catch (RuntimeException e) {
+            log.warn("[LTM] extraction scheduling failed: {}", e.getMessage());
+        }
     }
 
     @Override

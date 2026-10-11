@@ -3,9 +3,11 @@ package cn.bugstack.ai.domain.agent.service.execute.common;
 import cn.bugstack.ai.domain.agent.model.valobj.AiClientToolMcpVO;
 import cn.bugstack.ai.domain.agent.model.valobj.enums.AiAgentEnumVO;
 import io.modelcontextprotocol.client.McpSyncClient;
+import io.modelcontextprotocol.spec.McpSchema;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.mcp.SyncMcpToolCallbackProvider;
+import org.springframework.ai.mcp.SyncMcpToolCallback;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.config.BeanDefinition;
@@ -52,6 +54,115 @@ public class McpClientRegistry {
 
     @Autowired(required = false)
     private cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository workspaceAccess;
+    @Autowired(required=false)
+    private cn.bugstack.ai.domain.agent.adapter.repository.IAgentRepository agentRepository;
+    @org.springframework.beans.factory.annotation.Value("${agent.mcp.pool.max-connections:64}") private int maxConnections=64;
+    @org.springframework.beans.factory.annotation.Value("${agent.mcp.pool.max-per-user:16}") private int maxPerUser=16;
+    @org.springframework.beans.factory.annotation.Value("${agent.mcp.pool.idle-ms:900000}") private long poolIdleMs=900000;
+    private final McpConnectionPool pool=new McpConnectionPool();
+    private final Map<String,String> capacityOwners=new ConcurrentHashMap<>();
+    private final com.google.common.cache.Cache<String,Long> evictedAt=com.google.common.cache.CacheBuilder.newBuilder()
+            .maximumSize(4096).expireAfterWrite(24,TimeUnit.HOURS).build();
+    private final com.google.common.cache.Cache<String,Long> lastUseBeforeEviction=com.google.common.cache.CacheBuilder.newBuilder()
+            .maximumSize(4096).expireAfterWrite(24,TimeUnit.HOURS).build();
+    private volatile Function<AiClientToolMcpVO,McpSyncClient> defaultFactory;
+
+    /** Reserve capacity before any transport/socket/process is created. Both eager and lazy paths use this. */
+    public McpSyncClient ensureClient(AiClientToolMcpVO candidate,Function<AiClientToolMcpVO,McpSyncClient> factory) {
+        String id=candidate.getMcpId();
+        synchronized(locks.computeIfAbsent(id,k->new Object())) {
+            AiClientToolMcpVO config=agentRepository==null?candidate:agentRepository.queryAiClientToolMcpVOByMcpId(id);
+            if(config==null)throw new IllegalStateException("MCP 配置已删除或停用");
+            String owner=workspaceAccess==null?capacityOwners.get(id):workspaceAccess.mcpCapacityOwner(id);
+            if(owner==null||owner.isBlank()) {
+                if(workspaceAccess!=null&&workspaceAccess.trustedSystemMcp(id)&&(org.slf4j.MDC.get("userId")==null||org.slf4j.MDC.get("userId").isBlank()))owner="SYSTEM";
+                else throw new IllegalStateException("MCP 配置缺少可信的归属，不能创建个人连接");
+            }
+            McpConnectionPool.Slot active=pool.current(id);
+            if(active!=null&&active.client!=null) {
+                if (sameTransport(configRegistry.get(id), config)) return active.client;
+                // Source credential rotation is authoritative even if an admin invalidation failed
+                // or the row was changed outside the UI. Never send another call on stale auth.
+                unregister(id);
+                clientFactories.put(id, factory);
+            }
+            makeRoom(owner,id);McpConnectionPool.Slot reservation=pool.reserve(id,owner,Math.max(1,maxConnections),Math.max(1,maxPerUser));
+            McpSyncClient client=null;
+            try {
+                client=factory.apply(config);pool.commit(reservation,client);
+                capacityOwners.put(id,owner);defaultFactory=factory;
+                registerState(id,config,client,factory);registerBean(AiAgentEnumVO.AI_CLIENT_TOOL_MCP.getBeanName(id),McpSyncClient.class,client);
+                evictedAt.invalidate(id);return client;
+            } catch(RuntimeException|Error failure){pool.abort(reservation);closeQuietly(client);if(client!=null)clientRegistry.remove(id,client);throw failure;}
+        }
+    }
+    private void makeRoom(String owner,String exclude) {
+        if(pool.hasCapacity(owner,Math.max(1,maxConnections),Math.max(1,maxPerUser)))return;
+        // Prefer this owner's oldest unused generation so one user cannot evict everyone else's working set.
+        var candidates=pool.idleCandidates(System.currentTimeMillis());
+        candidates=new ArrayList<>(candidates);candidates.sort(java.util.Comparator.comparing(id->!owner.equals(capacityOwners.get(id))));
+        for(String id:candidates){if(id.equals(exclude))continue;evictIdle(id,System.currentTimeMillis());if(pool.hasCapacity(owner,Math.max(1,maxConnections),Math.max(1,maxPerUser)))return;}
+    }
+    @org.springframework.scheduling.annotation.Scheduled(fixedDelayString="${agent.mcp.pool.sweep-ms:60000}")
+    public void evictIdleConnections(){long cutoff=System.currentTimeMillis()-Math.max(1000,poolIdleMs);for(String id:pool.idleCandidates(cutoff))evictIdle(id,cutoff);}
+    private void evictIdle(String id,long cutoff) {
+        // Never wait on another connection's creation lock while holding our own admission lock.
+        McpConnectionPool.Slot slot=pool.current(id);if(slot==null||slot.lastUsed>cutoff)return;
+        McpSyncClient closed=pool.retireIfIdle(id,slot.client,cutoff);if(closed==null)return;
+        clientRegistry.remove(id,closed);evictedAt.put(id,System.currentTimeMillis());lastUseBeforeEviction.put(id,slot.lastUsed);closeQuietly(closed);
+        // Leave the bean routing slot alone here: a concurrent recreation may already have replaced it.
+    }
+    private static final class SharedLease {final McpConnectionPool.Lease lease;int references;SharedLease(McpConnectionPool.Lease lease){this.lease=lease;}}
+    private final ThreadLocal<Map<String,SharedLease>> callScopes=ThreadLocal.withInitial(java.util.HashMap::new);
+    public final class CallLease implements AutoCloseable {
+        private final String id;private final SharedLease scope;private boolean closed;
+        private CallLease(String id,SharedLease scope){this.id=id;this.scope=scope;scope.references++;}
+        public McpSyncClient client(){return scope.lease.client();}
+        @Override public void close(){if(closed)return;closed=true;if(--scope.references==0){callScopes.get().remove(id,scope);if(callScopes.get().isEmpty())callScopes.remove();scope.lease.close();}}
+    }
+    /** Callback registration-only test/legacy registries have no transport to lease. */
+    public CallLease borrowCall(String id) {
+        if(id!=null&&agentRepository!=null&&agentRepository.queryAiClientToolMcpVOByMcpId(id)==null)
+            throw new IllegalStateException("MCP 配置已删除或停用");
+        if(id!=null&&workspaceAccess!=null&&workspaceAccess.mcpCapacityOwner(id)==null&&!workspaceAccess.trustedSystemMcp(id))
+            throw new IllegalStateException("MCP 配置已删除或停用");
+        SharedLease existing=id==null?null:callScopes.get().get(id);if(existing!=null)return new CallLease(id,existing);
+        if(id==null||!configRegistry.containsKey(id)&&agentRepository==null)return null;
+        synchronized(locks.computeIfAbsent(id,k->new Object())) {
+            AiClientToolMcpVO config=agentRepository==null?configRegistry.get(id):agentRepository.queryAiClientToolMcpVOByMcpId(id);
+            Function<AiClientToolMcpVO,McpSyncClient> factory=clientFactories.getOrDefault(id,defaultFactory);
+            if (config == null) throw new IllegalStateException("MCP 已撤销，不能恢复旧连接");
+            if (pool.current(id) != null && !sameTransport(configRegistry.get(id), config)) {
+                unregister(id);
+                if (factory != null) clientFactories.put(id, factory);
+            }
+            McpConnectionPool.Lease acquired=pool.acquireCurrent(id,true);
+            if(acquired==null) {
+                if(factory==null)throw new IllegalStateException("MCP 已撤销，不能恢复旧连接");
+                // Admission may evict an unused connection immediately. Retry this internal race,
+                // before any business request is sent; never replay a tool call to recover it.
+                for(int i=0;i<3&&acquired==null;i++){ensureClient(config,factory);acquired=pool.acquireCurrent(id,true);}
+                if(acquired==null)throw new IllegalStateException("MCP 容量正在调整，请稍后重试");
+                try{registerCallbacks(id,listCallbacksWithMetadata(id,acquired.client()));}
+                catch(RuntimeException|Error failure){acquired.close();throw failure;}
+            }
+            SharedLease scope=new SharedLease(acquired);callScopes.get().put(id,scope);return new CallLease(id,scope);
+        }
+    }
+
+    private static boolean sameTransport(AiClientToolMcpVO old, AiClientToolMcpVO current) {
+        return old != null && java.util.Objects.equals(old.getMcpName(), current.getMcpName())
+                && java.util.Objects.equals(old.getTransportType(), current.getTransportType())
+                && java.util.Objects.equals(old.getTransportConfig(), current.getTransportConfig())
+                && java.util.Objects.equals(old.getRequestTimeout(), current.getRequestTimeout());
+    }
+    private void retireClient(String id,McpSyncClient client) {
+        McpConnectionPool.Slot slot=pool.current(id);
+        if(slot==null){closeQuietly(client);return;}
+        closeQuietly(pool.retire(id,client,false));clientRegistry.remove(id,client);
+    }
+    private void removeClientBean(String id){if(applicationContext!=null){DefaultListableBeanFactory factory=(DefaultListableBeanFactory)applicationContext.getAutowireCapableBeanFactory();String bean=AiAgentEnumVO.AI_CLIENT_TOOL_MCP.getBeanName(id);if(factory.containsBeanDefinition(bean))factory.removeBeanDefinition(bean);}}
+    public Map<String,Object> lifecycle(String id){Map<String,Object> result=new java.util.LinkedHashMap<>();result.put("activeLeases",pool.activeLeases(id));Long used=pool.lastUsed(id);result.put("lastUsedAt",used==null?lastUseBeforeEviction.getIfPresent(id):used);result.put("evictedAt",evictedAt.getIfPresent(id));return result;}
 
     public void assertAccessible(String mcpId, String userId) {
         if (userId == null || userId.isBlank() || mcpId == null || workspaceAccess == null
@@ -113,6 +224,11 @@ public class McpClientRegistry {
      */
     public void register(String mcpId, AiClientToolMcpVO config, McpSyncClient client,
                          Function<AiClientToolMcpVO, McpSyncClient> clientFactory) {
+        // Trusted internal compatibility entry point. Production creation uses ensureClient.
+        if(pool.current(mcpId)==null){var slot=pool.reserve(mcpId,"SYSTEM",Math.max(1,maxConnections),Math.max(1,maxPerUser));pool.commit(slot,client);capacityOwners.put(mcpId,"SYSTEM");}
+        registerState(mcpId,config,client,clientFactory);
+    }
+    private void registerState(String mcpId,AiClientToolMcpVO config,McpSyncClient client,Function<AiClientToolMcpVO,McpSyncClient> clientFactory) {
         clientRegistry.put(mcpId, client);
         configRegistry.put(mcpId, config);
         clientFactories.put(mcpId, clientFactory);
@@ -150,7 +266,7 @@ public class McpClientRegistry {
     public void unregister(String mcpId) {
         if (mcpId == null) return;
         synchronized (locks.computeIfAbsent(mcpId, ignored -> new Object())) {
-            closeQuietly(clientRegistry.remove(mcpId));
+            retireClient(mcpId,clientRegistry.get(mcpId));
             configRegistry.remove(mcpId);
             clientFactories.remove(mcpId);
             callbackRegistry.keySet().removeIf(key -> mcpId.equals(key.mcpId()));
@@ -161,6 +277,7 @@ public class McpClientRegistry {
             lastProbeTime.remove(mcpId);
             lastProbeOkTime.remove(mcpId);
             lastProbeFailTime.remove(mcpId);
+            capacityOwners.remove(mcpId);evictedAt.invalidate(mcpId);lastUseBeforeEviction.invalidate(mcpId);
             if (applicationContext != null) {
                 DefaultListableBeanFactory factory = (DefaultListableBeanFactory) applicationContext.getAutowireCapableBeanFactory();
                 String bean = AiAgentEnumVO.AI_CLIENT_TOOL_MCP.getBeanName(mcpId);
@@ -197,7 +314,7 @@ public class McpClientRegistry {
             }
 
             try {
-                ToolCallback[] callbacks = new SyncMcpToolCallbackProvider(List.of(client)).getToolCallbacks();
+                ToolCallback[] callbacks = listCallbacksWithMetadata(mcpId, client);
                 lastProbeOkTime.computeIfAbsent(mcpId, k -> new AtomicLong(0)).set(System.currentTimeMillis());
                 AtomicLong fail = lastProbeFailTime.get(mcpId);
                 if (fail != null) fail.set(0);
@@ -215,19 +332,99 @@ public class McpClientRegistry {
         }
     }
 
+    /** Capture annotations during the existing tools/list, without an extra remote request. */
+    private ToolCallback[] listCallbacksWithMetadata(String mcpId, McpSyncClient client) {
+        Map<String, McpSchema.ToolAnnotations> annotations = new java.util.HashMap<>();
+        ToolCallback[] callbacks;
+        // Only the legacy, never-managed discovery path can omit a lease. A known generation
+        // may have been retired before clientRegistry.remove; never issue tools/list on it.
+        try(McpConnectionPool.Lease ignored=!configRegistry.containsKey(mcpId)&&pool.current(mcpId)==null
+                ?null:pool.acquire(mcpId,client,false)) {
+        callbacks = SyncMcpToolCallbackProvider.builder().mcpClients(client)
+                .toolFilter((connection, tool) -> {
+                    annotations.put(tool.name(), tool.annotations());
+                    return true;
+                }).build().getToolCallbacks();
+        }
+        return java.util.Arrays.stream(callbacks).map(callback -> {
+            String originalName = callback instanceof SyncMcpToolCallback mcpCallback
+                    ? mcpCallback.getOriginalToolName() : callback.getToolDefinition().name();
+            McpToolCallMetadata metadata = McpToolCallMetadata.from(mcpId, annotations.get(originalName),
+                    callback.getToolMetadata().returnDirect());
+            return (ToolCallback) new LeasedCallback(mcpId,client,callback,metadata);
+        }).toArray(ToolCallback[]::new);
+    }
+    public interface OriginalToolName {
+        String getOriginalToolName();
+    }
+
+    private final class LeasedCallback implements ToolCallback, OriginalToolName {
+        final String id;final McpSyncClient client;final ToolCallback callback;final McpToolCallMetadata metadata;
+        LeasedCallback(String id,McpSyncClient client,ToolCallback callback,McpToolCallMetadata metadata){this.id=id;this.client=client;this.callback=callback;this.metadata=metadata;}
+                @Override public org.springframework.ai.tool.definition.ToolDefinition getToolDefinition() {
+                    return callback.getToolDefinition();
+                }
+                @Override public org.springframework.ai.tool.metadata.ToolMetadata getToolMetadata() { return metadata; }
+                @Override public String getOriginalToolName() { return originalToolName(callback); }
+                @Override public String call(String input) { return invoke(input,null); }
+                @Override public String call(String input, org.springframework.ai.chat.model.ToolContext context) {
+                    return invoke(input,context);
+                }
+        private String invoke(String input,org.springframework.ai.chat.model.ToolContext context) {
+            if(workspaceAccess!=null){
+                Map<String,Object> values=context==null?Map.of():context.getContext();
+                Object user=values.get("userId"),agent=values.get("agentId");
+                assertAccessible(id,user==null?org.slf4j.MDC.get("userId"):String.valueOf(user),
+                        agent==null?org.slf4j.MDC.get("agentId"):String.valueOf(agent));
+            }
+            try(CallLease lease=borrowCall(id)) {
+                if(lease==null)throw new IllegalStateException("MCP connection is no longer authorized");
+                ToolCallback target=callback;
+                if(lease.client()!=client){
+                    ToolCallback current=getCurrentCallback(id,getToolDefinition().name());
+                    if(!(current instanceof LeasedCallback active)||active.client!=lease.client()
+                            ||!java.util.Objects.equals(getOriginalToolName(),active.getOriginalToolName())
+                            ||!java.util.Objects.equals(getToolDefinition().inputSchema(),active.getToolDefinition().inputSchema()))
+                        throw new IllegalStateException("MCP tool changed; reload its capabilities");
+                    target=active.callback;
+                }
+                return context==null?target.call(input):target.call(input,context);
+            }
+        }
+    }
+
     /**
      * 注册工具回调并建立反向索引（在 AiClientModelNode 装配时调用）
      */
     public void registerCallbacks(String mcpId, ToolCallback[] callbacks) {
         if (mcpId == null || callbacks == null) return;
-        Set<String> current = new LinkedHashSet<>();
-        for (ToolCallback cb : callbacks) {
-            String toolName = cb.getToolDefinition().name();
-            current.add(toolName);
-            callbackRegistry.computeIfAbsent(new ToolKey(mcpId, toolName), ignored -> new AtomicReference<>()).set(cb);
+        synchronized (locks.computeIfAbsent(mcpId, ignored -> new Object())) {
+            Map<String, ToolCallback> current = new java.util.LinkedHashMap<>();
+            Map<String, ToolCallback> names = new java.util.HashMap<>();
+            for (ToolCallback cb : callbacks) {
+                String name = cb.getToolDefinition().name();
+                if (current.putIfAbsent(name, cb) != null) {
+                    throw new IllegalStateException("Duplicate MCP tool name for mcpId=" + mcpId + ": " + name);
+                }
+                for (String alias : new String[]{name, originalToolName(cb)}) {
+                    ToolCallback previous = names.putIfAbsent(alias, cb);
+                    if (previous != null && previous != cb) {
+                        throw new IllegalStateException("Ambiguous MCP tool name for mcpId=" + mcpId + ": " + alias);
+                    }
+                }
+            }
+            current.forEach((name, cb) -> callbackRegistry
+                    .computeIfAbsent(new ToolKey(mcpId, name), ignored -> new AtomicReference<>()).set(cb));
+            callbackRegistry.keySet().removeIf(key -> mcpId.equals(key.mcpId()) && !current.containsKey(key.name()));
         }
-        callbackRegistry.keySet().removeIf(key -> mcpId.equals(key.mcpId()) && !current.contains(key.name()));
         log.info("[McpRegistry] registered {} callbacks for mcpId={}", callbacks.length, mcpId);
+    }
+
+    /** Stable server-side name; SDK model-facing names can be formatted or prefixed. */
+    public static String originalToolName(ToolCallback callback) {
+        if (callback instanceof OriginalToolName named) return named.getOriginalToolName();
+        if (callback instanceof SyncMcpToolCallback mcpCallback) return mcpCallback.getOriginalToolName();
+        return callback == null || callback.getToolDefinition() == null ? null : callback.getToolDefinition().name();
     }
 
     /**
@@ -235,8 +432,10 @@ public class McpClientRegistry {
      */
     public String getMcpIdForTool(String toolName) {
         String match = null;
-        for (ToolKey key : callbackRegistry.keySet()) {
-            if (!java.util.Objects.equals(toolName, key.name())) continue;
+        for (var entry : callbackRegistry.entrySet()) {
+            ToolKey key = entry.getKey();
+            if (!java.util.Objects.equals(toolName, key.name())
+                    && !java.util.Objects.equals(toolName, originalToolName(entry.getValue().get()))) continue;
             if (match != null && !match.equals(key.mcpId())) return null;
             match = key.mcpId();
         }
@@ -256,11 +455,29 @@ public class McpClientRegistry {
     public ToolCallback getCurrentCallback(String mcpId, String toolName) {
         if (mcpId == null || toolName == null) return null;
         AtomicReference<ToolCallback> ref = callbackRegistry.get(new ToolKey(mcpId, toolName));
-        return ref != null ? ref.get() : null;
+        if (ref != null) return availableCallback(ref.get());
+        // Resolve only names actually reported by this connection. Character replacement or
+        // global alias lookup can route an old catalog hit to a different tool/tenant.
+        ToolCallback match = null;
+        for (var entry : callbackRegistry.entrySet()) {
+            if (!mcpId.equals(entry.getKey().mcpId())) continue;
+            ToolCallback callback = availableCallback(entry.getValue().get());
+            if (callback == null) continue;
+            if (!toolName.equals(originalToolName(callback))) continue;
+            if (match != null && match != callback) return null;
+            match = callback;
+        }
+        return match;
+    }
+
+    /** Keep name metadata for recovery, but never advertise a retired transport as callable. */
+    private ToolCallback availableCallback(ToolCallback callback) {
+        if (callback instanceof LeasedCallback leased && !pool.isCurrent(leased.id, leased.client)) return null;
+        return callback;
     }
     public ToolCallback[] currentCallbacks(String mcpId) {
         return callbackRegistry.entrySet().stream().filter(e->java.util.Objects.equals(mcpId,e.getKey().mcpId()))
-                .map(e->e.getValue().get()).filter(java.util.Objects::nonNull).toArray(ToolCallback[]::new);
+                .map(e->availableCallback(e.getValue().get())).filter(java.util.Objects::nonNull).toArray(ToolCallback[]::new);
     }
 
     /**
@@ -292,19 +509,24 @@ public class McpClientRegistry {
             // listTools 正常 200-500ms 返回，给 1 秒上限
             java.util.concurrent.CompletableFuture<Boolean> future =
                     java.util.concurrent.CompletableFuture.supplyAsync(() -> {
-                        try {
+                        String id=clientRegistry.entrySet().stream().filter(e->e.getValue()==client).map(Map.Entry::getKey).findFirst().orElse(null);
+                        if(id==null)return false;
+                        try (McpConnectionPool.Lease ignored=pool.acquire(id,client,false)) {
                             client.listTools();
                             return true;
                         } catch (Exception e) {
                             return false;
                         }
-                    });
+                    },probeExecutor);
             return future.get(PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
             log.debug("[McpRegistry] probe timeout or failed: {}", e.toString());
             return false;
         }
     }
+    private final java.util.concurrent.ExecutorService probeExecutor=new java.util.concurrent.ThreadPoolExecutor(4,4,0,TimeUnit.MILLISECONDS,
+            new java.util.concurrent.ArrayBlockingQueue<>(64),r->{Thread thread=new Thread(r,"mcp-health-probe");thread.setDaemon(true);return thread;},new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+    @jakarta.annotation.PreDestroy public void shutdown(){probeExecutor.shutdownNow();for(String id:new ArrayList<>(clientRegistry.keySet()))unregister(id);}
 
     /**
      * 获取新鲜的 ToolCallback。
@@ -343,8 +565,7 @@ public class McpClientRegistry {
 
             // 快速路径：客户端健康，直接返回
             if (isHealthy(client)) {
-                AtomicReference<ToolCallback> ref = callbackRegistry.get(new ToolKey(mcpId, toolName));
-                return ref != null ? ref.get() : null;
+                return getCurrentCallback(mcpId, toolName);
             }
 
             // 客户端死亡，尝试重建
@@ -403,8 +624,7 @@ public class McpClientRegistry {
                     if (mcpToolMetrics != null) {
                         mcpToolMetrics.recordReconnectCooldownHit(mcpId);
                     }
-                    AtomicReference<ToolCallback> ref = callbackRegistry.get(new ToolKey(mcpId, toolName));
-                    return ref != null ? ref.get() : null;
+                    return getCurrentCallback(mcpId, toolName);
                 }
             }
 
@@ -434,8 +654,7 @@ public class McpClientRegistry {
         if (newCallbacks == null) {
             return null;
         }
-        AtomicReference<ToolCallback> ref = callbackRegistry.get(new ToolKey(mcpId, toolName));
-        return ref != null ? ref.get() : null;
+        return getCurrentCallback(mcpId, toolName);
     }
 
     private ToolCallback[] doRecreateCallbacks(String mcpId, McpSyncClient oldClient, String trigger) {
@@ -447,17 +666,16 @@ public class McpClientRegistry {
                 return null;
             }
 
-            closeQuietly(oldClient);
+            retireClient(mcpId,oldClient);
 
             Function<AiClientToolMcpVO, McpSyncClient> factory = clientFactories.get(mcpId);
             if (factory == null) {
                 log.error("[McpRegistry] no client factory for mcpId={}", mcpId);
                 return null;
             }
-            McpSyncClient newClient = factory.apply(config);
-            clientRegistry.put(mcpId, newClient);
+            McpSyncClient newClient = ensureClient(config,factory);
 
-            ToolCallback[] newCallbacks = new SyncMcpToolCallbackProvider(List.of(newClient)).getToolCallbacks();
+            ToolCallback[] newCallbacks = listCallbacksWithMetadata(mcpId, newClient);
             registerCallbacks(mcpId, newCallbacks);
 
             registerBean(AiAgentEnumVO.AI_CLIENT_TOOL_MCP.getBeanName(mcpId), McpSyncClient.class, newClient);
@@ -486,7 +704,7 @@ public class McpClientRegistry {
             }
             // 清理 stale clientRegistry entry：oldClient 已 closeQuietly，新 client 创建失败，
             // 留着这个 stale 引用会让 snapshotAll 误报 alive。移除后状态变 unknown，跟真实情况对齐。
-            clientRegistry.remove(mcpId);
+            retireClient(mcpId,clientRegistry.get(mcpId));
 
             if (failures >= CIRCUIT_BREAKER_THRESHOLD) {
                 long until = System.currentTimeMillis() + CIRCUIT_BREAKER_COOLDOWN_MS;
@@ -507,7 +725,9 @@ public class McpClientRegistry {
         if (client == null) {
             return false;
         }
-        try {
+        String id=clientRegistry.entrySet().stream().filter(e->e.getValue()==client).map(Map.Entry::getKey).findFirst().orElse(null);
+        if(id==null)return false;
+        try (McpConnectionPool.Lease ignored=pool.acquire(id,client,false)) {
             client.listTools();
             return true;
         } catch (Exception e) {
@@ -566,6 +786,7 @@ public class McpClientRegistry {
         for (String mcpId : ids) {
             McpSyncClient client = clientRegistry.get(mcpId);
             if (client == null) continue; // 无 client 不探，由重连流程负责
+            if (pool.activeLeases(mcpId)>0) continue;
             AtomicLong lastSuccess = lastSuccessTime.get(mcpId);
             long lastSuccessTs = lastSuccess == null ? 0 : lastSuccess.get();
             if (lastSuccessTs > 0 && now - lastSuccessTs < ALIVE_SUCCESS_WINDOW_MS) continue; // 业务调用 5min 内有成功 → 已 alive
@@ -629,7 +850,9 @@ public class McpClientRegistry {
                     && lastProbeFailTs > lastReconnectTs;
 
             String status;
-            if (failFastTs > now) {
+            if (client == null && evictedAt.getIfPresent(mcpId)!=null) {
+                status="idle_evicted";
+            } else if (failFastTs > now) {
                 status = "circuit_open";
             } else if (reconnectRemain > 0) {
                 status = "reconnect_cooldown";
@@ -640,6 +863,8 @@ public class McpClientRegistry {
                 status = lastProbeFailTs > 0 ? "dead" : "unknown";
             } else if (recentBusiness || recentProbeOk) {
                 status = "alive";
+            } else if (pool.activeLeases(mcpId)>0) {
+                status = "in_use";
             } else {
                 // 5min+ 没有业务成功或探活成功时，本轮 snapshot 会按节流触发探活；
                 // 如果探活未能提供成功证据，则观测面直接标 dead，避免长期停留在语义模糊的 idle。
@@ -736,10 +961,12 @@ public class McpClientRegistry {
     ) {}
 
     private <T> void registerBean(String beanName, Class<T> beanClass, T beanInstance) {
+        if(applicationContext==null)return;
         DefaultListableBeanFactory beanFactory =
                 (DefaultListableBeanFactory) applicationContext.getAutowireCapableBeanFactory();
         BeanDefinitionBuilder builder = BeanDefinitionBuilder.genericBeanDefinition(beanClass, () -> beanInstance);
         BeanDefinition definition = builder.getRawBeanDefinition();
+        ((org.springframework.beans.factory.support.AbstractBeanDefinition)definition).setDestroyMethodName("");
         definition.setScope(BeanDefinition.SCOPE_SINGLETON);
         if (beanFactory.containsBeanDefinition(beanName)) {
             beanFactory.removeBeanDefinition(beanName);

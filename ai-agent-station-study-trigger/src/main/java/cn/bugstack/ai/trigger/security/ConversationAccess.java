@@ -24,6 +24,18 @@ public class ConversationAccess {
         if (owner == null && id.startsWith("default:" + userId + ":")) {
             owner = owners.owner(id.substring(("default:" + userId + ":").length()));
         }
+        if (owner == null) {
+            // Eval/background dispatch bypasses HTTP body advice. Trust only durable, unanimous
+            // ownership; an eval- prefix or a user ID embedded in a client-supplied ID is not proof.
+            String sessionId = id;
+            if (id.startsWith("default:" + userId + ":")) {
+                sessionId = id.substring(("default:" + userId + ":").length());
+            } else if (id.startsWith(userId + ":")) {
+                sessionId = id.substring(userId.length() + 1);
+            }
+            owner = owners.persistedOwner(sessionId, "default:" + userId + ":" + sessionId,
+                    userId + ":" + sessionId);
+        }
         if (owner == null && create) {
             if (id.contains(":")) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "新会话标识不能包含冒号");
             owners.claim(id, userId); // Unique key arbitrates simultaneous claims.

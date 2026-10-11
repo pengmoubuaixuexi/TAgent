@@ -5,6 +5,7 @@ import cn.bugstack.ai.domain.agent.model.valobj.*;
 import cn.bugstack.ai.domain.agent.service.router.*;
 import cn.bugstack.ai.domain.agent.service.execute.common.*;
 import cn.bugstack.ai.domain.agent.service.execute.flow.step.Step1McpToolsAnalysisNode;
+import cn.bugstack.ai.domain.agent.service.execute.flow.step.Step2PlanningNode;
 import org.junit.*;
 import org.slf4j.MDC;
 import org.springframework.ai.tool.ToolCallback;
@@ -65,7 +66,9 @@ public class FlowBoundMcpCapabilitiesTest {
         when(access.agentMcpIds("alice","agent")).thenReturn(Set.of());
         assertFalse(service.describeBoundMcpCapabilities("executor").contains("maps_weather"));
         MDC.put("agentId","another");assertEquals("",service.describeBoundMcpCapabilities("executor"));
-        verify(repo,never()).queryEnabledMcpToolCatalog();verifyNoInteractions(registry);
+        verify(repo,never()).queryEnabledMcpToolCatalog();
+        verify(registry).getCurrentCallback("owned","delete_file");
+        verifyNoMoreInteractions(registry); // local alias lookup only; no MCP discovery or invocation
     }
     @Test public void unindexedConnectionUsesListedDefinitionsButNeverCallsATool() {
         var cb=mock(ToolCallback.class);
@@ -74,10 +77,31 @@ public class FlowBoundMcpCapabilitiesTest {
         assertTrue(service.describeBoundMcpCapabilities("executor").contains("maps_weather"));
         verify(cb,never()).call(anyString());verifyNoInteractions(vectors);
     }
+    @Test public void savedCanonicalSelectionCanSeeTheAuthoritativeOriginalNameInBoundCatalog() {
+        when(repo.queryWorkspaceNodePolicy("executor")).thenReturn(policy(Set.of("get_tickets"),false));
+        when(repo.queryMcpToolCatalogByMcpId("platform")).thenReturn(List.of(tool("get-tickets")));
+        var raw=mock(org.springframework.ai.mcp.SyncMcpToolCallback.class);
+        when(raw.getOriginalToolName()).thenReturn("get-tickets");
+        when(raw.getToolDefinition()).thenReturn(ToolDefinition.builder().name("get_tickets")
+                .description("查询车票").inputSchema("{}").build());
+        when(registry.getCurrentCallback("owned","get-tickets")).thenReturn(raw);
+        assertTrue(service.describeBoundMcpCapabilities("executor").contains("get-tickets"));
+        verify(raw,never()).call(anyString());verifyNoInteractions(vectors);
+        verify(registry).getCurrentCallback("owned","get-tickets");verifyNoMoreInteractions(registry);
+    }
     @Test public void failedCatalogIsUnknownNotAbsenceOfCapabilities() {
         when(registry.currentCallbacks("owned")).thenThrow(new IllegalStateException("secret URL"));
         String result=service.describeBoundMcpCapabilities("executor");
         assertTrue(result.contains("目录读取失败，能力未知"));assertFalse(result.contains("secret URL"));
+    }
+    @Test public void missingCatalogDoesNotConnectToRemoteServiceDuringPlanning() {
+        when(registry.currentCallbacks("owned")).thenReturn(new ToolCallback[0]);
+        String result=service.describeBoundMcpCapabilities("executor");
+        assertTrue(result.contains("尚未发现工具目录，能力未知"));
+        assertTrue(result.contains("执行阶段再按需发现"));
+        verify(registry).currentCallbacks("owned");
+        verifyNoMoreInteractions(registry);
+        verifyNoInteractions(vectors);
     }
     @Test public void inventoryBudgetReportsOmissionsInsteadOfPretendingItIsComplete() {
         var entries=new ArrayList<AiMcpToolCatalogVO>();
@@ -92,5 +116,45 @@ public class FlowBoundMcpCapabilitiesTest {
         var found=service.previewMatchedTools("maps_weather","weather",Set.of());
         assertEquals(List.of("maps_weather"),found.stream().map(AiMcpToolCatalogVO::getToolName).toList());
         assertEquals("owned",found.get(0).getMcpId());verifyNoInteractions(vectors);
+    }
+
+    @Test public void loadedToolDoesNotHideUnloadedExecutorBindingsFromEitherFlowStage() {
+        when(repo.queryMcpToolCatalogByMcpId("platform")).thenReturn(List.of(tool("maps_weather"),tool("get-tickets")));
+        var callback=mock(ToolCallback.class);
+        when(callback.getToolDefinition()).thenReturn(ToolDefinition.builder().name("maps_weather")
+                .description("已装载的天气查询").inputSchema("{}").build());
+        var catalog=ExecutorToolCatalog.from(List.of(callback),ExecutorToolCatalog.Source.RESIDENT,1);
+        for (Object step:List.of(new Step1McpToolsAnalysisNode(),new Step2PlanningNode())) {
+            ReflectionTestUtils.setField(step,"dynamicMcpToolCatalogService",service);
+            String prompt=ReflectionTestUtils.invokeMethod(step,"renderToolRuntimeForPrompt",catalog,"executor");
+            assertTrue(prompt.contains("maps_weather"));
+            assertTrue(prompt.contains("get-tickets"));
+            assertTrue(prompt.contains("不授予分析/规划节点业务执行权限"));
+        }
+        verify(callback,never()).call(anyString());verifyNoInteractions(registry,vectors);
+    }
+
+    @Test public void onlyConfiguredAnalysisAndPlanningRolesCanInspectTheirExecutorGrant() {
+        when(repo.queryMcpToolCatalogByMcpId("platform")).thenReturn(List.of(tool("maps_weather")));
+        var roles=Map.of("TOOL_MCP_CLIENT","analysis","PLANNING_CLIENT","planning",
+                "TASK_ANALYZER_CLIENT","auto-analysis","QUALITY_SUPERVISOR_CLIENT","quality");
+        Map<String,AiAgentClientFlowConfigVO> flow=new HashMap<>();
+        roles.forEach((role,client)->{
+            flow.put(role,AiAgentClientFlowConfigVO.builder().clientId(client).clientType(role).build());
+            when(repo.queryWorkspaceNodePolicy(client)).thenReturn(new WorkspaceNodePolicy("agent",client,"",Map.of(),Set.of()));
+        });
+        flow.put("EXECUTOR_CLIENT",AiAgentClientFlowConfigVO.builder().clientId("executor").build());
+        flow.put("PRECISION_EXECUTOR_CLIENT",AiAgentClientFlowConfigVO.builder().clientId("executor").build());
+        when(repo.queryAiAgentClientFlowConfig("agent")).thenReturn(flow);
+        for (String client:List.of("analysis","planning","auto-analysis")) {
+            assertTrue(service.describeBoundMcpCapabilities(client).contains("maps_weather"));
+        }
+        assertFalse(service.describeBoundMcpCapabilities("quality").contains("maps_weather"));
+        when(repo.queryWorkspaceNodePolicy("executor")).thenReturn(
+                new WorkspaceNodePolicy("other-agent","executor","",Map.of("owned",Set.of()),Set.of("owned")));
+        assertFalse(service.describeBoundMcpCapabilities("analysis").contains("maps_weather"));
+        MDC.put("agentId","other-agent");
+        assertEquals("",service.describeBoundMcpCapabilities("analysis"));
+        verifyNoInteractions(registry,vectors);
     }
 }

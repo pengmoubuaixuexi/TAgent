@@ -15,6 +15,7 @@ import cn.bugstack.ai.infrastructure.dao.po.DailyRegistrationCount;
  */
 @Mapper
 public interface IAdminUserDao {
+    int updatePasswordIfCurrent(@Param("userId") String userId,@Param("oldPassword") String oldPassword,@Param("newPassword") String newPassword);
 
     /** Existing account creation timestamps, grouped by calendar date; no new tracking table. */
     List<DailyRegistrationCount> countRegistrationsByDay(@Param("start") LocalDateTime start,

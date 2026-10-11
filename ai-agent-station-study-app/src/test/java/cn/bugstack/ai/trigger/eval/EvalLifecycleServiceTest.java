@@ -4,6 +4,8 @@ import cn.bugstack.ai.domain.agent.adapter.repository.IAgentRepository;
 import cn.bugstack.ai.domain.agent.service.IAgentDispatchService;
 import cn.bugstack.ai.domain.agent.service.execute.event.RunEventPublisher;
 import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService;
+import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot;
+import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunStepSnapshot;
 import cn.bugstack.ai.infrastructure.dao.IAiEvalOpsDao;
 import cn.bugstack.ai.infrastructure.dao.po.AiEvalCaseResult;
 import cn.bugstack.ai.infrastructure.dao.po.AiEvalCase;
@@ -13,19 +15,29 @@ import cn.bugstack.ai.infrastructure.dao.po.AiEvalJudgeResult;
 import cn.bugstack.ai.infrastructure.dao.po.AiEvalRun;
 import com.alibaba.fastjson.JSONObject;
 import org.junit.Test;
+import org.mockito.ArgumentCaptor;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 
+import static org.junit.Assert.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.times;
 
 public class EvalLifecycleServiceTest {
 
@@ -203,13 +215,15 @@ public class EvalLifecycleServiceTest {
     public void shouldDispatchJudgeOnlyAfterTransactionCommit() {
         IAiEvalOpsDao dao = mock(IAiEvalOpsDao.class);
         when(dao.findRun("run-1")).thenReturn(
-                AiEvalRun.builder().evalRunId("run-1").status("RULE_COMPLETED").build());
+                AiEvalRun.builder().evalRunId("run-1").datasetId("dataset-1").status("RULE_COMPLETED").build());
+        when(dao.findDataset("dataset-1")).thenReturn(
+                AiEvalDataset.builder().datasetId("dataset-1").ownerUserId("owner-1").build());
         when(dao.listJudgeJobs("run-1")).thenReturn(List.of());
         EvalJudgeService service = new EvalJudgeService(dao, mock(IAgentRepository.class));
         TransactionSynchronizationManager.setActualTransactionActive(true);
         TransactionSynchronizationManager.initSynchronization();
         try {
-            service.createJudgeJob("run-1", new EvalJudgeService.JudgeCommand());
+            service.createJudgeJob("run-1", selectedJudgeModel());
 
             org.junit.Assert.assertEquals(1, TransactionSynchronizationManager.getSynchronizations().size());
             verify(dao, never()).findJudgeJob(any(String.class));
@@ -223,17 +237,19 @@ public class EvalLifecycleServiceTest {
     @Test
     public void shouldRecoverLegacyCancelledJudgeRunWhenRulesAreComplete() {
         IAiEvalOpsDao dao = mock(IAiEvalOpsDao.class);
-        AiEvalRun cancelled = AiEvalRun.builder().evalRunId("run-1").status("CANCELLED")
+        AiEvalRun cancelled = AiEvalRun.builder().evalRunId("run-1").datasetId("dataset-1").status("CANCELLED")
                 .totalCases(80).completedCases(80).build();
-        AiEvalRun restored = AiEvalRun.builder().evalRunId("run-1").status("RULE_COMPLETED")
+        AiEvalRun restored = AiEvalRun.builder().evalRunId("run-1").datasetId("dataset-1").status("RULE_COMPLETED")
                 .totalCases(80).completedCases(80).build();
         when(dao.findRun("run-1")).thenReturn(cancelled, restored);
+        when(dao.findDataset("dataset-1")).thenReturn(
+                AiEvalDataset.builder().datasetId("dataset-1").ownerUserId("owner-1").build());
         when(dao.listJudgeJobs("run-1")).thenReturn(List.of());
         EvalJudgeService service = new EvalJudgeService(dao, mock(IAgentRepository.class));
         TransactionSynchronizationManager.setActualTransactionActive(true);
         TransactionSynchronizationManager.initSynchronization();
         try {
-            service.createJudgeJob("run-1", new EvalJudgeService.JudgeCommand());
+            service.createJudgeJob("run-1", selectedJudgeModel());
 
             verify(dao).restoreRuleCompletedForJudgeRetry("run-1");
             verify(dao, never()).findJudgeJob(any(String.class));
@@ -242,6 +258,150 @@ public class EvalLifecycleServiceTest {
             TransactionSynchronizationManager.setActualTransactionActive(false);
             service.shutdown();
         }
+    }
+
+    private static EvalJudgeService.JudgeCommand selectedJudgeModel() {
+        var command = new EvalJudgeService.JudgeCommand();
+        command.setModelId("fixture-judge");
+        command.setApiId("fixture-api");
+        return command;
+    }
+
+    @Test
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public void shouldPersistIncompleteEvidenceAndContinueFollowingScenarioCases() {
+        IAiEvalOpsDao dao = mock(IAiEvalOpsDao.class);
+        AiEvalRun run = diagnosticRun();
+        AiEvalCase first = diagnosticCase("case-1", 1);
+        AiEvalCase second = diagnosticCase("case-2", 2);
+        when(dao.findRun("run-1")).thenReturn(run);
+        when(dao.listCases("version-1", true)).thenReturn(List.of(first, second));
+        when(dao.listCaseResults("run-1")).thenReturn(List.of(diagnosticResult("case-1"), diagnosticResult("case-2")));
+        doAnswer(call -> { run.setCompletedCases(run.getCompletedCases() + 1); return 1; })
+                .when(dao).finishCaseResult(any());
+        RunSnapshot bad = completedSnapshot();
+        Map<Object, Object> backing = new LinkedHashMap<>();
+        backing.put(1, Set.of());
+        backing.put("1", Set.of(2));
+        JSONObject collision = new JSONObject((Map) backing);
+        bad.setFlowPlanDependencies((Map) collision);
+        RunSnapshotService snapshots = mock(RunSnapshotService.class);
+        when(snapshots.find(any(String.class))).thenReturn(Optional.of(bad), Optional.of(completedSnapshot()));
+        EvalRunService service = diagnosticService(dao, snapshots, new EvalRuleEngine());
+        try {
+            ReflectionTestUtils.invokeMethod(service, "executeRun", "run-1");
+            ArgumentCaptor<AiEvalCaseResult> results = ArgumentCaptor.forClass(AiEvalCaseResult.class);
+            verify(dao, times(2)).finishCaseResult(results.capture());
+            AiEvalCaseResult failed = results.getAllValues().get(0);
+            assertEquals("ERROR", failed.getStatus());
+            assertNull(failed.getOverallScore());
+            assertNull(failed.getAnswerScore());
+            assertNull(failed.getGrade());
+            assertEquals("已完成的答案", failed.getFinalAnswer());
+            assertTrue(failed.getErrorMessage().contains("Trace 不完整"));
+            JSONObject fallback = EvalTraceCodec.read(failed.getTraceJson());
+            assertEquals("INCOMPLETE", fallback.getString("traceCompleteness"));
+            assertEquals("PASS", fallback.getString("executionStatus"));
+            assertFalse(fallback.containsKey("runSnapshot"));
+            assertTrue(fallback.getJSONArray("omittedFields").contains("runSnapshot"));
+            assertFalse(fallback.getJSONObject("traceError").getBooleanValue("originalTracePersisted"));
+            assertThrows(IllegalArgumentException.class, () -> EvalJudgeService.parseTrace(failed.getTraceJson()));
+            failed.setEvalRunId("run-1");
+            when(dao.findCaseResult(failed.getResultId())).thenReturn(failed);
+            Map<String, Object> detail = service.getResult("run-1", failed.getResultId());
+            assertEquals(failed.getErrorMessage(), detail.get("traceError"));
+            assertTrue(detail.get("trace") instanceof JSONObject);
+            AiEvalCaseResult passed = results.getAllValues().get(1);
+            assertEquals("PASS", passed.getStatus());
+            assertNotNull(passed.getOverallScore());
+            assertEquals("COMPLETE", EvalJudgeService.parseTrace(passed.getTraceJson()).getString("traceCompleteness"));
+            verify(dao).finishRuleRun(eq("run-1"), eq("RULE_COMPLETED"), any(LocalDateTime.class), eq(null));
+        } finally {
+            service.shutdown();
+        }
+    }
+
+    @Test
+    public void shouldPropagateDatabaseFailureInsteadOfRetryingAsIncompleteEvidence() {
+        IAiEvalOpsDao dao = mock(IAiEvalOpsDao.class);
+        DataAccessResourceFailureException databaseFailure = new DataAccessResourceFailureException("database unavailable");
+        doThrow(databaseFailure).when(dao).finishCaseResult(any());
+        RunSnapshotService snapshots = mock(RunSnapshotService.class);
+        when(snapshots.find(any(String.class))).thenReturn(Optional.of(completedSnapshot()));
+        EvalRunService service = diagnosticService(dao, snapshots, new EvalRuleEngine());
+        try {
+            assertSame(databaseFailure, assertThrows(DataAccessResourceFailureException.class,
+                    () -> ReflectionTestUtils.invokeMethod(service, "executeCase", diagnosticRun(),
+                            diagnosticCase("case-1", 1), diagnosticResult("case-1"), "session-1")));
+            verify(dao, times(1)).finishCaseResult(any());
+            verify(dao, never()).refreshRunProgress(any(String.class));
+        } finally {
+            service.shutdown();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void shouldPreserveCancellationWhenDiagnosticCaptureFails() {
+        IAiEvalOpsDao dao = mock(IAiEvalOpsDao.class);
+        RunSnapshotService snapshots = mock(RunSnapshotService.class);
+        when(snapshots.find(any(String.class))).thenReturn(Optional.of(completedSnapshot()));
+        EvalRuleEngine rules = mock(EvalRuleEngine.class);
+        EvalRunService service = diagnosticService(dao, snapshots, rules);
+        when(rules.evaluate(any())).thenAnswer(call -> {
+            ((Set<String>) ReflectionTestUtils.getField(service, "cancelledRuns")).add("run-1");
+            throw new IllegalArgumentException("diagnostic failure after cancellation");
+        });
+        try {
+            ReflectionTestUtils.invokeMethod(service, "executeCase", diagnosticRun(),
+                    diagnosticCase("case-1", 1), diagnosticResult("case-1"), "session-1");
+            verify(dao, never()).finishCaseResult(any());
+        } finally {
+            service.shutdown();
+        }
+    }
+
+    @Test
+    public void shouldRefuseIncompleteEvidenceBeforeCallingJudgeProvider() {
+        IAiEvalOpsDao dao = mock(IAiEvalOpsDao.class);
+        when(dao.findCase("case-1")).thenReturn(diagnosticCase("case-1", 1));
+        EvalJudgeService service = new EvalJudgeService(dao, mock(IAgentRepository.class));
+        AiEvalCaseResult result = diagnosticResult("case-1");
+        result.setTraceJson("{\"traceSchemaVersion\":\"eval-trace-v3-json-values\",\"traceCompleteness\":\"INCOMPLETE\"}");
+        try {
+            IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
+                    () -> ReflectionTestUtils.invokeMethod(service, "judgeOne",
+                            AiEvalJudgeJob.builder().judgeJobId("job-1").build(), null, result, List.of(result)));
+            assertTrue(failure.getMessage().contains("拒绝使用缺失证据"));
+        } finally {
+            service.shutdown();
+        }
+    }
+
+    private static AiEvalRun diagnosticRun() {
+        return AiEvalRun.builder().evalRunId("run-1").versionId("version-1").executionMode("SCENARIO")
+                .configSnapshotJson("{}").concurrency(1).totalCases(2).completedCases(0)
+                .userId("owner").tenantId("default").build();
+    }
+
+    private static AiEvalCase diagnosticCase(String caseId, int sequenceNo) {
+        return AiEvalCase.builder().caseId(caseId).question("测试问题").sequenceNo(sequenceNo).configJson("{}").build();
+    }
+
+    private static AiEvalCaseResult diagnosticResult(String caseId) {
+        return AiEvalCaseResult.builder().resultId("result-" + caseId).caseId(caseId).build();
+    }
+
+    private static RunSnapshot completedSnapshot() {
+        RunSnapshot snapshot = RunSnapshot.builder().status(RunSnapshotService.STATUS_COMPLETED)
+                .agentId("8013").agentType("FLOW").build();
+        snapshot.getSteps().add(RunStepSnapshot.builder().content("已完成的答案").build());
+        return snapshot;
+    }
+
+    private static EvalRunService diagnosticService(IAiEvalOpsDao dao, RunSnapshotService snapshots, EvalRuleEngine rules) {
+        return new EvalRunService(dao, new EvalDatasetService(dao), rules, mock(IAgentDispatchService.class),
+                mock(RunEventPublisher.class), snapshots, mock(EvalCodeVersionService.class));
     }
 
     private EvalRunService runService(IAiEvalOpsDao dao, IAgentDispatchService dispatch) {

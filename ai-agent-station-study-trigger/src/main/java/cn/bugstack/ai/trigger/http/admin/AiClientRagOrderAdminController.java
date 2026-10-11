@@ -6,6 +6,8 @@ import cn.bugstack.ai.api.dto.AiClientRagOrderRequestDTO;
 import cn.bugstack.ai.api.dto.AiClientRagOrderResponseDTO;
 import cn.bugstack.ai.api.response.Response;
 import cn.bugstack.ai.domain.agent.service.IRagService;
+import cn.bugstack.ai.domain.agent.service.rag.IRagFileDeletionService;
+import cn.bugstack.ai.domain.agent.service.rag.RagStorageException;
 import cn.bugstack.ai.infrastructure.dao.IAiClientRagOrderDao;
 import cn.bugstack.ai.infrastructure.dao.po.AiClientRagOrder;
 import cn.bugstack.ai.types.enums.ResponseCode;
@@ -18,6 +20,7 @@ import org.springframework.web.multipart.MultipartFile;
 import javax.annotation.Resource;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 /**
@@ -37,6 +40,12 @@ public class AiClientRagOrderAdminController implements IAiClientRagOrderAdminSe
 
     @Resource
     private IRagService ragService;
+
+    @Resource
+    private IRagFileDeletionService ragFileDeletionService;
+
+    @Resource
+    private cn.bugstack.ai.infrastructure.adapter.repository.rag.ingestion.RagIngestionService ragIngestionService;
 
     @Override
     @PostMapping("/create")
@@ -80,8 +89,7 @@ public class AiClientRagOrderAdminController implements IAiClientRagOrderAdminSe
                         .build();
             }
             
-            // DTO转PO
-            AiClientRagOrder aiClientRagOrder = convertToAiClientRagOrder(request);
+            AiClientRagOrder aiClientRagOrder = prepareUpdate(aiClientRagOrderDao.queryById(request.getId()), request);
             aiClientRagOrder.setUpdateTime(LocalDateTime.now());
             
             int result = aiClientRagOrderDao.updateById(aiClientRagOrder);
@@ -95,7 +103,7 @@ public class AiClientRagOrderAdminController implements IAiClientRagOrderAdminSe
             log.error("根据ID更新知识库配置失败", e);
             return Response.<Boolean>builder()
                     .code(ResponseCode.UN_ERROR.getCode())
-                    .info(ResponseCode.UN_ERROR.getInfo())
+                    .info(e instanceof RagStorageException ? e.getMessage() : ResponseCode.UN_ERROR.getInfo())
                     .data(false)
                     .build();
         }
@@ -115,8 +123,7 @@ public class AiClientRagOrderAdminController implements IAiClientRagOrderAdminSe
                         .build();
             }
             
-            // DTO转PO
-            AiClientRagOrder aiClientRagOrder = convertToAiClientRagOrder(request);
+            AiClientRagOrder aiClientRagOrder = prepareUpdate(aiClientRagOrderDao.queryByRagId(request.getRagId()), request);
             aiClientRagOrder.setUpdateTime(LocalDateTime.now());
             
             int result = aiClientRagOrderDao.updateByRagId(aiClientRagOrder);
@@ -130,10 +137,22 @@ public class AiClientRagOrderAdminController implements IAiClientRagOrderAdminSe
             log.error("根据知识库ID更新知识库配置失败", e);
             return Response.<Boolean>builder()
                     .code(ResponseCode.UN_ERROR.getCode())
-                    .info(ResponseCode.UN_ERROR.getInfo())
+                    .info(e instanceof RagStorageException ? e.getMessage() : ResponseCode.UN_ERROR.getInfo())
                     .data(false)
                     .build();
         }
+    }
+
+    /** Directory fields are storage locators, not independent display labels. */
+    private AiClientRagOrder prepareUpdate(AiClientRagOrder stored, AiClientRagOrderRequestDTO request) {
+        if (stored == null) throw new RagStorageException("知识库文件不存在，请刷新后重试。");
+        if ((request.getRagId() != null && !Objects.equals(request.getRagId(), stored.getRagId()))
+                || (request.getRagName() != null && !Objects.equals(request.getRagName(), stored.getRagName()))
+                || (request.getKnowledgeTag() != null && !Objects.equals(request.getKnowledgeTag(), stored.getKnowledgeTag()))) {
+            throw new RagStorageException("文件标识、原文件名和知识库标签用于关联索引，不能仅修改目录；请重新上传到目标知识库。");
+        }
+        if (request.getStatus() != null) stored.setStatus(request.getStatus());
+        return stored;
     }
 
     @Override
@@ -142,18 +161,18 @@ public class AiClientRagOrderAdminController implements IAiClientRagOrderAdminSe
         try {
             log.info("根据ID删除知识库配置：{}", id);
             
-            int result = aiClientRagOrderDao.deleteById(id);
+            boolean result = ragFileDeletionService.deleteById(id);
             
             return Response.<Boolean>builder()
                     .code(ResponseCode.SUCCESS.getCode())
                     .info(ResponseCode.SUCCESS.getInfo())
-                    .data(result > 0)
+                    .data(result)
                     .build();
         } catch (Exception e) {
             log.error("根据ID删除知识库配置失败", e);
             return Response.<Boolean>builder()
                     .code(ResponseCode.UN_ERROR.getCode())
-                    .info(ResponseCode.UN_ERROR.getInfo())
+                    .info(e instanceof RagStorageException ? e.getMessage() : ResponseCode.UN_ERROR.getInfo())
                     .data(false)
                     .build();
         }
@@ -165,18 +184,18 @@ public class AiClientRagOrderAdminController implements IAiClientRagOrderAdminSe
         try {
             log.info("根据知识库ID删除知识库配置：{}", ragId);
             
-            int result = aiClientRagOrderDao.deleteByRagId(ragId);
+            boolean result = ragFileDeletionService.deleteByRagId(ragId);
             
             return Response.<Boolean>builder()
                     .code(ResponseCode.SUCCESS.getCode())
                     .info(ResponseCode.SUCCESS.getInfo())
-                    .data(result > 0)
+                    .data(result)
                     .build();
         } catch (Exception e) {
             log.error("根据知识库ID删除知识库配置失败", e);
             return Response.<Boolean>builder()
                     .code(ResponseCode.UN_ERROR.getCode())
-                    .info(ResponseCode.UN_ERROR.getInfo())
+                    .info(e instanceof RagStorageException ? e.getMessage() : ResponseCode.UN_ERROR.getInfo())
                     .data(false)
                     .build();
         }
@@ -426,7 +445,7 @@ public class AiClientRagOrderAdminController implements IAiClientRagOrderAdminSe
         try {
             String userId = org.slf4j.MDC.get("userId");
             log.info("上传知识库，请求 name={} userId={}", name, userId);
-            ragService.storeRagFile(name, tag, files, userId);
+            ragIngestionService.submitAndWait(userId, tag, files);
             Response<Boolean> response = Response.<Boolean>builder()
                     .code(ResponseCode.SUCCESS.getCode())
                     .info(ResponseCode.SUCCESS.getInfo())
@@ -438,7 +457,7 @@ public class AiClientRagOrderAdminController implements IAiClientRagOrderAdminSe
             log.error("上传知识库，异常 {}", name, e);
             return Response.<Boolean>builder()
                     .code(ResponseCode.UN_ERROR.getCode())
-                    .info(ResponseCode.UN_ERROR.getInfo())
+                    .info(e instanceof RagStorageException ? e.getMessage() : ResponseCode.UN_ERROR.getInfo())
                     .data(false)
                     .build();
         }

@@ -38,7 +38,27 @@ public class FixedStreamingFailureTest {
 
     @Test
     public void emptyCompletionIsNotDisplayedAsSuccess() throws Exception {
-        verifyFailedRun(Flux.empty(), "without an answer");
+        AtomicInteger subscriptions = new AtomicInteger();
+        verifyFailedRun(Flux.defer(() -> { subscriptions.incrementAndGet(); return Flux.empty(); }), "没有生成回答正文");
+        assertEquals("empty output has one bounded recovery attempt", 2, subscriptions.get());
+    }
+
+    @Test public void emptyCompletionAfterToolExecutionNeverReplaysTool() throws Exception {
+        AtomicInteger subscriptions = new AtomicInteger();
+        verifyFailedRun(Flux.deferContextual(context -> {
+            subscriptions.incrementAndGet();
+            ((StreamingActivityTracker.Activity) context.get(StreamingActivityTracker.CONTEXT_KEY)).markToolActivity();
+            return Flux.empty();
+        }), "没有生成回答正文");
+        assertEquals(1, subscriptions.get());
+    }
+
+    @Test public void emptyFirstResponseThenAnswerCompletesOnce() throws Exception {
+        AtomicInteger subscriptions = new AtomicInteger();
+        var answer = new ChatClientResponse(new org.springframework.ai.chat.model.ChatResponse(List.of(
+                new org.springframework.ai.chat.model.Generation(new org.springframework.ai.chat.messages.AssistantMessage("recovered answer")))), java.util.Map.of());
+        verifyFailedRun(Flux.defer(() -> subscriptions.incrementAndGet() == 1 ? Flux.empty() : Flux.just(answer)), null);
+        assertEquals(2, subscriptions.get());
     }
 
     @SuppressWarnings("unchecked")
@@ -58,12 +78,22 @@ public class FixedStreamingFailureTest {
         ReflectionTestUtils.setField(strategy, "repository", repository);
         ReflectionTestUtils.setField(strategy, "applicationContext", application);
         ReflectionTestUtils.setField(strategy, "longTermMemoryTurnSnapshot", mock(LongTermMemoryTurnSnapshot.class));
+        ReflectionTestUtils.setField(strategy, "llmObservationRecorder", mock(cn.bugstack.ai.domain.agent.service.execute.common.LlmObservationRecorder.class));
         ReflectionTestUtils.setField(strategy, "tokenStreamingEnabled", true);
         ReflectionTestUtils.setField(strategy, "streamingRetryMaxAttempts", 3);
         ReflectionTestUtils.setField(strategy, "streamingIdleTimeoutSeconds", 60);
         ResponseBodyEmitter emitter = mock(ResponseBodyEmitter.class);
         var previous = MDC.getCopyOfContextMap();
         try {
+            if (reason == null) {
+                strategy.execute(ExecuteCommandEntity.builder().aiAgentId("agent").sessionId("session-fixed")
+                        .userId("user").runId("run-fixed").message("test").build(), emitter);
+                verify(emitter, times(1)).send(org.mockito.ArgumentMatchers.<Object>argThat(value -> value instanceof String event
+                        && event.contains("event: step_end") && event.contains("\"status\":\"completed\"")));
+                verify(emitter, never()).send(org.mockito.ArgumentMatchers.<Object>argThat(value -> value instanceof String event
+                        && event.contains("event: step_end") && event.contains("\"status\":\"failed\"")));
+                return;
+            }
             RuntimeException error = assertThrows(RuntimeException.class, () -> strategy.execute(
                     ExecuteCommandEntity.builder().aiAgentId("agent").sessionId("session-fixed")
                             .userId("user").runId("run-fixed").message("test").build(), emitter));

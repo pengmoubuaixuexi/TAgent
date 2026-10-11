@@ -137,6 +137,8 @@ public interface IAiEvalOpsDao {
 
     int insertJudgeJob(AiEvalJudgeJob job);
 
+    String lockRunForJudge(@Param("evalRunId") String evalRunId);
+
     AiEvalJudgeJob findJudgeJob(@Param("judgeJobId") String judgeJobId);
 
     List<AiEvalJudgeJob> listJudgeJobs(@Param("evalRunId") String evalRunId);

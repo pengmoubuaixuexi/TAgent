@@ -21,6 +21,9 @@ public class ExecuteCommandEntity {
 
     private String aiAgentId;
 
+    /** Server-bound active configuration revision; never trusted from request JSON. */
+    private Integer agentVersion;
+
     private String message;
 
     /** Original images attached to this user turn. */

@@ -46,6 +46,7 @@ public class AiClientToolMcpRequestDTO implements Serializable {
     /**
      * 传输配置(sse/stdio)
      */
+    @lombok.ToString.Exclude
     private String transportConfig;
 
     /**

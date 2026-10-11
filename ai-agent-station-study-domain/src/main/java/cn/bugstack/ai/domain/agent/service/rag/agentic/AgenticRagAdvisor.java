@@ -115,6 +115,7 @@ public class AgenticRagAdvisor implements BaseAdvisor {
             }
             log.debug("[AgenticRAG] 判定输出无法识别，默认检索（安全侧）: {}", resp);
         } catch (Exception e) {
+            cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.rethrowCancellation(e);
             log.debug("[AgenticRAG] decision call failed, defaulting to YES: {}", e.getMessage());
         }
         return true; // 失败 / 无法识别默认检索（安全侧）

@@ -24,6 +24,7 @@ public class RunSnapshot {
     /** Owner used only for listing this user's still-live Redis runs. */
     private String userId;
     private String agentId;
+    private Integer agentVersion;
     private String agentName;
     private String agentType;
     private String originalMessage;

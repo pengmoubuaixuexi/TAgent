@@ -49,6 +49,9 @@ public class CrossEncoderRerankService implements IRerankService {
 
     private HttpClient httpClient;
 
+    @org.springframework.beans.factory.annotation.Autowired
+    private cn.bugstack.ai.domain.agent.service.model.ModelProviderAccess modelProviderAccess;
+
     @PostConstruct
     public void init() {
         httpClient = HttpClient.newBuilder()
@@ -66,6 +69,8 @@ public class CrossEncoderRerankService implements IRerankService {
         if (candidates.size() <= topN) return candidates;
 
         long start = System.currentTimeMillis();
+        modelProviderAccess.requirePlatformAuxiliary(
+                cn.bugstack.ai.domain.agent.service.model.ModelInvocationScope.currentUser(),"RERANK");
 
         List<String> texts = new ArrayList<>(candidates.size());
         for (Document d : candidates) {
@@ -80,23 +85,33 @@ public class CrossEncoderRerankService implements IRerankService {
         body.put("top_n", topN);
 
         List<Document> reranked;
+        var budget = cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.find(java.util.Map.of());
+        var reservation = budget == null ? null : budget.reserveModel(
+                body.toJSONString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length, 0);
+        var usageTicket=cn.bugstack.ai.domain.agent.service.execute.common.ModelRequestGuard.account(budget,
+                cn.bugstack.ai.domain.agent.service.model.ModelUsageContext.api(null,"RERANK",apiUrl),model,
+                body.toJSONString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length,0);
         try {
+            long remainingMillis = budget == null ? timeoutSeconds * 1000L : Math.max(1,
+                    Math.min(timeoutSeconds * 1000L, ((Number) budget.snapshot().get("remainingMillis")).longValue()));
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(apiUrl))
                     .header("Authorization", "Bearer " + apiKey)
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(body.toJSONString()))
-                    .timeout(Duration.ofSeconds(timeoutSeconds))
+                    .timeout(Duration.ofMillis(remainingMillis))
                     .build();
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
             if (response.statusCode() != 200) {
-                log.warn("Rerank HTTP {}: {}, fallback to original order",
-                        response.statusCode(), response.body());
+                log.warn("Rerank HTTP {}, fallback to original order", response.statusCode());
                 return candidates.subList(0, Math.min(topN, candidates.size()));
             }
 
             JSONObject respJson = JSON.parseObject(response.body());
+            Long actual=cn.bugstack.ai.domain.agent.service.execute.common.ModelRequestGuard.usage(respJson);
+            if(reservation!=null)reservation.settle(actual);
+            if(usageTicket!=null)usageTicket.settle(actual,"SUCCESS");
             JSONArray results = respJson.getJSONArray("results");
             if (results == null || results.isEmpty()) {
                 log.warn("Rerank returned empty results");
@@ -118,8 +133,12 @@ public class CrossEncoderRerankService implements IRerankService {
                 }
             }
         } catch (Exception e) {
+            cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.rethrowCancellation(e);
             log.warn("Rerank failed: {}, fallback to original order", e.getMessage());
             return candidates.subList(0, Math.min(topN, candidates.size()));
+        } finally {
+            if (reservation != null) reservation.settle(null);
+            if(usageTicket!=null)usageTicket.settle(null,"ERROR");
         }
 
         long latency = System.currentTimeMillis() - start;

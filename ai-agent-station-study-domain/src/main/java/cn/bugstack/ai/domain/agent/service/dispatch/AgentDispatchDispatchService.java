@@ -34,6 +34,12 @@ import java.util.concurrent.ThreadPoolExecutor;
 @Slf4j
 @Service
 public class AgentDispatchDispatchService implements IAgentDispatchService {
+    @Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.adapter.repository.IRunHistoryRepository runHistory;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry runBudgets;
+    @Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.execute.flow.plan.FlowPlanReviewService flowPlanReviewService;
 
     @Resource
     private Map<String, IExecuteStrategy> executeStrategyMap;
@@ -65,6 +71,11 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
     @Autowired
     private RunEventPublisher runEventPublisher;
 
+    @Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.execute.event.RunPreparationProgress preparationProgress;
+
+    private final java.util.Set<String> cancelledRuns = ConcurrentHashMap.newKeySet();
+
     /** A browser connection is only a subscriber; the session owns the run. */
     private final ConcurrentHashMap<String, String> activeRunBySession = new ConcurrentHashMap<>();
 
@@ -92,6 +103,8 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
         }
         String oldUser = org.slf4j.MDC.get("userId");
         String oldTenant = org.slf4j.MDC.get("tenantId");
+        String oldRun = org.slf4j.MDC.get("runId");
+        String oldAgentRun = org.slf4j.MDC.get("agent.run_id");
         try {
             putMdc("userId", userId);
             putMdc("tenantId", requestParameter.getTenantId());
@@ -99,6 +112,8 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
         } finally {
             restoreMdc("userId", oldUser);
             restoreMdc("tenantId", oldTenant);
+            restoreMdc("runId", oldRun);
+            restoreMdc("agent.run_id", oldAgentRun);
         }
     }
 
@@ -129,195 +144,210 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
             }
             throw RunDispatchConflictException.sessionBusy(__needSid, __runId, existingRunId);
         }
-        if (runSnapshotService != null && runSnapshotService.find(__runId).isPresent()) {
+        try {
+            if (runSnapshotService != null && runSnapshotService.find(__runId).isPresent()) {
+                activeRunBySession.remove(__needSid, __runId);
+                throw RunDispatchConflictException.duplicateRunId(__needSid, __runId);
+            }
+        } catch (RuntimeException failure) {
             activeRunBySession.remove(__needSid, __runId);
-            throw RunDispatchConflictException.duplicateRunId(__needSid, __runId);
+            throw failure;
         }
         runEventPublisher.registerRun(__runId, __needSid);
-        if (runSnapshotService != null) {
-            // Create the RUNNING anchor before routing/arming so a refresh can
-            // reconnect even while the first model/router call is still busy.
-            runSnapshotService.startRun(requestParameter, "ROUTING", null);
-        }
-        boolean __handedOff = false;
-        WorkspaceExecutionGuard.Lease executionLease = null;
+        boolean historyStarted = false;
         try {
-        if (mcpToolCatalogService != null && __needSid != null && !__needSid.isBlank()) {
-            mcpToolCatalogService.clearNeeds(__needSid);
-        }
-        // 1. 如果前端没选 agent（aiAgentId 为空），走统一路由
-        if (agentId == null || agentId.isBlank()) {
-            if (unifiedAgentRouter != null) {
-                RouteDecision routeDecision = unifiedAgentRouter.routeDecision(requestParameter.getMessage());
-                agentId = routeDecision != null ? routeDecision.agentId() : null;
-                if (agentId == null) {
-                    var allowed = workspaceAccess.ownedAgentIds(requestParameter.getUserId());
-                    agentId = allowed.contains(fallbackAgentId) ? fallbackAgentId
-                            : repository.queryAvailableAgents().stream()
-                                    .map(AiAgentVO::getAgentId).filter(allowed::contains).findFirst().orElse(null);
-                }
-                if (routeDecision != null) {
-                    requestParameter.setRouteConfidence(routeDecision.confidence());
-                }
-                if (routeDecision != null && routeDecision.hasMissingToolDesc()) {
-                    // 多条 need 用换行连成单串，按 sessionId 写入统一 store（下游 resolveDynamicToolCallbacks 拆开、各取 top-k 再并集）
-                    if (mcpToolCatalogService != null) {
-                        mcpToolCatalogService.setNeeds(requestParameter.getSessionId(), routeDecision.missingToolDescJoined());
-                    }
-                }
-                requestParameter.setAiAgentId(agentId);
-                log.info("[Dispatch] 统一路由选中 agent: {} missingTool='{}'",
-                        agentId, mcpToolCatalogService != null ? mcpToolCatalogService.needsFor(requestParameter.getSessionId()) : null);
-            } else {
-                throw new BizException("未配置路由器且未指定 agentId");
-            }
-        } else if (unifiedAgentRouter != null && dynamicToolInferenceEnabled) {
-            // M1：前端已选定 agent，不走路由，但仍推断该 agent 可能缺失的工具能力（可多条），给动态补挂用
-            java.util.List<String> missing = unifiedAgentRouter.inferMissingTool(agentId, requestParameter.getMessage());
-            if (missing != null && !missing.isEmpty()) {
-                if (mcpToolCatalogService != null) {
-                    mcpToolCatalogService.setNeeds(requestParameter.getSessionId(), String.join("\n", missing));
-                }
-                log.info("[Dispatch] 已选定 agent={} 推断 missingTools={}", agentId, missing);
-            }
-        }
-
-        // 2. 懒加载装配
-        if (agentId != null) executionLease = workspaceExecutionGuard.startRun(agentId);
-        if (agentId == null || !workspaceAccess.ownsAgent(requestParameter.getUserId(), agentId)) {
-            throw new BizException("请先创建或选用自己的 Agent");
-        }
-        if (armoryService != null) {
-            armoryService.ensureArmed(agentId);
-        }
-
-        // 3. 查 agent 信息，取策略
-        AiAgentVO aiAgentVO = repository.queryAiAgentByAgentId(agentId);
-        if (aiAgentVO == null) {
-            throw new BizException("agent 不存在: " + agentId);
-        }
-
-        // 路由命中后第一时间把 agent 透传给前端（TTFT：前端先显示"路由中…"，收到本事件后替换成 名称(id)）。
-        // 发送失败（客户端断开等）不影响主流程。
-        java.util.Map<String, Object> routedPayload = new java.util.LinkedHashMap<>();
-        routedPayload.put("agentId", agentId);
-        routedPayload.put("agentName", aiAgentVO.getAgentName() == null ? "" : aiAgentVO.getAgentName());
-        routedPayload.put("runId", requestParameter.getRunId());
-        runEventPublisher.publish(__runId, __needSid, "agent_routed", routedPayload);
-
-        String strategy = aiAgentVO.getStrategy();
-
-        IExecuteStrategy executeStrategy = executeStrategyMap.get(strategy);
-        if (executeStrategy == null) {
-            throw new BizException("不存在的执行策略: " + strategy);
-        }
-        if (runSnapshotService != null) {
-            runSnapshotService.startRun(requestParameter, strategy, aiAgentVO.getAgentName());
-        }
-
-        // 4. 异步执行（用 final 变量供 lambda 引用）
-        final String finalAgentId = agentId;
-        final String finalStrategy = strategy;
-        final IExecuteStrategy finalStrategy1 = executeStrategy;
-        final WorkspaceExecutionGuard.Lease finalExecutionLease = executionLease;
-        try {
-            threadPoolExecutor.execute(() -> {
-                String sessionId = requestParameter.getSessionId();
-                String oldRunId = org.slf4j.MDC.get("runId");
-                String oldAgentRunId = org.slf4j.MDC.get("agent.run_id");
-                String oldAgentId = org.slf4j.MDC.get("agentId");
-                String oldSessionId = org.slf4j.MDC.get("sessionId");
-                String oldUserId = org.slf4j.MDC.get("userId");
-                String oldTenantId = org.slf4j.MDC.get("tenantId");
-                try {
-                    putMdc("runId", requestParameter.getRunId());
-                    putMdc("agent.run_id", requestParameter.getRunId());
-                    putMdc("agentId", requestParameter.getAiAgentId());
-                    putMdc("sessionId", requestParameter.getSessionId());
-                    putMdc("userId", requestParameter.getUserId());
-                    putMdc("tenantId", requestParameter.getTenantId());
-                    if (sessionRefCounter != null) sessionRefCounter.clear(sessionId);
-                    finalStrategy1.execute(requestParameter, emitter);
-                    if (runSnapshotService != null) {
-                        runSnapshotService.markStatus(requestParameter.getRunId(),
-                                cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_COMPLETED,
-                                null);
-                    }
-                } catch (Exception e) {
-                    // 取消（用户点取消 / 客户端断开）会抛 CancellationException，属正常中止，静默结束不报错给前端
-                    if (e instanceof java.util.concurrent.CancellationException
-                            || e.getCause() instanceof java.util.concurrent.CancellationException) {
-                        if (runSnapshotService != null) {
-                            runSnapshotService.markStatus(requestParameter.getRunId(),
-                                    cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_CANCELLED,
-                                    e.getMessage());
-                        }
-                        log.info("[Dispatch] 执行已取消 agentId={} strategy={} sessionId={}", finalAgentId, finalStrategy, sessionId);
-                    } else {
-                        if (runSnapshotService != null) {
-                            runSnapshotService.markStatus(requestParameter.getRunId(),
-                                    cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_FAILED,
-                                    e.getMessage());
-                        }
-                        log.error("Agent执行异常：agentId={} strategy={} error={}", finalAgentId, finalStrategy, e.getMessage(), e);
-                        runEventPublisher.publish(__runId, __needSid, "message",
-                                java.util.Map.of(
-                                        "type", "error",
-                                        "content", "执行异常：" + (e.getMessage() == null
-                                                ? e.getClass().getSimpleName() : e.getMessage()),
-                                        "sessionId", __needSid));
-                    }
-                } finally {
-                    finalExecutionLease.close();
-                    if (sessionRefCounter != null) sessionRefCounter.clear(sessionId);
-                    activeRunBySession.remove(sessionId, __runId);
-                    runEventPublisher.finishRun(__runId);
-                    restoreMdc("runId", oldRunId);
-                    restoreMdc("agent.run_id", oldAgentRunId);
-                    restoreMdc("agentId", oldAgentId);
-                    restoreMdc("sessionId", oldSessionId);
-                    restoreMdc("userId", oldUserId);
-                    restoreMdc("tenantId", oldTenantId);
-                }
-            });
-            __handedOff = true; // 已成功交给异步策略执行 → 本轮 need/lease 的清理归策略 finally
-        } catch (RejectedExecutionException e) {
-            log.warn("线程池已满，拒绝执行 agent={} strategy={}", finalAgentId, finalStrategy);
-            if (runSnapshotService != null) {
-                runSnapshotService.markStatus(requestParameter.getRunId(),
-                        cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_FAILED,
-                        e.getMessage());
-            }
-            runEventPublisher.publish(__runId, __needSid, "message",
-                    java.util.Map.of("type", "error",
-                            "content", "Server too busy, please retry later",
-                            "error", "service_unavailable", "status", 503,
-                            "sessionId", __needSid));
-        }
-        } finally {
-            if (!__handedOff && executionLease != null) executionLease.close();
-            // 同步路径异常（armory/查 agent/策略查找抛 BizException）或线程池拒绝 → 没交给异步策略 → 策略 finally 不跑，
-            // 这里兜底清掉本轮已写入的 need，避免 session 维度泄漏 + 下次同 session 读到旧 need。
-            if (!__handedOff && mcpToolCatalogService != null && __needSid != null && !__needSid.isBlank()) {
-                mcpToolCatalogService.clearNeeds(__needSid);
-            }
-            if (!__handedOff && mcpToolCatalogService != null && __runId != null && !__runId.isBlank()) {
-                mcpToolCatalogService.cleanupRun(__runId);
-            }
-            if (!__handedOff) {
-                if (runSnapshotService != null) {
-                    runSnapshotService.find(__runId)
-                            .filter(snapshot -> cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_RUNNING
-                                    .equals(snapshot.getStatus()))
-                            .ifPresent(snapshot -> runSnapshotService.markStatus(
-                                    __runId,
-                                    cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_FAILED,
-                                    "dispatch failed before execution started"));
-                }
+            // Persist admission before returning ACK, including queued/cancelled/rejected runs.
+            if (runHistory != null) { runHistory.start(requestParameter); historyStarted = true; }
+            if (runSnapshotService != null) runSnapshotService.startRun(requestParameter, "ROUTING", null);
+            // Reserve before queueing: a cancel immediately after ACK also cancels preparation.
+            if (runBudgets != null) runBudgets.start(__runId, requestParameter.getUserId());
+            if (preparationProgress != null) preparationProgress.start(__runId, __needSid);
+            threadPoolExecutor.execute(() -> executeOwned(requestParameter, emitter));
+        } catch (RuntimeException failure) {
+            try {
+                if (historyStarted) historyStatus(__runId, "FAILED", failure.getMessage());
+                snapshotStatus(__runId, "FAILED", failure.getMessage());
+                publishFailure(__runId, __needSid, failure);
+            } finally {
+                if (preparationProgress != null) preparationProgress.close(__runId);
+                cancelledRuns.remove(__runId);
                 activeRunBySession.remove(__needSid, __runId);
                 runEventPublisher.finishRun(__runId);
             }
         }
+    }
+
+    /** The MVC handler can now return its emitter before routing or any MCP connection is started. */
+    private void executeOwned(ExecuteCommandEntity requestParameter, ResponseBodyEmitter emitter) {
+        String __needSid = requestParameter.getSessionId();
+        String __runId = requestParameter.getRunId();
+        String agentId = requestParameter.getAiAgentId();
+        Map<String, String> previousMdc = org.slf4j.MDC.getCopyOfContextMap();
+        WorkspaceExecutionGuard.Lease executionLease = null;
+        boolean reviewPaused = false;
+        boolean strategyStarted = false;
+        try {
+            putMdc("runId", __runId);
+            putMdc("agent.run_id", __runId);
+            putMdc("agentId", agentId);
+            putMdc("agentVersion", null);
+            putMdc("sessionId", __needSid);
+            putMdc("userId", requestParameter.getUserId());
+            putMdc("tenantId", requestParameter.getTenantId());
+            checkPreparationActive(__runId);
+            if (mcpToolCatalogService != null) mcpToolCatalogService.clearNeeds(__needSid);
+            checkPreparationActive(__runId);
+            if (preparationProgress != null && ((agentId == null || agentId.isBlank()) || dynamicToolInferenceEnabled))
+                preparationProgress.phase(__runId, "agent_routing");
+            // 1. 如果前端没选 agent（aiAgentId 为空），走统一路由
+            if (agentId == null || agentId.isBlank()) {
+                if (unifiedAgentRouter != null) {
+                    RouteDecision routeDecision = unifiedAgentRouter.routeDecision(requestParameter.getMessage());
+                    agentId = routeDecision != null ? routeDecision.agentId() : null;
+                    if (agentId == null) {
+                        var allowed = workspaceAccess.ownedAgentIds(requestParameter.getUserId());
+                        agentId = allowed.contains(fallbackAgentId) ? fallbackAgentId
+                                : repository.queryAvailableAgents().stream()
+                                        .map(AiAgentVO::getAgentId).filter(allowed::contains).findFirst().orElse(null);
+                    }
+                    if (routeDecision != null) {
+                        requestParameter.setRouteConfidence(routeDecision.confidence());
+                    }
+                    if (routeDecision != null && routeDecision.hasMissingToolDesc()) {
+                        // 多条 need 用换行连成单串，按 sessionId 写入统一 store（下游 resolveDynamicToolCallbacks 拆开、各取 top-k 再并集）
+                        if (mcpToolCatalogService != null) {
+                            mcpToolCatalogService.setNeeds(requestParameter.getSessionId(), routeDecision.missingToolDescJoined());
+                        }
+                    }
+                    requestParameter.setAiAgentId(agentId);
+                    log.info("[Dispatch] 统一路由选中 agent: {} missingTool='{}'",
+                            agentId, mcpToolCatalogService != null ? mcpToolCatalogService.needsFor(requestParameter.getSessionId()) : null);
+                } else {
+                    throw new BizException("未配置路由器且未指定 agentId");
+                }
+            } else if (unifiedAgentRouter != null && dynamicToolInferenceEnabled) {
+                // M1：前端已选定 agent，不走路由，但仍推断该 agent 可能缺失的工具能力（可多条），给动态补挂用
+                java.util.List<String> missing = unifiedAgentRouter.inferMissingTool(agentId, requestParameter.getMessage());
+                if (missing != null && !missing.isEmpty()) {
+                    if (mcpToolCatalogService != null) {
+                        mcpToolCatalogService.setNeeds(requestParameter.getSessionId(), String.join("\n", missing));
+                    }
+                    log.info("[Dispatch] 已选定 agent={} 推断 missingTools={}", agentId, missing);
+                }
+            }
+
+            checkPreparationActive(__runId);
+            if (preparationProgress != null) preparationProgress.phase(__runId, "agent_preparing");
+            // 2. 懒加载装配
+            if (agentId != null) executionLease = workspaceExecutionGuard.startRun(agentId);
+            if (agentId == null || !workspaceAccess.ownsAgent(requestParameter.getUserId(), agentId)) {
+                throw new BizException("请先创建或选用自己的 Agent");
+            }
+            requestParameter.setAgentVersion(workspaceAccess.activeAgentVersion(requestParameter.getUserId(),agentId));
+            if (armoryService != null) {
+                armoryService.ensureArmed(agentId);
+            }
+
+            checkPreparationActive(__runId);
+            // 3. 查 agent 信息，取策略
+            AiAgentVO aiAgentVO = repository.queryAiAgentByAgentId(agentId);
+            if (aiAgentVO == null) {
+                throw new BizException("agent 不存在: " + agentId);
+            }
+
+            // 路由命中后第一时间把 agent 透传给前端（TTFT：前端先显示"路由中…"，收到本事件后替换成 名称(id)）。
+            // 发送失败（客户端断开等）不影响主流程。
+            java.util.Map<String, Object> routedPayload = new java.util.LinkedHashMap<>();
+            routedPayload.put("agentId", agentId);
+            routedPayload.put("agentName", aiAgentVO.getAgentName() == null ? "" : aiAgentVO.getAgentName());
+            routedPayload.put("runId", requestParameter.getRunId());
+            routedPayload.put("agentVersion",requestParameter.getAgentVersion());
+            runEventPublisher.publish(__runId, __needSid, "agent_routed", routedPayload);
+
+            String strategy = aiAgentVO.getStrategy();
+            if (runHistory != null) runHistory.bindAgent(requestParameter,strategy);
+
+            IExecuteStrategy executeStrategy = executeStrategyMap.get(strategy);
+            if (executeStrategy == null) {
+                throw new BizException("不存在的执行策略: " + strategy);
+            }
+            if (runSnapshotService != null) {
+                runSnapshotService.startRun(requestParameter, strategy, aiAgentVO.getAgentName());
+            }
+
+            checkPreparationActive(__runId);
+            putMdc("agentId", requestParameter.getAiAgentId());
+            putMdc("agentVersion", requestParameter.getAgentVersion() == null ? null : requestParameter.getAgentVersion().toString());
+            if (preparationProgress != null) preparationProgress.ready(__runId);
+            if (sessionRefCounter != null) sessionRefCounter.clear(__needSid);
+            strategyStarted = true;
+            executeStrategy.execute(requestParameter, emitter);
+            var phaseBudget = cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.find(__runId);
+            reviewPaused = phaseBudget != null && phaseBudget.waitingForReview();
+            historyStatus(__runId, reviewPaused ? "BLOCKED" : "COMPLETED", null);
+            snapshotStatus(__runId, reviewPaused ? "BLOCKED" : "COMPLETED", null);
+        } catch (Exception failure) {
+            boolean cancelled = failure instanceof java.util.concurrent.CancellationException
+                    || failure.getCause() instanceof java.util.concurrent.CancellationException;
+            String status = cancelled ? "CANCELLED" : "FAILED";
+            historyStatus(__runId, status, failure.getMessage());
+            snapshotStatus(__runId, status, failure.getMessage());
+            if (cancelled) {
+                log.info("[Dispatch] run cancelled during preparation/execution sessionId={} runId={}", __needSid, __runId);
+            } else {
+                log.error("[Dispatch] preparation/execution failed runId={} agentId={}", __runId, agentId, failure);
+                publishFailure(__runId, __needSid, failure);
+            }
+        } finally {
+            try {
+                if (preparationProgress != null) preparationProgress.close(__runId);
+                try {
+                    if (executionLease != null) executionLease.close();
+                    if (sessionRefCounter != null) sessionRefCounter.clear(__needSid);
+                } finally {
+                    try {
+                        if (!strategyStarted && mcpToolCatalogService != null) {
+                            mcpToolCatalogService.clearNeeds(__needSid);
+                            mcpToolCatalogService.cleanupRun(__runId);
+                        }
+                    } finally {
+                        cancelledRuns.remove(__runId);
+                        activeRunBySession.remove(__needSid, __runId);
+                        runEventPublisher.finishRun(__runId);
+                    }
+                }
+                // A resumed phase must not overtake the initial phase's cleanup.
+                if (reviewPaused && flowPlanReviewService != null) flowPlanReviewService.releaseInitialPhase(__runId);
+            } finally {
+                if (previousMdc == null) org.slf4j.MDC.clear(); else org.slf4j.MDC.setContextMap(previousMdc);
+            }
+        }
+    }
+
+    private void checkPreparationActive(String runId) {
+        if (cancelledRuns.contains(runId)) throw new java.util.concurrent.CancellationException("任务已取消");
+        var budget = cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.find(runId);
+        if (budget != null) budget.checkActive();
+    }
+
+    private void snapshotStatus(String runId, String status, String error) {
+        if (runSnapshotService == null) return;
+        try { runSnapshotService.markStatus(runId, status, error); }
+        catch (RuntimeException unavailable) { log.warn("[Dispatch] terminal snapshot unavailable runId={}", runId); }
+    }
+
+    private void publishFailure(String runId, String sessionId, Exception failure) {
+        boolean rejected = failure instanceof RejectedExecutionException;
+        runEventPublisher.publish(runId, sessionId, "message", java.util.Map.of(
+                "type", "error", "content", rejected ? "服务繁忙，请稍后重试。"
+                        : "执行异常：" + (failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage()),
+                "sessionId", sessionId));
+    }
+
+    private void historyStatus(String run,String status,String error) {
+        if(runHistory==null)return;
+        try {runHistory.status(run,status,error);}
+        catch(RuntimeException e){log.warn("[RunHistory] status update unavailable runId={} status={}",run,status);}
     }
 
     /** 立即回答：广播给所有策略；持有该 session 的策略生效，其余 no-op（activeContexts 查不到）。 */
@@ -350,6 +380,11 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
     @Override
     public void cancelExecute(String sessionId) {
         if (sessionId == null || sessionId.isBlank()) return;
+        String runId = activeRunBySession.get(sessionId);
+        if (runId == null) runId = runEventPublisher.currentRunId(sessionId);
+        if (runId != null) cancelledRuns.add(runId);
+        var budget = cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.find(runId);
+        if (budget != null) budget.cancel();
         for (IExecuteStrategy s : executeStrategyMap.values()) {
             try {
                 s.cancelExecute(sessionId);

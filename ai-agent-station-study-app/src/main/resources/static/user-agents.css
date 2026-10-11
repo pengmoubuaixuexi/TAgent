@@ -135,3 +135,14 @@ html{color-scheme:dark}body{margin:0;background:#0d131c;color:#e6edf7;font-famil
 #tagent-node-builder .ta-inherited-connections li{padding:12px 0;border-bottom:1px solid var(--ta-border)}
 #tagent-node-builder .ta-inherited-draft{margin-top:12px}
 #tagent-node-builder .ta-missing-node{cursor:default;border-style:dashed}
+#tagent-node-builder .ta-version-panel{margin:0 22px 18px;padding:14px;border:1px solid var(--ta-border);border-radius:8px}
+#tagent-node-builder .ta-version-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--ta-border)}
+#tagent-node-builder #version-detail{margin-top:14px}
+#tagent-node-builder #node-debug{border-top:1px solid var(--ta-border)}
+#tagent-node-builder #debug-form .ta-field{display:block;margin:12px 0}
+#tagent-node-builder #debug-form .ta-input{display:block;margin-top:6px;width:100%}
+#tagent-node-builder #debug-result details{padding:10px 0;border-bottom:1px solid var(--ta-border)}
+#tagent-node-builder #debug-result summary{cursor:pointer}
+#tagent-node-builder #debug-result pre,#tagent-node-builder #version-detail pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:420px;overflow:auto;padding:12px;background:var(--ta-bg);font-size:12px;line-height:1.6}
+#tagent-node-builder .ta-debug-output{padding-top:16px}
+#tagent-node-builder #debug-status{margin-left:12px;font-size:12px}

@@ -16,9 +16,11 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.security.MessageDigest;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * 知识库服务
@@ -39,7 +41,7 @@ public class RagService implements IRagService {
     @Resource
     private TextSplitter textSplitter;
 
-    @Resource
+    @Resource(name = "ragVectorStore")
     private PgVectorStore vectorStore;
 
     @Resource
@@ -68,10 +70,17 @@ public class RagService implements IRagService {
 
     @Override
     public void storeRagFile(String name, String tag, List<MultipartFile> files, String userId) {
-        // 同一批上传共享毫秒时间戳，附加文件序号保证唯一；ai_client_rag_order.rag_id 是 NOT NULL UNIQUE
-        long batch = System.currentTimeMillis();
-        int seq = 0;
+        storeRagFile(name, tag, files, userId, RagIngestionObserver.NONE);
+    }
+
+    @Override
+    public void storeRagFile(String name, String tag, List<MultipartFile> files, String userId, RagIngestionObserver observer) {
+        if (userId == null || userId.isBlank() || tag == null || tag.isBlank()) {
+            throw new RagStorageException("上传知识库需要有效的用户和知识库标识。");
+        }
+        if (files == null || files.isEmpty()) throw new RagStorageException("请选择要上传的文件。");
         for (MultipartFile file : files) {
+            observer.progress("VERIFYING", 5, 0);
             // P2.3 12.5 文件去重：计算 SHA-256，已存在则跳过
             String fileHash;
             long fileSize;
@@ -81,9 +90,7 @@ public class RagService implements IRagService {
                 fileHash = HexFormat.of().formatHex(md.digest(bytes));
                 fileSize = bytes.length;
             } catch (Exception e) {
-                log.warn("SHA-256 compute failed for '{}', skip dedup check: {}", file.getOriginalFilename(), e.getMessage());
-                fileHash = null;
-                fileSize = -1L;
+                throw new RagStorageException("无法读取上传文件，未开始写入知识库。", e);
             }
 
             // Claude 修复：原版只算了 hash 没用，现在真正做幂等去重——
@@ -92,17 +99,25 @@ public class RagService implements IRagService {
             if (fileHash != null && repository.existsRagFileByHashTagAndUser(fileHash, tag, userId)) {
                 log.info("[RAG] 跳过重复文件 name='{}' size={} hash={}",
                         file.getOriginalFilename(), fileSize, fileHash);
-                seq++;
+                observer.progress("SUCCEEDED", 100, 0);
                 continue;
             }
 
+            // Stable across retry, scoped to owner and knowledge base; never merge two users' files.
+            String fileId = RagFileScope.stableId(userId, tag, fileHash);
+
+            observer.progress("PARSING", 10, 0);
             TikaDocumentReader documentReader = new TikaDocumentReader(file.getResource());
             List<Document> documentList = textSplitter.apply(documentReader.get());
+            if (documentList.isEmpty() || documentList.stream().allMatch(d -> d.getText() == null || d.getText().isBlank())) {
+                throw new RagStorageException("文件没有可提取的文本，请使用含文字的文件或先完成 OCR。");
+            }
 
             String originalFilename = file.getOriginalFilename() != null ? file.getOriginalFilename() : name;
 
             // 添加知识库标签、原始文件名、userId
             documentList.forEach(doc -> {
+                doc.getMetadata().put(RagFileScope.FILE_ID_KEY, fileId);
                 doc.getMetadata().put("knowledge", tag);
                 doc.getMetadata().put("source", originalFilename);
                 if (userId != null && !userId.isBlank()) {
@@ -113,6 +128,7 @@ public class RagService implements IRagService {
             // P2.3 12.4 Parent Document Retriever：两段式存储
             // parent（大块）存 MySQL，child（小块）存 PgVector；检索时换出 parent 喂 LLM
             if (parentDocumentService != null) {
+                observer.progress("ENRICHING", 20, 0);
                 // 第 61 轮 Phase 2 (A 方案)：在切 child 前先给每个 parent 生成精炼小标题
                 // 跟 contextualPrefixGenerator 共用小模型 client，但落地字段不同：
                 //   - title 写 ai_parent_document.title 列 + 透传到 child metadata（A）
@@ -122,10 +138,12 @@ public class RagService implements IRagService {
                         : null;
                 List<org.springframework.ai.document.Document> allChildren = new java.util.ArrayList<>();
                 for (int i = 0; i < documentList.size(); i++) {
+                    observer.progress("VECTORIZING", 25 + (int) (55L * i / documentList.size()), allChildren.size());
                     org.springframework.ai.document.Document parent = documentList.get(i);
-                    String parentId = batch + "-" + seq + "-p" + i;
+                    String parentId = fileId + "-p" + i;
                     String title = (parentTitles != null && i < parentTitles.size()) ? parentTitles.get(i) : null;
                     List<org.springframework.ai.document.Document> children = splitToChildren(parent, parentId, tag, originalFilename, title);
+                    children.forEach(child -> child.getMetadata().put(RagFileScope.FILE_ID_KEY, fileId));
                     // Phase 3 (C 方案 Contextual Retrieval)：给每个 child 添加上下文前缀拼到正文头部，
                     // 提升向量库 / BM25 召回率（论文 +49%）。注意：只改 child，parent 表里的内容保持原文干净，
                     // LLM 最终看到的是 resolveParents 拿到的 parent 原文，不被 prefix 污染。
@@ -137,10 +155,12 @@ public class RagService implements IRagService {
                         contextualPrefixGenerator.generate(anchor, children);
                     }
                     allChildren.addAll(children);
+                    observer.progress("VECTORIZING", 25 + (int) (55L * i / documentList.size()), allChildren.size());
                     parentDocumentService.store(parentId, parent.getText(), children, tag, originalFilename, userId, title);
                 }
                 // BM25 镜像索引用 child chunks（已带 contextual prefix）
                 if (bm25SearchService != null) {
+                    observer.progress("INDEXING", 85, allChildren.size());
                     bm25SearchService.index(allChildren);
                 }
             } else {
@@ -150,23 +170,32 @@ public class RagService implements IRagService {
                 }
 
                 // 存储知识库文件（PgVector 承担语义向量索引）
-                vectorStore.accept(documentList);
+                List<Document> stableDocuments = new ArrayList<>(documentList.size());
+                for (int i = 0; i < documentList.size(); i++) {
+                    Document doc = documentList.get(i);
+                    stableDocuments.add(new Document(stableChunkId(fileId + ":" + i), doc.getText(), doc.getMetadata()));
+                }
+                observer.progress("VECTORIZING", 40, stableDocuments.size());
+                vectorStore.accept(stableDocuments);
 
                 // 同步镜像到 ES，为 BM25 关键词检索提供一致的数据源（亮点 3 混合检索）
                 if (bm25SearchService != null) {
-                    bm25SearchService.index(documentList);
+                    observer.progress("INDEXING", 85, stableDocuments.size());
+                    bm25SearchService.index(stableDocuments);
                 }
             }
 
             // 存储到数据库
+            observer.progress("PUBLISHING", 95, -1);
             AiRagOrderVO aiRagOrderVO = new AiRagOrderVO();
-            aiRagOrderVO.setRagId(batch + "-" + (seq++));
+            aiRagOrderVO.setRagId(fileId);
             aiRagOrderVO.setRagName(originalFilename);
             aiRagOrderVO.setKnowledgeTag(tag);
             aiRagOrderVO.setFileHash(fileHash);
             aiRagOrderVO.setFileSize(fileSize);
             aiRagOrderVO.setUserId(userId);
             repository.createTagOrder(aiRagOrderVO);
+            observer.progress("SUCCEEDED", 100, -1);
         }
     }
 
@@ -191,7 +220,7 @@ public class RagService implements IRagService {
         int seq = 0;
         for (String chunk : chunks) {
             if (chunk == null || chunk.isBlank()) continue;
-            Document child = new Document(chunk, new java.util.HashMap<>());
+            Document child = new Document(stableChunkId(parentId + ":" + seq), chunk, new java.util.HashMap<>());
             child.getMetadata().put("parent_id", parentId);
             child.getMetadata().put("knowledge", tag);
             child.getMetadata().put("source", source);
@@ -200,6 +229,10 @@ public class RagService implements IRagService {
             children.add(child);
         }
         return children;
+    }
+
+    private static String stableChunkId(String identity) {
+        return UUID.nameUUIDFromBytes(identity.getBytes(StandardCharsets.UTF_8)).toString();
     }
 
 }

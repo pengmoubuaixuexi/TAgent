@@ -64,12 +64,14 @@
             .table-wrap { padding: 0 16px 24px; overflow-x: auto; }
         }
     </style>
+<link rel="stylesheet" href="/workspace-nav.css"><script defer src="/workspace-nav.js"></script>
 </head>
 <body>
+<div data-workspace-nav hidden></div>
 <header>
     <h1>TAgent · 网站统计</h1>
     <span class="muted">仅管理员可见 · 全站访问与注册</span>
-    <nav class="tabs" aria-label="导航"><a href="/index.html">对话</a><a href="/user-agents.html">我的 Agent</a><a href="/observe.html">用量观测</a></nav>
+
     <div class="right"><button id="refresh-stats" type="button">刷新</button></div>
 </header>
 <main id="admin-content" hidden>

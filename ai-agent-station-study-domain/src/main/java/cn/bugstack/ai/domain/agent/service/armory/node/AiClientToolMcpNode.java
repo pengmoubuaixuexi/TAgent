@@ -45,6 +45,9 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
     @org.springframework.beans.factory.annotation.Autowired
     private cn.bugstack.ai.domain.agent.service.security.WorkspaceMcpPolicy workspaceMcpPolicy;
 
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.execute.event.RunPreparationProgress preparationProgress;
+
     @Override
     protected String doApply(ArmoryCommandEntity requestParameter, DefaultArmoryStrategyFactory.DynamicContext dynamicContext) throws Exception {
         log.info("Ai Agent 构建节点，Tool MCP 工具配置{}", JSON.toJSONString(requestParameter));
@@ -57,6 +60,8 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
         }
 
         for (AiClientToolMcpVO mcpVO : aiClientToolMcpList) {
+            var budget = cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.find(Map.of());
+            if (budget != null) budget.checkActive();
             List<cn.bugstack.ai.domain.agent.model.valobj.AiClientModelVO> models =
                     dynamicContext.getValue(AiAgentEnumVO.AI_CLIENT_MODEL.getDataName());
             if (!requiresEagerConnection(mcpVO.getMcpId(),models)) continue;
@@ -71,13 +76,7 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
                 }
 
                 // 创建 MCP 服务
-                McpSyncClient mcpSyncClient = createMcpSyncClient(mcpVO);
-
-                // 注册 MCP 对象
-                registerMcpBean(mcpVO.getMcpId(), mcpSyncClient);
-
-                // 注册到 McpClientRegistry（用于 SSE 断连后自动重建）
-                mcpClientRegistry.register(mcpVO.getMcpId(), mcpVO, mcpSyncClient, this::createMcpSyncClient);
+                mcpClientRegistry.ensureClient(mcpVO,this::createMcpSyncClient);
             } catch (Exception ex) {
                 // 单个 MCP 不可达不应阻塞整个 agent 装配（否则一个坏 URL 让所有 agent 全废）
                 log.warn("[McpInit] MCP id={} name={} 初始化失败，已跳过：{}",
@@ -120,8 +119,18 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
         registerBean(beanName(mcpId), McpSyncClient.class, mcpSyncClient);
     }
 
+    private Object initializeOrClose(McpSyncClient client) {
+        try { return client.initialize(); }
+        catch(RuntimeException failure) { try { client.close(); } catch(RuntimeException ignored) {} throw failure; }
+    }
     public McpSyncClient createMcpSyncClient(AiClientToolMcpVO aiClientToolMcpVO) {
         workspaceMcpPolicy.validate(aiClientToolMcpVO);
+        try (var ignored = preparationProgress == null ? null : preparationProgress.connecting(aiClientToolMcpVO.getMcpName())) {
+            return createValidatedMcpSyncClient(aiClientToolMcpVO);
+        }
+    }
+
+    private McpSyncClient createValidatedMcpSyncClient(AiClientToolMcpVO aiClientToolMcpVO) {
         String transportType = aiClientToolMcpVO.getTransportType();
 
         switch (transportType) {
@@ -168,7 +177,7 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
                 HttpClientSseClientTransport sseClientTransport = sseBuilder.build();
 
                 McpSyncClient mcpSyncClient = McpClient.sync(sseClientTransport).requestTimeout(Duration.ofSeconds(aiClientToolMcpVO.getRequestTimeout())).build();
-                var init_sse = mcpSyncClient.initialize();
+                var init_sse = initializeOrClose(mcpSyncClient);
 
                 log.info("Tool SSE MCP Initialized {}", init_sse);
                 return mcpSyncClient;
@@ -189,7 +198,7 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
 
                 var mcpClient = McpClient.sync(new StdioClientTransport(stdioParams, new io.modelcontextprotocol.json.jackson2.JacksonMcpJsonMapperSupplier().get()))
                         .requestTimeout(Duration.ofSeconds(aiClientToolMcpVO.getRequestTimeout())).build();
-                var init_stdio = mcpClient.initialize();
+                var init_stdio = initializeOrClose(mcpClient);
 
                 log.info("Tool Stdio MCP Initialized {}", init_stdio);
                 return mcpClient;
@@ -218,7 +227,7 @@ public class AiClientToolMcpNode extends AbstractArmorySupport {
 
                 McpSyncClient mcpSyncClient = McpClient.sync(streamableTransport)
                         .requestTimeout(Duration.ofSeconds(aiClientToolMcpVO.getRequestTimeout())).build();
-                var init_streamable = mcpSyncClient.initialize();
+                var init_streamable = initializeOrClose(mcpSyncClient);
 
                 log.info("Tool Streamable-HTTP MCP Initialized {}", init_streamable);
                 return mcpSyncClient;

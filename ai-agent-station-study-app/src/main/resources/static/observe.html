@@ -64,18 +64,14 @@
             .table-wrap { padding: 0 16px 24px; overflow-x: auto; }
         }
     </style>
+<link rel="stylesheet" href="/workspace-nav.css"><script defer src="/workspace-nav.js"></script>
 </head>
 <body>
+<div data-workspace-nav hidden></div>
 <header>
     <h1>TAgent · 用量观测</h1>
     <span class="muted" id="status"><span class="dot ok"></span>就绪</span>
-    <nav class="tabs" aria-label="观测视图">
-        <a href="/index.html">对话</a>
-        <a href="/user-agents.html">我的 Agent</a>
-        <a class="active" href="/observe.html">用量观测</a>
-        <a href="/observe-mcp.html">MCP 连接与工具</a>
-        <a data-admin-only hidden href="/admin-stats.html">网站统计</a>
-    </nav>
+
     <div class="right">
         <label id="scope-control" hidden>范围 <select id="observation-scope"><option value="mine">仅本人</option><option value="all">全站（管理员）</option></select></label>
         <span class="muted">时间窗口</span>

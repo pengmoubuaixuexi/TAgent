@@ -1,0 +1,13 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>开始使用与账户 · TAgent</title><link rel="stylesheet" href="/history.css"><script src="/auth.js"></script><script src="/account.js" defer></script><style>.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px}.steps article{padding:20px}.steps a{display:inline-block;margin-top:12px}form{max-width:460px}label{display:block;margin:18px 0 8px}input{width:100%;padding:12px;border:1px solid #385071;border-radius:8px;background:#0d1726;color:inherit}form button{margin-top:22px}#passwordStatus{min-height:24px}</style><link rel="stylesheet" href="/workspace-nav.css"><script defer src="/workspace-nav.js"></script>
+</head><body>
+<div data-workspace-nav hidden></div>
+<header><h1>开始使用与账户</h1><span id="accountName"></span></header><main><p id="notice" role="status"></p>
+<h2>搭建你的第一个 Agent</h2><p class="muted">可以先试用配置好的公共 Agent，也可以从骨架逐个配置节点。模型、工具和知识库分别管理，再绑定到节点。</p>
+<section class="steps"><article><h2>1 · 先体验一个 Agent</h2><p>在工作台选用公共 Agent，回到对话页提出一个小任务。Fixed 按固定节点运行，Auto 自主迭代，Flow 先规划再执行。</p><a href="/user-agents.html">选择 Agent →</a></article>
+<article><h2>2 · 选择模型来源</h2><p>试用可以使用平台提供的模型。需要个人模型时，创建自己的连接，并明确是否允许辅助功能使用平台模型。</p><p id="modelState" class="muted"></p><a href="/models.html">管理模型连接 →</a></article>
+<article><h2>3 · 配置并启用</h2><p>为各节点选择模型、Prompt、Advisor 和 MCP 连接。修改先存为草稿，确认后启用；节点调试默认不执行工具。</p><a href="/user-agents.html">进入 Agent 工作台 →</a></article>
+<article><h2>4 · 添加资料与验证</h2><p>按需上传个人知识文档，等待入库成功，再用检索测试确认命中。绑定知识库后，执行一次实际任务并查看记录。</p><a href="/knowledge.html">管理知识库 →</a><br><a href="/history.html">查看运行历史 →</a></article></section>
+<p class="muted">用量和额度查看：<a href="/usage.html">个人用量</a>。保存回答、导出表格或提供反馈：<a href="/outcomes.html">产物与反馈</a>。反馈加入评测需要你明确选择。</p>
+<article><h2>修改登录密码</h2><p class="muted">修改后需要重新登录，其他设备上的旧登录会话会在下次请求时失效。已在执行的任务不会因此自动重跑。</p>
+<form id="passwordForm"><label for="currentPassword">当前密码</label><input id="currentPassword" type="password" autocomplete="current-password" required maxlength="72"><label for="newPassword">新密码</label><input id="newPassword" type="password" autocomplete="new-password" required minlength="10" maxlength="72"><label for="confirmPassword">再次输入新密码</label><input id="confirmPassword" type="password" autocomplete="new-password" required minlength="10" maxlength="72"><button id="savePassword" type="submit">修改密码</button><p id="passwordStatus" role="status"></p></form></article>
+</main></body></html>

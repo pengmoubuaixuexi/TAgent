@@ -7,6 +7,8 @@ import cn.bugstack.ai.api.response.Response;
 import cn.bugstack.ai.domain.agent.service.memory.longterm.ILongTermMemoryService;
 import cn.bugstack.ai.domain.agent.service.memory.longterm.LongTermMemoryItem;
 import cn.bugstack.ai.domain.agent.service.memory.longterm.LongTermMemoryPage;
+import cn.bugstack.ai.domain.agent.service.model.ModelInvocationScope;
+import cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry;
 import cn.bugstack.ai.types.enums.ResponseCode;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.CrossOrigin;
@@ -40,6 +42,9 @@ public class LongTermMemoryController {
     @Resource
     private ILongTermMemoryService longTermMemoryService;
 
+    @Resource
+    private RunBudgetRegistry runBudgets;
+
     @GetMapping
     public Response<LongTermMemoryPageResponseDTO> list(
             @RequestHeader(value = USER_HEADER, required = false) String userId,
@@ -68,15 +73,17 @@ public class LongTermMemoryController {
             @RequestParam(defaultValue = "20") int limit) {
         try {
             String owner = requireUserId(userId);
+            try (var scope = ModelInvocationScope.open(runBudgets, owner, "MEMORY_MANAGEMENT")) {
             List<LongTermMemoryResponseDTO> data = longTermMemoryService
                     .searchForManagement(owner, query, limit)
                     .stream().map(LongTermMemoryController::toResponse).toList();
             return success(data);
+            }
         } catch (IllegalArgumentException e) {
             return illegal(e.getMessage());
         } catch (Exception e) {
             log.error("语义搜索长期记忆失败", e);
-            return failure("语义搜索失败，请稍后重试");
+            return failure(readableMessage(e, "语义搜索失败，请稍后重试"));
         }
     }
 
@@ -87,8 +94,10 @@ public class LongTermMemoryController {
         try {
             String owner = requireUserId(userId);
             requireRequest(request);
+            try (var scope = ModelInvocationScope.open(runBudgets, owner, "MEMORY_MANAGEMENT")) {
             return success(toResponse(longTermMemoryService.createManual(
                     owner, request.getContent(), request.getTopic())));
+            }
         } catch (IllegalArgumentException e) {
             return illegal(e.getMessage());
         } catch (Exception e) {
@@ -105,8 +114,10 @@ public class LongTermMemoryController {
         try {
             String owner = requireUserId(userId);
             requireRequest(request);
+            try (var scope = ModelInvocationScope.open(runBudgets, owner, "MEMORY_MANAGEMENT")) {
             return success(toResponse(longTermMemoryService.correctForManagement(
                     owner, memoryId, request.getContent(), request.getTopic())));
+            }
         } catch (IllegalArgumentException e) {
             return illegal(e.getMessage());
         } catch (Exception e) {

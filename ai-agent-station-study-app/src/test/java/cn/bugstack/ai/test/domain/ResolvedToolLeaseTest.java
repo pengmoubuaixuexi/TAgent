@@ -107,7 +107,7 @@ public class ResolvedToolLeaseTest {
     }
 
     @Test
-    public void catalogMcpDownMarksLeaseAndThrowsTypedSignal() {
+    public void catalogMcpDownMarksLeaseAndThrowsTypedSignal() throws Exception {
         InMemoryResolvedToolLeaseStore store = new InMemoryResolvedToolLeaseStore();
         IToolVectorStore vectorStore = mock(IToolVectorStore.class);
         McpClientRegistry registry = mock(McpClientRegistry.class);
@@ -126,6 +126,14 @@ public class ResolvedToolLeaseTest {
         service.resolveDynamicToolCallbacks("run-1", "s1", "client-1", "查询网页资料", "用户问题", List.of());
         String identity = store.listLeases("run-1").get(0).toolIdentity();
         when(registry.hasClient("mcp-search")).thenReturn(false);
+        when(registry.getCurrentCallback("mcp-search", "web_search")).thenReturn(null);
+        var repository = (cn.bugstack.ai.domain.agent.adapter.repository.IAgentRepository)
+                ReflectionTestUtils.getField(service, "repository");
+        var config = cn.bugstack.ai.domain.agent.model.valobj.AiClientToolMcpVO.builder().mcpId("mcp-search").build();
+        when(repository.queryAiClientToolMcpVOByMcpId("mcp-search")).thenReturn(config);
+        ReflectionTestUtils.setField(service, "aiClientToolMcpNode",
+                mock(cn.bugstack.ai.domain.agent.service.armory.node.AiClientToolMcpNode.class));
+        when(registry.ensureClient(any(), any())).thenThrow(new IllegalStateException("transport unavailable"));
 
         DynamicToolUnavailableException ex = assertThrows(DynamicToolUnavailableException.class,
                 () -> service.resolveDynamicToolCallbacks("run-1", "s1", "client-1", "查询网页资料", "用户问题", List.of()));

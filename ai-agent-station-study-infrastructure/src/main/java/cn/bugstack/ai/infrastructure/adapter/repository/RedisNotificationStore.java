@@ -5,6 +5,7 @@ import cn.bugstack.ai.domain.agent.service.notification.INotificationStore;
 import com.alibaba.fastjson.JSON;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
@@ -18,6 +19,25 @@ import java.util.Set;
 
 @Service
 public class RedisNotificationStore implements INotificationStore {
+
+    // Read the latest value inside Redis so concurrent resolution/archive cannot be overwritten.
+    private static final DefaultRedisScript<Long> ACKNOWLEDGE_BEFORE = new DefaultRedisScript<>("""
+            local raw = redis.call('GET', KEYS[1])
+            if not raw then return 0 end
+            local item = cjson.decode(raw)
+            if item.userId ~= ARGV[1] then return 0 end
+            if item.readStatus and item.readStatus ~= cjson.null and item.readStatus ~= 'UNREAD' then return 0 end
+            local updated = tonumber(item.updatedAt) or tonumber(item.createdAt) or 0
+            if updated <= 0 or updated > tonumber(ARGV[2]) then return 0 end
+            local ttl = redis.call('PTTL', KEYS[1])
+            if ttl == 0 or ttl == -2 then return 0 end
+            item.readStatus = 'ACKNOWLEDGED'
+            item.acknowledgedAt = tonumber(ARGV[3])
+            item.updatedAt = tonumber(ARGV[3])
+            redis.call('SET', KEYS[1], cjson.encode(item))
+            if ttl > 0 then redis.call('PEXPIRE', KEYS[1], ttl) end
+            return 1
+            """, Long.class);
 
     private final StringRedisTemplate redis;
 
@@ -76,6 +96,22 @@ public class RedisNotificationStore implements INotificationStore {
         List<AgentNotification> result = new ArrayList<>();
         for (String id : ids) find(userId, id).ifPresent(result::add);
         return result;
+    }
+
+    @Override
+    public int acknowledgeAll(String userId, long before, long acknowledgedAt) {
+        if (blank(userId)) throw new IllegalArgumentException("notification userId is required");
+        // Capture retained IDs once; the list API's display limit must not truncate this action.
+        Set<String> ids = redis.opsForZSet().reverseRange(indexKey(userId), 0, -1);
+        if (ids == null || ids.isEmpty()) return 0;
+        int changed = 0;
+        for (String id : ids) {
+            Long result = redis.execute(ACKNOWLEDGE_BEFORE, List.of(itemKey(userId, id)),
+                    userId, String.valueOf(before), String.valueOf(acknowledgedAt));
+            if (result == null) throw new IllegalStateException("notification acknowledgement was not confirmed");
+            changed += result.intValue();
+        }
+        return changed;
     }
 
     private void trimOldest(String userId) {

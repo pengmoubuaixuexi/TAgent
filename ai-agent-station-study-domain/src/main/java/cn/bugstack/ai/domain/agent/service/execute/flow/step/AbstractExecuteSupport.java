@@ -110,6 +110,17 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
     public static final String FLOW_TOOL_CATALOG_V2_KEY = "flow.toolCatalog.v2";
     public static final String FLOW_TOOL_CATALOG_V3_KEY = "flow.toolCatalog.v3";
 
+    /** Appended as a trusted system message without replacing the user's configured node persona. */
+    protected static final String FLOW_READ_ONLY_TOOL_PROTOCOL = """
+            【当前 FLOW 分析/规划阶段的工具协议】
+            本轮只读取运行时提供的已授权工具目录，分析能力或制定计划，不装载、连接、试调用任何业务工具。
+            本轮不开放 request_tool。已有节点提示词中“允许/必须 request_tool”或“先装载再分析”的旧说明不适用于本轮；不要发起或模拟这种调用。
+            目录中的工具即使未装载，也可以按其真实名称规划；未知、缺失或省略的能力明确标记待执行阶段发现，不编造工具名称或查询结果。
+            实际执行步骤会按需装载并调用工具。仅在本轮确实提供 ask_user 且缺少必要用户信息时才使用它，已补充的信息直接复用。
+            文档与表格交付由执行或最终整理阶段的内置 create_artifact 完成（以该阶段实际工具列表为准），不需要搜索文件写入 MCP，也不要让用户手动复制到产物页；当前分析/规划阶段不保存产物。
+            保留用户配置的领域角色、业务目标和回答风格；当前协议只规定本阶段的工具行为。
+            """;
+
     protected List<ToolCallback> resolveAgentDynamicToolCallbacks(ExecuteCommandEntity requestParameter, String clientId) {
         if (requestParameter == null || clientId == null || dynamicMcpToolCatalogService == null) {
             return List.of();
@@ -196,7 +207,7 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         return "<tool_runtime>\n"
                 + "  <no_tools client_id=\"" + escapeXml(clientId) + "\">"
                 + "当前尚未装载业务 MCP 工具，不代表未配置或没有能力。"
-                + (requestToolEnabled ? "需要工具时先用 request_tool 申请，再使用实际返回的工具；不要虚构调用结果。" : "当前未开放动态装载，请如实说明限制，不要虚构调用结果。")
+                + (requestToolEnabled ? "分析/规划直接阅读下方目录，执行阶段再按需装载并调用工具；不要虚构调用结果。" : "当前未开放动态装载，请如实说明限制，不要虚构调用结果。")
                 + "</no_tools>\n"
                 + "</tool_runtime>" + (bound==null?"":bound);
     }
@@ -869,6 +880,12 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
     @org.springframework.beans.factory.annotation.Value("${agent.streaming.idle-timeout-seconds:120}")
     protected int streamingIdleTimeoutSeconds;
 
+    @org.springframework.beans.factory.annotation.Value("${agent.streaming.first-response-timeout-seconds:300}")
+    protected int streamingFirstResponseTimeoutSeconds = 300;
+
+    @org.springframework.beans.factory.annotation.Value("${agent.streaming.tool-timeout-seconds:300}")
+    protected int streamingToolTimeoutSeconds = 300;
+
     /**
      * Token-Level Streaming：逐 token 发送 SSE event:token 事件，同时拼接完整响应返回。
      * <p>
@@ -909,7 +926,7 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         // 立即回答 finalize（stepName 含 answer_now）那一发关思考：与 scopeSession 同机制（订阅在调用线程，filter 读 ThreadLocal）。
         // 其余步骤 __noThink=false，scopeNoThinking 退化为 no-op → 零影响。
         boolean __noThink = stepName != null && stepName.contains("answer_now");
-        try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeSession(__sid, __runId);
+        try (AutoCloseable __scope = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeCall(__sid, __runId);
              AutoCloseable __noThinkScope = __noThink
                      ? cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.scopeNoThinking(__sid)
                      : (AutoCloseable) () -> {}) {
@@ -927,6 +944,8 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
             cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.Activity __activity =
                     cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.start(
                             stepName + "#attempt-" + attempt);
+            cn.bugstack.ai.domain.agent.service.execute.common.StreamingProgressEmitter.attach(
+                    __activity, dynamicContext.getValue("emitter"), stepName, __sid, __runId);
             try {
                 spec = spec.toolContext(java.util.Map.of(
                         cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.CONTEXT_KEY, __activity));
@@ -935,7 +954,8 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
                 Flux<ChatClientResponse> flux = spec.stream().chatClientResponse()
                         .doOnNext(__activity::markDecodedResponse);
                 cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker
-                        .timeoutOnInactivity(flux, __activity, Duration.ofSeconds(streamingIdleTimeoutSeconds))
+                        .timeoutOnInactivity(flux, __activity, Duration.ofSeconds(streamingIdleTimeoutSeconds),
+                                Duration.ofSeconds(streamingFirstResponseTimeoutSeconds), Duration.ofSeconds(streamingToolTimeoutSeconds))
                 .map(cr -> {
                     if (cr.chatResponse() != null) lastResponse[0] = cr.chatResponse();
                     // 2026-05-07 修：getText() 在 tool_use / metadata-only 末帧会返回 null，
@@ -1042,7 +1062,7 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
 
 
                 if (result.isBlank() && !dynamicContext.isFinalizeRequested() && !dynamicContext.hasSteerIdea()) {
-                    throw new IllegalStateException("LLM stream completed without an answer");
+                    throw cn.bugstack.ai.domain.agent.service.execute.common.ModelStreamException.emptyAnswer();
                 }
                 llmObservationRecorder.record(buildCallContext(stepName, promptText, result, model, dynamicContext),
                         lastResponse[0], latency, null);

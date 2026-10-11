@@ -15,6 +15,11 @@
         <result column="created_at"      property="createdAt"/>
     </resultMap>
 
+    <select id="findRevision" resultType="cn.bugstack.ai.infrastructure.dao.po.AiChatMemoryRevision">
+        SELECT COUNT(*) AS messageCount, COALESCE(MAX(id), 0) AS latestMessageId
+        FROM ai_chat_memory WHERE conversation_id = #{conversationId}
+    </select>
+
     <select id="findConversationIds" resultType="java.lang.String">
         SELECT DISTINCT conversation_id
         FROM ai_chat_memory

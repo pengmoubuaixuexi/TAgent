@@ -1,6 +1,7 @@
 package cn.bugstack.ai.domain.agent.service.rag.fusion;
 
 import cn.bugstack.ai.domain.agent.service.rag.hybrid.HybridRetriever;
+import cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.document.Document;
@@ -8,9 +9,8 @@ import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
 
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 /**
@@ -29,8 +29,15 @@ public class RagFusionService implements IRagFusionService {
 
     private static final int DEFAULT_VARIANTS = 3;
     private static final double RRF_K = 60.0;
-    /** 单变体检索超时；超过即返回空列表，不阻塞主请求 */
-    private static final long PER_VARIANT_TIMEOUT_SEC = 15L;
+    /** All variants share one deadline. Blocking stores must not occupy the common pool. */
+    private static final AtomicInteger WORKER_IDS = new AtomicInteger();
+    private static final ExecutorService RETRIEVAL_WORKERS = new ThreadPoolExecutor(4, 4, 30, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(64), runnable -> {
+                Thread thread = new Thread(runnable, "rag-fusion-" + WORKER_IDS.incrementAndGet());
+                thread.setDaemon(true);
+                return thread;
+            }, new ThreadPoolExecutor.AbortPolicy());
+    private long retrievalTimeoutMs = 15_000;
     private static final io.micrometer.context.ContextSnapshotFactory SNAPSHOT_FACTORY =
             io.micrometer.context.ContextSnapshotFactory.builder().build();
 
@@ -59,7 +66,7 @@ public class RagFusionService implements IRagFusionService {
                             HybridRetriever hybridRetriever, String knowledgeTag) {
         this.chatClient = chatClient;
         this.vectorStore = vectorStore;
-        this.variantCount = variantCount;
+        this.variantCount = Math.max(1, Math.min(variantCount, 8));
         this.enabled = enabled;
         this.hybridRetriever = hybridRetriever;
         this.knowledgeTag = knowledgeTag;
@@ -79,20 +86,9 @@ public class RagFusionService implements IRagFusionService {
     public List<Document> fusedRetrieve(String originalQuery, SearchRequest baseSearchRequest, int topK) {
         if (!isAvailable()) return List.of();
 
-        try {
-            List<String> variants = generateVariants(originalQuery);
-            if (variants.isEmpty()) {
-                return singleQueryRetrieve(originalQuery, baseSearchRequest, topK);
-            }
-            return doMultiQueryRetrieve(originalQuery, variants, baseSearchRequest, topK);
-        } catch (Exception e) {
-            log.warn("RAG Fusion failed, falling back to single-query retrieval: {}", e.getMessage());
-            try {
-                return singleQueryRetrieve(originalQuery, baseSearchRequest, topK);
-            } catch (Exception ex) {
-                return List.of();
-            }
-        }
+        // Variant generation may fall back to the original query, but an unavailable retrieval
+        // backend is not an empty knowledge base and must not start a second unbounded search.
+        return doMultiQueryRetrieve(originalQuery, generateVariants(originalQuery), baseSearchRequest, topK);
     }
 
     @Override
@@ -107,61 +103,66 @@ public class RagFusionService implements IRagFusionService {
         if (variants == null || variants.isEmpty()) {
             return fusedRetrieve(originalQuery, baseSearchRequest, topK);
         }
-        try {
-            return doMultiQueryRetrieve(originalQuery, variants, baseSearchRequest, topK);
-        } catch (Exception e) {
-            log.warn("RAG Fusion with given variants failed: {}", e.getMessage());
-            try {
-                return singleQueryRetrieve(originalQuery, baseSearchRequest, topK);
-            } catch (Exception ex) {
-                return List.of();
-            }
-        }
+        return doMultiQueryRetrieve(originalQuery, variants, baseSearchRequest, topK);
     }
 
     /** 多查询并行检索 + RRF 融合：originalQuery + variants 分别查，RRF 去重排序。
      *  baseSearchRequest 携带 RagAnswerAdvisor 已合并好的 filterExpression（knowledge + user_id） */
     private List<Document> doMultiQueryRetrieve(String originalQuery, List<String> variants,
                                                 SearchRequest baseSearchRequest, int topK) {
-        List<String> allQueries = new ArrayList<>();
-        allQueries.add(originalQuery);
-        allQueries.addAll(variants);
-
-        // 捕获主线程上下文（MDC + OTel span）让 worker 线程接力 trace；
-        // 单变体超时 PER_VARIANT_TIMEOUT_SEC 秒，超时返回空列表不拖死主请求
-        io.micrometer.context.ContextSnapshot snapshot;
-        try { snapshot = SNAPSHOT_FACTORY.captureAll(); } catch (Throwable ignored) { snapshot = null; }
-        final io.micrometer.context.ContextSnapshot finalSnapshot = snapshot;
-
-        List<CompletableFuture<List<Document>>> futures = allQueries.stream()
-                .map(q -> CompletableFuture.supplyAsync(() -> {
-                    try (io.micrometer.context.ContextSnapshot.Scope ignored =
-                                 finalSnapshot != null ? finalSnapshot.setThreadLocals() : null) {
-                        SearchRequest sr = buildSearchRequest(baseSearchRequest, q, topK);
-                        if (hybridRetriever != null) {
-                            return hybridRetriever.retrieve(q, sr, knowledgeTag, topK);
+        LinkedHashSet<String> queries = new LinkedHashSet<>();
+        queries.add(originalQuery);
+        variants.stream().filter(Objects::nonNull).filter(q -> !q.isBlank()).limit(variantCount).forEach(queries::add);
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(Math.max(1, retrievalTimeoutMs));
+        var activity = StreamingActivityTracker.current();
+        StreamingActivityTracker.checkActive(activity);
+        var snapshot = SNAPSHOT_FACTORY.captureAll();
+        CompletionService<List<Document>> completed = new ExecutorCompletionService<>(RETRIEVAL_WORKERS);
+        List<Future<List<Document>>> pending = new ArrayList<>();
+        List<List<Document>> results = new ArrayList<>();
+        int processed = 0;
+        try {
+            for (String query : queries) {
+                try {
+                    pending.add(completed.submit(() -> {
+                        try (var ignored = snapshot.setThreadLocals(); var scope = StreamingActivityTracker.scope(activity)) {
+                            StreamingActivityTracker.checkActive(activity);
+                            SearchRequest sr = buildSearchRequest(baseSearchRequest, query, topK);
+                            return hybridRetriever != null ? hybridRetriever.retrieve(query, sr, knowledgeTag, topK)
+                                    : vectorStore.similaritySearch(sr);
                         }
-                        return vectorStore.similaritySearch(sr);
-                    } catch (Exception e) {
-                        log.debug("RAG Fusion retrieve failed for variant: {}", e.getMessage());
-                        return List.<Document>of();
-                    }
-                }).orTimeout(PER_VARIANT_TIMEOUT_SEC, TimeUnit.SECONDS)
-                  .exceptionally(ex -> {
-                      log.debug("RAG Fusion variant timed out or failed: {}", ex.getMessage());
-                      return List.<Document>of();
-                  }))
-                .toList();
-
-        List<List<Document>> allResults = futures.stream()
-                .map(CompletableFuture::join)
-                .collect(Collectors.toList());
-
-        return rrfFuse(allResults, topK);
-    }
-
-    private List<Document> singleQueryRetrieve(String query, SearchRequest baseSearchRequest, int topK) {
-        return vectorStore.similaritySearch(buildSearchRequest(baseSearchRequest, query, topK));
+                    }));
+                } catch (RejectedExecutionException saturated) {
+                    log.warn("RAG Fusion retrieval queue full; variant rejected");
+                }
+            }
+            while (processed < pending.size()) {
+                StreamingActivityTracker.checkActive(activity);
+                if (Thread.currentThread().isInterrupted()) throw new CancellationException("RAG Fusion interrupted");
+                long remaining = deadline - System.nanoTime();
+                Future<List<Document>> next = remaining <= 0 ? completed.poll()
+                        : completed.poll(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(25)), TimeUnit.NANOSECONDS);
+                if (next == null) {
+                    if (remaining <= 0) break;
+                    continue;
+                }
+                processed++;
+                try {
+                    List<Document> documents = next.get();
+                    results.add(documents == null ? List.of() : documents);
+                } catch (ExecutionException failed) {
+                    StreamingActivityTracker.rethrowCancellation(failed);
+                    log.warn("RAG Fusion retrieval variant failed: {}", failed.getCause().getClass().getSimpleName());
+                }
+            }
+            if (results.isEmpty()) throw new IllegalStateException("知识库检索暂不可用，所有查询分支均失败或超时，请稍后重试。");
+            return rrfFuse(results, topK);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new CancellationException("RAG Fusion interrupted");
+        } finally {
+            pending.forEach(future -> { if (!future.isDone()) future.cancel(true); });
+        }
     }
 
     /** 用 baseSearchRequest 模板继承 filter；baseSearchRequest 为 null 时构造新的（保持向后兼容）。 */
@@ -180,6 +181,7 @@ public class RagFusionService implements IRagFusionService {
             if (result == null || result.isBlank()) return List.of();
             return parseVariants(result);
         } catch (Exception e) {
+            StreamingActivityTracker.rethrowCancellation(e);
             log.debug("RAG Fusion variant generation failed: {}", e.getMessage());
             return List.of();
         }

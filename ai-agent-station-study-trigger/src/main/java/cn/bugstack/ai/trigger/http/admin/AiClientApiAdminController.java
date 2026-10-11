@@ -366,6 +366,11 @@ public class AiClientApiAdminController implements IAiClientApiAdminService {
     private AiClientApi convertToAiClientApi(AiClientApiRequestDTO requestDTO) {
         AiClientApi aiClientApi = new AiClientApi();
         BeanUtils.copyProperties(requestDTO, aiClientApi);
+        if (!StringUtils.hasText(requestDTO.getApiKey()) || "••••••••".equals(requestDTO.getApiKey())) {
+            AiClientApi existing = requestDTO.getId() != null ? aiClientApiDao.queryById(requestDTO.getId())
+                    : StringUtils.hasText(requestDTO.getApiId()) ? aiClientApiDao.queryByApiId(requestDTO.getApiId()) : null;
+            aiClientApi.setApiKey(existing == null ? null : existing.getApiKey());
+        }
         return aiClientApi;
     }
 
@@ -375,6 +380,7 @@ public class AiClientApiAdminController implements IAiClientApiAdminService {
     private AiClientApiResponseDTO convertToAiClientApiResponseDTO(AiClientApi aiClientApi) {
         AiClientApiResponseDTO responseDTO = new AiClientApiResponseDTO();
         BeanUtils.copyProperties(aiClientApi, responseDTO);
+        responseDTO.setApiKey(StringUtils.hasText(aiClientApi.getApiKey()) ? "••••••••" : "");
         return responseDTO;
     }
 

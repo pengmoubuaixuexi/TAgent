@@ -1,6 +1,7 @@
 package cn.bugstack.ai.infrastructure.dao;
 
 import cn.bugstack.ai.infrastructure.dao.po.AiChatMemory;
+import cn.bugstack.ai.infrastructure.dao.po.AiChatMemoryRevision;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 
@@ -17,6 +18,8 @@ public interface IAiChatMemoryDao {
     List<String> findConversationIds();
 
     List<AiChatMemory> findByConversationId(@Param("conversationId") String conversationId);
+
+    AiChatMemoryRevision findRevision(@Param("conversationId") String conversationId);
 
     void insertBatch(@Param("list") List<AiChatMemory> list);
 

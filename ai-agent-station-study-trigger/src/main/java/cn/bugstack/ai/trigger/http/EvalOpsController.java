@@ -164,6 +164,11 @@ public class EvalOpsController {
         return execute(() -> codeVersionService.bindTag(evalRunId, command));
     }
 
+    @GetMapping("/runs/{evalRunId}/judge-models")
+    public Response<List<Map<String, Object>>> judgeModels(@PathVariable String evalRunId) {
+        return execute(() -> judgeService.listJudgeModels(evalRunId));
+    }
+
     @PostMapping("/runs/{evalRunId}/judge")
     public Response<Map<String, Object>> judge(@PathVariable String evalRunId,
                                                @RequestBody(required = false) EvalJudgeService.JudgeCommand command) {
@@ -178,6 +183,11 @@ public class EvalOpsController {
     @GetMapping("/judge-jobs/{judgeJobId}")
     public Response<Map<String, Object>> judgeJob(@PathVariable String judgeJobId) {
         return execute(() -> judgeService.getJob(judgeJobId));
+    }
+
+    @PostMapping("/judge-jobs/{judgeJobId}/retry-failed")
+    public Response<Map<String, Object>> retryFailedJudge(@PathVariable String judgeJobId) {
+        return execute(() -> judgeService.retryFailed(judgeJobId));
     }
 
     private <T> Response<T> execute(Action<T> action) {

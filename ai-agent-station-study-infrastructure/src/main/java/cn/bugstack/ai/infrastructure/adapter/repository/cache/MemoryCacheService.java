@@ -1,6 +1,9 @@
 package cn.bugstack.ai.infrastructure.adapter.repository.cache;
 
 import cn.bugstack.ai.infrastructure.dao.po.AiChatMemory;
+import cn.bugstack.ai.infrastructure.dao.IAiChatMemoryDao;
+import cn.bugstack.ai.infrastructure.dao.IAiChatMemorySummaryDao;
+import cn.bugstack.ai.infrastructure.dao.po.AiChatMemoryRevision;
 import cn.bugstack.ai.infrastructure.dao.po.AiChatMemorySummary;
 import cn.bugstack.ai.infrastructure.dao.po.AiEpisodicMemory;
 import com.alibaba.fastjson.JSON;
@@ -14,14 +17,16 @@ import org.springframework.stereotype.Component;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Memory 层 Redis 缓存（chat_memory 列表 / chat_memory_summary / episodic by session）。
  * <p>
  * 策略：
  * <ul>
- *   <li>读：cache hit 返回；miss 由调用方查 DB，再回填缓存</li>
- *   <li>写：调用方先 put 缓存（同步），再异步落 DB；下次读永远命中 Redis</li>
+ *   <li>会话读：cache hit 先核对 DB 修订信息；失效失败或旧查询晚回填都不会持续返回旧历史</li>
+ *   <li>miss 由调用方查 DB，再回填缓存；DB 验证失败不能返回未经验证的缓存</li>
+ *   <li>会话写入：先提交 DB，再失效列表/计数/摘要缓存；缓存不承担持久化职责</li>
  *   <li>失败兜底：任何 Redis 异常被 catch，调用方退回纯 DB 路径，不阻断业务</li>
  * </ul>
  * <p>
@@ -37,6 +42,12 @@ public class MemoryCacheService {
 
     @Autowired
     private StringRedisTemplate stringRedisTemplate;
+
+    @Autowired
+    private IAiChatMemoryDao aiChatMemoryDao;
+
+    @Autowired
+    private IAiChatMemorySummaryDao summaryDao;
 
     @Value("${agent.memory-cache.ttl-seconds:3600}")
     private long ttlSeconds;
@@ -61,7 +72,12 @@ public class MemoryCacheService {
         try {
             String json = stringRedisTemplate.opsForValue().get(K_CHAT_LIST + conversationId);
             if (json == null) return null;
-            return JSON.parseObject(json, new TypeReference<List<AiChatMemory>>() {});
+            List<AiChatMemory> cached = JSON.parseObject(json, new TypeReference<List<AiChatMemory>>() {});
+            if (cached == null || cached.stream().anyMatch(row -> row == null || row.getId() == null)) return null;
+            AiChatMemoryRevision revision = aiChatMemoryDao.findRevision(conversationId);
+            long latestId = cached.stream().mapToLong(AiChatMemory::getId).max().orElse(0);
+            return revision != null && revision.getMessageCount() == cached.size()
+                    && Objects.equals(revision.getLatestMessageId(), latestId) ? cached : null;
         } catch (Exception e) {
             log.warn("[MemoryCache] getChatList failed conv={}: {}", conversationId, e.getMessage());
             return null;
@@ -81,7 +97,7 @@ public class MemoryCacheService {
     public void evictChatList(String conversationId) {
         if (!enabled || conversationId == null || conversationId.isBlank()) return;
         try {
-            stringRedisTemplate.delete(K_CHAT_LIST + conversationId);
+            stringRedisTemplate.delete(List.of(K_CHAT_LIST + conversationId, "episodic:msg_count:" + conversationId));
         } catch (Exception e) {
             log.warn("[MemoryCache] evictChatList failed conv={}: {}", conversationId, e.getMessage());
         }
@@ -95,7 +111,12 @@ public class MemoryCacheService {
         try {
             String json = stringRedisTemplate.opsForValue().get(K_SUMMARY + conversationId);
             if (json == null || "null".equals(json)) return null;
-            return JSON.parseObject(json, AiChatMemorySummary.class);
+            AiChatMemorySummary cached = JSON.parseObject(json, AiChatMemorySummary.class);
+            AiChatMemorySummary current = summaryDao.findRevision(conversationId);
+            return cached != null && current != null && Objects.equals(cached.getId(), current.getId())
+                    && Objects.equals(cached.getVersion(), current.getVersion())
+                    && Objects.equals(cached.getSummaryMsgCount(), current.getSummaryMsgCount())
+                    && Objects.equals(cached.getLastMessageId(), current.getLastMessageId()) ? cached : null;
         } catch (Exception e) {
             log.warn("[MemoryCache] getSummary failed conv={}: {}", conversationId, e.getMessage());
             return null;

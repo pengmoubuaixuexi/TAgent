@@ -16,13 +16,13 @@
     .toast { animation: toast-in .2s ease-out; }
     @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
   </style>
+<link rel="stylesheet" href="/workspace-nav.css"><script defer src="/workspace-nav.js"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen">
+<div data-workspace-nav hidden></div>
   <header class="sticky top-0 z-20 bg-slate-900/95 backdrop-blur border-b border-slate-800">
     <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between gap-4">
       <div class="flex items-center gap-3 min-w-0">
-        <a href="/" class="text-sm text-slate-400 hover:text-white transition">← 返回对话</a>
-        <span class="text-slate-700">|</span>
         <div class="min-w-0">
           <h1 class="font-semibold text-white truncate">长期记忆管理</h1>
           <p class="text-xs text-slate-500">查看和纠正 Agent 跨会话记住的事实与偏好</p>

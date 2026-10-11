@@ -2,6 +2,8 @@ package cn.bugstack.ai.test.domain;
 
 import cn.bugstack.ai.domain.agent.service.execute.common.McpClientRegistry;
 import cn.bugstack.ai.domain.agent.service.execute.common.RobustToolCallingManager;
+import cn.bugstack.ai.domain.agent.service.execute.common.McpToolCallMetadata;
+import cn.bugstack.ai.domain.agent.service.execute.common.HintedToolCallback;
 import org.junit.Test;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
@@ -24,6 +26,7 @@ import java.util.Map;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -92,6 +95,18 @@ public class RobustToolCallingManagerParallelTest {
         return new Prompt("用户问题", options);
     }
 
+    private static Prompt promptWithMcpTools(Map<String, String> identities) {
+        ToolCallback[] callbacks = identities.entrySet().stream().map(entry -> (ToolCallback) new ToolCallback() {
+            @Override public ToolDefinition getToolDefinition() { return callback(entry.getKey()).getToolDefinition(); }
+            @Override public org.springframework.ai.tool.metadata.ToolMetadata getToolMetadata() {
+                return new McpToolCallMetadata(entry.getValue(), true, false, null, false);
+            }
+            @Override public String call(String input) { return "result-of-" + entry.getKey(); }
+        }).toArray(ToolCallback[]::new);
+        return new Prompt("用户问题", OpenAiChatOptions.builder().toolCallbacks(callbacks)
+                .toolContext(Map.of("agent.tool_capabilities", "BUSINESS_ONLY")).build());
+    }
+
     private static Prompt promptWithToolsAndPriorRounds(int priorRounds, String... toolNames) {
         ToolCallback[] cbs = new ToolCallback[toolNames.length];
         for (int i = 0; i < toolNames.length; i++) cbs[i] = callback(toolNames[i]);
@@ -138,7 +153,7 @@ public class RobustToolCallingManagerParallelTest {
             RobustToolCallingManager mgr = new RobustToolCallingManager(delegate, null, exec, true, reg);
 
             ToolExecutionResult result = mgr.executeToolCalls(
-                    promptWithTools("toolA", "toolB"), responseWithToolCalls("toolA", "toolB"));
+                    promptWithMcpTools(Map.of("toolA", "mcpA", "toolB", "mcpB")), responseWithToolCalls("toolA", "toolB"));
 
             // 不同 server → 每组单工具委托一次
             assertEquals("不同 MCP server 的工具应各委托一次", 2, delegate.callCount.get());
@@ -175,7 +190,7 @@ public class RobustToolCallingManagerParallelTest {
             McpClientRegistry reg = registry(Map.of("toolA", "mcpA", "toolB", "mcpA"));
             RobustToolCallingManager mgr = new RobustToolCallingManager(delegate, null, exec, true, reg);
 
-            mgr.executeToolCalls(promptWithTools("toolA", "toolB"), responseWithToolCalls("toolA", "toolB"));
+            mgr.executeToolCalls(promptWithMcpTools(Map.of("toolA", "mcpA", "toolB", "mcpA")), responseWithToolCalls("toolA", "toolB"));
 
             assertEquals("同一 MCP server 应退回 delegate 一次性串行", 1, delegate.callCount.get());
             assertEquals(1, delegate.toolCountsPerCall.size());
@@ -242,5 +257,66 @@ public class RobustToolCallingManagerParallelTest {
         } finally {
             exec.shutdownNow();
         }
+    }
+
+    @Test
+    public void anotherUsersSameNamedToolsCannotDisableCurrentRequestsParallelism() {
+        ThreadPoolExecutor exec = pool();
+        CountDownLatch bothEntered = new CountDownLatch(2);
+        AtomicInteger overlapped = new AtomicInteger();
+        AtomicInteger unrelatedCalls = new AtomicInteger();
+        McpClientRegistry reg = new McpClientRegistry() {
+            @Override public String getMcpIdForTool(String name) {
+                throw new AssertionError("request scheduling must not use the global name index");
+            }
+        };
+        for (String owner : List.of("alice", "bob")) {
+            reg.registerCallbacks(owner + "-map", new ToolCallback[]{callback("map_search")});
+            reg.registerCallbacks(owner + "-web", new ToolCallback[]{callback("web_search")});
+        }
+        List<ToolCallback> ownCallbacks = new ArrayList<>();
+        for (String name : List.of("map_search", "web_search")) {
+            ToolCallback own = new ToolCallback() {
+                @Override public ToolDefinition getToolDefinition() { return callback(name).getToolDefinition(); }
+                @Override public org.springframework.ai.tool.metadata.ToolMetadata getToolMetadata() {
+                    return new McpToolCallMetadata("alice-" + name, true, false, null, false);
+                }
+                @Override public String call(String input) {
+                    bothEntered.countDown();
+                    try {
+                        if (bothEntered.await(2, TimeUnit.SECONDS)) overlapped.incrementAndGet();
+                    } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IllegalStateException(e); }
+                    return name;
+                }
+            };
+            ownCallbacks.add(new HintedToolCallback(own, "test hint survives decoration"));
+        }
+        reg.registerCallbacks("unrelated", new ToolCallback[]{new ToolCallback() {
+            @Override public ToolDefinition getToolDefinition() { return callback("map_search").getToolDefinition(); }
+            @Override public String call(String input) { unrelatedCalls.incrementAndGet(); return "wrong owner"; }
+        }});
+        try {
+            Prompt prompt = new Prompt("query", OpenAiChatOptions.builder().toolCallbacks(ownCallbacks)
+                    .toolContext(Map.of("agent.tool_capabilities", "BUSINESS_ONLY")).build());
+            RobustToolCallingManager manager = new RobustToolCallingManager(ToolCallingManager.builder().build(), null, exec, true, reg);
+            ToolExecutionResult result = manager.executeToolCalls(prompt, responseWithToolCalls("map_search", "web_search"));
+            assertEquals("both actual callbacks must overlap", 2, overlapped.get());
+            assertEquals(0, unrelatedCalls.get());
+            ToolResponseMessage response = (ToolResponseMessage) result.conversationHistory().get(result.conversationHistory().size() - 1);
+            assertEquals(List.of("map_search", "web_search"), response.getResponses().stream().map(ToolResponseMessage.ToolResponse::responseData).toList());
+        } finally { exec.shutdownNow(); }
+    }
+
+    @Test
+    public void callbacksWithoutConnectionMetadataRemainConservativelySerial() {
+        FakeDelegate delegate = new FakeDelegate();
+        ThreadPoolExecutor exec = pool();
+        try {
+            RobustToolCallingManager manager = new RobustToolCallingManager(delegate, null, exec, true,
+                    registry(Map.of("toolA", "mcpA", "toolB", "mcpB")));
+            manager.executeToolCalls(promptWithTools("toolA", "toolB"), responseWithToolCalls("toolA", "toolB"));
+            assertEquals(1, delegate.callCount.get());
+            assertEquals(2, delegate.toolCountsPerCall.get(0).intValue());
+        } finally { exec.shutdownNow(); }
     }
 }

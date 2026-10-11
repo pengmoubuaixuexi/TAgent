@@ -12,6 +12,16 @@ import static org.junit.Assert.*;
 
 public class StreamingRetryPolicyTest {
     @Test
+    public void localWaitReasonSurvivesFrameworkWrappingWithoutTechnicalStepNames() {
+        String reason = "模型服务在 300 秒内未返回正文、思考或工具调用，已停止等待。可稍后重试或更换模型。";
+        var timeout = new cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.WaitTimeoutException(reason);
+        var wrapper = new IllegalStateException("Stream processing failed", timeout);
+        var surfaced = StreamingRetryPolicy.failed("flow_step4_execute_step_3", wrapper);
+        assertEquals(reason, surfaced.getMessage());
+        assertSame(wrapper, surfaced.getCause());
+        assertFalse(StreamingRetryPolicy.canRetry(wrapper, true, 0, 1, 3));
+    }
+    @Test
     public void onlyUnstartedTransientRequestsCanBeReplayed() {
         Throwable timeout = new RuntimeException(new TimeoutException("idle"));
         assertTrue(StreamingRetryPolicy.canRetry(timeout, false, 0, 1, 3));

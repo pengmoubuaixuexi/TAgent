@@ -143,6 +143,7 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
                         + "\n如需补足信息可调用上述工具后再作答；不需要则直接作答。";
             }
             summaryPrompt = appendCurrentTimeContext(summaryPrompt);
+            if (!answerNow) summaryPrompt += "\n若用户要求可下载文档或表格，使用本轮提供的 create_artifact 保存完整成果；已有相同产物不重复创建。无需搜索文件写入 MCP 或让用户复制粘贴，不编造保存成功或下载地址。";
             // P0-B2b-Step3：质量未通过/未验证时，要求最终交付向用户明示局限，且不泄露内部流程
             summaryPrompt += qualityDeliveryDirective(dynamicContext.getQualityVerificationStatus());
 

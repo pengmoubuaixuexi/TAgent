@@ -10,6 +10,12 @@
     <artifactId>ai-agent-station-study-domain</artifactId>
 
     <dependencies>
+        <!-- The legacy wrench jar bundles Spring classes. Resolve HTTP contracts from
+             the Boot-managed Spring version before that jar, matching application runtime. -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-web</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>

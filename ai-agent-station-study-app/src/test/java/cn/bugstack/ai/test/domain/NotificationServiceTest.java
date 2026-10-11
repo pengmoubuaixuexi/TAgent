@@ -76,6 +76,70 @@ public class NotificationServiceTest {
         assertFalse(service.resolve("u2", "input-2", AgentNotification.Status.RESOLVED).isPresent());
     }
 
+    @Test
+    public void shouldAcknowledgeEntireOwnerSnapshotWithoutResolvingPendingOrReadingNewArrivals() {
+        MemoryStore store = new MemoryStore();
+        NotificationService service = new NotificationService(store);
+        long before = System.currentTimeMillis() - 1000;
+        for (int i = 0; i < 205; i++) {
+            AgentNotification item = service.publish(command("alice", "question-" + i, null));
+            item.setUpdatedAt(before); item.setCreatedAt(before); store.save(item);
+        }
+        AgentNotification plan = service.publish(NotificationCommand.builder().userId("alice")
+                .type(AgentNotification.Type.PLAN_REVIEW).referenceId("plan").title("Review").build());
+        plan.setCreatedAt(before); plan.setUpdatedAt(before); store.save(plan);
+        AgentNotification archived = service.publish(command("alice", "archive", null));
+        service.archive("alice", archived.getNotificationId());
+        AgentNotification newer = service.publish(command("alice", "new-arrival", null));
+        AgentNotification other = service.publish(command("bob", "other-owner", null));
+
+        assertEquals(206, service.acknowledgeAll("alice", before));
+        assertEquals(0, service.acknowledgeAll("alice", before));
+        assertEquals(AgentNotification.ReadStatus.UNREAD, service.find("alice", newer.getNotificationId()).orElseThrow().getReadStatus());
+        assertEquals(AgentNotification.ReadStatus.UNREAD, service.find("bob", other.getNotificationId()).orElseThrow().getReadStatus());
+        assertEquals(AgentNotification.ReadStatus.ARCHIVED, service.find("alice", archived.getNotificationId()).orElseThrow().getReadStatus());
+        AgentNotification readPlan = service.find("alice", plan.getNotificationId()).orElseThrow();
+        assertEquals(AgentNotification.Status.PLAN_REVIEW, readPlan.getStatus());
+        assertEquals(AgentNotification.ReadStatus.ACKNOWLEDGED, readPlan.getReadStatus());
+        assertNotNull(readPlan.getAcknowledgedAt());
+        assertTrue(store.items.values().stream().filter(item -> item.getReferenceId().startsWith("question-"))
+                .allMatch(item -> item.getStatus() == AgentNotification.Status.WAITING
+                        && item.getReadStatus() == AgentNotification.ReadStatus.ACKNOWLEDGED));
+    }
+
+    @Test
+    public void shouldRejectMissingSnapshotAndSkipNewVersionOfExistingNotification() {
+        MemoryStore store = new MemoryStore();
+        NotificationService service = new NotificationService(store);
+        long before = System.currentTimeMillis() - 1000;
+        AgentNotification changed = service.publish(command("alice", "changed", null));
+        changed.setCreatedAt(before - 1); changed.setUpdatedAt(before + 1); store.save(changed);
+        assertEquals(0, service.acknowledgeAll("alice", before));
+        assertEquals(AgentNotification.ReadStatus.UNREAD, service.find("alice", changed.getNotificationId()).orElseThrow().getReadStatus());
+        assertThrows(IllegalArgumentException.class, () -> service.acknowledgeAll("alice", 0));
+        assertThrows(IllegalArgumentException.class, () -> service.acknowledgeAll(" ", before));
+    }
+
+    @Test
+    public void duplicateTerminalPreservesReadStatusAndPlanCardRemainsResolvable() {
+        NotificationService service = new NotificationService(new MemoryStore());
+        AgentNotification plan = service.publish(NotificationCommand.builder().userId("u1")
+                .type(AgentNotification.Type.PLAN_REVIEW).referenceId("r1").title("Review plan").build());
+        NotificationCommand completion = NotificationCommand.builder().userId("u1")
+                .notificationId(NotificationService.terminalId("u1", "r1"))
+                .type(AgentNotification.Type.TASK_COMPLETED).referenceId("run-terminal:r1")
+                .runId("r1").sessionId("s1").title("Completed").build();
+        AgentNotification terminal = service.publish(completion);
+        service.acknowledge("u1", terminal.getNotificationId());
+        service.publish(completion);
+        service.resolve("u1", "r1", AgentNotification.Status.RESOLVED);
+        assertEquals(2, service.list("u1", 20, false).size());
+        assertEquals(AgentNotification.ReadStatus.ACKNOWLEDGED,
+                service.find("u1", terminal.getNotificationId()).orElseThrow().getReadStatus());
+        assertEquals(AgentNotification.Status.RESOLVED, service.find("u1", plan.getNotificationId()).orElseThrow().getStatus());
+        assertEquals(AgentNotification.Status.TASK_COMPLETED, service.find("u1", terminal.getNotificationId()).orElseThrow().getStatus());
+    }
+
     private static NotificationCommand command(String userId, String referenceId, Long expiresAt) {
         return NotificationCommand.builder()
                 .userId(userId)
@@ -114,6 +178,19 @@ public class NotificationServiceTest {
             return items.values().stream().filter(item -> userId.equals(item.getUserId()))
                     .sorted(Comparator.comparing(AgentNotification::getCreatedAt).reversed())
                     .limit(limit).map(MemoryStore::copy).toList();
+        }
+
+        @Override
+        public int acknowledgeAll(String userId, long before, long acknowledgedAt) {
+            int changed = 0;
+            for (AgentNotification item : items.values()) {
+                long updated = item.getUpdatedAt() == null ? item.getCreatedAt() : item.getUpdatedAt();
+                if (!userId.equals(item.getUserId()) || item.getReadStatus() != AgentNotification.ReadStatus.UNREAD
+                        || updated > before) continue;
+                item.setReadStatus(AgentNotification.ReadStatus.ACKNOWLEDGED);
+                item.setAcknowledgedAt(acknowledgedAt); item.setUpdatedAt(acknowledgedAt); changed++;
+            }
+            return changed;
         }
 
         private static AgentNotification copy(AgentNotification source) {

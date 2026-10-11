@@ -3,6 +3,7 @@ package cn.bugstack.ai.domain.agent.service.armory.node.factory.element;
 import cn.bugstack.ai.domain.agent.model.valobj.RagRouterDecision;
 import cn.bugstack.ai.domain.agent.service.execute.common.RagEvidenceEmitter;
 import cn.bugstack.ai.domain.agent.service.execute.common.SessionRefCounter;
+import cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker;
 import cn.bugstack.ai.domain.agent.service.rag.hybrid.HybridRetriever;
 import cn.bugstack.ai.domain.agent.service.rag.hybrid.IRerankService;
 import cn.bugstack.ai.domain.agent.service.router.IQueryRewriter;
@@ -229,9 +230,14 @@ public class RagAnswerAdvisor implements BaseAdvisor {
         } else {
             // A 三层模型：① 要不要检索 → ② 查询策略（router 一次决策 4 选 1，载荷一并产出）→ ③ 引擎自适应。
             // HYBRID（旧值/兜底）与未知策略统一按 SIMPLE 单 query 检索；引擎层（hybrid/纯向量）在下游 helper 决定。
-            RagRouterDecision decision = (ragRouter != null)
-                    ? ragRouter.decide(retrievalQuery)
-                    : RagRouterDecision.retrieve();
+            RagRouterDecision decision;
+            if (ragRouter != null) {
+                try (var ignored = StreamingActivityTracker.advisorPhase(StreamingActivityTracker.AdvisorPhase.RAG_ROUTING)) {
+                    decision = ragRouter.decide(retrievalQuery);
+                }
+            } else {
+                decision = RagRouterDecision.retrieve();
+            }
             String path = decision.getPath();
 
             if (!decision.isShouldRetrieve()) {
@@ -247,10 +253,12 @@ public class RagAnswerAdvisor implements BaseAdvisor {
             else if (RagRouterDecision.PATH_FUSION.equals(path) && !decision.getVariants().isEmpty()
                     && ragFusionService != null && ragFusionService.isAvailable()) {
                 SearchRequest baseSr = SearchRequest.from(this.searchRequest).query(retrievalQuery).filterExpression(filterExpr).build();
-                List<Document> fused = ragFusionService.fusedRetrieveWithVariants(
-                        retrievalQuery, decision.getVariants(), baseSr, rerankTopN);
+                List<Document> fused;
+                try (var ignored = StreamingActivityTracker.advisorPhase(StreamingActivityTracker.AdvisorPhase.KNOWLEDGE_RETRIEVAL)) {
+                    fused = ragFusionService.fusedRetrieveWithVariants(retrievalQuery, decision.getVariants(), baseSr, rerankTopN);
+                }
                 documents = (rerankService != null && !fused.isEmpty())
-                        ? rerankService.rerank(retrievalQuery, fused, rerankTopN)
+                        ? rerankWithProgress(retrievalQuery, fused)
                         : fused;
             }
             // ② SIMPLE / HYDE / HYBRID(兜底)：单 query 检索，检索 query 取自 router 载荷
@@ -272,9 +280,12 @@ public class RagAnswerAdvisor implements BaseAdvisor {
         // 第 61 轮修：原 resolveParents 返回 List<String> + new Document(text) 会丢光 source/knowledge metadata，
         // 导致前端引用依据卡片走 doc.getId() fallback 显示 UUID。改用 resolveParentDocuments 保留 metadata。
         if (parentDocumentService != null && !documents.isEmpty()) {
-            List<Document> parentDocs = parentDocumentService.resolveParentDocuments(documents).stream()
-                    .filter(document -> userId.equals(String.valueOf(document.getMetadata().get("user_id"))))
-                    .toList();
+            List<Document> parentDocs;
+            try (var ignored = StreamingActivityTracker.advisorPhase(StreamingActivityTracker.AdvisorPhase.KNOWLEDGE_RETRIEVAL)) {
+                parentDocs = parentDocumentService.resolveParentDocuments(documents).stream()
+                        .filter(document -> userId.equals(String.valueOf(document.getMetadata().get("user_id"))))
+                        .toList();
+            }
             if (!parentDocs.isEmpty()) {
                 documents = parentDocs;
                 context.put("qa_retrieved_documents", documents);
@@ -435,12 +446,17 @@ public class RagAnswerAdvisor implements BaseAdvisor {
         SearchRequest sr = SearchRequest.from(this.searchRequest).query(query).filterExpression(filterExpr).build();
         if (hybridRetriever != null) {
             int candidatePool = Math.max(sr.getTopK() * 3, rerankTopN);
-            List<Document> fused = hybridRetriever.retrieve(query, sr, knowledgeTag, candidatePool);
+            List<Document> fused;
+            try (var ignored = StreamingActivityTracker.advisorPhase(StreamingActivityTracker.AdvisorPhase.KNOWLEDGE_RETRIEVAL)) {
+                fused = hybridRetriever.retrieve(query, sr, knowledgeTag, candidatePool);
+            }
             return (rerankService != null)
-                    ? rerankService.rerank(userText, fused, rerankTopN)
+                    ? rerankWithProgress(userText, fused)
                     : fused.subList(0, Math.min(rerankTopN, fused.size()));
         }
-        return this.vectorStore.similaritySearch(sr);
+        try (var ignored = StreamingActivityTracker.advisorPhase(StreamingActivityTracker.AdvisorPhase.KNOWLEDGE_RETRIEVAL)) {
+            return this.vectorStore.similaritySearch(sr);
+        }
     }
 
     /**
@@ -449,25 +465,33 @@ public class RagAnswerAdvisor implements BaseAdvisor {
     private List<Document> retrieveForSubQueries(SearchRequest baseSr, List<String> subQueries, String userText) {
         java.util.Set<String> seen = new java.util.HashSet<>();
         java.util.List<Document> allDocs = new java.util.ArrayList<>();
-        for (String sq : subQueries) {
-            SearchRequest sr = SearchRequest.from(baseSr).query(sq).build();
-            List<Document> docs;
-            if (hybridRetriever != null) {
-                int pool = Math.max(baseSr.getTopK(), rerankTopN);
-                docs = hybridRetriever.retrieve(sq, sr, knowledgeTag, pool);
-            } else {
-                docs = vectorStore.similaritySearch(sr);
-            }
-            for (Document d : docs) {
-                String key = d.getId() != null ? d.getId() : d.getText();
-                if (seen.add(key)) allDocs.add(d);
+        try (var ignored = StreamingActivityTracker.advisorPhase(StreamingActivityTracker.AdvisorPhase.KNOWLEDGE_RETRIEVAL)) {
+            for (String sq : subQueries) {
+                SearchRequest sr = SearchRequest.from(baseSr).query(sq).build();
+                List<Document> docs;
+                if (hybridRetriever != null) {
+                    int pool = Math.max(baseSr.getTopK(), rerankTopN);
+                    docs = hybridRetriever.retrieve(sq, sr, knowledgeTag, pool);
+                } else {
+                    docs = vectorStore.similaritySearch(sr);
+                }
+                for (Document d : docs) {
+                    String key = d.getId() != null ? d.getId() : d.getText();
+                    if (seen.add(key)) allDocs.add(d);
+                }
             }
         }
         if (allDocs.isEmpty()) return List.of();
         if (rerankService != null) {
-            return rerankService.rerank(userText, allDocs, rerankTopN);
+            return rerankWithProgress(userText, allDocs);
         }
         return allDocs.subList(0, Math.min(rerankTopN, allDocs.size()));
+    }
+
+    private List<Document> rerankWithProgress(String query, List<Document> documents) {
+        try (var ignored = StreamingActivityTracker.advisorPhase(StreamingActivityTracker.AdvisorPhase.KNOWLEDGE_RERANKING)) {
+            return rerankService.rerank(query, documents, rerankTopN);
+        }
     }
 
 }

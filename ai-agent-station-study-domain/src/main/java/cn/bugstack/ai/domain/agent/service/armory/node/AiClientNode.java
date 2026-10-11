@@ -65,6 +65,9 @@ public class AiClientNode extends AbstractArmorySupport {
     @Resource
     private cn.bugstack.ai.domain.agent.service.execute.common.ToolCallLedger toolCallLedger;
 
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.execute.common.ToolResultReferenceService toolResultReferenceService;
+
     @Resource
     private cn.bugstack.ai.domain.agent.service.prompt.RunUserInputAdvisor runUserInputAdvisor;
 
@@ -179,6 +182,9 @@ public class AiClientNode extends AbstractArmorySupport {
             for (String advisorBeanName : advisorBeanNameList) {
                 advisors.add(getBean(advisorBeanName));
             }
+            // Dynamic memory/RAG/other advisors can change inputs after an early cache lookup.
+            boolean cacheStateless = advisors.stream().allMatch(a ->
+                    a instanceof cn.bugstack.ai.domain.agent.service.rag.cache.SemanticCacheAdvisor);
             // P2-B-2：LTM/Episodic 只采集 section 到 request.context，统一由 render advisor 渲染单个 envelope。
             // 无 ctx.envelope.* 时 no-op；不需要改 DB advisor 配置。
             advisors.add(new ContextEnvelopeRenderAdvisor());
@@ -216,6 +222,7 @@ public class AiClientNode extends AbstractArmorySupport {
                 metered.setHumanApprovalGate(humanApprovalGate); // G1-C
                 metered.setToolCallProgressEmitter(toolCallProgressEmitter); // H3-A
                 metered.setToolCallLedger(toolCallLedger); // P0 Codex#2：工具调用实证台账
+                metered.setToolResultReferenceService(toolResultReferenceService);
                 meteredToolList.add(metered);
             }
             // LLM 工具名大小写幻觉不再用 alias 翻倍 prompt 解决，
@@ -233,11 +240,15 @@ public class AiClientNode extends AbstractArmorySupport {
                 }
             }
 
+            boolean cacheEligible = cacheStateless && !hasEffectiveTools && configuredModel != null;
+            String cacheModelId = configuredModel == null ? "" : configuredModel.getModelId();
             ChatClient chatClient = ChatClient.builder(chatModel)
                     // P2-B-1：公共信任边界 prepend 到 defaultSystem 之前（不改 DB prompt 内容）。固定前缀，prompt cache 仍稳定。
                     .defaultSystem(cn.bugstack.ai.domain.agent.service.prompt.SystemPolicyComposer.prepend(defaultSystem.toString()))
                     .defaultToolCallbacks(meteredTools)
                     .defaultAdvisors(advisorArray)
+                    .defaultAdvisors(a -> a.param(cn.bugstack.ai.domain.agent.service.rag.cache.SemanticCacheAdvisor.STATELESS, cacheEligible)
+                            .param(cn.bugstack.ai.domain.agent.service.rag.cache.SemanticCacheAdvisor.MODEL_ID, cacheModelId))
                     .build();
 
             registerBean(beanName(aiClientVO.getClientId()), ChatClient.class, chatClient);

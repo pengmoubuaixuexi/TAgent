@@ -28,7 +28,7 @@ public class ParentDocumentService implements IParentDocumentService {
     @Resource
     private IAiParentDocumentDao parentDocumentDao;
 
-    @Resource
+    @Resource(name = "ragVectorStore")
     private PgVectorStore vectorStore;
 
     @Override
@@ -44,6 +44,11 @@ public class ParentDocumentService implements IParentDocumentService {
     @Override
     public void store(String parentId, String parentText, List<Document> childDocs,
                       String knowledgeTag, String source, String userId, String title) {
+        AiParentDocument existing = parentDocumentDao.findByParentId(parentId);
+        if (existing != null && (!java.util.Objects.equals(existing.getUserId(), userId)
+                || !java.util.Objects.equals(existing.getKnowledgeTag(), knowledgeTag))) {
+            throw new cn.bugstack.ai.domain.agent.service.rag.RagStorageException("文档归属冲突，未覆盖已有资料。");
+        }
         // 1. 存 parent 到 MySQL（含 title）
         AiParentDocument po = AiParentDocument.builder()
                 .parentId(parentId)

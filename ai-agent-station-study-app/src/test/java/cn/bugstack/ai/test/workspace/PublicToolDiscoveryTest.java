@@ -135,7 +135,7 @@ public class PublicToolDiscoveryTest {
         when(registry.currentCallbacks("alice-docs")).thenReturn(new ToolCallback[]{docs});
         when(registry.getCurrentCallback("alice-docs","docs_search")).thenReturn(docs);
         when(registry.getCurrentCallback("alice-search","web-search")).thenReturn(web);
-        var found=service.resolveDynamicToolCallbacks("run","session","c1","搜索","query",List.of());
+        var found=service.resolveDynamicToolCallbacks("run","session","c1","搜索公司文档","query",List.of());
         assertEquals(List.of("docs_search","web-search"),found.stream().map(c->c.getToolDefinition().name()).toList());
         verify(docs,never()).call(anyString());
     }

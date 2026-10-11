@@ -38,6 +38,12 @@ public class AiClientToolMcpAdminController implements IAiClientToolMcpAdminServ
     @Resource
     private McpToolCatalogService mcpToolCatalogService;
 
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry runBudgets;
+
+    @Resource
+    private cn.bugstack.ai.trigger.workspace.McpConfigurationInvalidator configurationInvalidator;
+
     @Override
     @PostMapping("/create")
     public Response<Boolean> createAiClientToolMcp(@RequestBody AiClientToolMcpRequestDTO request) {
@@ -83,10 +89,13 @@ public class AiClientToolMcpAdminController implements IAiClientToolMcpAdminServ
             }
             
             // DTO转PO
+            AiClientToolMcp previous = aiClientToolMcpDao.queryById(request.getId());
             AiClientToolMcp aiClientToolMcp = convertToAiClientToolMcp(request);
             aiClientToolMcp.setUpdateTime(LocalDateTime.now());
             
             int result = aiClientToolMcpDao.updateById(aiClientToolMcp);
+            if (result > 0) configurationInvalidator.invalidateAfterCommit(
+                    previous == null ? null : previous.getMcpId(), aiClientToolMcp.getMcpId());
             
             return Response.<Boolean>builder()
                     .code(ResponseCode.SUCCESS.getCode())
@@ -122,6 +131,7 @@ public class AiClientToolMcpAdminController implements IAiClientToolMcpAdminServ
             aiClientToolMcp.setUpdateTime(LocalDateTime.now());
             
             int result = aiClientToolMcpDao.updateByMcpId(aiClientToolMcp);
+            if (result > 0) configurationInvalidator.invalidateAfterCommit(aiClientToolMcp.getMcpId());
             
             return Response.<Boolean>builder()
                     .code(ResponseCode.SUCCESS.getCode())
@@ -144,7 +154,9 @@ public class AiClientToolMcpAdminController implements IAiClientToolMcpAdminServ
         try {
             log.info("根据ID删除MCP客户端配置：{}", id);
             
+            AiClientToolMcp previous = aiClientToolMcpDao.queryById(id);
             int result = aiClientToolMcpDao.deleteById(id);
+            if (result > 0 && previous != null) configurationInvalidator.invalidateAfterCommit(previous.getMcpId());
             
             return Response.<Boolean>builder()
                     .code(ResponseCode.SUCCESS.getCode())
@@ -168,6 +180,7 @@ public class AiClientToolMcpAdminController implements IAiClientToolMcpAdminServ
             log.info("根据MCP ID删除MCP客户端配置：{}", mcpId);
             
             int result = aiClientToolMcpDao.deleteByMcpId(mcpId);
+            if (result > 0) configurationInvalidator.invalidateAfterCommit(mcpId);
             
             return Response.<Boolean>builder()
                     .code(ResponseCode.SUCCESS.getCode())
@@ -360,7 +373,8 @@ public class AiClientToolMcpAdminController implements IAiClientToolMcpAdminServ
 
     @PostMapping("/tool-catalog/refresh")
     public Response<java.util.Map<String, Object>> refreshAllMcpToolCatalog() {
-        try {
+        try (var scope = cn.bugstack.ai.domain.agent.service.model.ModelInvocationScope.open(
+                runBudgets, AdminConfigurationOwnership.currentOwner(), "MCP_CATALOG_REFRESH")) {
             int toolCount = mcpToolCatalogService.refreshEnabledMcpCatalog();
             java.util.Map<String, Object> data = new java.util.LinkedHashMap<>();
             data.put("scope", "enabled");
@@ -382,7 +396,8 @@ public class AiClientToolMcpAdminController implements IAiClientToolMcpAdminServ
 
     @PostMapping("/tool-catalog/refresh/{mcpId}")
     public Response<java.util.Map<String, Object>> refreshMcpToolCatalog(@PathVariable("mcpId") String mcpId) {
-        try {
+        try (var scope = cn.bugstack.ai.domain.agent.service.model.ModelInvocationScope.open(
+                runBudgets, AdminConfigurationOwnership.currentOwner(), "MCP_CATALOG_REFRESH")) {
             int toolCount = mcpToolCatalogService.refreshMcpCatalog(mcpId);
             java.util.Map<String, Object> data = new java.util.LinkedHashMap<>();
             data.put("scope", "single");

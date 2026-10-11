@@ -6,6 +6,17 @@ package cn.bugstack.ai.domain.agent.service.rag.cache;
  */
 public interface ISemanticCacheService {
 
+    /** Server-derived identity and complete input fingerprint; legacy rows have no matching scope. */
+    record Scope(String ownerUserId, String agentId, String agentVersion, String modelId, String inputHash) {
+        public boolean valid() {
+            return java.util.stream.Stream.of(ownerUserId, agentId, agentVersion, modelId, inputHash)
+                    .allMatch(value -> value != null && !value.isBlank());
+        }
+    }
+
+    default String lookup(String query, double minSimilarity, int ttlMinutes, Scope scope) { return null; }
+    default void store(String query, String response, Scope scope) { }
+
     /**
      * 查询缓存：返回相似度 > minSimilarity 且创建时间在 ttlMinutes 内的缓存响应。
      *

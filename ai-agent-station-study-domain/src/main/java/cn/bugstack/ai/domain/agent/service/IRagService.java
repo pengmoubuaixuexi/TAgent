@@ -15,4 +15,9 @@ public interface IRagService {
 
     void storeRagFile(String name, String tag, List<MultipartFile> files, String userId);
 
+    default void storeRagFile(String name, String tag, List<MultipartFile> files, String userId,
+                              cn.bugstack.ai.domain.agent.service.rag.RagIngestionObserver observer) {
+        storeRagFile(name, tag, files, userId);
+    }
+
 }

@@ -29,8 +29,11 @@ public class AuthenticatedUserFilter extends OncePerRequestFilter {
         }
         var account = users.queryByUserId(auth.getName());
         boolean wasAdmin = auth.getAuthorities().stream().anyMatch(a -> "ROLE_ADMIN".equals(a.getAuthority()));
+        var session=request.getSession(false);
+        Object revision=session==null?null:session.getAttribute("credentialRevision");
         if (account == null || !Integer.valueOf(1).equals(account.getStatus())
-                || wasAdmin != "ADMIN".equals(account.getRole())) {
+                || wasAdmin != "ADMIN".equals(account.getRole())
+                || revision==null || !revision.equals(AccountService.credentialRevision(account.getPassword()))) {
             if (request.getSession(false) != null) request.getSession(false).invalidate();
             SecurityContextHolder.clearContext();
             response.sendError(401); return;

@@ -14,7 +14,7 @@ public class WorkspaceAccessRepository implements IWorkspaceAccessRepository {
     @Override public Set<String> platformModelIds() {
         return new LinkedHashSet<>(jdbc.queryForList("""
             SELECT m.model_id FROM ai_client_model m JOIN ai_client_api a ON a.api_id=m.api_id
-            WHERE m.platform_enabled=1 AND m.status=1 AND a.status=1
+            WHERE m.platform_enabled=1 AND m.status=1 AND a.status=1 AND a.secret_ref IS NULL
             """, String.class));
     }
     @Override public Set<String> ownedAgentIds(String userId) {
@@ -31,7 +31,10 @@ public class WorkspaceAccessRepository implements IWorkspaceAccessRepository {
               LEFT JOIN ai_client_model origin ON origin.model_id=m.source_model_id
               WHERE f.agent_id=a.agent_id AND f.status=1 AND
                 (m.model_id IS NULL OR m.status<>1 OR p.api_id IS NULL OR p.status<>1 OR
-                 (m.source_model_id IS NOT NULL AND (origin.model_id IS NULL OR origin.status<>1 OR origin.platform_enabled<>1))))
+                 (m.source_model_id IS NULL AND (m.owner_user_id<>a.owner_user_id OR p.owner_user_id<>a.owner_user_id)) OR
+                 (m.source_model_id IS NOT NULL AND (origin.model_id IS NULL OR origin.status<>1 OR origin.api_id<>m.api_id OR
+                    NOT ((origin.platform_enabled=1 AND p.secret_ref IS NULL) OR
+                         (origin.owner_user_id=a.owner_user_id AND p.owner_user_id=a.owner_user_id AND p.secret_ref IS NOT NULL))))))
             """, String.class, userId));
     }
     @Override public Set<String> ownedMcpIds(String userId) {
@@ -77,5 +80,17 @@ public class WorkspaceAccessRepository implements IWorkspaceAccessRepository {
     }
     @Override public boolean ownsMcp(String userId, String mcpId) {
         return mcpId != null && ownedMcpIds(userId).contains(mcpId);
+    }
+    @Override public String mcpCapacityOwner(String mcpId) {
+        var owners=jdbc.queryForList("SELECT owner_user_id FROM ai_client_tool_mcp WHERE mcp_id=? AND status=1 AND owner_user_id IS NOT NULL",String.class,mcpId);
+        return owners.isEmpty()?null:owners.get(0);
+    }
+    @Override public boolean trustedSystemMcp(String mcpId) {
+        return jdbc.queryForObject("SELECT COUNT(*) FROM ai_client_tool_mcp WHERE mcp_id=? AND status=1 AND owner_user_id IS NULL AND source_mcp_id IS NULL AND is_public=1",Integer.class,mcpId)==1;
+    }
+    @Override public Integer activeAgentVersion(String userId,String agentId) {
+        var rows=jdbc.queryForList("SELECT workspace_version FROM ai_agent WHERE agent_id=? AND owner_user_id=? AND archived=0",Integer.class,agentId,userId);
+        if(rows.isEmpty()) throw new SecurityException("Agent 不存在或无权访问");
+        return rows.get(0);
     }
 }

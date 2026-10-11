@@ -4,6 +4,9 @@ import cn.bugstack.ai.config.DataSourceConfig;
 import cn.bugstack.ai.domain.agent.service.IArmoryService;
 import cn.bugstack.ai.domain.agent.service.execute.common.LlmObservationRecorder;
 import cn.bugstack.ai.domain.agent.service.execute.common.McpClientRegistry;
+import cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry;
+import cn.bugstack.ai.domain.agent.service.model.ModelCredentialRequestAuthorizer;
+import cn.bugstack.ai.domain.agent.service.model.ModelProviderAccess;
 import cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService;
 import cn.bugstack.ai.domain.agent.service.security.WorkspaceMcpPolicy;
 import cn.bugstack.ai.domain.agent.service.workspace.WorkspaceExecutionGuard;
@@ -102,6 +105,9 @@ public class DataSourceRoutingTest {
                     beans.registerSingleton("mcpClientRegistry", mock(McpClientRegistry.class));
                     beans.registerSingleton("mcpToolCatalogService", mock(McpToolCatalogService.class));
                     beans.registerSingleton("llmObservationRecorder", mock(LlmObservationRecorder.class));
+                    beans.registerSingleton("modelCredentialRequestAuthorizer",
+                            new ModelCredentialRequestAuthorizer(mock(ModelProviderAccess.class)));
+                    beans.registerSingleton("runBudgetRegistry", new RunBudgetRegistry());
                     beans.registerSingleton("workspaceMcpPolicy", new WorkspaceMcpPolicy(""));
                     beans.registerSingleton("workspaceExecutionGuard", new WorkspaceExecutionGuard());
                     beans.registerSingleton("objectMapper", new ObjectMapper());

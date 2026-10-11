@@ -44,7 +44,7 @@ import java.util.stream.Collectors;
  *
  * <p>匹配走 {@link IToolVectorStore} 的 PgVector 语义相似度——把路由给出的"缺失工具描述"(need)
  * embed 后对目录里每条工具的语义向量取 cosine top-N。纯词法 BM25 在"同义词错位 + 多个'搜索X'工具"下
- * 结构性分不开，已弃用；embedding 跨同义词、分领域，又快(~150ms)。可选再加一道 LLM rerank 精排（默认关）。
+ * 向量相似度只负责候选排序，中低分还需能力描述佐证；目录可以明确返回无匹配，不强行补满 top-N。
  * 公共目录以源连接索引，命中映射至用户自己的连接；向量不可用时只在授权目录内回退名称/描述匹配。
  */
 @Slf4j
@@ -73,6 +73,7 @@ public class McpToolCatalogService {
     public void invalidateMcp(String mcpId) {
         synchronized (mcpLocks.computeIfAbsent(mcpId, ignored -> new Object())) {
             dynamicWrapperCache.keySet().removeIf(key -> key.startsWith(mcpId + "::"));
+            dynamicRawCache.keySet().removeIf(key -> key.startsWith(mcpId + "::"));
             matchCache.clear();
             mcpClientRegistry.unregister(mcpId);
         }
@@ -99,6 +100,9 @@ public class McpToolCatalogService {
     /** P0（Codex #2）工具调用事实摘要台账；动态 request_tool 装载的工具也要记账，否则 Auto Step3 对动态工具(如 search_papers)仍误判编造。 */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private cn.bugstack.ai.domain.agent.service.execute.common.ToolCallLedger toolCallLedger;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.execute.common.ToolResultReferenceService toolResultReferenceService;
 
     @Resource
     private ToolDescriptionTranslator toolDescriptionTranslator;
@@ -173,6 +177,7 @@ public class McpToolCatalogService {
     private final Map<String, Object> mcpLocks = new ConcurrentHashMap<>();
 
     private final Map<String, ToolCallback> dynamicWrapperCache = new ConcurrentHashMap<>();
+    private final Map<String, ToolCallback> dynamicRawCache = new ConcurrentHashMap<>();
 
     /**
      * 本次执行（按 sessionId）已知的"缺失工具能力描述"(need，多条换行连接)。统一来源：
@@ -253,21 +258,7 @@ public class McpToolCatalogService {
             return Collections.emptyList();
         }
 
-        var nodePolicy=repository.queryWorkspaceNodePolicy(clientId);
-        if(nodePolicy!=null&&nodePolicy.tools().isEmpty()&&nodePolicy.publicMcpIds().isEmpty()
-                && nodePolicy.agentId().equals(org.slf4j.MDC.get("agentId"))) {
-            // Flow's capability-analysis phase discovers for its executor; it never receives
-            // permission to execute business tools itself (the caller remains DISCOVERY_ONLY).
-            var flow=repository.queryAiAgentClientFlowConfig(nodePolicy.agentId());
-            var analysis=flow==null?null:flow.get("TOOL_MCP_CLIENT");
-            var planning=flow==null?null:flow.get("PLANNING_CLIENT");
-            var executor=flow==null?null:flow.get("EXECUTOR_CLIENT");
-            if(executor!=null&&((analysis!=null&&clientId.equals(analysis.getClientId()))
-                    || (planning!=null&&clientId.equals(planning.getClientId())))) {
-                var executorPolicy=repository.queryWorkspaceNodePolicy(executor.getClientId());
-                if(executorPolicy!=null&&nodePolicy.agentId().equals(executorPolicy.agentId()))nodePolicy=executorPolicy;
-            }
-        }
+        var nodePolicy=discoveryPolicy(clientId);
         if (nodePolicy!=null) {
             // Private nodes are explicit capability sets. Do not inherit another node's run leases
             // or search the whole Agent's catalog when a configured connection reconnects.
@@ -282,7 +273,8 @@ public class McpToolCatalogService {
                 if (config==null) continue;
                 for (var callback:ensureMcpCallbacks(config)) {
                     String name=callback.getToolDefinition().name();
-                    if (!resident.contains(name) && nodePolicy.allows(mcpId,name)) selected.add(wrapToolCallback(callback,mcpId));
+                    if (!resident.contains(name) && nodePolicy.allows(mcpId,callback))
+                        selected.add(wrapToolCallback(callback,mcpId));
                 }
             }
             Set<String> publicAllowed=new LinkedHashSet<>(nodePolicy.publicMcpIds());
@@ -295,10 +287,9 @@ public class McpToolCatalogService {
             selected.forEach(c->names.add(c.getToolDefinition().name()));
             int publicCount=0,publicCap=maxExtraToolsPerRequest>0?maxExtraToolsPerRequest:6;
             publicSearch: for(String need:needs) for(var tool:matchOnDemand(need,names,perNeedTopK>0?perNeedTopK:2,publicAllowed,lazyBound)) {
-                if(!nodePolicy.allows(tool.getMcpId(),tool.getToolName()))continue;
                 try {
                     ToolCallback callback=ensureToolCallback(tool);
-                    if(callback!=null&&names.add(callback.getToolDefinition().name())) {
+                    if(callback!=null&&nodePolicy.allows(callback)&&names.add(callback.getToolDefinition().name())) {
                         selected.add(callback);if(++publicCount>=publicCap)break publicSearch;
                     }
                 } catch(Exception e) { log.warn("[DynamicTools] authorized connection unavailable mcpId={}",tool.getMcpId()); }
@@ -324,13 +315,15 @@ public class McpToolCatalogService {
                 if (lease == null || !needs.contains(lease.originalNeed())) {
                     continue;
                 }
-                // A pinned capability must not silently rematch after revocation or disconnection.
-                if (!lease.isAvailable()) {
+                // A temporary disconnect can recover only this pinned identity; revocation
+                // and schema changes remain terminal and must never silently rematch.
+                if (!lease.isAvailable() && lease.availability() != ResolvedToolLease.Availability.MCP_DOWN) {
                     throw new DynamicToolUnavailableException(lease.toolIdentity(), lease.availability());
                 }
                 ToolCallback callback;
                 try {
                     callback = materializeLease(lease);
+                    resolvedToolLeaseStore.createOrMerge(runId, sessionId, lease.originalNeed(), lease.toolIdentity());
                 } catch (DynamicToolUnavailableException e) {
                     log.warn("[DynamicTools] unavailable leased tool runId={} need={} identity={} reason={}",
                             runId, lease.originalNeed(), lease.toolIdentity(), e.getMessage());
@@ -426,11 +419,32 @@ public class McpToolCatalogService {
         return result;
     }
 
+    /** Discovery may inspect its configured executor's grant; invocation still uses the caller's own policy. */
+    private cn.bugstack.ai.domain.agent.model.valobj.WorkspaceNodePolicy discoveryPolicy(String clientId) {
+        var policy=repository.queryWorkspaceNodePolicy(clientId);
+        if (policy==null || !policy.tools().isEmpty() || !policy.publicMcpIds().isEmpty()
+                || !policy.agentId().equals(org.slf4j.MDC.get("agentId"))) return policy;
+        var flow=repository.queryAiAgentClientFlowConfig(policy.agentId());
+        if (flow==null) return policy;
+        String executorRole=null;
+        for (String role:List.of("TOOL_MCP_CLIENT","PLANNING_CLIENT","TASK_ANALYZER_CLIENT")) {
+            var node=flow.get(role);
+            if (node!=null && clientId.equals(node.getClientId())) {
+                executorRole="TASK_ANALYZER_CLIENT".equals(role)?"PRECISION_EXECUTOR_CLIENT":"EXECUTOR_CLIENT";
+                break;
+            }
+        }
+        var executor=executorRole==null?null:flow.get(executorRole);
+        if (executor==null) return policy;
+        var executorPolicy=repository.queryWorkspaceNodePolicy(executor.getClientId());
+        return executorPolicy!=null && policy.agentId().equals(executorPolicy.agentId()) ? executorPolicy : policy;
+    }
+
     /** Read-only inventory of explicitly granted connections, separate from the few loaded callbacks.
      * It needs no search query and is never subject to the per-request tool loading cap.
      */
     public String describeBoundMcpCapabilities(String clientId) {
-        var policy=repository.queryWorkspaceNodePolicy(clientId);
+        var policy=discoveryPolicy(clientId);
         if (policy==null || !policy.agentId().equals(org.slf4j.MDC.get("agentId"))) return "";
         Map<String,String> origins=workspaceAccess==null?Map.of():workspaceAccess.publicMcpOrigins(org.slf4j.MDC.get("userId"));
         List<Map<String,Object>> connections=new ArrayList<>();
@@ -445,19 +459,26 @@ public class McpToolCatalogService {
                 entries=new ArrayList<>();
                 try {
                     var callbacks=mcpClientRegistry.currentCallbacks(id);
-                    if (callbacks==null || callbacks.length==0) callbacks=ensureMcpCallbacks(config);
-                    for (var cb:callbacks) {
+                    // A metadata read must not start/reconnect remote transports just to plan a task.
+                    // Discovery for a new connection stays in the actual execution/request_tool path.
+                    for (var cb:callbacks==null?new ToolCallback[0]:callbacks) {
                         var def=cb.getToolDefinition();if(def==null)continue;
-                        entries.add(AiMcpToolCatalogVO.builder().mcpId(id).toolName(def.name()).toolDescription(def.description())
+                        entries.add(AiMcpToolCatalogVO.builder().mcpId(id).toolName(McpClientRegistry.originalToolName(cb)).toolDescription(def.description())
                                 .inputSchemaJson(def.inputSchema()).enabled(1).build());
                     }
-                    status=entries.isEmpty()?"未读取到目录，能力未知":"已通过 tools/list 读取；未执行业务工具";
+                    status=entries.isEmpty()?"尚未发现工具目录，能力未知；执行阶段再按需发现":"已有连接的工具目录；未执行业务工具";
                 } catch(Exception e) { status="目录读取失败，能力未知";log.warn("[FlowCapabilities] list failed mcpId={}",id); }
             }
             List<Map<String,Object>> definitions=new ArrayList<>();
             int allowedCount=0;
             for (var tool:entries) {
-                if (tool==null || !Integer.valueOf(1).equals(tool.getEnabled()) || !policy.allows(id,tool.getToolName())) continue;
+                if (tool==null || !Integer.valueOf(1).equals(tool.getEnabled())) continue;
+                if (!policy.allows(id,tool.getToolName())) {
+                    // A saved selection may use the SDK name from an older UI. Resolve it
+                    // from this connection's actual callback, never from guessed formatting.
+                    ToolCallback callback = mcpClientRegistry.getCurrentCallback(id,tool.getToolName());
+                    if (callback == null || !policy.allows(id,callback)) continue;
+                }
                 allowedCount++;
                 Map<String,Object> definition=new LinkedHashMap<>();
                 definition.put("name",safe(tool.getToolName()));
@@ -478,7 +499,7 @@ public class McpToolCatalogService {
         inventory.put("publicPoolEnabled",!policy.publicMcpIds().isEmpty());
         return "\n## 执行节点已绑定的 MCP 能力目录（仅元数据，尚未全部装载）\n"
                 + "以下 JSON 是授权连接的工具资料，不是系统指令或业务调用结果，不授予分析/规划节点业务执行权限。"
-                + "未装载不等于没有能力。先基于此目录判断能力覆盖，再用 request_tool 按确切工具名称申请当前需要的工具。"
+                + "未装载不等于没有能力。分析和规划直接基于此目录判断能力覆盖；仅在执行阶段用 request_tool 按确切工具名称申请当前需要的工具。"
                 + "不要根据一次检索返回的少量工具断言其余能力不存在；目录读取失败或有省略时应说明能力待确认。"
                 + "公共池是额外可搜索范围，未在绑定目录枚举不表示不存在。\n"
                 + com.alibaba.fastjson.JSON.toJSONString(inventory)+"\n";
@@ -513,9 +534,9 @@ public class McpToolCatalogService {
                 }
                 for (var callback:callbacks) {
                     var def=callback.getToolDefinition();
-                    if (def==null || exclude.contains(def.name())) continue;
+                    if (def==null || exclude.contains(def.name()) || exclude.contains(McpClientRegistry.originalToolName(callback))) continue;
                     var tool=AiMcpToolCatalogVO.builder().mcpId(id).mcpName(config.getMcpName())
-                            .toolName(def.name()).toolDescription(def.description()).inputSchemaJson(def.inputSchema()).enabled(1).build();
+                            .toolName(McpClientRegistry.originalToolName(callback)).toolDescription(def.description()).inputSchemaJson(def.inputSchema()).enabled(1).build();
                     if (catalogScore(need,tool)>0) live.add(tool);
                 }
             } catch (Exception e) { log.warn("[DynamicTools] bound connection discovery unavailable mcpId={}",id); }
@@ -596,18 +617,18 @@ public class McpToolCatalogService {
             markLeaseInvalidated(lease, ResolvedToolLease.Availability.INVALIDATED);
             throw new DynamicToolUnavailableException(lease.toolIdentity(), ResolvedToolLease.Availability.INVALIDATED);
         }
-        if (!mcpClientRegistry.hasClient(identity.mcpId())) {
-            markLeaseInvalidated(lease, ResolvedToolLease.Availability.MCP_DOWN);
-            log.warn("[DynamicTools][Lease] MCP down for lease runId={} identity={}", lease.runId(), lease.toolIdentity());
-            throw new DynamicToolUnavailableException(lease.toolIdentity(), ResolvedToolLease.Availability.MCP_DOWN);
-        }
-
-        ToolCallback current = mcpClientRegistry.getCurrentCallback(identity.mcpId(), identity.toolName());
-        if (current == null) {
+        // Idle eviction is not revocation. Recreate the authorized connection and discover
+        // its current tools before comparing the pinned schema; never issue a business call.
+        ToolCallback current;
+        try {
             current = ensureToolCallback(AiMcpToolCatalogVO.builder()
                     .mcpId(identity.mcpId())
                     .toolName(identity.toolName())
-                    .build());
+                    .build(), false);
+        } catch (McpToolDiscoveryException unavailable) {
+            markLeaseInvalidated(lease, ResolvedToolLease.Availability.MCP_DOWN);
+            log.warn("[DynamicTools][Lease] recovery failed runId={} identity={}", lease.runId(), lease.toolIdentity());
+            throw new DynamicToolUnavailableException(lease.toolIdentity(), ResolvedToolLease.Availability.MCP_DOWN);
         }
         if (current == null) {
             markLeaseInvalidated(lease, ResolvedToolLease.Availability.INVALIDATED);
@@ -615,22 +636,15 @@ public class McpToolCatalogService {
         }
 
         String actualHash = definitionHash(readInputSchema(current));
-        if (!identity.definitionHash().equals(actualHash)) {
+        if (!identity.definitionHash().equals(actualHash)
+                || !identity.toolName().equals(McpClientRegistry.originalToolName(current))) {
             markLeaseInvalidated(lease, ResolvedToolLease.Availability.INVALIDATED);
-            log.warn("[DynamicTools][Lease] definition hash changed runId={} identity={} actual={}",
-                    lease.runId(), lease.toolIdentity(), actualHash);
+            log.warn("[DynamicTools][Lease] tool contract changed runId={} identity={} actualTool={} actualHash={}",
+                    lease.runId(), lease.toolIdentity(), McpClientRegistry.originalToolName(current), actualHash);
             throw new DynamicToolUnavailableException(lease.toolIdentity(), ResolvedToolLease.Availability.INVALIDATED);
         }
 
-        ToolCallback wrapped = ensureToolCallback(AiMcpToolCatalogVO.builder()
-                .mcpId(identity.mcpId())
-                .toolName(identity.toolName())
-                .build());
-        if (wrapped == null) {
-            markLeaseInvalidated(lease, ResolvedToolLease.Availability.INVALIDATED);
-            throw new DynamicToolUnavailableException(lease.toolIdentity(), ResolvedToolLease.Availability.INVALIDATED);
-        }
-        return wrapped;
+        return current;
     }
 
     private void markLeaseInvalidated(ResolvedToolLease lease, ResolvedToolLease.Availability reason) {
@@ -642,7 +656,7 @@ public class McpToolCatalogService {
     private String toolIdentity(AiMcpToolCatalogVO tool, ToolCallback callback) {
         String mcpId = safe(tool != null ? tool.getMcpId() : null);
         String toolName = callback != null && callback.getToolDefinition() != null
-                ? safe(callback.getToolDefinition().name())
+                ? safe(McpClientRegistry.originalToolName(callback))
                 : safe(tool != null ? tool.getToolName() : null);
         String schema = callback != null ? readInputSchema(callback)
                 : safe(tool != null ? tool.getInputSchemaJson() : null);
@@ -700,20 +714,52 @@ public class McpToolCatalogService {
         Map<String,String> runtimeIds=new LinkedHashMap<>();
         for(String id:allowed)runtimeIds.put(origins.getOrDefault(id,id),id);
         List<AiMcpToolCatalogVO> catalog=new ArrayList<>();
+        Set<String> catalogSources=new LinkedHashSet<>();
         for(String source:runtimeIds.keySet()) {
             var entries=repository.queryMcpToolCatalogByMcpId(source);
+            if(entries!=null&&!entries.isEmpty())catalogSources.add(source);
             if(entries!=null) for(var t:entries)if(t!=null&&Integer.valueOf(1).equals(t.getEnabled())&&!exclude.contains(t.getToolName()))catalog.add(t);
         }
         // A model can request a precise name learned from the bound inventory. Do not let a
         // semantically similar top-k result hide that exact, authorized tool.
-        List<AiMcpToolCatalogVO> hits=catalog.stream().filter(t->need.trim().equalsIgnoreCase(t.getToolName())).limit(limit).toList();
+        List<AiMcpToolCatalogVO> hits=catalog.stream()
+                .filter(t->ToolCatalogRelevance.explicitNamePosition(need,t.getToolName())>=0)
+                .sorted(java.util.Comparator.comparingInt(t->ToolCatalogRelevance.explicitNamePosition(need,t.getToolName())))
+                .limit(limit).toList();
         if(hits.isEmpty()) {
             try { hits=toolVectorStore.searchOwned(need,exclude,limit,runtimeIds.keySet()); }
-            catch(Exception e) { hits=List.of();log.warn("[DynamicTools] vector search unavailable; trying authorized catalog text"); }
+            catch(Exception e) {
+                cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.rethrowCancellation(e);
+                hits=null;log.warn("[DynamicTools] vector search unavailable; trying authorized catalog text");
+            }
+            if (hits != null) {
+                // Vectors can outlive a lazy catalog refresh. Resolve only within the same
+                // authorized source/runtime pair and take metadata from the current catalog.
+                List<AiMcpToolCatalogVO> verified = new ArrayList<>();
+                for (var hit : hits) {
+                    if (hit == null || !runtimeIds.containsKey(hit.getMcpId())) continue;
+                    List<AiMcpToolCatalogVO> sourceCatalog = catalog.stream()
+                            .filter(t -> hit.getMcpId().equals(t.getMcpId())).toList();
+                    if (sourceCatalog.isEmpty()) {
+                        if (!catalogSources.contains(hit.getMcpId())) verified.add(hit);
+                        continue;
+                    }
+                    ToolCallback callback = mcpClientRegistry.getCurrentCallback(runtimeIds.get(hit.getMcpId()), hit.getToolName());
+                    for (var current : sourceCatalog) {
+                        if (java.util.Objects.equals(hit.getToolName(), current.getToolName())
+                                || callback != null && (java.util.Objects.equals(McpClientRegistry.originalToolName(callback), current.getToolName())
+                                || java.util.Objects.equals(callback.getToolDefinition().name(), current.getToolName()))) {
+                            verified.add(current);
+                            break;
+                        }
+                    }
+                }
+                hits = verified;
+            }
         }
-        // A newly allocated copy has no vectors of its own. Also allow exact/lexical catalog
-        // discovery when embeddings are unavailable, without scanning another user's catalog.
-        if(hits==null||hits.isEmpty()) {
+        // Missing/unavailable vectors can fall back within the authorized scope. A deliberate
+        // semantic no-match must not be replaced by a coincidental keyword overlap.
+        if(hits==null) {
             List<AiMcpToolCatalogVO> fallback=new ArrayList<>();
             for(var t:catalog)if(catalogScore(need,t)>0)fallback.add(t);
             hits=fallback.stream().sorted(java.util.Comparator.<AiMcpToolCatalogVO>comparingInt(t->catalogScore(need,t)).reversed())
@@ -730,15 +776,7 @@ public class McpToolCatalogService {
         return result;
     }
     private int catalogScore(String need,AiMcpToolCatalogVO tool) {
-        String query=need.toLowerCase(java.util.Locale.ROOT);
-        String text=(safe(tool.getToolName())+" "+safe(tool.getMcpName())+" "+safe(tool.getToolDescription())+" "+safe(tool.getToolDescriptionZh())+" "+safe(tool.getToolIntentZh())).toLowerCase(java.util.Locale.ROOT);
-        int score=0;
-        for(String token:query.split("[^\\p{L}\\p{N}_-]+")) {
-            if(token.length()<2)continue;
-            if(text.contains(token))score+=10;
-            if(token.matches(".*[\\p{IsHan}].*"))for(int i=0;i+1<token.length();i++)if(text.contains(token.substring(i,i+2)))score++;
-        }
-        return score;
+        return ToolCatalogRelevance.score(need,tool);
     }
 
     /** 把换行连成的多条 need 串拆回列表（去空白、去空行、按序去重）。 */
@@ -767,7 +805,8 @@ public class McpToolCatalogService {
         if (!warmupOnStartup) {
             return;
         }
-        try {
+        try (var modelScope=cn.bugstack.ai.domain.agent.service.model.ModelInvocationScope.openSystem(
+                modelRunBudgets,cn.bugstack.ai.domain.agent.service.model.ModelInvocationScope.SystemPurpose.STARTUP_CATALOG)) {
             log.info("[DynamicTools] warmup MCP tool catalog on startup");
             int count = refreshEnabledMcpCatalog();
             log.info("[DynamicTools] warmup MCP tool catalog done, tools={}", count);
@@ -775,6 +814,9 @@ public class McpToolCatalogService {
             log.warn("[DynamicTools] warmup MCP tool catalog failed: {}", e.toString());
         }
     }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    private cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry modelRunBudgets;
 
     public int refreshEnabledMcpCatalog() {
         String userId = org.slf4j.MDC.get("userId");
@@ -830,7 +872,7 @@ public class McpToolCatalogService {
             callbacks=ensureMcpCallbacks(config);
         }
         return java.util.Arrays.stream(callbacks).filter(c->c.getToolDefinition()!=null)
-                .map(c->Map.of("name",c.getToolDefinition().name(),"description",
+                .map(c->Map.of("name",McpClientRegistry.originalToolName(c),"description",
                         c.getToolDefinition().description()==null?"":c.getToolDefinition().description()))
                 .sorted(java.util.Comparator.comparing(m->m.get("name"))).toList();
     }
@@ -846,22 +888,15 @@ public class McpToolCatalogService {
     }
 
     private ToolCallback ensureToolCallback(AiMcpToolCatalogVO catalogTool) {
+        return ensureToolCallback(catalogTool, true);
+    }
+
+    private ToolCallback ensureToolCallback(AiMcpToolCatalogVO catalogTool, boolean updateCatalog) {
         if (catalogTool == null || catalogTool.getMcpId() == null || catalogTool.getToolName() == null) {
             return null;
         }
         if (!mayUse(catalogTool.getMcpId())) return null;
-        String cacheKey = catalogTool.getMcpId() + "::" + catalogTool.getToolName();
-        ToolCallback cached = dynamicWrapperCache.get(cacheKey);
-        if (cached != null) {
-            return cached;
-        }
-
         synchronized (mcpLocks.computeIfAbsent(catalogTool.getMcpId(), k -> new Object())) {
-            cached = dynamicWrapperCache.get(cacheKey);
-            if (cached != null) {
-                return cached;
-            }
-
             if (!mayUse(catalogTool.getMcpId())) return null;
             ToolCallback raw = mcpClientRegistry.getCurrentCallback(catalogTool.getMcpId(), catalogTool.getToolName());
             if (raw == null) {
@@ -871,23 +906,41 @@ public class McpToolCatalogService {
                             catalogTool.getMcpId(), catalogTool.getToolName());
                     return null;
                 }
-                ToolCallback[] callbacks = ensureMcpCallbacks(config);
-                upsertCatalog(config, callbacks);
+                ToolCallback[] callbacks = ensureMcpCallbacks(config, true);
+                // Restoring a pinned capability must not invoke translation/embedding models
+                // or mutate the catalog before validating its original schema.
+                if (updateCatalog) upsertCatalog(config, callbacks);
                 raw = findTool(callbacks, catalogTool.getToolName());
             }
+            // A remote initialize/list may outlive an edit or ownership change.
+            if (!mayUse(catalogTool.getMcpId())) return null;
             if (raw == null) {
                 log.warn("[DynamicTools] tool not found after mcp init mcpId={} tool={}",
                         catalogTool.getMcpId(), catalogTool.getToolName());
                 return null;
             }
 
+            // Original and SDK-formatted names share a wrapper only within this connection.
+            // Recheck the live callback before using a cache entry, including after reconnect.
+            String cacheKey = catalogTool.getMcpId() + "::" + raw.getToolDefinition().name();
+            ToolCallback cached = dynamicWrapperCache.get(cacheKey);
+            if (cached != null && dynamicRawCache.get(cacheKey) == raw) return cached;
             ToolCallback wrapped = wrapToolCallback(raw, catalogTool.getMcpId());
             dynamicWrapperCache.put(cacheKey, wrapped);
+            dynamicRawCache.put(cacheKey, raw);
             return wrapped;
         }
     }
 
     private ToolCallback[] ensureMcpCallbacks(AiClientToolMcpVO config) {
+        return ensureMcpCallbacks(config, false);
+    }
+
+    private static final class McpToolDiscoveryException extends IllegalStateException {
+        private McpToolDiscoveryException(Throwable cause) { super("MCP connection or tool discovery unavailable", cause); }
+    }
+
+    private ToolCallback[] ensureMcpCallbacks(AiClientToolMcpVO config, boolean failOnUnavailable) {
         synchronized (mcpLocks.computeIfAbsent(config.getMcpId(), k -> new Object())) {
             // A catalog scan may have captured this row before an edit committed and invalidated it.
             // Reload under the same lock as invalidateMcp so that stale scans cannot resurrect old credentials.
@@ -895,16 +948,22 @@ public class McpToolCatalogService {
             if (config == null) return new ToolCallback[0];
             McpSyncClient client = mcpClientRegistry.getClient(config.getMcpId());
             if (client == null) {
-                client = aiClientToolMcpNode.createMcpSyncClient(config);
-                aiClientToolMcpNode.registerMcpBean(config.getMcpId(), client);
-                mcpClientRegistry.register(config.getMcpId(), config, client, aiClientToolMcpNode::createMcpSyncClient);
+                try {
+                    client = mcpClientRegistry.ensureClient(config,aiClientToolMcpNode::createMcpSyncClient);
+                } catch (RuntimeException failure) {
+                    cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.rethrowCancellation(failure);
+                    if (failOnUnavailable) throw new McpToolDiscoveryException(failure);
+                    throw failure;
+                }
             }
             ToolCallback[] callbacks;
             try {
                 callbacks = mcpClientRegistry.getToolCallbacksForAssembly(config.getMcpId(), client);
             } catch (Exception ex) {
+                cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.rethrowCancellation(ex);
                 log.warn("[DynamicTools] mcp callbacks unavailable after reconnect mcpId={}: {}",
                         config.getMcpId(), ex.toString());
+                if (failOnUnavailable) throw new McpToolDiscoveryException(ex);
                 return new ToolCallback[0];
             }
             mcpClientRegistry.registerCallbacks(config.getMcpId(), callbacks);
@@ -930,7 +989,7 @@ public class McpToolCatalogService {
         Map<String, ToolCallback> currentCallback = new LinkedHashMap<>();
         for (ToolCallback callback : callbacks) {
             if (callback == null || callback.getToolDefinition() == null) continue;
-            String toolName = safe(callback.getToolDefinition().name());
+            String toolName = safe(McpClientRegistry.originalToolName(callback));
             if (toolName.isBlank() || currentRawDesc.containsKey(toolName)) continue;
             currentRawDesc.put(toolName, safe(callback.getToolDefinition().description()));
             currentCallback.put(toolName, callback);
@@ -947,23 +1006,27 @@ public class McpToolCatalogService {
             }
         }
 
-        // 3. 删除：库里有、MCP 已不再上报的工具
+        // Keep catalog identity in the server's original namespace. Recover rows previously
+        // written using SDK-formatted names without losing their translated descriptions.
+        Map<String, AiMcpToolCatalogVO> previousByName = new HashMap<>();
+        for (var entry : currentCallback.entrySet()) {
+            AiMcpToolCatalogVO previous = existing.get(entry.getKey());
+            if (previous == null) previous = existing.get(entry.getValue().getToolDefinition().name());
+            if (previous != null) previousByName.put(entry.getKey(), previous);
+        }
+
+        // 3. Remove old aliases only after their replacement rows have been saved successfully.
         List<String> removed = new ArrayList<>();
         for (String name : existing.keySet()) {
             if (!currentRawDesc.containsKey(name)) {
                 removed.add(name);
             }
         }
-        if (!removed.isEmpty()) {
-            repository.deleteMcpToolCatalog(mcpId, removed);
-            log.info("[DynamicTools] catalog mcpId={} removed stale tools={}", mcpId, removed);
-        }
-
         // 4. 找新增/变更：库里没有 || 描述变了 || 中文用途为空 || 意图扩写(doc2query)为空。只对这批增强。
         List<String> changedNames = new ArrayList<>();
         List<String> changedRaws = new ArrayList<>();
         for (Map.Entry<String, String> entry : currentRawDesc.entrySet()) {
-            AiMcpToolCatalogVO old = existing.get(entry.getKey());
+            AiMcpToolCatalogVO old = previousByName.get(entry.getKey());
             boolean unchanged = old != null
                     && java.util.Objects.equals(safe(old.getToolDescription()), entry.getValue())
                     && old.getToolDescriptionZh() != null && !old.getToolDescriptionZh().isBlank()
@@ -973,33 +1036,42 @@ public class McpToolCatalogService {
                 changedRaws.add(entry.getValue());
             }
         }
-        if (changedNames.isEmpty()) {
-            log.info("[DynamicTools] catalog mcpId={} unchanged ({} tools), skip enrichment; removed {}",
-                    mcpId, currentRawDesc.size(), removed.size());
-            return;
-        }
-
         // 5. 只增强变更的：一次 LLM 调用产出 {中文用途, doc2query 意图扩写}，写回
-        List<ToolDescriptionTranslator.ToolText> texts =
-                toolDescriptionTranslator.toCatalogText(changedNames, changedRaws);
+        List<ToolDescriptionTranslator.ToolText> texts = changedNames.isEmpty() ? List.of()
+                : toolDescriptionTranslator.toCatalogText(changedNames, changedRaws);
+        Map<String, ToolDescriptionTranslator.ToolText> enriched = new HashMap<>();
+        for (int i = 0; i < changedNames.size(); i++) enriched.put(changedNames.get(i), texts.get(i));
         LocalDateTime now = LocalDateTime.now();
         List<AiMcpToolCatalogVO> rows = new ArrayList<>(changedNames.size());
-        for (int i = 0; i < changedNames.size(); i++) {
-            String name = changedNames.get(i);
-            ToolDescriptionTranslator.ToolText text = texts.get(i);
+        for (String name : currentRawDesc.keySet()) {
+            AiMcpToolCatalogVO old = previousByName.get(name);
+            ToolDescriptionTranslator.ToolText text = enriched.get(name);
+            String schema = readInputSchema(currentCallback.get(name));
+            if (text == null && old != null && name.equals(old.getToolName())
+                    && java.util.Objects.equals(schema, safe(old.getInputSchemaJson()))
+                    && Integer.valueOf(1).equals(old.getEnabled())) continue;
             rows.add(AiMcpToolCatalogVO.builder()
                     .mcpId(mcpId)
                     .mcpName(config.getMcpName())
                     .toolName(name)
-                    .toolDescription(changedRaws.get(i))
-                    .toolDescriptionZh(text.zh())
-                    .toolIntentZh(text.intentZh())
-                    .inputSchemaJson(readInputSchema(currentCallback.get(name)))
+                    .toolDescription(currentRawDesc.get(name))
+                    .toolDescriptionZh(text == null ? old.getToolDescriptionZh() : text.zh())
+                    .toolIntentZh(text == null ? old.getToolIntentZh() : text.intentZh())
+                    .inputSchemaJson(schema)
                     .enabled(1)
                     .lastSeenAt(now)
                     .build());
         }
-        repository.upsertMcpToolCatalog(rows);
+        if (!rows.isEmpty()) repository.upsertMcpToolCatalog(rows);
+        if (!removed.isEmpty()) repository.deleteMcpToolCatalog(mcpId, removed);
+        if (!rows.isEmpty() || !removed.isEmpty()) {
+            // A lazy discovery does not perform another model/embedding call just to rename a
+            // tool. Search revalidates vector hits below; explicit refresh rebuilds the index.
+            matchCache.entrySet().removeIf(entry -> entry.getValue().tools().stream()
+                    .anyMatch(tool -> mcpId.equals(tool.getMcpId())));
+            dynamicWrapperCache.keySet().removeIf(key -> key.startsWith(mcpId + "::"));
+            dynamicRawCache.keySet().removeIf(key -> key.startsWith(mcpId + "::"));
+        }
         log.info("[DynamicTools] catalog mcpId={} upserted {} add/changed tools (translated), removed {}, unchanged {}",
                 mcpId, rows.size(), removed.size(), currentRawDesc.size() - changedNames.size());
     }
@@ -1019,6 +1091,7 @@ public class McpToolCatalogService {
         metered.setHumanApprovalGate(humanApprovalGate);
         metered.setToolCallProgressEmitter(toolCallProgressEmitter);
         metered.setToolCallLedger(toolCallLedger); // P0 Codex#2：动态工具也记账，Step3 才看得到 search_papers 等 request_tool 装载的工具
+        metered.setToolResultReferenceService(toolResultReferenceService);
         return metered;
     }
 
@@ -1028,7 +1101,8 @@ public class McpToolCatalogService {
         }
         for (ToolCallback callback : callbacks) {
             if (callback != null && callback.getToolDefinition() != null
-                    && toolName.equals(callback.getToolDefinition().name())) {
+                    && (toolName.equals(callback.getToolDefinition().name())
+                    || toolName.equals(McpClientRegistry.originalToolName(callback)))) {
                 return callback;
             }
         }

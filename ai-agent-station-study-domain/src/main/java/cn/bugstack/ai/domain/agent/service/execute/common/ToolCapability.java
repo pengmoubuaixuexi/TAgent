@@ -7,5 +7,6 @@ package cn.bugstack.ai.domain.agent.service.execute.common;
 public enum ToolCapability {
     BUSINESS_TOOL,
     ASK_USER,
-    REQUEST_TOOL
+    REQUEST_TOOL,
+    CREATE_ARTIFACT
 }

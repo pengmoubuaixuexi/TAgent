@@ -2,6 +2,10 @@
 <html lang="zh-CN">
 <head>
 <script src="/auth.js"></script>
+<link rel="stylesheet" href="/workspace-nav.css">
+<script defer src="/workspace-nav.js"></script>
+<link rel="stylesheet" href="/run-artifacts.css">
+<script src="/run-artifacts.js"></script>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI Agent Station</title>
@@ -13,6 +17,7 @@
 <style>
   * { box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+  #chatScreen { height:calc(100vh - var(--workspace-nav-height,0px)); height:calc(100dvh - var(--workspace-nav-height,0px)); }
   .msg-content pre { background:#1e293b; color:#e2e8f0; padding:12px; border-radius:8px; overflow-x:auto; margin:8px 0; font-size:13px; }
   .msg-content code { background:#334155; color:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:13px; }
   .msg-content pre code { background:transparent; padding:0; }
@@ -42,6 +47,8 @@
   .step-card.blocked { border-color:#78350f; }
   .step-card.blocked .step-head .step-status::before { content:'⊘ '; color:#f59e0b; }
   .step-body { padding:8px 12px; background:#0f172a; font-size:13px; color:#cbd5e1; max-height:300px; overflow-y:auto; word-break:break-word; }
+  .run-preparation-status { margin:6px 0; padding:8px 10px; border:1px solid #334155; border-radius:8px; background:#0f172a; color:#93c5fd; font-size:12px; overflow-wrap:anywhere; }
+  .run-preparation-status::before { content:'⏳ '; }
   .tool-card { border:1px solid #374151; border-radius:8px; margin:6px 0; overflow:hidden; background:#0b1120; }
   .tool-card .tool-head { display:flex; align-items:center; gap:8px; padding:6px 10px; background:#111827; font-size:12px; color:#9ca3af; cursor:pointer; user-select:none; }
   .tool-card .tool-action { font-weight:600; color:#bfdbfe; white-space:nowrap; }
@@ -120,6 +127,7 @@
 </style>
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
+<div data-workspace-nav></div>
 
 <!-- ==================== LOGIN SCREEN ==================== -->
 <div id="loginScreen" class="min-h-screen flex items-center justify-center p-4">
@@ -176,7 +184,12 @@
               <div class="text-sm font-semibold text-gray-100">通知中心</div>
               <div id="notificationPanelSummary" class="text-[11px] text-gray-500 mt-0.5">正在加载...</div>
             </div>
-            <button type="button" onclick="refreshNotifications()" class="text-xs text-gray-500 hover:text-blue-300">刷新</button>
+            <div class="flex items-center gap-3">
+              <button id="notificationMarkAllRead" type="button" onclick="ackAllNotifications(event)" disabled
+                title="将当前通知标为已读，待处理事项仍需单独处理"
+                class="text-xs text-blue-300 hover:text-blue-200 disabled:opacity-40 disabled:cursor-not-allowed">一键已读</button>
+              <button type="button" onclick="refreshNotifications()" class="text-xs text-gray-500 hover:text-blue-300">刷新</button>
+            </div>
           </div>
           <div class="px-3 pt-2 flex gap-2 text-xs">
             <button id="notificationPendingTab" type="button" onclick="setNotificationFilter('pending')" class="px-2.5 py-1.5 rounded-md bg-blue-600/20 text-blue-200 border border-blue-700/60">待处理</button>
@@ -188,7 +201,7 @@
         </div>
       </div>
     </div>
-    <div class="flex items-center gap-3">
+    <div class="flex flex-wrap items-center gap-3 justify-end">
       <!-- Agent Selector -->
       <select id="agentSelect" onchange="onAgentChange()"
         class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-blue-500">
@@ -205,11 +218,6 @@
         计划确认
       </label>
       <span class="text-xs text-gray-500">|</span>
-      <a href="/user-agents.html" class="text-xs text-blue-300">我的 Agent</a>
-      <a href="/observe.html" class="text-xs text-blue-300">我的用量</a>
-      <a href="/observe-mcp.html" class="text-xs text-blue-300">MCP 观测</a>
-      <a data-admin-only hidden href="/admin-stats.html" class="text-xs text-blue-300">网站统计</a>
-      <a data-admin-only hidden href="/agent-config.html" class="text-xs text-blue-300">配置详情</a>
       <!-- User Info -->
       <div class="flex items-center gap-2">
         <div class="w-7 h-7 bg-blue-600 rounded-full flex items-center justify-center text-xs font-bold" id="userAvatar"></div>
@@ -223,6 +231,11 @@
       <button onclick="doLogout()" class="text-xs text-gray-500 hover:text-red-400 transition">退出</button>
     </div>
   </header>
+  <section id="startGuide" hidden class="px-5 py-3 border-b border-blue-900 bg-blue-950/40 text-sm">
+    <span>第一次使用新版？先体验公共 Agent，再按需连接模型、配置节点和上传知识文档。</span>
+    <a href="/account.html" class="text-blue-300">查看开始使用指南 →</a>
+    <button onclick="dismissStartGuide()" class="text-xs text-gray-400">暂时收起</button>
+  </section>
 
   <!-- Main layout: sidebar + chat -->
   <div class="flex-1 flex overflow-hidden">
@@ -533,6 +546,7 @@ async function init() {
 
 // ==================== LOGIN ====================
 function showLogin() {
+  window.WorkspaceNav?.setUser(null);
   document.getElementById('loginScreen').style.display = 'flex';
   document.getElementById('chatScreen').classList.add('hidden');
 }
@@ -616,17 +630,30 @@ async function doLogout() {
 
 // ==================== CHAT ====================
 async function showChat() {
+  window.WorkspaceNav?.setUser({userId:state.userId,username:state.username,role:state.role});
   document.getElementById('loginScreen').style.display = 'none';
   document.getElementById('chatScreen').classList.remove('hidden');
   document.querySelectorAll('[data-admin-only]').forEach(el => { el.hidden = state.role !== 'ADMIN'; });
   document.getElementById('userDisplay').textContent = state.username;
   document.getElementById('userAvatar').textContent = (state.username || 'U')[0].toUpperCase();
+  try {document.getElementById('startGuide').hidden=localStorage.getItem('tagent:v2:guide:'+state.userId)==='dismissed';} catch(e) {document.getElementById('startGuide').hidden=false;}
   await loadAgents();
   await refreshNotifications();
   startNotificationPolling();
   // An explicit workspace entry starts a fresh conversation with the selected Agent.
   // Consume the link so reloading subsequently restores that conversation normally.
   const entryUrl = new URL(location.href);
+  if (entryUrl.searchParams.get('inbox') === '1') {
+    entryUrl.searchParams.delete('inbox');
+    history.replaceState(null, '', entryUrl.pathname + entryUrl.search + entryUrl.hash);
+    document.getElementById('notificationPanel')?.classList.remove('hidden');
+  }
+  const notificationId = entryUrl.searchParams.get('notificationId');
+  if (notificationId) {
+    entryUrl.searchParams.delete('notificationId');
+    history.replaceState(null, '', entryUrl.pathname + entryUrl.search + entryUrl.hash);
+    if (await openNotification(notificationId)) return;
+  }
   if (entryUrl.searchParams.get('agentId') && state.currentAgentId) {
     entryUrl.searchParams.delete('agentId');
     history.replaceState(null, '', entryUrl.pathname + entryUrl.search + entryUrl.hash);
@@ -676,8 +703,12 @@ function setNotificationFilter(filter) {
   renderNotifications();
 }
 
-async function refreshNotifications(silent = false) {
+let notificationMarkAllBusy = false, notificationRefreshVersion = 0;
+async function refreshNotifications(silent = false, afterMarkAll = false) {
+  if (notificationMarkAllBusy && !afterMarkAll) return;
   if (!state.userId) return;
+  const owner = state.userId;
+  const version = ++notificationRefreshVersion;
   const list = document.getElementById('notificationList');
   if (!silent && list && !state.notifications.length) {
     list.innerHTML = '<div class="text-xs text-gray-500 text-center py-8">正在加载...</div>';
@@ -688,8 +719,10 @@ async function refreshNotifications(silent = false) {
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok || body.code !== '0000') throw new Error(body.info || `HTTP ${res.status}`);
+    if (owner !== state.userId || version !== notificationRefreshVersion) return;
     state.notifications = Array.isArray(body.data) ? body.data : [];
     renderNotifications();
+    await acknowledgeVisibleRunNotifications();
   } catch (e) {
     if (!silent && list) {
       list.innerHTML = `<div class="text-xs text-red-300 text-center py-8">通知加载失败：${escapeHtml(e.message || '')}</div>`;
@@ -724,6 +757,34 @@ function notificationVisibleInInbox(item) {
   return !notificationIsCurrentSessionInteraction(item);
 }
 
+function notificationIsViewedRun(item) {
+  if (!item || !['TASK_COMPLETED', 'TASK_FAILED'].includes(String(item.type || '').toUpperCase())) return false;
+  if (document.visibilityState !== 'visible' || !document.hasFocus()
+      || document.getElementById('chatScreen')?.classList.contains('hidden')) return false;
+  if (!item.runId || String(item.sessionId || '') !== String(state.sessionId || '')) return false;
+  const area = document.getElementById('messageArea');
+  const runNodes = area ? [...area.children].filter(node => node.dataset.runId
+    && node.dataset.messageRole === 'assistant' && node.querySelector('.msg-content')) : [];
+  // A run already in the session history is not necessarily the task being viewed.
+  const node = runNodes.filter(value => String(value.dataset.runId || '') === String(item.runId)).at(-1);
+  if (!node) return false;
+  const bounds = node.getBoundingClientRect(), viewport = area.getBoundingClientRect();
+  return bounds.bottom > Math.max(0, viewport.top) && bounds.top < Math.min(innerHeight, viewport.bottom);
+}
+
+const notificationAutoAcks = new Set();
+async function acknowledgeVisibleRunNotifications() {
+  const owner = String(state.userId || '');
+  if (!owner) return;
+  const visible = (state.notifications || []).filter(item => String(item.readStatus || 'UNREAD') === 'UNREAD'
+    && notificationIsViewedRun(item) && !notificationAutoAcks.has(item.notificationId));
+  await Promise.all(visible.map(async item => {
+    notificationAutoAcks.add(item.notificationId);
+    try { await ackNotification(null, item.notificationId); }
+    finally { notificationAutoAcks.delete(item.notificationId); }
+  }));
+}
+
 function notificationVisual(item) {
   const status = notificationEffectiveStatus(item);
   const type = String((item && item.type) || '').toUpperCase();
@@ -755,13 +816,15 @@ function renderNotifications() {
   const inbox = all.filter(notificationVisibleInInbox);
   const unread = inbox.filter(item => String(item.readStatus || 'UNREAD').toUpperCase() === 'UNREAD').length;
   const pending = inbox.filter(notificationIsPending).length;
+  window.dispatchEvent(new CustomEvent('tagent:inbox-count', {detail:{unread, pending}}));
   const badge = document.getElementById('notificationBadge');
   if (badge) {
     badge.textContent = unread > 99 ? '99+' : String(unread);
     badge.classList.toggle('hidden', unread <= 0);
   }
   const summary = document.getElementById('notificationPanelSummary');
-  if (summary) summary.textContent = `${pending} 条待处理 · ${unread} 条未确认`;
+  if (summary) summary.textContent = `${pending} 条待处理 · ${unread} 条未读`;
+  updateNotificationMarkAllButton();
   const pendingTab = document.getElementById('notificationPendingTab');
   const allTab = document.getElementById('notificationAllTab');
   if (pendingTab) {
@@ -812,12 +875,14 @@ async function ackNotification(event, notificationId) {
   if (event) event.stopPropagation();
   const item = state.notifications.find(value => String(value.notificationId) === String(notificationId));
   if (!item || String(item.readStatus).toUpperCase() === 'ACKNOWLEDGED') return;
+  const owner = state.userId;
   try {
     const res = await fetch(`${API}/notifications/${encodeURIComponent(notificationId)}/ack`, {
       method: 'POST', headers: notificationHeaders()
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok || body.code !== '0000') throw new Error(body.info || `HTTP ${res.status}`);
+    if (state.userId !== owner) return;
     item.readStatus = 'ACKNOWLEDGED';
     item.acknowledgedAt = Date.now();
     renderNotifications();
@@ -827,22 +892,111 @@ async function ackNotification(event, notificationId) {
 }
 
 async function openNotification(notificationId) {
-  const item = state.notifications.find(value => String(value.notificationId) === String(notificationId));
-  if (!item) return;
-  await ackNotification(null, notificationId);
+  let item = state.notifications.find(value => String(value.notificationId) === String(notificationId));
+  const owner = state.userId;
+  if (!item) {
+    try {
+      const response = await fetch(`${API}/notifications/${encodeURIComponent(notificationId)}`, {headers:notificationHeaders()});
+      const body = await response.json();
+      if (!response.ok || body.code !== '0000' || !body.data) throw new Error(body.info || '通知不存在或已过期');
+      if (owner !== state.userId) return false;
+      item = body.data;
+      state.notifications.push(item);
+    } catch (error) { showNotificationToast(error.message, true); return false; }
+  }
   const panel = document.getElementById('notificationPanel');
   if (panel) panel.classList.add('hidden');
   if (!item.sessionId) {
     showNotificationToast('这条通知没有关联会话，无法跳转。', true);
-    return;
+    return false;
   }
   const loaded = await loadConversation(conversationIdForSession(item.sessionId));
   if (!loaded) {
     showNotificationToast('关联会话加载失败。', true);
-    return;
+    return false;
   }
+  await ensureNotificationRunVisible(item);
+  if (owner !== state.userId || String(state.sessionId) !== String(item.sessionId)) return false;
+  await ackNotification(null, notificationId);
   setTimeout(() => focusNotificationTarget(item), 80);
+  return true;
 }
+
+function updateNotificationMarkAllButton() {
+  const button = document.getElementById('notificationMarkAllRead');
+  if (!button) return;
+  button.disabled = notificationMarkAllBusy || !(state.notifications || []).some(item =>
+    notificationVisibleInInbox(item) && String(item.readStatus || 'UNREAD') === 'UNREAD');
+  button.textContent = notificationMarkAllBusy ? '正在标为已读…' : '一键已读';
+}
+
+async function ackAllNotifications(event) {
+  if (event) event.stopPropagation();
+  if (notificationMarkAllBusy || !state.userId) return;
+  const rows = state.notifications || [];
+  if (!rows.some(item => notificationVisibleInInbox(item) && String(item.readStatus || 'UNREAD') === 'UNREAD')) return;
+  const before = Math.max(0, ...rows.map(item => Number(item.updatedAt || item.createdAt || 0)));
+  if (!before) return;
+  const owner = state.userId;
+  notificationMarkAllBusy = true; ++notificationRefreshVersion; updateNotificationMarkAllButton();
+  try {
+    const res = await fetch(`${API}/notifications/ack-all?before=${encodeURIComponent(before)}`, {
+      method:'POST', headers:notificationHeaders()
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.code !== '0000') throw new Error(body.info || `HTTP ${res.status}`);
+    if (owner !== state.userId) return;
+    await refreshNotifications(true, true);
+  } catch (error) {
+    if (owner === state.userId) showNotificationToast(`一键已读失败：${error.message || ''}`, true);
+  } finally {
+    notificationMarkAllBusy = false; updateNotificationMarkAllButton();
+  }
+}
+
+async function ensureNotificationRunVisible(item) {
+  const area = document.getElementById('messageArea');
+  if (!area || !item.runId || [...area.querySelectorAll('[data-run-id][data-message-role="assistant"]')]
+      .some(node => String(node.dataset.runId) === String(item.runId))) return;
+  const sessionId = state.sessionId, generation = state.runUiGeneration;
+  try {
+    const res = await fetch(`${API}/run-snapshots/${encodeURIComponent(item.runId)}?sessionId=${encodeURIComponent(sessionId)}`);
+    const body = await res.json();
+    if (generation !== state.runUiGeneration || sessionId !== state.sessionId) return;
+    if (body.code === '0000' && body.data && body.data.sessionId === sessionId
+        && Array.isArray(body.data.timelineEvents) && body.data.timelineEvents.length) {
+      const snapshot = body.data;
+      const node = addMessage('assistant', '', false, snapshot.agentId, snapshot.runId);
+      restoreTimelineSnapshot(node, snapshot, '');
+      return;
+    }
+    // Redis snapshots expire earlier than durable run history; preserve a precise jump for older notices.
+    const historyResponse = await fetch(`/api/v1/history/${encodeURIComponent(item.runId)}`);
+    const historyBody = await historyResponse.json();
+    if (generation !== state.runUiGeneration || sessionId !== state.sessionId) return;
+    const run = historyBody.data;
+    if (historyBody.code === '0000' && run && run.sessionId === sessionId) {
+      addMessage('assistant', run.answer || '本次任务未生成完整回答，请在运行历史中查看详情。', false, run.agentId, item.runId);
+    }
+  } catch (_) { showNotificationToast('会话已打开，原任务详情暂时无法加载。', true); }
+}
+
+window.TAgentChatInbox = {
+  open() {
+    const panel = document.getElementById('notificationPanel');
+    if (panel) panel.classList.remove('hidden');
+    return refreshNotifications(true);
+  },
+  refresh() { return refreshNotifications(true); },
+  markAllRead() { return ackAllNotifications(); },
+  counts() {
+    const rows = (state.notifications || []).filter(notificationVisibleInInbox);
+    return {unread:rows.filter(item => String(item.readStatus || 'UNREAD') === 'UNREAD').length,
+      pending:rows.filter(notificationIsPending).length};
+  }
+};
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') void refreshNotifications(true); });
+window.addEventListener('focus', () => { void acknowledgeVisibleRunNotifications(); });
 
 function focusNotificationTarget(item) {
   const area = document.getElementById('messageArea');
@@ -880,7 +1034,7 @@ function focusNotificationTarget(item) {
       .find(card => String(card.dataset.interactionId || '') === refId) || null;
   }
   if (!target && runId) {
-    target = [...area.querySelectorAll('[data-run-id]')]
+    target = [...area.querySelectorAll('[data-run-id][data-message-role="assistant"]')]
       .find(node => String(node.dataset.runId || '') === runId) || null;
   }
   if (type === 'ASK_USER' && notificationIsPending(item) && refId) {
@@ -944,6 +1098,11 @@ function agentDisplayLabel(agent) {
   const sameMode = sameName.filter(item => item.strategy === agent.strategy);
   const ordinal = sameMode.length > 1 ? ` · ${sameMode.findIndex(item => String(item.agentId) === String(agent.agentId)) + 1}` : '';
   return `${name} · ${mode}${ordinal}`;
+}
+
+function dismissStartGuide() {
+  document.getElementById('startGuide').hidden=true;
+  try {localStorage.setItem('tagent:v2:guide:'+state.userId,'dismissed');} catch(e) {}
 }
 
 async function loadAgents() {
@@ -1185,6 +1344,7 @@ async function restorePendingFlowPlanAfterRefresh(payload = null) {
   if (snapshot.assistantHtml && !existingMessage) {
     msgContent.innerHTML = snapshot.assistantHtml;
     initializeRunEventLedger(aiMsg, payload.runId, sessionId, snapshot.eventLedger);
+    clearRunPreparation(aiMsg);
     rebindRestoredMessageInteractions(msgContent);
     const restoredCard = findRestoredPlanReviewCard(msgContent, payload.runId);
     if (restoredCard) {
@@ -1603,6 +1763,7 @@ function setRestoredPlanCardStatus(card, status, summary) {
 
 function appendRestoredCancelledMarker(aiMsg) {
   if (!aiMsg) return;
+  clearRunPreparation(aiMsg);
   aiMsg.classList.remove('typing');
   const c = aiMsg.querySelector('.msg-content');
   if (c && !c.querySelector('.cancel-marker')) {
@@ -1638,12 +1799,6 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
   let curData = '';
   let curEventId = '';
 
-  function depBadgeHtml(dependsOn) {
-    if (!Array.isArray(dependsOn) || dependsOn.length === 0) return '';
-    const depNames = dependsOn.map(did => dependencyDisplayName(did, stepBuffers)).join(' / ');
-    return `<span class="step-dep" title="此步骤依赖以下步骤完成后才能执行">依赖: ${escapeHtml(depNames)}</span>`;
-  }
-
   function depPendingMessage(dependsOn) {
     if (!Array.isArray(dependsOn) || dependsOn.length === 0) {
       return '<span class="text-gray-500">⏳ 等待执行中...</span>';
@@ -1670,6 +1825,7 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
     card.querySelector('.step-head').addEventListener('click', () => card.classList.toggle('collapsed'));
     stepsContainer.appendChild(card);
     stepBuffers[stepId] = { card, body: card.querySelector('.step-body'), buf: '', displayName: shownName, dependsOn, status: 'pending' };
+    updateStepDependencies(stepBuffers, stepId, displayName, dependsOn);
     scrollBottom();
     return stepBuffers[stepId];
   }
@@ -1677,7 +1833,8 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
   function activateStepCard(stepId, displayName, dependsOn) {
     if (!stepsContainer) return null;
     let entry = stepBuffers[stepId];
-    const shownName = normalizeExecutionStepName(displayName, stepId) || stepId;
+    const shownName = normalizeExecutionStepName(displayName || entry?.displayName, stepId) || stepId;
+    dependsOn = Array.isArray(dependsOn) ? dependsOn : entry?.dependsOn;
     if (!entry) {
       const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card):not(.tool-card)');
       if (placeholder) placeholder.remove();
@@ -1687,7 +1844,6 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
         <div class="step-head">
           <span class="chev">▾</span>
           <span class="step-name">${escapeHtml(shownName)}</span>
-          ${depBadgeHtml(dependsOn)}
           <span class="step-status">进行中…</span>
         </div>
         <div class="step-body"></div>
@@ -1702,11 +1858,7 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
       const head = entry.card.querySelector('.step-head');
       const stepNameEl = head.querySelector('.step-name');
       if (stepNameEl) stepNameEl.textContent = shownName;
-      const oldBadge = head.querySelector('.step-dep');
-      if (oldBadge) oldBadge.remove();
       const status = head.querySelector('.step-status');
-      const badgeHtml = depBadgeHtml(dependsOn);
-      if (badgeHtml) status.insertAdjacentHTML('beforebegin', badgeHtml);
       status.textContent = '进行中…';
       entry.body.innerHTML = '';
       entry.buf = '';
@@ -1714,6 +1866,7 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
       entry.displayName = shownName;
       entry.status = 'running';
     }
+    updateStepDependencies(stepBuffers, stepId, shownName, dependsOn);
     scrollBottom();
     return entry;
   }
@@ -1812,8 +1965,11 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
     if (!payload || !acceptRunEvent(aiMsg, payload, curEventId)) {
       curEvent = 'message'; curData = ''; curEventId = ''; return;
     }
+    handleRunPreparationEvent(aiMsg, curEvent, payload);
 
-    if (curEvent === 'step_pending') {
+    if (curEvent === 'run_replay_context') {
+      renderInheritedRunSteps(stepsContainer, stepBuffers, payload);
+    } else if (curEvent === 'step_pending') {
       if (!stepBuffers[payload.stepId]) {
         createPendingStepCard(payload.stepId, payload.displayName, payload.dependsOn);
       }
@@ -1836,6 +1992,8 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
           if (wasAtBottom) card.body.scrollTop = card.body.scrollHeight;
         }
       }
+    } else if (curEvent === 'step_progress') {
+      updateStepProgress(stepBuffers, payload);
     } else if (curEvent === 'step_end') {
       const card = stepBuffers[payload.stepId];
       if (card) {
@@ -1852,6 +2010,10 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
         state.interventionEnabled = true;
         showAnswerNow(true);
       }
+    } else if (curEvent === 'artifact_created') {
+      window.RunArtifacts?.render(aiMsg, payload);
+    } else if (curEvent === 'artifact_progress') {
+      window.RunArtifacts?.progress(aiMsg, payload);
     } else if (curEvent === 'tool_call_start') {
       createRestoredToolCard(payload);
     } else if (curEvent === 'tool_call_end') {
@@ -2196,6 +2358,91 @@ function executionResultDisplayFallback(content) {
   return `> 本步骤未单独生成展示正文，以下为实际执行产物。\n\n${text}`;
 }
 
+// Transient waiting feedback only updates an existing running step. Late frames must not
+// create a new card, clear generated content, or revive a failed/completed/cancelled step.
+function updateStepProgress(stepBuffers, payload) {
+  if (!stepBuffers || !payload || !payload.stepId) return false;
+  const entry = stepBuffers[payload.stepId];
+  if (!entry || !entry.card || !entry.card.classList.contains('running')
+      || ['done', 'failed', 'blocked', 'cancelled'].some(status => entry.card.classList.contains(status))) return false;
+  const labels = {
+    awaiting_model: '等待模型响应', model_streaming: '模型正在生成',
+    memory_retrieval: '正在检索记忆', rag_routing: '正在判断知识库检索策略',
+    knowledge_retrieval: '正在检索知识库', knowledge_reranking: '正在筛选检索结果',
+    preparing_model: '正在准备模型请求',
+    tool_running: '正在等待工具结果', awaiting_user: '等待你的补充或确认',
+    artifact_generating: '正在生成产物内容', artifact_repairing: '正在修复产物格式',
+    artifact_saving: '正在保存产物', artifact_fallback: '文件未保存，正在保留回答'
+  };
+  if (typeof payload.phase !== 'string' || !Object.prototype.hasOwnProperty.call(labels, payload.phase)) return false;
+  const label = labels[payload.phase];
+  const timestamp = Number(payload.timestamp);
+  if (Number.isFinite(timestamp) && Number.isFinite(entry.progressTimestamp) && timestamp < entry.progressTimestamp) return false;
+  const status = entry.card.querySelector('.step-status');
+  if (!status) return false;
+  const seconds = Math.max(0, Math.floor(Number(payload.waitSeconds) || 0));
+  status.textContent = label + (seconds >= 5 && Number.isFinite(seconds) ? ` · 已等待 ${seconds} 秒` : '');
+  if (Number.isFinite(timestamp)) entry.progressTimestamp = timestamp;
+  return true;
+}
+
+function clearRunPreparation(aiMsg) {
+  if (!aiMsg) return;
+  const scope = aiMsg._runEventLedger?.scope;
+  const previous = aiMsg._runPreparation;
+  aiMsg._runPreparation = {scope, timestamp: previous?.scope === scope ? previous.timestamp : null, closed: true};
+  aiMsg.querySelectorAll('.run-preparation-status,.run-connected-status').forEach(node => node.remove());
+}
+
+function persistentRunContentHtml(content) {
+  if (!content) return '';
+  const clone = content.cloneNode(true);
+  clone.querySelectorAll('.run-preparation-status,.run-connected-status').forEach(node => node.remove());
+  return clone.innerHTML;
+}
+
+// Preparation exists before the first execution step. Keep it out of saved answers
+// and use only known phases; provider messages, URLs and connection IDs are not UI labels.
+function handleRunPreparationEvent(aiMsg, eventType, payload) {
+  if (!aiMsg || !payload) return false;
+  if (['step_start', 'token', 'step_end', 'plan_review_error'].includes(eventType)
+      || ((eventType === 'message' || !eventType) && ['summary', 'complete', 'error', 'cancelled'].includes(payload.type))
+      || (eventType === 'plan_review_status' && ['COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED'].includes(payload.status))) {
+    clearRunPreparation(aiMsg);
+    return false;
+  }
+  if (eventType !== 'run_progress') return false;
+  const ledger = aiMsg._runEventLedger;
+  if (!ledger || String(payload.runId || '') !== ledger.runId
+      || String(payload.sessionId || '') !== ledger.sessionId || ledger.userId !== String(state.userId || '')) return false;
+  const labels = {agent_routing: '正在选择 Agent', agent_preparing: '正在准备 Agent', mcp_connecting: '正在连接 MCP 工具'};
+  if (payload.phase !== 'run_ready' && (typeof payload.phase !== 'string'
+      || !Object.prototype.hasOwnProperty.call(labels, payload.phase))) return false;
+  const previous = aiMsg._runPreparation?.scope === ledger.scope ? aiMsg._runPreparation : null;
+  if (previous?.closed || aiMsg.querySelector('.cancel-marker')) return false;
+  const timestamp = Number(payload.timestamp);
+  if (!Number.isFinite(timestamp) || (Number.isFinite(previous?.timestamp) && timestamp < previous.timestamp)) return false;
+  aiMsg._runPreparation = {scope: ledger.scope, timestamp, closed: false};
+  if (payload.phase === 'run_ready') { clearRunPreparation(aiMsg); return true; }
+  const content = aiMsg.querySelector('.msg-content');
+  if (!content) return false;
+  let status = content.querySelector('.run-preparation-status');
+  if (!status) {
+    status = document.createElement('div');
+    status.className = 'run-preparation-status';
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    content.prepend(status);
+  }
+  content.querySelectorAll('.run-connected-status').forEach(node => node.remove());
+  const resource = payload.phase === 'mcp_connecting' && typeof payload.resourceName === 'string'
+    ? payload.resourceName.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 120) : '';
+  const seconds = Math.max(0, Math.floor(Number(payload.waitSeconds) || 0));
+  status.textContent = labels[payload.phase] + (resource ? `：${resource}` : '')
+    + (seconds >= 5 && Number.isFinite(seconds) ? ` · 已等待 ${seconds} 秒` : '');
+  return true;
+}
+
 function fillEmptyExecutionStepCard(stepBuffers, payload) {
   if (!stepBuffers || !payload || payload.step == null) return false;
   const stepNo = Number(payload.step);
@@ -2214,13 +2461,77 @@ function dependencyDisplayName(depId, stepBuffers) {
   return normalizeExecutionStepName(entry && entry.displayName ? entry.displayName : '', depId) || String(depId || '');
 }
 
+// Retain metadata across token/progress/end events, which normally omit dependsOn.
+// Use one presentation path for live cards and restored snapshots.
+function updateStepDependencies(stepBuffers, stepId, displayName, dependsOn) {
+  const entry = stepBuffers[stepId];
+  if (!entry) return;
+  const name = normalizeExecutionStepName(displayName || entry.displayName, stepId) || stepId;
+  const deps = Array.isArray(dependsOn)
+    ? [...new Set(dependsOn.filter(id => typeof id === 'string' || typeof id === 'number').map(String).filter(Boolean))]
+    : (entry.dependsOn || []);
+  const presentationKey = JSON.stringify([name, deps]);
+  const changed = presentationKey !== entry.dependencyPresentationKey;
+  entry.displayName = name;
+  entry.dependsOn = deps;
+  entry.dependencyPresentationKey = presentationKey;
+  entry.card.querySelector('.step-name').textContent = name;
+  if (!changed) return;
+  // Names may arrive after the cards which reference them; refresh those labels too.
+  for (const dependent of Object.values(stepBuffers)) {
+    const head = dependent.card.querySelector('.step-head');
+    const labels = (dependent.dependsOn || []).map(id => dependencyDisplayName(id, stepBuffers));
+    let badge = head.querySelector('.step-dep');
+    if (!labels.length) badge?.remove();
+    else {
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'step-dep';
+        badge.title = '此步骤依赖以下步骤完成后才能执行';
+        head.insertBefore(badge, head.querySelector('.step-status'));
+      }
+      badge.textContent = '依赖: ' + labels.join(' / ');
+    }
+    if (dependent.card.classList.contains('pending') && !dependent.buf) {
+      const hint = document.createElement('span');
+      hint.className = 'text-gray-500';
+      hint.dataset.stepPlaceholder = 'true';
+      hint.textContent = labels.length ? '⏳ 依赖 ' + labels.join('、') + ' 完成后开始执行' : '⏳ 等待执行中...';
+      dependent.body.replaceChildren(hint);
+    }
+  }
+}
+
+function renderInheritedRunSteps(stepsContainer, stepBuffers, payload) {
+  const steps = payload && Array.isArray(payload.steps) ? payload.steps : [];
+  steps.forEach(step => {
+    const ordinal = step.ordinal || step.stepNo || 1;
+    const inheritedName = normalizeExecutionStepName(step.title || '已沿用步骤', step.stepId) || '已沿用步骤';
+    const stepId = `inherited_${ordinal}_${step.stepId || ''}`;
+    if (stepBuffers[stepId]) return;
+    const content = step.content || step.preview || '';
+    const card = document.createElement('div');
+    card.className = 'step-card done collapsed fade-in';
+    card.innerHTML = `
+      <div class="step-head">
+        <span class="chev">▾</span>
+        <span class="step-name">${escapeHtml(inheritedName)}</span>
+        <span class="step-status">已沿用</span>
+      </div>
+      <div class="step-body">${renderMarkdown(content)}</div>`;
+    card.querySelector('.step-head').addEventListener('click', () => card.classList.toggle('collapsed'));
+    stepsContainer.appendChild(card);
+    stepBuffers[stepId] = { card, body: card.querySelector('.step-body'), buf: content, displayName: inheritedName, status: 'done' };
+  });
+}
+
 function shortRunId(runId) {
   const s = String(runId || '');
   return s.length > 12 ? s.slice(0, 8) + '...' + s.slice(-4) : s;
 }
 
 function runStatusText(status) {
-  const map = { RUNNING: '运行中', COMPLETED: '已完成', FAILED: '失败', CANCELLED: '已取消' };
+  const map = { RUNNING: '运行中', BLOCKED: '等待计划确认', COMPLETED: '已完成', FAILED: '失败', CANCELLED: '已取消', INTERRUPTED: '执行中断', EXPIRED: '已失效' };
   return map[status] || status || '未知';
 }
 
@@ -2845,12 +3156,6 @@ async function sendMessage() {
     const toolProgressByName = {}; // toolName → running entries queue
     const planReviewEntriesByRunId = {};
 
-    function depBadgeHtml(dependsOn) {
-      if (!Array.isArray(dependsOn) || dependsOn.length === 0) return '';
-      const depNames = dependsOn.map(did => dependencyDisplayName(did, stepBuffers)).join(' / ');
-      return `<span class="step-dep" title="此步骤依赖以下步骤完成后才能执行">依赖: ${escapeHtml(depNames)}</span>`;
-    }
-
     function depPendingMessage(dependsOn) {
       if (!Array.isArray(dependsOn) || dependsOn.length === 0) {
         return '<span class="text-gray-500">⏳ 等待执行中...</span>';
@@ -2867,7 +3172,6 @@ async function sendMessage() {
       const card = document.createElement('div');
       card.className = 'step-card pending collapsed fade-in';
       const shownName = normalizeExecutionStepName(displayName, stepId) || stepId;
-      // pending 态：head 不显示 dep badge（badge 只在 running 后才出现）
       card.innerHTML = `
         <div class="step-head">
           <span class="chev">▾</span>
@@ -2881,14 +3185,16 @@ async function sendMessage() {
       });
       stepsContainer.appendChild(card);
       stepBuffers[stepId] = { card, body: card.querySelector('.step-body'), buf: '', displayName: shownName, dependsOn, status: 'pending' };
+      updateStepDependencies(stepBuffers, stepId, displayName, dependsOn);
       scrollBottom();
       return stepBuffers[stepId];
     }
 
-    // 一个 step 真正开始执行时调（来自 step_start 事件）：从 pending 切到 running，head 加 dep badge
+    // 一个 step 真正开始执行时调：从 pending 切到 running，保留已有依赖信息。
     function activateStepCard(stepId, displayName, dependsOn) {
       let entry = stepBuffers[stepId];
-      const shownName = normalizeExecutionStepName(displayName, stepId) || stepId;
+      const shownName = normalizeExecutionStepName(displayName || entry?.displayName, stepId) || stepId;
+      dependsOn = Array.isArray(dependsOn) ? dependsOn : entry?.dependsOn;
       if (!entry) {
         // 没收到 pending（比如 fixed / auto 的单 step 路径），临时创建一张
         const placeholder = stepsContainer.querySelector(':scope > div:not(.step-card):not(.tool-card)');
@@ -2899,7 +3205,6 @@ async function sendMessage() {
           <div class="step-head">
             <span class="chev">▾</span>
             <span class="step-name">${escapeHtml(shownName)}</span>
-            ${depBadgeHtml(dependsOn)}
             <span class="step-status">进行中…</span>
           </div>
           <div class="step-body"></div>
@@ -2914,15 +3219,10 @@ async function sendMessage() {
         // 已有 pending 卡片 → 切到 running
         entry.card.classList.remove('pending', 'collapsed');
         entry.card.classList.add('running');
-        // head 注入 dep badge（dep 信息以 step_start 携带的为准，确保稳定）
         const head = entry.card.querySelector('.step-head');
         const stepNameEl = head.querySelector('.step-name');
         if (stepNameEl) stepNameEl.textContent = shownName;
-        const oldBadge = head.querySelector('.step-dep');
-        if (oldBadge) oldBadge.remove();
         const status = head.querySelector('.step-status');
-        const badgeHtml = depBadgeHtml(dependsOn);
-        if (badgeHtml) status.insertAdjacentHTML('beforebegin', badgeHtml);
         status.textContent = '进行中…';
         // 清空 body 的 "等待依赖" 占位，等接 token
         entry.body.innerHTML = '';
@@ -2931,6 +3231,7 @@ async function sendMessage() {
         entry.displayName = shownName;
         entry.status = 'running';
       }
+      updateStepDependencies(stepBuffers, stepId, shownName, dependsOn);
       scrollBottom();
       return entry;
     }
@@ -2940,31 +3241,9 @@ async function sendMessage() {
       return stepBuffers[stepId] || activateStepCard(stepId, displayName, dependsOn);
     }
 
-    function renderInheritedRunSteps(payload) {
-      const steps = payload && Array.isArray(payload.steps) ? payload.steps : [];
-      steps.forEach(step => {
-        const ordinal = step.ordinal || step.stepNo || 1;
-        const inheritedName = normalizeExecutionStepName(step.title || '已沿用步骤', step.stepId) || '已沿用步骤';
-        const stepId = `inherited_${ordinal}_${step.stepId || ''}`;
-        if (stepBuffers[stepId]) return;
-        const card = document.createElement('div');
-        card.className = 'step-card done collapsed fade-in';
-        card.innerHTML = `
-          <div class="step-head">
-            <span class="chev">▾</span>
-            <span class="step-name">${escapeHtml(inheritedName)}</span>
-            <span class="step-status">已沿用</span>
-          </div>
-          <div class="step-body">${renderMarkdown(step.content || step.preview || '')}</div>
-        `;
-        card.querySelector('.step-head').addEventListener('click', () => card.classList.toggle('collapsed'));
-        stepsContainer.appendChild(card);
-        stepBuffers[stepId] = { card, body: card.querySelector('.step-body'), buf: step.content || '', displayName: inheritedName, status: 'done' };
-      });
-      scrollBottom();
-    }
 
     function appendCancelledMarker() {
+      clearRunPreparation(aiMsg);
       aiMsg.classList.remove('typing');
       const c = aiMsg.querySelector('.msg-content');
       if (c && !c.querySelector('.cancel-marker')) {
@@ -3394,7 +3673,7 @@ async function sendMessage() {
         userMessage: message,
         agentId: payload && payload.agentId ? payload.agentId : state.currentAgentId,
         assistantAuthor: aiAuthorEl ? aiAuthorEl.textContent : '',
-        assistantHtml: msgContent.innerHTML,
+        assistantHtml: persistentRunContentHtml(msgContent),
         eventLedger: serializeRunEventLedger(aiMsg)
       });
     }
@@ -3718,9 +3997,11 @@ async function sendMessage() {
       if (!acceptRunEvent(aiMsg, payload, curEventId)) {
         curEvent = 'message'; curData = ''; curEventId = ''; return;
       }
+      handleRunPreparationEvent(aiMsg, curEvent, payload);
 
       if (curEvent === 'run_replay_context') {
-        renderInheritedRunSteps(payload);
+        renderInheritedRunSteps(stepsContainer, stepBuffers, payload);
+        scrollBottom();
       } else if (curEvent === 'step_pending') {
         // 2026-05-07 DAG UX：执行前先给所有步骤画占位卡片
         if (!stepBuffers[payload.stepId]) {
@@ -3747,6 +4028,8 @@ async function sendMessage() {
           // 只有用户在 step body 底部附近时才自动跟随
           if (wasAtBottom) card.body.scrollTop = card.body.scrollHeight;
         }
+      } else if (curEvent === 'step_progress') {
+        updateStepProgress(stepBuffers, payload);
       } else if (curEvent === 'step_end') {
         const sid = payload.stepId;
         const card = stepBuffers[sid];
@@ -3760,8 +4043,8 @@ async function sendMessage() {
       } else if (curEvent === 'ack') {
         if (payload && payload.runId) setMessageRunId(aiMsg, payload.runId);
         // 2026-05-07 #2 TTFT：服务器已接收，立即给视觉反馈，避免空屏几秒
-        if (!stepsContainer.querySelector('.step-card')) {
-          stepsContainer.innerHTML = '<div class="text-xs text-gray-500 px-2 py-1 fade-in">⚡ 已连接，正在分析...</div>';
+        if (!stepsContainer.querySelector('.step-card') && !aiMsg.querySelector('.run-preparation-status') && !aiMsg._runPreparation?.closed) {
+          stepsContainer.innerHTML = '<div class="run-connected-status text-xs text-gray-500 px-2 py-1 fade-in">已接收任务，等待执行…</div>';
         }
         // 干预总开关：服务端启用时亮出「立即回答」按钮
         if (payload && payload.intervention) {
@@ -3777,6 +4060,10 @@ async function sendMessage() {
         enqueueApproval(payload);
       } else if (curEvent === 'user_input_required') {
         showUserInput(payload);
+      } else if (curEvent === 'artifact_created') {
+        window.RunArtifacts?.render(aiMsg, payload);
+      } else if (curEvent === 'artifact_progress') {
+        window.RunArtifacts?.progress(aiMsg, payload);
       } else if (curEvent === 'tool_call_start') {
         createToolProgressCard(payload);
       } else if (curEvent === 'tool_call_end') {
@@ -3839,7 +4126,7 @@ async function sendMessage() {
           // 正常情况下步骤卡由 token 填充；若模型只返回结构化业务产物，或 token 在重连中缺失，补齐空卡。
           fillEmptyExecutionStepCard(stepBuffers, payload);
         } else if (payload.type === 'complete') {
-          // 全部完成；没必要做什么
+          window.RunArtifacts?.refresh(aiMsg);
         }
         // 其他 type（analysis_status / analysis_history / execution / etc.）忽略，已被 step 卡片取代
       }
@@ -3999,6 +4286,9 @@ async function cancelSend() {
   const b = document.getElementById('sendBtn');
   if (b) { b.disabled = true; b.textContent = '取消中…'; }
   state.userCancelling = true;
+  document.querySelectorAll('#messageArea [data-message-role="assistant"][data-run-id]').forEach(message => {
+    if (message.dataset.runId === String(state.activeRunId || '')) clearRunPreparation(message);
+  });
   if (state.sessionId && state.activeRunId) {
     try {
       await fetch(API + '/cancel', {
@@ -4543,6 +4833,7 @@ function attachMessageActions(node, role, content, runId) {
 function setMessageRunId(aiMsg, runId) {
   if (!aiMsg || !runId) return;
   aiMsg.dataset.runId = runId;
+  window.RunArtifacts?.refresh(aiMsg);
   const btn = aiMsg.querySelector('.msg-copy-run');
   if (btn) {
     btn.classList.remove('hidden');
@@ -4560,12 +4851,26 @@ function initializeRunEventLedger(aiMsg, runId, sessionId, seed, reset = false) 
   if (!reset && aiMsg._runEventLedger?.scope === scope) return aiMsg._runEventLedger;
   const saved = seed && seed.scope === scope ? seed : {};
   return aiMsg._runEventLedger = {scope, userId: String(state.userId || ''), runId: String(runId || ''), sessionId: String(sessionId || ''),
-    seen: new Set(Array.isArray(saved.eventIds) ? saved.eventIds.map(String) : []), lastEventId: saved.lastEventId || null};
+    seen: new Set(Array.isArray(saved.eventIds) ? saved.eventIds.map(String) : []), lastEventId: saved.lastEventId || null,
+    snapshotCoveredThrough: saved.snapshotCoveredThrough || null};
 }
 
 function serializeRunEventLedger(aiMsg) {
   const ledger = aiMsg && aiMsg._runEventLedger;
-  return ledger ? {scope: ledger.scope, eventIds: [...ledger.seen], lastEventId: ledger.lastEventId} : null;
+  return ledger ? {scope: ledger.scope, eventIds: [...ledger.seen], lastEventId: ledger.lastEventId,
+    snapshotCoveredThrough: ledger.snapshotCoveredThrough} : null;
+}
+
+// Only Redis Stream IDs have a durable ordering. Legacy/custom IDs still use exact identity.
+function compareRunEventIds(left, right) {
+  const pattern = /^(\d+)-(\d+)$/;
+  const a = pattern.exec(String(left || '')), b = pattern.exec(String(right || ''));
+  if (!a || !b) return null;
+  for (let index = 1; index <= 2; index++) {
+    const difference = BigInt(a[index]) - BigInt(b[index]);
+    if (difference !== 0n) return difference > 0n ? 1 : -1;
+  }
+  return 0;
 }
 
 function acceptRunEvent(aiMsg, payload, eventId) {
@@ -4577,11 +4882,15 @@ function acceptRunEvent(aiMsg, payload, eventId) {
   if (!eventId) return true; // Legacy streams have no event ID; do not conflate legitimate repeated calls.
   const id = String(eventId);
   if (ledger.seen.has(id)) return false;
+  // A snapshot may merge several token chunks into one event. Earlier raw chunk IDs
+  // are absent from `seen`, but their content is already rendered. Do not confuse
+  // this snapshot boundary with the live cursor: live events may arrive out of order.
+  const covered = compareRunEventIds(id, ledger.snapshotCoveredThrough);
+  if (covered !== null && covered <= 0) return false;
   ledger.seen.add(id);
   const old = ledger.lastEventId;
-  const redisId = /^(\d+)-(\d+)$/;
-  const a = redisId.exec(id), b = old && redisId.exec(old);
-  if (!old || !a || !b || BigInt(a[1]) > BigInt(b[1]) || (a[1] === b[1] && BigInt(a[2]) > BigInt(b[2]))) {
+  const order = compareRunEventIds(id, old);
+  if (!old || order === null || order > 0) {
     ledger.lastEventId = id;
   }
   if (state.activeRunId === ledger.runId && String(state.sessionId || '') === ledger.sessionId) {
@@ -4621,6 +4930,7 @@ function restoreToolCardEntries(container) {
 
 function setFinalAnswerCopy(aiMsg, content) {
   if (!aiMsg || !content || !String(content).trim()) return;
+  window.RunArtifacts?.refresh(aiMsg);
   const btn = aiMsg.querySelector('.msg-copy-final');
   if (btn) {
     btn.dataset.copyText = String(content);
@@ -5071,7 +5381,7 @@ function extractFinalAnswerText(msg) {
   const content = msg.querySelector('.msg-content');
   if (!content) return '';
   const clone = content.cloneNode(true);
-  clone.querySelectorAll('.steps-container,.memory-evidence-container,.rag-evidence-container,.cancel-marker').forEach(el => el.remove());
+  clone.querySelectorAll('.steps-container,.memory-evidence-container,.rag-evidence-container,.cancel-marker,.run-preparation-status,.run-connected-status').forEach(el => el.remove());
   return clone.textContent.trim();
 }
 
@@ -5198,19 +5508,23 @@ function timelineStep(view, payload, status) {
       <div class="step-body"></div>`;
     card.querySelector('.step-head').addEventListener('click', () => card.classList.toggle('collapsed'));
     view.steps.appendChild(card);
-    entry = { card, body: card.querySelector('.step-body'), buf: '' };
+    entry = { card, body: card.querySelector('.step-body'), buf: '', displayName: '', dependsOn: [] };
     view.stepById[stepId] = entry;
   }
+  updateStepDependencies(view.stepById, stepId, payload && payload.displayName, payload && payload.dependsOn);
   if (status === 'running') {
+    entry.body.querySelector('[data-step-placeholder]')?.remove();
     entry.card.classList.remove('pending', 'done', 'failed', 'blocked');
     entry.card.classList.add('running');
     entry.card.querySelector('.step-status').textContent = '执行中';
   } else if (status === 'done') {
+    entry.body.querySelector('[data-step-placeholder]')?.remove();
     entry.card.classList.remove('pending', 'running', 'failed', 'blocked');
     entry.card.classList.add('done', 'collapsed');
     entry.card.querySelector('.step-status').textContent =
       (payload && payload.summary) || '已完成';
   } else if (status === 'failed' || status === 'blocked') {
+    entry.body.querySelector('[data-step-placeholder]')?.remove();
     entry.card.classList.remove('pending', 'running', 'done', 'failed', 'blocked');
     entry.card.classList.add(status, 'collapsed');
     entry.card.querySelector('.step-status').textContent =
@@ -5461,6 +5775,7 @@ function timelineInteraction(view, eventType, payload) {
 function applyRunTimelineEvent(view, eventType, payload, eventId, interactive) {
   if (!view || !eventType) return;
   if (!acceptRunEvent(view.aiMsg, payload, eventId)) return;
+  handleRunPreparationEvent(view.aiMsg, eventType, payload);
   view.lastEventId = view.aiMsg._runEventLedger.lastEventId;
   if (eventType === 'ack') {
     view.interventionEnabled = !!(payload && payload.intervention);
@@ -5480,19 +5795,28 @@ function applyRunTimelineEvent(view, eventType, payload, eventId, interactive) {
     timelineStep(view, payload, 'running');
   }
   else if (eventType === 'token') {
-    const step = timelineStep(view, payload, 'running');
+    const stepId = String((payload && payload.stepId) || 'step');
+    // Content can arrive after a progress or terminal event. Only an explicit
+    // step_start may reactivate an existing card; match the live-stream path.
+    const step = view.stepById[stepId] || timelineStep(view, payload, 'running');
+    updateStepDependencies(view.stepById, stepId, payload && payload.displayName, payload && payload.dependsOn);
     if (payload && payload.token !== '[DONE]') step.buf += payload.token || '';
     step.body.innerHTML = renderMarkdown(step.buf);
+  } else if (eventType === 'step_progress') {
+    updateStepProgress(view.stepById, payload);
   } else if (eventType === 'step_end') {
     const terminalStatus = payload && payload.status === 'failed' ? 'failed'
       : (payload && payload.status === 'blocked' ? 'blocked' : 'done');
     timelineStep(view, payload, terminalStatus);
   }
+  else if (eventType === 'artifact_created') window.RunArtifacts?.render(view.aiMsg, payload);
+  else if (eventType === 'artifact_progress') window.RunArtifacts?.progress(view.aiMsg, payload);
   else if (eventType === 'tool_call_start') timelineToolCard(view, payload, 'running', '');
   else if (eventType === 'tool_call_end') timelineToolCard(view, payload, payload.status || 'success', '');
   else if (eventType === 'tool_call_error') timelineToolCard(view, payload, 'error', payload.error || '');
   else if (eventType === 'rag_evidence') timelineEvidence(view, payload, false);
   else if (eventType === 'memory_evidence') timelineEvidence(view, payload, true);
+  else if (eventType === 'run_replay_context') renderInheritedRunSteps(view.steps, view.stepById, payload);
   else if (eventType === 'plan_review_required') {
     createRestoredPlanReviewRow(payload, view.aiMsg, view.steps);
   } else if (eventType === 'plan_review_resumed' || eventType === 'plan_review_status') {
@@ -5507,12 +5831,17 @@ function applyRunTimelineEvent(view, eventType, payload, eventId, interactive) {
   } else if (eventType === 'agent_routed' && payload) {
     const author = view.aiMsg.querySelector('.msg-author');
     if (author) author.textContent = payload.agentName || agentLabel(payload.agentId);
+  } else if ((eventType === 'message' || !eventType) && payload && payload.type === 'execution') {
+    fillEmptyExecutionStepCard(view.stepById, payload);
   } else if ((eventType === 'message' || !eventType) && payload && payload.type === 'summary') {
     view.finalContent = payload.content || '';
     view.finalAnswer.innerHTML = renderMarkdown(view.finalContent);
     setFinalAnswerCopy(view.aiMsg, view.finalContent);
   } else if ((eventType === 'message' || !eventType) && payload && payload.type === 'error') {
     view.finalAnswer.innerHTML = `<span class="text-red-400">❌ ${escapeHtml(payload.content || '')}</span>`;
+    window.RunArtifacts?.refresh(view.aiMsg);
+  } else if ((eventType === 'message' || !eventType) && payload && payload.type === 'complete') {
+    window.RunArtifacts?.refresh(view.aiMsg);
   }
 }
 
@@ -5523,7 +5852,25 @@ function restoreTimelineSnapshot(aiMsg, snapshot, finalContent) {
   for (const record of (snapshot.timelineEvents || [])) {
     applyRunTimelineEvent(view, record.eventType, timelinePayload(record), record.eventId, false);
   }
-  view.lastEventId = snapshot.lastEventId || view.lastEventId;
+  if (snapshot.readOnly) {
+    aiMsg.querySelectorAll('[data-plan-review-card]').forEach(card => {
+      if (planReviewCanExecute(card.dataset.planReviewStatus) || card.dataset.planReviewStatus === 'RUNNING')
+        applyPlanReviewCardStatus(card, 'EXPIRED', '历史记录仅供查看，请重新发起任务。', null);
+    });
+  }
+  if (['COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED'].includes(snapshot.status)) clearRunPreparation(aiMsg);
+  const ledger = aiMsg._runEventLedger;
+  const cursorOrder = compareRunEventIds(snapshot.lastEventId, ledger.lastEventId);
+  if (snapshot.lastEventId && (!ledger.lastEventId || cursorOrder === null || cursorOrder > 0)) {
+    ledger.lastEventId = snapshot.lastEventId;
+  }
+  // Set coverage only after all compact snapshot records have been applied.
+  // It also survives the saved plan-review HTML/ledger path after another refresh.
+  if (compareRunEventIds(ledger.lastEventId, ledger.lastEventId) === 0) {
+    ledger.snapshotCoveredThrough = ledger.lastEventId;
+  }
+  view.lastEventId = ledger.lastEventId;
+  window.RunArtifacts?.refresh(aiMsg);
   return view;
 }
 
@@ -5631,11 +5978,175 @@ async function recoverRunAfterInitialDisconnect(runId, sessionId, aiMsg) {
   }
 }
 
+// A failed/cancelled Eval run may never have written ChatMemory. Discover its durable
+// record independently, and fetch potentially large diagnostics only when expanded.
+async function restorePersistentSessionRuns(messages, sessionId, generation) {
+  const userId = state.userId;
+  const isCurrent = () => state.userId === userId && state.sessionId === sessionId
+    && historyPage.generation === generation;
+  const area = document.getElementById('messageArea');
+  const represented = new Set(messages.filter(message => message.runId && message.messageType === 'ASSISTANT')
+    .map(message => String(message.runId)));
+  area.querySelectorAll('[data-message-role="assistant"][data-run-id]').forEach(node => represented.add(node.dataset.runId));
+  const section = document.createElement('section');
+  section.dataset.sessionRunHistory = 'true';
+  section.className = 'border border-gray-700 rounded-xl p-4 space-y-3';
+  const title = document.createElement('h3');
+  title.className = 'text-sm font-semibold text-gray-200';
+  title.textContent = '本会话运行记录';
+  const note = document.createElement('p');
+  note.className = 'text-xs text-gray-400';
+  note.textContent = '当前聊天页未展示的运行记录，按时间由新到旧排列。查看记录不会重新执行任务。';
+  const rows = document.createElement('div');
+  rows.dataset.sessionRunRows = 'true';
+  rows.className = 'space-y-3';
+  const notice = document.createElement('p');
+  notice.className = 'text-xs text-gray-400';
+  const more = document.createElement('button');
+  more.type = 'button';
+  more.className = 'text-sm border border-gray-600 rounded px-3 py-1';
+  section.append(title, note, rows, notice, more);
+  let offset = 0, busy = false, hasMore = true;
+  const seen = new Set();
+  const refreshRepresented = () => {
+    area.querySelectorAll('[data-message-role="assistant"][data-run-id]').forEach(node => {
+      if (!node.closest('[data-session-run-history]')) represented.add(node.dataset.runId);
+    });
+  };
+  const matches = run => run && typeof run.runId === 'string' && run.userId === userId && run.sessionId === sessionId;
+  const mount = () => { if (isCurrent() && !section.isConnected) area.appendChild(section); };
+  const addRun = run => {
+    const card = document.createElement('details');
+    card.dataset.persistedRunId = run.runId;
+    card.className = 'border border-gray-700 rounded-lg p-3';
+    const summary = document.createElement('summary');
+    summary.className = 'cursor-pointer text-sm text-gray-200';
+    const status = document.createElement('strong');
+    status.textContent = runStatusText(run.status);
+    const time = document.createElement('span');
+    time.className = 'ml-3 text-xs text-gray-400';
+    const date = new Date(run.createdAt);
+    time.textContent = Number.isNaN(date.getTime()) ? '' : date.toLocaleString('zh-CN');
+    const question = document.createElement('p');
+    question.className = 'mt-2 whitespace-pre-wrap break-words';
+    question.textContent = run.question || '原始问题未保存';
+    summary.append(status, time, question);
+    if (run.error) {
+      const error = document.createElement('p');
+      error.className = 'mt-2 text-xs text-red-300 whitespace-pre-wrap break-words';
+      error.textContent = run.error;
+      summary.append(error);
+    }
+    const body = document.createElement('div');
+    body.className = 'mt-3 space-y-3';
+    card.append(summary, body);
+    let loaded = false, loading = false;
+    const load = async () => {
+      if (loaded || loading || !isCurrent()) return;
+      loading = true;
+      body.textContent = '正在读取执行过程…';
+      try {
+        const result = await readConversationResponse(await fetch(`/api/v1/history/${encodeURIComponent(run.runId)}`));
+        if (!isCurrent()) return;
+        const detail = result.data;
+        if (!matches(detail) || detail.runId !== run.runId) throw new Error('运行记录归属不匹配，无法展示。');
+        question.textContent = detail.question || run.question || '原始问题未保存';
+        body.replaceChildren();
+        const aiMsg = buildMessageNode('assistant', detail.answer || '', detail.agentId, detail.runId);
+        body.appendChild(aiMsg);
+        restoreTimelineSnapshot(aiMsg, {
+          runId: detail.runId, sessionId, userId, agentId: detail.agentId, agentType: detail.strategy,
+          status: ['RUNNING', 'BLOCKED'].includes(detail.status) ? 'EXPIRED' : detail.status,
+          readOnly: true, lastError: detail.error,
+          timelineEvents: (Array.isArray(detail.events) ? detail.events : []).map(event => ({...event, data: event.payload}))
+        }, detail.answer || '');
+        // Checkpoints may end midway through a step. Historical activity is not a live spinner.
+        aiMsg.querySelectorAll('.step-card.running, .step-card.pending').forEach(step => {
+          step.classList.remove('running', 'pending');
+          step.classList.add('blocked');
+          step.querySelector('.step-status').textContent = '未保存完成状态';
+        });
+        aiMsg.querySelectorAll('.tool-card.running').forEach(tool => {
+          tool.classList.remove('running');
+          const label = tool.querySelector('.tool-status');
+          if (label) label.textContent = '未保存执行结果';
+        });
+        const hint = document.createElement('p');
+        hint.className = 'text-xs text-gray-400';
+        hint.textContent = detail.eventsTruncated
+          ? '执行记录达到保存上限，以下仅展示已保存的部分。'
+          : !(detail.events || []).length ? '未保存详细执行事件；上方显示运行状态和错误。' : '历史记录仅供查看。';
+        body.prepend(hint);
+        const link = document.createElement('a');
+        link.className = 'text-xs text-blue-400';
+        link.href = `/history.html?runId=${encodeURIComponent(detail.runId)}`;
+        link.textContent = '查看完整运行记录';
+        body.appendChild(link);
+        loaded = true;
+      } catch (error) {
+        if (!isCurrent()) return;
+        body.textContent = error.message || '执行过程加载失败';
+        const retry = document.createElement('button');
+        retry.type = 'button';
+        retry.className = 'ml-3 text-blue-400 text-sm';
+        retry.textContent = '重试读取';
+        retry.onclick = load;
+        body.appendChild(retry);
+      } finally { loading = false; }
+    };
+    card.addEventListener('toggle', () => { if (card.open) void load(); });
+    rows.appendChild(card);
+  };
+  const loadPage = async () => {
+    if (busy || !hasMore || !isCurrent()) return;
+    busy = true;
+    more.disabled = true;
+    notice.textContent = '正在读取运行记录…';
+    try {
+      const result = await readConversationResponse(await fetch(`/api/v1/history/session/${encodeURIComponent(sessionId)}?offset=${offset}&limit=50`));
+      if (!isCurrent()) return;
+      if (!Array.isArray(result.data)) throw new Error('运行记录返回异常，请重试。');
+      const page = result.data;
+      refreshRepresented();
+      for (const run of page) {
+        if (!matches(run) || seen.has(run.runId) || represented.has(run.runId)) continue;
+        seen.add(run.runId);
+        addRun(run);
+      }
+      offset += page.length;
+      hasMore = page.length === 50;
+      section.dataset.hasMore = String(hasMore);
+      more.hidden = !hasMore;
+      more.textContent = '加载更早的运行记录';
+      notice.textContent = rows.childElementCount ? '' : hasMore
+        ? '本页运行已在聊天中展示，可继续查看更早记录。' : '该会话暂无已保存的聊天消息或运行记录。';
+      if (rows.childElementCount || hasMore || (!messages.length && !represented.size)) mount();
+    } catch (error) {
+      if (!isCurrent()) return;
+      notice.textContent = '运行记录加载失败：' + (error.message || '请重试');
+      more.hidden = false;
+      more.textContent = '重试读取运行记录';
+      mount();
+    } finally { busy = false; more.disabled = false; }
+  };
+  more.onclick = loadPage;
+  await loadPage();
+}
+
 async function restoreRunTimelines(messages, renderedMessages, sessionId) {
+  const userId = state.userId, generation = historyPage.generation;
+  const isCurrent = () => state.userId === userId && state.sessionId === sessionId
+    && historyPage.generation === generation;
   try {
-    const response = await fetch(`${API}/run-snapshots?sessionId=${encodeURIComponent(sessionId)}&limit=50`);
-    const body = await response.json();
-    const snapshots = Array.isArray(body && body.data) ? body.data : [];
+    let snapshots = [];
+    try {
+      const body = await readConversationResponse(await fetch(`${API}/run-snapshots?sessionId=${encodeURIComponent(sessionId)}&limit=50`));
+      snapshots = Array.isArray(body.data) ? body.data : [];
+    } catch (e) {
+      // Redis is optional for already persisted conversation content and run diagnostics.
+    }
+    if (!isCurrent()) return;
+    snapshots = snapshots.filter(snapshot => snapshot && snapshot.sessionId === sessionId);
     const byRunId = new Map(snapshots.map(snapshot => [String(snapshot.runId), snapshot]));
     const assistantByRunId = new Map();
     const userRunIds = new Set();
@@ -5645,7 +6156,7 @@ async function restoreRunTimelines(messages, renderedMessages, sessionId) {
       if (message.messageType === 'USER') userRunIds.add(String(message.runId));
     });
     const detailRunIds = new Set(
-      [...assistantByRunId.keys()].filter(runId => {
+      [...new Set([...assistantByRunId.keys(), ...userRunIds])].filter(runId => {
         const snapshot = byRunId.get(runId);
         return !snapshot || !Array.isArray(snapshot.timelineEvents) || !snapshot.timelineEvents.length;
       })
@@ -5657,12 +6168,34 @@ async function restoreRunTimelines(messages, renderedMessages, sessionId) {
         const snapshotRes = await fetch(
           `${API}/run-snapshots/${encodeURIComponent(runId)}?sessionId=${encodeURIComponent(sessionId)}`
         );
-        const snapshotBody = await snapshotRes.json();
-        if (snapshotBody && snapshotBody.data) byRunId.set(runId, snapshotBody.data);
+        const snapshotBody = await readConversationResponse(snapshotRes);
+        if (snapshotBody.data && snapshotBody.data.runId === runId && snapshotBody.data.sessionId === sessionId)
+          byRunId.set(runId, snapshotBody.data);
       } catch (e) {
-        // Snapshot 已过期时保留 ChatMemory 的纯文本展示。
+        // Redis expiry or outage must not hide durable diagnostics.
+      }
+      const snapshot = byRunId.get(runId);
+      if (snapshot && Array.isArray(snapshot.timelineEvents) && snapshot.timelineEvents.length) return;
+      try {
+        const history = await readConversationResponse(await fetch(`/api/v1/history/${encodeURIComponent(runId)}`));
+        const run = history.data;
+        if (!run || run.runId !== runId || run.userId !== userId || run.sessionId !== sessionId) return;
+        byRunId.set(runId, {
+          runId, sessionId, userId, agentId: run.agentId, agentType: run.strategy,
+          // Durable checkpoints are read-only; only a live Redis snapshot may attach a stream.
+          status: snapshot && snapshot.status === 'RUNNING' ? 'RUNNING'
+            : ['RUNNING', 'BLOCKED'].includes(run.status) ? 'EXPIRED' : run.status,
+          readOnly: !snapshot || snapshot.status !== 'RUNNING',
+          lastError: run.error, originalMessage: run.question,
+          timelineEvents: (Array.isArray(run.events) ? run.events : []).map(event => ({
+            ...event, data: event.payload
+          }))
+        });
+      } catch (e) {
+        // If neither source is available, keep the authoritative ChatMemory text.
       }
     }));
+    if (!isCurrent()) return;
     for (const [runId, pair] of assistantByRunId.entries()) {
       const snapshot = byRunId.get(runId);
       if (snapshot && Array.isArray(snapshot.timelineEvents) && snapshot.timelineEvents.length) {
@@ -5867,13 +6400,15 @@ function toggleHistory() {
 
 async function loadHistory() {
   if (!state.userId) return;
+  const userId = state.userId;
   const list = document.getElementById('historyList');
   try {
-    const [conversationRes, activeRunRes] = await Promise.all([
-      fetch(`/api/v1/agent/conversations?userId=${encodeURIComponent(state.userId)}`),
-      fetch(`${API}/active-runs?userId=${encodeURIComponent(state.userId)}`)
+    const [data, activeRunData] = await Promise.all([
+      fetch(`/api/v1/agent/conversations?userId=${encodeURIComponent(userId)}`).then(readConversationResponse),
+      fetch(`${API}/active-runs?userId=${encodeURIComponent(userId)}`).then(readConversationResponse)
+        .catch(() => ({data: []}))
     ]);
-    const [data, activeRunData] = await Promise.all([conversationRes.json(), activeRunRes.json()]);
+    if (state.userId !== userId) return;
     const conversations = data.code === '0000' && Array.isArray(data.data) ? data.data : [];
     const activeRuns = activeRunData.code === '0000' && Array.isArray(activeRunData.data)
       ? activeRunData.data
@@ -5925,8 +6460,19 @@ async function loadHistory() {
       </div>`;
     }).join('');
   } catch(e) {
-    list.innerHTML = '<div class="text-xs text-red-400 text-center py-4">加载失败</div>';
+    if (state.userId === userId) list.innerHTML = `<div class="text-xs text-red-400 text-center py-4">${escapeHtml(e.message || '会话列表加载失败')}</div>`;
   }
+}
+
+async function readConversationResponse(response) {
+  if (response.status === 401) throw new Error('登录已失效，请重新登录后查看会话。');
+  if (response.status === 403) throw new Error('无权访问该会话，请确认当前登录账号。');
+  if (response.status >= 500) throw new Error('服务暂时不可用，请稍后重试。');
+  let body;
+  try { body = await response.json(); }
+  catch (error) { throw new Error('会话服务返回异常，请稍后重试。'); }
+  if (!response.ok || !body || body.code !== '0000') throw new Error('会话加载失败，请稍后重试。');
+  return body;
 }
 
 // 删除单个会话历史（带确认；后端 DELETE /conversation 带归属校验）
@@ -6007,7 +6553,7 @@ async function loadConversation(conversationId, options = {}) {
 
   try {
     const res = await fetch(`/api/v1/agent/conversation_messages?conversationId=${encodeURIComponent(conversationId)}&limit=${HISTORY_PAGE_SIZE}`);
-    const data = await res.json();
+    const data = await readConversationResponse(res);
     // 返回时用户已切到别的会话 / 点了新会话 → 丢弃，不要污染当前页面
     if (myGen !== historyPage.generation) return;
     if (data.code !== '0000' || !data.data) {
@@ -6030,8 +6576,17 @@ async function loadConversation(conversationId, options = {}) {
     updateHistoryTopSentinel();
     setupHistoryScrollWatcher();
     await restoreRunTimelines(messages, renderedMessages, state.sessionId);
+    if (myGen !== historyPage.generation) return false;
+    await restorePersistentSessionRuns(messages, targetSessionId, myGen);
+    if (myGen !== historyPage.generation || state.sessionId !== targetSessionId) return false;
   } catch(e) {
-    area.innerHTML = '<div class="text-center text-red-400 py-4">加载失败</div>';
+    if (myGen !== historyPage.generation) return false;
+    area.innerHTML = `<div class="text-center text-red-400 py-4">${escapeHtml(e.message || '会话加载失败，请稍后重试。')}</div>`;
+    const retry = document.createElement('button');
+    retry.className = 'block mx-auto px-3 py-1 text-sm border border-gray-600 rounded';
+    retry.textContent = '重试加载';
+    retry.onclick = () => loadConversation(conversationId, options);
+    area.appendChild(retry);
     return false;
   }
   scrollBottom(true);
@@ -6123,6 +6678,15 @@ async function loadHistoryEarlier() {
     } else {
       area.appendChild(fragment);
     }
+
+    // A previously unloaded ChatMemory answer may now replace a durable-only record.
+    const newlyRepresented = new Set(messages.filter(m => m.messageType === 'ASSISTANT' && m.runId).map(m => String(m.runId)));
+    area.querySelectorAll('[data-session-run-history]').forEach(section => {
+      section.querySelectorAll('[data-persisted-run-id]').forEach(card => {
+        if (newlyRepresented.has(card.dataset.persistedRunId)) card.remove();
+      });
+      if (!section.querySelector('[data-persisted-run-id]') && section.dataset.hasMore === 'false') section.remove();
+    });
 
     // 校正 scrollTop，让用户视觉位置不跳
     const newScrollHeight = area.scrollHeight;

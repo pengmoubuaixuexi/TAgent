@@ -19,6 +19,7 @@ public class FlowPlanReviewState implements Serializable {
     private String sessionId;
 
     private String agentId;
+    private Integer agentVersion;
 
     private String userId;
 
@@ -43,6 +44,9 @@ public class FlowPlanReviewState implements Serializable {
     private List<FlowPlanReviewStep> steps;
 
     private String status;
+
+    /** The initial execution phase has finished cleanup; a review may not resume before this handoff. */
+    private Boolean initialPhaseReleased;
 
     private List<FlowPlanReviewStep> approvedSteps;
 

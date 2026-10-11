@@ -26,6 +26,11 @@ public class AiClientToolMcp {
     /** Set by the server on creation; never transferred through an update DTO. */
     private String ownerUserId;
 
+    /** Public platform source; a clone keeps its own runtime identity, not copied credentials. */
+    private String sourceMcpId;
+
+    private Integer isPublic;
+
     /**
      * MCP ID
      */

@@ -38,7 +38,9 @@ public class AccountController {
         this.workspace=workspace;
     }
     @com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)
-    public record Credentials(String username, String password) {}
+    public record Credentials(String username, String password) {
+        @Override public String toString(){return "Credentials[redacted]";}
+    }
 
     @GetMapping("/csrf") public Map<String, String> csrf(CsrfToken token) {
         return Map.of("headerName", token.getHeaderName(), "token", token.getToken());
@@ -61,6 +63,7 @@ public class AccountController {
         session.setAttribute("username", user.getUsername());
         session.setAttribute("role", user.getRole());
         session.setAttribute("isAdmin", "ADMIN".equals(user.getRole()));
+        session.setAttribute("credentialRevision",AccountService.credentialRevision(user.getPassword()));
         var auth = UsernamePasswordAuthenticationToken.authenticated(user.getUserId(), null,
                 List.of(new SimpleGrantedAuthority("ROLE_" + ("ADMIN".equals(user.getRole()) ? "ADMIN" : "USER"))));
         var context = SecurityContextHolder.createEmptyContext();
@@ -80,6 +83,18 @@ public class AccountController {
         if (authentication.getAuthorities().stream().noneMatch(a -> a.getAuthority().equals("ROLE_ADMIN")))
             throw new ResponseStatusException(HttpStatus.FORBIDDEN);
         response.setStatus(204);
+    }
+    @com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown=true)
+    public record PasswordChange(String currentPassword,String newPassword) {
+        @Override public String toString(){return "PasswordChange[redacted]";}
+    }
+    @PostMapping("/password") public Map<String,Object> password(Authentication auth,@RequestBody PasswordChange input,HttpServletRequest request) {
+        if(auth==null||!auth.isAuthenticated()||"anonymousUser".equals(auth.getPrincipal()))throw new ResponseStatusException(HttpStatus.UNAUTHORIZED,"请先登录");
+        throttle("password:"+auth.getName(),8);
+        accounts.changePassword(auth.getName(),input.currentPassword(),input.newPassword());
+        if(request.getSession(false)!=null)request.getSession(false).invalidate();
+        SecurityContextHolder.clearContext();
+        return Map.of("code","0000","info","密码已修改，请重新登录。其他登录会话将在下次请求时失效。","data",Map.of());
     }
     private void throttle(String key, int limit) {
         if (attempts.get(key, k -> new AtomicInteger()).incrementAndGet() > limit)

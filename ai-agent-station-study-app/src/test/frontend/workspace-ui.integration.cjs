@@ -6,7 +6,8 @@ const roles={fixed:['DEFAULT'],auto:['TASK_ANALYZER_CLIENT','PRECISION_EXECUTOR_
 const names={fixed:['回答'],auto:['分析','执行','质检','总结'],flow:['工具分析','步骤规划','任务执行']};
 const nodes=mode=>roles[mode].map((role,i)=>({nodeId:'node_'+i,role,name:names[mode][i],modelId:'m1',systemPrompt:'独立节点指令 '+names[mode][i],taskPrompt:'',outputRequirement:'',mcpBindings:[],advisors:[],usePublicTools:['DEFAULT','PRECISION_EXECUTOR_CLIENT','EXECUTOR_CLIENT'].includes(role)}));
 let role='USER',conflict=false,discoverFailure=false,acceptDialog=true,hosts=['mcp.example.test'],agents=[],mcps=[],requests=[];
-const options=()=>({models:[{modelId:'m1',modelName:'平台通用模型'},{modelId:'m2',modelName:'平台推理模型'}],templates:Object.keys(roles).map(strategy=>({id:strategy,strategy,name:strategy,nodes:nodes(strategy)})),advisors:[{type:'LongTermMemory',name:'长期记忆',description:'本人的长期偏好'},{type:'ChatMemory',name:'会话记忆',description:'当前会话上下文'},{type:'RagAnswer',name:'知识库检索',description:'本人的知识库'}],knowledge:[{knowledgeTag:'mine',name:'我的论文'}],mcpAllowedHosts:hosts});
+const savedDrafts=new Map(),versions=new Map();
+const options=()=>({models:[{modelId:'m1',modelName:'平台通用模型'},{modelId:'m2',modelName:'个人推理模型',providerSource:'USER_BYOK'}],templates:Object.keys(roles).map(strategy=>({id:strategy,strategy,name:strategy,nodes:nodes(strategy)})),advisors:[{type:'LongTermMemory',name:'长期记忆',description:'本人的长期偏好'},{type:'ChatMemory',name:'会话记忆',description:'当前会话上下文'},{type:'RagAnswer',name:'知识库检索',description:'本人的知识库'}],knowledge:[{knowledgeTag:'mine',name:'我的论文'}],mcpAllowedHosts:hosts});
 const server=http.createServer((req,res)=>{let input='';req.on('data',d=>input+=d);req.on('end',()=>{
  const url=new URL(req.url,'http://localhost'),route=url.pathname,body=input?JSON.parse(input):undefined;
  requests.push({method:req.method,path:route,search:url.search,body,csrf:req.headers['x-csrf-token']});
@@ -18,6 +19,20 @@ const server=http.createServer((req,res)=>{let input='';req.on('data',d=>input+=
  if(route.endsWith('/workspace/draft'))return send({schemaVersion:2,name:'生成的研究助手',description:'草稿',strategy:body.strategy,status:1,nodes:nodes(body.strategy).map(n=>({...n,systemPrompt:'生成 '+n.name,taskPrompt:n.role==='EXECUTOR_CLIENT'?'生成任务要求':''}))});
  if(route.endsWith('/use'))return send({agentId:'fork1'});
  if(route.endsWith('/workspace/agents')){if(req.method==='GET')return send(agents);const a={...body,agentId:'a'+(agents.length+1),version:1,editable:true};agents.push(a);return send(a);}
+ const versionRoute=route.match(/\/workspace\/agents\/([^/]+)\/(draft|publish|versions(?:\/.*)?|nodes\/[^/]+\/debug)$/);
+ if(versionRoute){const id=versionRoute[1],operation=versionRoute[2],a=agents.find(a=>a.agentId===id);
+  if(!versions.has(id))versions.set(id,[structuredClone(a)]);
+  if(operation==='draft'){
+   if(req.method==='GET')return send(savedDrafts.get(id)||{config:a,baseVersion:a.version,revision:0});
+   if(conflict)return send(null,409);
+   const draft={config:body,baseVersion:a.version,revision:(savedDrafts.get(id)?.revision||0)+1};savedDrafts.set(id,draft);return send(draft);
+  }
+  if(operation==='publish'){if(conflict)return send(null,409);Object.assign(a,savedDrafts.get(id).config,{version:a.version+1});savedDrafts.delete(id);versions.get(id).push(structuredClone(a));return send(a);}
+  if(operation==='versions')return send(versions.get(id).map(v=>({version:v.version,note:'配置快照',createdAt:'2026-10-09'})));
+  if(operation==='versions/compare')return send([{path:'/name',before:versions.get(id)[0].name,after:a.name}]);
+  if(operation.endsWith('/restore')){const selected=versions.get(id).find(v=>v.version===Number(operation.split('/')[1]));const draft={config:selected,baseVersion:a.version,revision:(savedDrafts.get(id)?.revision||0)+1};savedDrafts.set(id,draft);return send(draft);}
+  if(operation.endsWith('/debug'))return send({status:'COMPLETED',elapsedMs:12,output:'调试输出 <img src=x onerror=window.debugXss=1>',systemPrompt:'实际指令',userPrompt:body.input,sources:[{title:'测试论文'}],tools:[],usage:{modelCalls:1,confirmedTokens:20}});
+ }
  if(route.includes('/workspace/agents/')){const id=route.split('/').pop(),a=agents.find(a=>a.agentId===id);if(req.method==='PUT'){if(conflict)return send(null,409);Object.assign(a,body,{version:a.version+1});}if(req.method==='DELETE'){agents=agents.filter(a=>a.agentId!==id);return send({});}return send(a);}
  if(route.endsWith('/discover'))return discoverFailure?send(null,502):send(route.includes('/public-search/')?[{name:'web-search',description:'平台联网搜索'}]:[{name:'search_docs',description:'检索资料 <img src=x onerror=alert(1)>'},{name:'delete_docs',description:'删除资料'}]);
  if(route.endsWith('/tools'))return send([]);
@@ -42,7 +57,7 @@ const server=http.createServer((req,res)=>{let input='';req.on('data',d=>input+=
   for(let i=0;i<4;i++){await click(`[data-node="${i}"]`);await page.fill('#node-prompt','各自指令 '+i);}
   await click('[data-node="0"]');await click('[data-tab="advisors"]');await page.check('[data-advisor="LongTermMemory"]');
   await click('[data-node="1"]');assert.equal(await page.isChecked('[data-advisor="LongTermMemory"]'),false);
-  await page.check('[data-advisor="RagAnswer"]');await page.selectOption('[data-param="knowledgeTag"]','mine');await page.selectOption('#node-model','m2');
+  await page.check('[data-advisor="RagAnswer"]');await page.selectOption('[data-param="knowledgeTag"]','mine');await page.selectOption('#node-model','m2');assert((await page.textContent('#node-model-hint')).includes('个人模型连接'));assert((await page.textContent('#node-model')).includes('个人连接'));
   await click('[data-tab="tools"]');await click('#inline-add-mcp');
   await page.fill('#mcp-name','私人资料');await page.fill('#mcp-url','https://mcp.example.test/mcp');await page.fill('#mcp-token','PRIVATE_FIXTURE_TOKEN');await click('#save-mcp');
   await page.waitForFunction(()=>document.getElementById('mcp-result').textContent.includes('连接已保存'));await ready();
@@ -66,6 +81,19 @@ const server=http.createServer((req,res)=>{let input='';req.on('data',d=>input+=
   await click('[data-node="1"]');await click('[data-tab="prompt"]');await page.screenshot({path:path.join(screenshots,'auto.png'),fullPage:true});
   await page.selectOption('#agent-select','');await page.selectOption('#agent-select','a1');await ready();
   await click('[data-node="1"]');assert.equal(await page.inputValue('#node-prompt'),'各自指令 1');assert.equal(await page.inputValue('#node-model'),'m2');
+  await page.fill('#agent-name','草稿改名');await click('#save-agent');await ready();
+  assert.equal(agents[0].name,'资料研究助手','saving a draft must not change active config');
+  assert.equal(await page.isEnabled('#publish-agent'),true);assert((await page.textContent('#save-state')).includes('草稿已保存'));
+  await page.fill('#debug-input','测试输入');await page.fill('#debug-upstream','上游示例');await click('#run-debug');await ready();
+  assert.equal(requests.filter(r=>r.path.endsWith('/debug')).at(-1).body.allowReadOnlyTools,false);
+  assert.equal(requests.filter(r=>r.path.endsWith('/debug')).at(-1).body.version,1,'debug must use active version');
+  assert.equal(await page.locator('#debug-result img').count(),0);assert.equal(await page.evaluate(()=>window.debugXss),undefined);
+  await page.locator('#node-debug').screenshot({path:path.join(screenshots,'node-debug.png')});
+  await click('#publish-agent');await ready();assert.equal(agents[0].name,'草稿改名');assert.equal(agents[0].version,2);
+  await click('#show-versions');await ready();await click('[data-view-version="1"]');await ready();assert((await page.textContent('#version-detail')).includes('资料研究助手'));
+  await click('[data-restore-version="1"]');await ready();assert.equal(agents[0].name,'草稿改名','restore must remain draft');assert.equal(await page.inputValue('#agent-name'),'资料研究助手');
+  assert.equal(await page.isEnabled('#publish-agent'),true);
+  await click('[data-node="1"]');
   conflict=true;await page.fill('#agent-name','冲突时保留');await click('#save-agent');await page.waitForFunction(()=>document.getElementById('notice').textContent.includes('当前输入已保留'));await ready();assert.equal(await page.inputValue('#agent-name'),'冲突时保留');conflict=false;
   await page.fill('#draft-requirement','帮我建立一个资料研究助手');await click('#generate-draft');await page.waitForSelector('[data-draft-action="apply"]');await ready();
   assert.equal(await page.inputValue('#agent-name'),'冲突时保留');assert.equal(await page.inputValue('#node-prompt'),'各自指令 1');
@@ -85,7 +113,7 @@ const server=http.createServer((req,res)=>{let input='';req.on('data',d=>input+=
   await click('#configure-flow-executor');await page.check('#node-public-tools');await click('[data-node="1"]');
   assert.equal(await page.textContent('[data-inherited-pool]'),'已开启');assert((await page.textContent('[data-inherited-empty]')).includes('仅允许从公共工具池'));
   await click('#configure-flow-executor');await click('[data-bind-mcp="c1"]');await click('[data-node="1"]');
-  assert.equal(await page.locator('[data-inherited-binding]').count(),1);assert((await page.textContent('.ta-inherited-draft')).includes('未保存'));
+  assert.equal(await page.locator('[data-inherited-binding]').count(),1);assert((await page.textContent('.ta-inherited-draft')).includes('启用草稿'));
   assert.equal(requests.filter(r=>r.path.includes('/workspace/agents')&&['POST','PUT'].includes(r.method)).length,writesBeforeInheritance,'inherited view must use unsaved editor state without persisting it');
   await page.screenshot({path:path.join(screenshots,'flow-inherited-mcp.png'),fullPage:true});
   for(const width of [736,390,320]){await page.setViewportSize({width,height:950});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'inherited panel overflow at '+width);}
@@ -147,12 +175,12 @@ const server=http.createServer((req,res)=>{let input='';req.on('data',d=>input+=
   assert((await page.textContent('.ta-legacy-binding')).includes('web-search'));
   acceptDialog=false;await click('[data-convert-binding="public-search"]');acceptDialog=true;
   await click('#save-agent');await ready();
-  assert.deepEqual(requests.filter(r=>r.method==='PUT'&&r.path.endsWith('/agents/legacy')).at(-1).body.nodes[0].mcpBindings,[oldBinding],'save must preserve fine-grained restrictions without conversion');
+  assert.deepEqual(requests.filter(r=>r.method==='PUT'&&r.path.endsWith('/agents/legacy/draft')).at(-1).body.nodes[0].mcpBindings,[oldBinding],'save must preserve fine-grained restrictions without conversion');
   await page.screenshot({path:path.join(screenshots,'legacy-restrictions.png'),fullPage:true});
   await click('[data-convert-binding="public-search"]');assert.equal(await page.locator('.ta-legacy-binding').count(),0);await click('#save-agent');await ready();
-  assert.deepEqual(requests.filter(r=>r.method==='PUT'&&r.path.endsWith('/agents/legacy')).at(-1).body.nodes[0].mcpBindings,[{mcpId:'public-search',allTools:true,toolNames:[],loadMode:'ON_DEMAND'}]);
+  assert.deepEqual(requests.filter(r=>r.method==='PUT'&&r.path.endsWith('/agents/legacy/draft')).at(-1).body.nodes[0].mcpBindings,[{mcpId:'public-search',allTools:true,toolNames:[],loadMode:'ON_DEMAND'}]);
   await page.selectOption('#agent-select','legacy-all');await ready();await click('#save-agent');await ready();
-  assert.deepEqual(requests.filter(r=>r.method==='PUT'&&r.path.endsWith('/agents/legacy-all')).at(-1).body.nodes[0].mcpBindings,[{mcpId:'public-search',allTools:true,toolNames:[],loadMode:'ON_DEMAND'}]);
+  assert.deepEqual(requests.filter(r=>r.method==='PUT'&&r.path.endsWith('/agents/legacy-all/draft')).at(-1).body.nodes[0].mcpBindings,[{mcpId:'public-search',allTools:true,toolNames:[],loadMode:'ON_DEMAND'}]);
   mcps.push({mcpId:'private-internal-mcp-id',name:'停用资料 <img src=x onerror=window.fixtureXss=1>',usable:false,status:0,editable:false});
   const inheritedLegacy=nodes('flow');inheritedLegacy[2].name='执行器 <svg onload=window.fixtureXss=1>';
   inheritedLegacy[2].mcpBindings=[structuredClone(oldBinding),{mcpId:'private-internal-mcp-id',allTools:true,toolNames:[]},{mcpId:'missing-internal-mcp-id',allTools:true,toolNames:[]}];

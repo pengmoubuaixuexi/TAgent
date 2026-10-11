@@ -56,6 +56,10 @@ public class Step1AnalyzerNode extends AbstractExecuteSupport {
 
         // 第一阶段：任务分析
         log.info("\n📊 阶段1: 任务状态分析");
+        AiAgentClientFlowConfigVO executorConfig = dynamicContext.getAiAgentClientFlowConfigVOMap()
+                .get(AiClientTypeEnumVO.PRECISION_EXECUTOR_CLIENT.getCode());
+        String executorClientId = executorConfig == null ? aiAgentClientFlowConfigVO.getClientId() : executorConfig.getClientId();
+        final String executorCapabilities = renderExecutorCapabilitiesForAnalysis(requestParameter, executorClientId);
         // 引导感知：本步 prompt 包成 Supplier，每轮按最新 currentTask(%5) 重建（引导后 currentTask 已折入引导）
         final AiAgentClientFlowConfigVO step1Config = aiAgentClientFlowConfigVO;
         java.util.function.Supplier<String> analysisPromptSupplier = () -> appendCurrentTimeContext(String.format(step1Config.getStepPrompt(),
@@ -64,7 +68,7 @@ public class Step1AnalyzerNode extends AbstractExecuteSupport {
                 dynamicContext.getMaxStep(),
                 !dynamicContext.getExecutionHistory().isEmpty() ? dynamicContext.getExecutionHistory().toString() : "[首次执行]",
                 dynamicContext.getCurrentTask()
-        ) + metaToolPromptHint(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.AUTO_STEP1_ANALYSIS,
+        ) + executorCapabilities + metaToolPromptHint(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.AUTO_STEP1_ANALYSIS,
                 requestParameter.getSessionId()))
                 // P0-B2a：shadow 契约尾注置于全文最末（晚于时间块），旧 parser 看不见
                 + SHADOW_COMPLETION_TRAILER_HINT;

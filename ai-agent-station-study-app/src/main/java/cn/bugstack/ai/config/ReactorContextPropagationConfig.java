@@ -9,7 +9,7 @@ import org.springframework.context.annotation.Configuration;
 import reactor.core.publisher.Hooks;
 
 /**
- * G1-C 终极修复：让 MDC 业务字段（sessionId/userId/tenantId）自动传播到 Reactor 流式线程。
+ * 将 MDC 中的业务身份和运行预算标识自动传播到 Reactor 流式线程。
  * <p>
  * <b>问题</b>：Agent 走 {@code spec.stream()} 时，工具调用 / advisor 实际执行在 Reactor 调度线程
  * （{@code boundedElastic-*}）上，MDC 是 ThreadLocal 不会自动跟过去 →
@@ -28,13 +28,20 @@ import reactor.core.publisher.Hooks;
  * <p>
  * 与 {@link ThreadPoolConfig} / {@link DagExecutorConfig} 的 {@code ContextSnapshot.wrap} 互补：
  * 那两个管自建线程池的接力，这个管 Reactor 调度线程的接力。
+ * 辅助模型（记忆向量、RAG 路由和重排）也必须沿用原 runId；只传 userId 会导致
+ * Advisor 在新线程中找不到预算，被模型请求账本拒绝。
  */
 @Slf4j
 @Configuration
 public class ReactorContextPropagationConfig {
 
     /** 需要跨 Reactor 线程传播的 MDC 业务键。traceId/spanId 已由 micrometer-tracing 处理，不重复注册。 */
-    private static final String[] PROPAGATED_MDC_KEYS = {"sessionId", "userId", "tenantId"};
+    // Auxiliary calls inside BaseAdvisor.before() run on Reactor workers too. They use MDC to
+    // find the existing run budget (embedding/router/rerank), not the main model's ToolContext.
+    // Propagate only server-owned identifiers; never reconstruct a budget from prompt/context text.
+    private static final String[] PROPAGATED_MDC_KEYS = {
+            "sessionId", "userId", "tenantId", "runId", "agent.run_id", "modelPurpose"
+    };
 
     @PostConstruct
     public void enableMdcContextPropagation() {

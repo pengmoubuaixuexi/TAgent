@@ -148,6 +148,25 @@ public class RobustToolCallingManager implements ToolCallingManager {
         this.toolCallProgressEmitter = e;
     }
 
+    private volatile ToolResultReferenceService toolResultReferenceService;
+    private volatile RunArtifactService runArtifactService;
+
+    public void setRunArtifactService(RunArtifactService service) { this.runArtifactService = service; }
+
+    public void setToolResultReferenceService(ToolResultReferenceService service) {
+        this.toolResultReferenceService = service;
+    }
+
+    private static final ToolDefinition INSPECT_RESULT_DEFINITION = ToolDefinition.builder()
+            .name(ToolResultReferenceService.TOOL_NAME)
+            .description("读取本次运行中工具返回的 resultRef 原始结果，不重复执行原工具。可按 JSON Pointer 选取字段，"
+                    + "再用 offset/limit 按字符分页；只读取确实需要的部分。空 jsonPointer 读取原文。")
+            .inputSchema("{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{"
+                    + "\"resultRef\":{\"type\":\"string\"},\"jsonPointer\":{\"type\":\"string\"},"
+                    + "\"offset\":{\"type\":\"integer\",\"minimum\":0},"
+                    + "\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":4000}},\"required\":[\"resultRef\"]}")
+            .build();
+
     /** request_tool 工具保留名（大小写不敏感匹配）。 */
     public static final String REQUEST_TOOL_TOOL_NAME = "request_tool";
 
@@ -162,6 +181,7 @@ public class RobustToolCallingManager implements ToolCallingManager {
                     + "每条用一句话描述（如「读取本地文件内容」「查询股票实时价格」「发送邮件」）。"
                     + "如果一次需要多个能力，请一次性在 needs 里把它们全部列出，不要逐个反复调用。"
                     + "系统会按每条描述分别语义匹配、一并为你装载真实工具；装载成功后你可在后续直接调用被装载的工具完成任务。"
+                    + "仅整理现有回答、排版 Markdown 不需要装配工具；保存文档、表格或代码文件请直接使用已提供的 create_artifact。"
                     + "禁止凭空编造工具名；同一能力不要重复 request。")
             .inputSchema("{\"type\":\"object\",\"properties\":{"
                     + "\"needs\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
@@ -221,6 +241,14 @@ public class RobustToolCallingManager implements ToolCallingManager {
         List<ToolDefinition> base = policy.allows(ToolCapability.BUSINESS_TOOL)
                 ? new ArrayList<>(delegate.resolveToolDefinitions(options))
                 : new ArrayList<>();
+        // Reserved platform name cannot be shadowed by a remote callback.
+        base.removeIf(definition -> isReservedMetaToolName(definition.name()));
+        if (policy.allows(ToolCapability.CREATE_ARTIFACT) && runArtifactService != null && !artifactRecoveryBlocked(options)) {
+            base.add(runArtifactService.definition());
+        }
+        if (policy.allows(ToolCapability.BUSINESS_TOOL) && toolResultReferenceService != null) {
+            base.add(INSPECT_RESULT_DEFINITION);
+        }
         // policy ceiling 与运行期 availability 取交集；NONE/BUSINESS_ONLY 不得再泄出元工具。
         if (policy.allows(ToolCapability.ASK_USER) && askUserAvailable(options)) {
             base.add(ASK_USER_DEFINITION);
@@ -342,39 +370,48 @@ public class RobustToolCallingManager implements ToolCallingManager {
 
         // definitions 是第一道门；这里是第二道门，防模型幻觉/旧上下文直接发起未授权调用。
         ToolCapabilityProfile policy = isForceNoTools(prompt) ? ToolCapabilityProfile.NONE : effectivePolicy(prompt);
-        Set<String> denied = findPolicyDeniedToolNames(chatResponse, policy);
+        if (prompt.getOptions() instanceof ToolCallingChatOptions options) restrictNodeOptions(options);
+        // Derive aliases only after narrowing to this node's actual callbacks. Catalog original
+        // names and SDK model names identify the same callback, not a permission to load others.
+        Map<String, String> caseMap = buildLowerToOriginalNameMap(prompt);
+        ChatResponse normalized = normalizeToolCallNames(chatResponse, caseMap);
+        if (artifactRecoveryBlocked(prompt.getOptions() instanceof ToolCallingChatOptions o ? o : null)
+                && hasToolCall(normalized, this::isCreateArtifactName)
+                && normalized.getResults().stream().allMatch(g -> g.getOutput() == null
+                    || g.getOutput().getToolCalls().stream().allMatch(c -> isCreateArtifactName(c.name())))) {
+            return artifactUnavailableResult(prompt, normalized);
+        }
+        ToolExecutionResult invalidArguments = rejectMalformedArguments(prompt, normalized);
+        if (invalidArguments != null) return invalidArguments;
+        Set<String> denied = findPolicyDeniedToolNames(normalized, policy);
         if (workspaceNodePolicy!=null) {
-            if (prompt.getOptions() instanceof ToolCallingChatOptions options) restrictNodeOptions(options);
-            var names=buildLowerToOriginalNameMap(prompt);
-            for (var generation:chatResponse.getResults()) {
+            for (var generation:normalized.getResults()) {
                 if (generation.getOutput()==null || !generation.getOutput().hasToolCalls()) continue;
                 for (var call:generation.getOutput().getToolCalls()) {
-                    if (!isAskUserName(call.name()) && !isRequestToolName(call.name())
-                            && !names.containsKey(call.name().toLowerCase(java.util.Locale.ROOT))) denied.add(call.name());
+                    if (!isReservedMetaToolName(call.name())
+                            && !caseMap.containsKey(call.name().toLowerCase(java.util.Locale.ROOT))) denied.add(call.name());
                 }
             }
         }
         if (!denied.isEmpty()) {
             log.warn("[ToolPolicy] denied tool calls at execution stage: {}", denied);
-            return buildPolicyDeniedResult(prompt, chatResponse, denied);
+            return buildPolicyDeniedResult(prompt, normalized, denied);
         }
 
         // ask_user / request_tool 都不是注册 callback（不在 toolCallbacks 里）→ 必须在 caseMap / unknown-tool 检查之前
         // 由本 manager 自己消化，否则会被 findUnknownToolNames 当成幻觉工具误杀。
-        boolean askUserActive = userInputGate != null && userInputGate.isEnabled() && hasAskUserCall(chatResponse);
-        boolean requestToolActive = requestToolAvailable() && hasRequestToolCall(chatResponse);
-        if (askUserActive || requestToolActive) {
-            return handleMetaToolCalls(prompt, chatResponse);
+        boolean askUserActive = userInputGate != null && userInputGate.isEnabled() && hasAskUserCall(normalized);
+        boolean requestToolActive = requestToolAvailable() && hasRequestToolCall(normalized);
+        if (askUserActive || requestToolActive || hasToolCall(normalized, this::isInspectResultName)
+                || hasToolCall(normalized, this::isCreateArtifactName)) {
+            return handleMetaToolCalls(prompt, normalized);
         }
 
         // 拿 prompt 自带的真实工具名（注入到 ChatClient.defaultToolCallbacks 的那一组）
-        Map<String, String> caseMap = buildLowerToOriginalNameMap(prompt);
-        if (caseMap.isEmpty()) {
-            return executeDelegate(prompt, chatResponse);
+        if (caseMap.isEmpty() && (!(prompt.getOptions() instanceof ToolCallingChatOptions options)
+                || options.getToolCallbacks() == null || options.getToolCallbacks().isEmpty())) {
+            return executeDelegate(prompt, normalized);
         }
-
-        // 重建 ChatResponse，把 ToolCall.name 按 case-insensitive 校正
-        ChatResponse normalized = normalizeToolCallNames(chatResponse, caseMap);
 
         // 校正后再次检查：是否还有找不到的工具名（拼写错误 / 幻觉工具）
         Set<String> unknownNames = findUnknownToolNames(normalized, caseMap);
@@ -418,6 +455,7 @@ public class RobustToolCallingManager implements ToolCallingManager {
             for (AssistantMessage.ToolCall tc : gen.getOutput().getToolCalls()) {
                 ToolCapability needed = isAskUserName(tc.name()) ? ToolCapability.ASK_USER
                         : isRequestToolName(tc.name()) ? ToolCapability.REQUEST_TOOL
+                        : isCreateArtifactName(tc.name()) ? ToolCapability.CREATE_ARTIFACT
                         : ToolCapability.BUSINESS_TOOL;
                 if (!policy.allows(needed)) denied.add(tc.name());
             }
@@ -466,7 +504,7 @@ public class RobustToolCallingManager implements ToolCallingManager {
     /** 该批响应是否「全是元工具(ask_user / request_tool)」——纯元工具轮不计工具预算。 */
     private boolean isMetaToolOnlyResponses(List<ToolResponseMessage.ToolResponse> responses) {
         for (ToolResponseMessage.ToolResponse r : responses) {
-            if (!isAskUserName(r.name()) && !isRequestToolName(r.name())) return false;
+            if (!isAskUserName(r.name()) && !isRequestToolName(r.name()) && !isInspectResultName(r.name())) return false;
         }
         return true;
     }
@@ -477,6 +515,10 @@ public class RobustToolCallingManager implements ToolCallingManager {
 
     private boolean isRequestToolName(String name) {
         return name != null && REQUEST_TOOL_TOOL_NAME.equalsIgnoreCase(name);
+    }
+
+    private boolean isInspectResultName(String name) {
+        return name != null && ToolResultReferenceService.TOOL_NAME.equalsIgnoreCase(name);
     }
 
     private boolean hasAskUserCall(ChatResponse chatResponse) {
@@ -540,12 +582,36 @@ public class RobustToolCallingManager implements ToolCallingManager {
         String stepLabel = currentStepLabel(prompt);
 
         List<ToolResponseMessage.ToolResponse> responses = new ArrayList<>(calls.size());
+        boolean artifactFailed = false, artifactSucceeded = false;
         for (AssistantMessage.ToolCall tc : calls) {
             StreamingActivityTracker.checkActive(activityFor(prompt));
             if (askUserActive && isAskUserName(tc.name())) {
                 responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(), runAskUser(prompt, sessionId, tc, stepLabel)));
             } else if (requestToolActive && isRequestToolName(tc.name())) {
                 responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(), runRequestTool(prompt, tc, sessionId, stepLabel)));
+            } else if (isInspectResultName(tc.name())) {
+                Map<String, Object> scope = prompt.getOptions() instanceof ToolCallingChatOptions options
+                        && options.getToolContext() != null ? options.getToolContext() : Map.of();
+                RunBudgetRegistry.State budget = RunBudgetRegistry.find(scope);
+                if (budget != null) budget.checkActive();
+                String result = toolResultReferenceService == null
+                        ? "{\"ok\":false,\"error\":\"RESULT_NOT_AVAILABLE\",\"message\":\"结果读取未启用\"}"
+                        : toolResultReferenceService.inspect(tc.arguments(), scope);
+                responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(), result));
+            } else if (isCreateArtifactName(tc.name())) {
+                Map<String, Object> scope = prompt.getOptions() instanceof ToolCallingChatOptions options
+                        && options.getToolContext() != null ? options.getToolContext() : Map.of();
+                boolean blocked = artifactRecoveryBlocked(prompt.getOptions() instanceof ToolCallingChatOptions o ? o : null);
+                if (!blocked) artifactProgress(prompt, "saving", "正在保存产物", 0);
+                String result = blocked ? artifactError("ARTIFACT_RECOVERY_EXHAUSTED", artifactFallbackMessage(), false, null)
+                        : runArtifactService == null
+                        ? "{\"ok\":false,\"message\":\"当前运行不能保存产物，请直接提供正文，不要声称已生成下载文件\"}"
+                        : runArtifactService.create(tc.id(), tc.arguments(), scope);
+                try {
+                    if (ASK_USER_JSON.readTree(result).path("ok").asBoolean(false)) artifactSucceeded = true;
+                    else artifactFailed = true;
+                } catch (Exception invalidResult) { artifactFailed = true; }
+                responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(), result));
             } else if (!realNames.contains(tc.name())) {
                 log.warn("[RobustToolMgr] unknown tool '{}' in meta-tool batch", tc.name());
                 if (metrics != null) metrics.recordUnknownToolName(tc.name());
@@ -563,6 +629,32 @@ public class RobustToolCallingManager implements ToolCallingManager {
                                     + "。请不要重复同样的无效调用，可基于已有信息回答。"));
                 }
             }
+        }
+
+        if (artifactFailed) {
+            boolean retryable = recordArtifactFailure(prompt);
+            List<ToolResponseMessage.ToolResponse> updated = new ArrayList<>();
+            for (var result : responses) {
+                if (isCreateArtifactName(result.name())) {
+                    try {
+                        var body = ASK_USER_JSON.readTree(result.responseData());
+                        if (body.isObject() && !body.path("ok").asBoolean(false)) {
+                            var error = (com.fasterxml.jackson.databind.node.ObjectNode) body;
+                            error.put("retryable", retryable);
+                            error.put("nextAction", retryable ? "按字段错误修正参数后再调用一次；不要改变正文事实。" : artifactFallbackMessage());
+                            updated.add(new ToolResponseMessage.ToolResponse(result.id(), result.name(), error.toString()));
+                            continue;
+                        }
+                    } catch (Exception ignored) { }
+                }
+                updated.add(result);
+            }
+            responses = updated;
+        } else if (artifactSucceeded) {
+            var state = ArtifactToolRecovery.find(prompt.getOptions() instanceof ToolCallingChatOptions o ? o : null);
+            if (state != null) state.succeeded();
+            var activity = activityFor(prompt);
+            if (activity != null) activity.clearArtifactPhase();
         }
 
         List<Message> conversationHistory = new ArrayList<>(prompt.getInstructions());
@@ -585,6 +677,13 @@ public class RobustToolCallingManager implements ToolCallingManager {
      * 返回给模型的文本按 profile 区分“当前可直接调用”与“仅供后续执行阶段”。
      */
     private String runRequestTool(Prompt prompt, AssistantMessage.ToolCall tc, String sessionId, String stepLabel) {
+        StreamingActivityTracker.Activity activity = activityFor(prompt);
+        try (StreamingActivityTracker.Scope ignored = activity == null ? () -> {} : activity.executingTool(REQUEST_TOOL_TOOL_NAME)) {
+            return runActiveRequestTool(prompt, tc, sessionId, stepLabel);
+        }
+    }
+
+    private String runActiveRequestTool(Prompt prompt, AssistantMessage.ToolCall tc, String sessionId, String stepLabel) {
         String needs = parseRequestToolNeeds(tc.arguments());
         // 观察卡片：开始（展示模型所列的能力描述 needs，让"装载工具"不再静默）
         ToolCallProgressEmitter p = this.toolCallProgressEmitter;
@@ -605,6 +704,8 @@ public class RobustToolCallingManager implements ToolCallingManager {
         List<ToolCallback> resolved;
         String priorUser = org.slf4j.MDC.get("userId");
         String priorAgent = org.slf4j.MDC.get("agentId");
+        String priorRun = org.slf4j.MDC.get("runId");
+        String priorAgentRun = org.slf4j.MDC.get("agent.run_id");
         try {
             if (prompt.getOptions() instanceof ToolCallingChatOptions scopedOptions
                     && scopedOptions.getToolContext() != null) {
@@ -612,6 +713,18 @@ public class RobustToolCallingManager implements ToolCallingManager {
                 if (owner != null && !owner.toString().isBlank()) org.slf4j.MDC.put("userId", owner.toString());
                 Object agent = scopedOptions.getToolContext().get("agentId");
                 if (agent != null && !agent.toString().isBlank()) org.slf4j.MDC.put("agentId", agent.toString());
+                // Embedding uses a synchronous HTTP interceptor, so explicitly bridge the
+                // trusted per-run ToolContext over the Reactor hop. Never mint another budget.
+                RunBudgetRegistry.State activeBudget = RunBudgetRegistry.find(scopedOptions.getToolContext());
+                if (activeBudget != null) {
+                    activeBudget.checkActive();
+                    org.slf4j.MDC.put("runId", activeBudget.runId());
+                    org.slf4j.MDC.put("agent.run_id", activeBudget.runId());
+                } else {
+                    // An unknown explicit run must not borrow a worker thread's previous run.
+                    org.slf4j.MDC.remove("runId");
+                    org.slf4j.MDC.remove("agent.run_id");
+                }
             }
             // needs 多条换行连接；resolveDynamicToolCallbacks 内部 splitNeeds 拆开、各取 top-k 再并集。
             // currentTools 传空：去重在 injectIntoOptions 按工具名统一做；clientId/query 仅供匹配器日志。
@@ -628,10 +741,18 @@ public class RobustToolCallingManager implements ToolCallingManager {
             else org.slf4j.MDC.put("userId", priorUser);
             if (priorAgent == null) org.slf4j.MDC.remove("agentId");
             else org.slf4j.MDC.put("agentId", priorAgent);
+            if (priorRun == null) org.slf4j.MDC.remove("runId");
+            else org.slf4j.MDC.put("runId", priorRun);
+            if (priorAgentRun == null) org.slf4j.MDC.remove("agent.run_id");
+            else org.slf4j.MDC.put("agent.run_id", priorAgentRun);
         }
+        StreamingActivityTracker.checkActive(activityFor(prompt));
         if (resolved == null || resolved.isEmpty()) {
             return requestToolEnd(sessionId, stepLabel, "error", "未匹配到「" + needs.replace("\n", " / ") + "」对应的工具",
-                    "没有匹配到「" + needs.replace("\n", " / ") + "」对应的可用工具。请基于现有工具完成任务，或换一种更具体的能力描述再试一次。");
+                    "没有匹配到「" + needs.replace("\n", " / ") + "」对应的可用 MCP 工具，未装载任何工具。"
+                            + "request_tool 只搜索 MCP 目录，不负责装载询问用户或生成产物等内置能力。"
+                            + "请先检查当前阶段已提供的工具；若已有 ask_user、create_artifact 或表格产物工具，应按其定义直接使用。"
+                            + "当前阶段未提供的能力不能调用，可留给后续执行阶段；仍无可用能力时明确说明限制，不要用无关工具替代。");
         }
         ToolCapabilityProfile policy = effectivePolicy(prompt);
         boolean businessAllowedNow = policy.allows(ToolCapability.BUSINESS_TOOL);
@@ -700,29 +821,33 @@ public class RobustToolCallingManager implements ToolCallingManager {
 
     /**
      * 解析 request_tool 入参里的能力描述，返回多条换行连接的串（喂给 resolveDynamicToolCallbacks 再 splitNeeds）。
-     * 优先 JSON 的 {@code needs} 数组（多条）；退化 {@code need}/{@code capability} 单值；再退原始串。
+     * 仅接受完整 JSON 对象。兼容旧版 need/capability 字符串，但不把异常参数当搜索词。
      */
     private String parseRequestToolNeeds(String argsJson) {
         if (argsJson == null || argsJson.isBlank()) return null;
         try {
-            com.alibaba.fastjson.JSONObject obj = com.alibaba.fastjson.JSON.parseObject(argsJson);
-            if (obj != null) {
-                com.alibaba.fastjson.JSONArray arr = obj.getJSONArray("needs");
-                if (arr != null && !arr.isEmpty()) {
+            com.fasterxml.jackson.databind.JsonNode obj = ASK_USER_JSON.reader()
+                    .with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS).readTree(argsJson);
+            if (obj != null && obj.isObject()) {
+                com.fasterxml.jackson.databind.JsonNode arr = obj.get("needs");
+                if (arr != null) {
+                    if (!arr.isArray() || arr.isEmpty() || arr.size() > 12) return null;
                     List<String> lines = new ArrayList<>();
                     for (int i = 0; i < arr.size(); i++) {
-                        String s = arr.getString(i);
-                        if (s != null && !s.isBlank()) lines.add(s.trim());
+                        if (!arr.get(i).isTextual()) return null;
+                        String s = arr.get(i).asText().trim();
+                        if (s.isBlank() || s.length() > 2000) return null;
+                        lines.add(s);
                     }
                     if (!lines.isEmpty()) return String.join("\n", lines);
                 }
-                String need = obj.getString("need");
-                if (need == null || need.isBlank()) need = obj.getString("capability");
-                if (need != null && !need.isBlank()) return need.trim();
+                var legacy = obj.has("need") ? obj.get("need") : obj.get("capability");
+                if (legacy != null && legacy.isTextual() && !legacy.asText().isBlank()
+                        && legacy.asText().length() <= 2000) return legacy.asText().trim();
             }
         } catch (Exception ignored) {
         }
-        return argsJson.trim();
+        return null;
     }
 
     /** 调 gate 阻塞提问，把状态翻译成给 LLM 的工具结果文本；同时发 ask_user 元工具观察卡片。 */
@@ -879,7 +1004,7 @@ public class RobustToolCallingManager implements ToolCallingManager {
         // 方案A：按 MCP server 分组。同一连接非并发安全 → 同组串行；不同连接 → 组间并行。
         java.util.LinkedHashMap<String, List<Integer>> groups = new java.util.LinkedHashMap<>();
         for (int i = 0; i < calls.size(); i++) {
-            groups.computeIfAbsent(resolveMcpGroupKey(calls.get(i).name()), k -> new ArrayList<>()).add(i);
+            groups.computeIfAbsent(resolveMcpGroupKey(prompt, calls.get(i).name()), k -> new ArrayList<>()).add(i);
         }
 
         // 全在同一个 MCP server（或无法识别 mcpId）→ 没有可安全并行的，退回 delegate 原生串行（零风险、零自定义合并）。
@@ -943,14 +1068,20 @@ public class RobustToolCallingManager implements ToolCallingManager {
                 .build();
     }
 
-    /** toolName → 分组键：优先用 mcpId（同连接一组）；拿不到时归到统一兜底组（保守串行）。 */
-    private String resolveMcpGroupKey(String toolName) {
-        if (mcpClientRegistry != null && toolName != null) {
-            try {
-                String mcpId = mcpClientRegistry.getMcpIdForTool(toolName);
-                if (mcpId != null && !mcpId.isBlank()) return mcpId;
-            } catch (Exception ignored) {
+    /** Resolve only from this request's authorized callbacks, never the global tool-name index. */
+    private String resolveMcpGroupKey(Prompt prompt, String toolName) {
+        if (toolName != null && prompt.getOptions() instanceof ToolCallingChatOptions options
+                && options.getToolCallbacks() != null) {
+            String selected = null;
+            for (ToolCallback callback : options.getToolCallbacks()) {
+                if (callback.getToolDefinition() == null || !toolName.equals(callback.getToolDefinition().name())) continue;
+                String mcpId = callback.getToolMetadata() instanceof McpToolCallMetadata metadata ? metadata.mcpId()
+                        : callback instanceof MeteredToolCallback metered ? metered.getMcpId() : null;
+                if (mcpId == null || mcpId.isBlank()) return "__no_mcp_id__";
+                if (selected != null && !selected.equals(mcpId)) return "__no_mcp_id__";
+                selected = mcpId;
             }
+            if (selected != null) return selected;
         }
         return "__no_mcp_id__";
     }
@@ -1109,19 +1240,141 @@ public class RobustToolCallingManager implements ToolCallingManager {
 
     private Map<String, String> buildLowerToOriginalNameMap(Prompt prompt) {
         Map<String, String> map = new HashMap<>();
+        Map<String, ToolCallback> owners = new HashMap<>();
+        Set<String> ambiguous = new HashSet<>();
         if (prompt.getOptions() instanceof ToolCallingChatOptions tco) {
             List<ToolCallback> callbacks = tco.getToolCallbacks();
             if (callbacks != null) {
                 for (ToolCallback cb : callbacks) {
                     if (cb == null || cb.getToolDefinition() == null) continue;
                     String name = cb.getToolDefinition().name();
-                    if (name == null || name.isBlank()) continue;
-                    // 同名 lower 撞车（理论不会，工具名唯一）保留先注册的
-                    map.putIfAbsent(name.toLowerCase(), name);
+                    if (name == null || name.isBlank() || isReservedMetaToolName(name)) continue;
+                    for (String alias : new String[]{name, McpClientRegistry.originalToolName(cb)}) {
+                        if (alias == null || alias.isBlank() || isReservedMetaToolName(alias)) continue;
+                        String key = alias.toLowerCase(java.util.Locale.ROOT);
+                        if (ambiguous.contains(key)) continue;
+                        ToolCallback previous = owners.putIfAbsent(key, cb);
+                        if (previous != null && previous != cb) {
+                            ambiguous.add(key);
+                            map.remove(key);
+                        } else {
+                            map.put(key, name);
+                        }
+                    }
                 }
             }
         }
+        // An original alias must not shadow another callback's canonical name. Remove every
+        // route to an ambiguous canonical name, including routes through an otherwise unique alias.
+        map.entrySet().removeIf(entry -> ambiguous.contains(entry.getValue().toLowerCase(java.util.Locale.ROOT)));
         return map;
+    }
+
+    private boolean isReservedMetaToolName(String name) {
+        return isAskUserName(name) || isRequestToolName(name) || isInspectResultName(name) || isCreateArtifactName(name);
+    }
+
+    private boolean isCreateArtifactName(String name) { return "create_artifact".equalsIgnoreCase(name); }
+
+    private boolean artifactRecoveryBlocked(ToolCallingChatOptions options) {
+        var state = ArtifactToolRecovery.find(options);
+        return state != null && state.blocked();
+    }
+
+    private String artifactFallbackMessage() {
+        return "本次产物参数修复仍未成功，停止调用 create_artifact，直接输出完整正文或代码，并明确说明文件未保存。不得声称保存成功或编造下载链接。";
+    }
+
+    private boolean recordArtifactFailure(Prompt prompt) {
+        int attempt = 2;
+        boolean retryable = false;
+        if (prompt.getOptions() instanceof ToolCallingChatOptions options) {
+            var recovery = ArtifactToolRecovery.get(options);
+            attempt = recovery.failed();
+            retryable = !recovery.blocked();
+        }
+        artifactProgress(prompt, retryable ? "repairing" : "failed",
+                retryable ? "产物参数格式有误，正在修复后保存" : "产物未保存，正在保留回答内容", attempt);
+        return retryable;
+    }
+
+    private void artifactProgress(Prompt prompt, String phase, String message, int attempt) {
+        var activity = activityFor(prompt);
+        if (activity != null) activity.markArtifactPhase("artifact_" + switch (phase) {
+            case "saving" -> "saving";
+            case "repairing" -> "repairing";
+            default -> "fallback";
+        });
+        if (toolCallProgressEmitter != null && prompt.getOptions() instanceof ToolCallingChatOptions options)
+            toolCallProgressEmitter.emitArtifactProgress(options.getToolContext(), phase, message, attempt);
+    }
+
+    private String artifactError(String code, String message, boolean retryable, com.fasterxml.jackson.core.JsonLocation location) {
+        var error = ASK_USER_JSON.createObjectNode().put("ok", false).put("error", code).put("message", message).put("retryable", retryable);
+        if (location != null) { error.put("line", location.getLineNr()); error.put("column", location.getColumnNr()); }
+        error.put("expected", "content 必须是对象。MARKDOWN: {\"markdown\":\"正文\"}；TABLE: {\"columns\":[\"列名\"],\"rows\":[[\"值\"]]}；CODE: {\"filename\":\"main.py\",\"language\":\"python\",\"code\":\"print(1)\\n\"}。字符串用双引号，正文换行/引号须 JSON 转义。");
+        return error.toString();
+    }
+
+    /** A provider ignoring the removed definition must not restart an unbounded tool loop. */
+    private ToolExecutionResult artifactUnavailableResult(Prompt prompt, ChatResponse response) {
+        var original = firstGenerationWithToolCalls(response).getOutput();
+        List<AssistantMessage.ToolCall> calls = new ArrayList<>();
+        List<ToolResponseMessage.ToolResponse> results = new ArrayList<>();
+        for (var call : original.getToolCalls()) {
+            calls.add(new AssistantMessage.ToolCall(call.id(), call.type(), call.name(), "{}"));
+            results.add(new ToolResponseMessage.ToolResponse(call.id(), call.name(),
+                    "文件未保存：模型连续返回无法解析的产物参数，自动修复未成功。本次停止重复生成；已有任务结果仍保留。"));
+        }
+        List<Message> history = new ArrayList<>(prompt.getInstructions());
+        history.add(AssistantMessage.builder().content(original.getText()).properties(original.getMetadata()).toolCalls(calls).build());
+        history.add(ToolResponseMessage.builder().responses(results).build());
+        return ToolExecutionResult.builder().conversationHistory(history).returnDirect(true).build();
+    }
+
+    /** Never execute a partial argument batch or resend invalid JSON in assistant tool_calls. */
+    private ToolExecutionResult rejectMalformedArguments(Prompt prompt, ChatResponse response) {
+        Generation generation = firstGenerationWithToolCalls(response);
+        if (generation == null || generation.getOutput() == null) return null;
+        AssistantMessage original = generation.getOutput();
+        Set<String> invalid = new HashSet<>();
+        Map<String, com.fasterxml.jackson.core.JsonLocation> locations = new HashMap<>();
+        for (var call : original.getToolCalls()) {
+            try {
+                var json = ASK_USER_JSON.reader().with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                        .readTree(call.arguments());
+                if (json == null || !json.isObject()) invalid.add(call.id());
+            } catch (Exception malformed) {
+                invalid.add(call.id());
+                if (malformed instanceof com.fasterxml.jackson.core.JsonProcessingException jsonError)
+                    locations.put(call.id(), jsonError.getLocation());
+                log.warn("[ToolArguments] invalid tool={} chars={} errorType={}", call.name(),
+                        call.arguments() == null ? 0 : call.arguments().length(), malformed.getClass().getSimpleName());
+            }
+        }
+        if (invalid.isEmpty()) return null;
+        boolean artifactInvalid = original.getToolCalls().stream().anyMatch(c -> invalid.contains(c.id()) && isCreateArtifactName(c.name()));
+        boolean artifactRetryable = !artifactInvalid || recordArtifactFailure(prompt);
+        List<AssistantMessage.ToolCall> calls = new ArrayList<>();
+        List<ToolResponseMessage.ToolResponse> results = new ArrayList<>();
+        for (var call : original.getToolCalls()) {
+            calls.add(invalid.contains(call.id())
+                    ? new AssistantMessage.ToolCall(call.id(), call.type(), call.name(), "{}") : call);
+            String result;
+            if (invalid.contains(call.id()) && isCreateArtifactName(call.name())) {
+                result = artifactError("INVALID_TOOL_ARGUMENTS", artifactRetryable
+                        ? "参数必须为单个合法 JSON 对象，本批未执行。请按 expected 修正参数后再调用一次；不要把 Markdown 或代码直接写在 content: 后。"
+                        : artifactFallbackMessage(), artifactRetryable, locations.get(call.id()));
+            } else result = invalid.contains(call.id())
+                    ? "{\"ok\":false,\"error\":\"INVALID_TOOL_ARGUMENTS\",\"message\":\"工具参数不是完整 JSON 对象，本批工具均未执行。请按工具定义重新提供完整参数。\"}"
+                    : "{\"ok\":false,\"error\":\"BATCH_NOT_EXECUTED\",\"message\":\"同批工具含不完整参数，本批均未执行。\"}";
+            results.add(new ToolResponseMessage.ToolResponse(call.id(), call.name(), result));
+        }
+        List<Message> history = new ArrayList<>(prompt.getInstructions());
+        history.add(AssistantMessage.builder().content(original.getText()).properties(original.getMetadata())
+                .media(original.getMedia()).toolCalls(calls).build());
+        history.add(ToolResponseMessage.builder().responses(results).build());
+        return ToolExecutionResult.builder().conversationHistory(history).returnDirect(false).build();
     }
 
     /**
@@ -1144,13 +1397,15 @@ public class RobustToolCallingManager implements ToolCallingManager {
             boolean genChanged = false;
             for (AssistantMessage.ToolCall tc : am.getToolCalls()) {
                 String origName = tc.name();
-                if (origName == null || caseMap.containsValue(origName)) {
+                if (origName == null || isReservedMetaToolName(origName)) {
                     // 已经是真实 name，原样保留
                     normCalls.add(tc);
                     continue;
                 }
-                String mapped = caseMap.get(origName.toLowerCase());
-                if (mapped != null) {
+                String mapped = caseMap.get(origName.toLowerCase(java.util.Locale.ROOT));
+                if (origName.equals(mapped)) {
+                    normCalls.add(tc);
+                } else if (mapped != null) {
                     log.info("[RobustToolMgr] normalize tool name '{}' -> '{}'", origName, mapped);
                     if (metrics != null) {
                         metrics.recordNameNormalized(origName, mapped);

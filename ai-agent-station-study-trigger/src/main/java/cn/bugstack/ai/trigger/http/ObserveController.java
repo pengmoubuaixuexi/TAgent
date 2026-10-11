@@ -251,6 +251,7 @@ public class ObserveController {
             row.put("lastProbeAt", s.lastProbeAt());
             row.put("lastProbeOkAt", s.lastProbeOkAt());
             row.put("registeredTools", s.registeredTools());
+            row.putAll(mcpClientRegistry.lifecycle(s.mcpId()));
             // 把重连/熔断的最近错误样本带过去：键约定为 "[client:<mcpId>]"，跟 McpClientRegistry.recordClientReconnectFailure 对齐
             row.put("lastClientError", lastErrorView("[client:" + s.mcpId() + "]", scope, s.mcpId()));
             clients.add(row);

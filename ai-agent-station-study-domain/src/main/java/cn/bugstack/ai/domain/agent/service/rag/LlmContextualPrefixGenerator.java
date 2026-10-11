@@ -88,6 +88,7 @@ public class LlmContextualPrefixGenerator implements IContextualPrefixGenerator 
                     fail++;
                 }
             } catch (Exception e) {
+                cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.rethrowCancellation(e);
                 log.debug("contextual prefix generation failed for chunk {} err={}", i, e.getMessage());
                 prefixes.add(null);
                 fail++;

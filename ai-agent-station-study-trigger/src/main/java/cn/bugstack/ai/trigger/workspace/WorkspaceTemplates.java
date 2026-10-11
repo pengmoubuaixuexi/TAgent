@@ -88,8 +88,8 @@ public final class WorkspaceTemplates {
                     new Step("RESPONSE_ASSISTANT", "总结", "整合已有证据，给出最终回答，不重复执行工具。",
                             "用户需求: %s\n执行记录: %s\n请整合并回答。"));
             case "flow" -> List.of(
-                    new Step("TOOL_MCP_CLIENT", "工具分析", "分析实际工具能力。本阶段不执行业务工具，允许 request_tool 查询可用能力。", "%s"),
-                    new Step("PLANNING_CLIENT", "步骤规划", "遵循运行时要求的 JSON 格式规划步骤，只使用真实工具。本阶段不执行业务工具。", "%s"),
+                    new Step("TOOL_MCP_CLIENT", "工具分析", "直接根据执行节点的授权工具目录分析能力，不为了解工具而装载或调用 request_tool。未知能力留待执行阶段发现，必要时使用 ask_user 澄清用户需求。", "%s"),
+                    new Step("PLANNING_CLIENT", "步骤规划", "遵循运行时要求的 Markdown 和 DEPENDS_ON 格式规划步骤，已知工具引用目录中的真实名称，未知能力标记待发现。本阶段不装载工具或调用 request_tool，实际执行时再按需装载。必要时使用 ask_user 澄清需求。", "%s"),
                     new Step("EXECUTOR_CLIENT", "任务执行", "依据计划和工具结果执行任务，结果必须有证据。", "%s"));
             default -> throw new IllegalArgumentException("无效执行模式");
         };

@@ -121,17 +121,20 @@ public class StreamingAttemptLifecycleTest {
     }
 
     @Test
-    public void cancelImmediatelyStopsSilentInnerHttpBody() {
+    public void cancelImmediatelyStopsSilentInnerHttpBody() throws Exception {
         StreamingActivityTracker.Activity activity = StreamingActivityTracker.start("silent-inner-body");
         AtomicBoolean bodyCancelled = new AtomicBoolean();
+        java.util.concurrent.CountDownLatch subscribed = new java.util.concurrent.CountDownLatch(1);
         ReasoningContentFilter filter = new ReasoningContentFilter();
         reactor.core.Disposable subscription = filter.filter(
                 ClientRequest.create(HttpMethod.GET, URI.create("http://unused/chat")).build(), request -> Mono.just(
                         ClientResponse.create(HttpStatus.OK).body(Flux.<org.springframework.core.io.buffer.DataBuffer>never()
+                                .doOnSubscribe(ignored -> subscribed.countDown())
                                 .doOnCancel(() -> bodyCancelled.set(true))).build()))
                 .flatMap(response -> response.bodyToMono(String.class))
                 .contextWrite(context -> context.put(StreamingActivityTracker.CONTEXT_KEY, activity)).subscribe();
         try {
+            assertTrue("inner HTTP body must be subscribed", subscribed.await(2, java.util.concurrent.TimeUnit.SECONDS));
             activity.cancel();
             assertTrue("even a silent nested stream must be cancelled", bodyCancelled.get());
         } finally {

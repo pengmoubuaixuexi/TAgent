@@ -295,15 +295,18 @@ public class BackgroundTaskScheduler {
             metadata.put("taskName", task.getName());
             metadata.put("executionStatus", executionStatus);
             notificationService.publish(NotificationCommand.builder()
+                    .notificationId(runId == null || runId.isBlank() ? null
+                            : NotificationService.terminalId(task.getUserId(), runId))
                     .userId(task.getUserId())
                     .tenantId(task.getTenantId())
                     .sessionId(task.getSessionId())
                     .runId(runId)
                     .type(completed ? AgentNotification.Type.TASK_COMPLETED : AgentNotification.Type.TASK_FAILED)
-                    .referenceId(referenceId)
+                    .referenceId(runId == null || runId.isBlank() ? referenceId : "run-terminal:" + runId)
                     .status(completed ? AgentNotification.Status.TASK_COMPLETED : AgentNotification.Status.TASK_FAILED)
                     .title("后台任务「" + task.getName() + "」" + (completed ? "已完成" : "执行失败"))
-                    .summary(completed ? "点击进入会话查看结果" : abbreviate(error, 240))
+                    .summary(completed ? "点击进入会话查看结果"
+                            : cn.bugstack.ai.domain.agent.service.notification.RunNotificationProjector.failureSummary(error))
                     .metadata(metadata)
                     .build());
         } catch (Exception e) {

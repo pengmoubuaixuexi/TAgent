@@ -214,20 +214,16 @@
             .section-head .tools { width: 100%; }
         }
     </style>
+<link rel="stylesheet" href="/workspace-nav.css"><script defer src="/workspace-nav.js"></script>
 </head>
 <body>
+<div data-workspace-nav hidden></div>
 <header>
     <div>
         <h1>TAgent · MCP 连接与工具</h1>
         <div class="muted" id="status"><span class="status-dot"></span>等待首次刷新</div>
     </div>
-    <nav class="tabs" aria-label="观测视图">
-        <a href="/index.html">对话</a>
-        <a href="/user-agents.html">我的 Agent</a>
-        <a href="/observe.html">用量观测</a>
-        <a class="active" href="/observe-mcp.html">MCP 连接与工具</a>
-        <a data-admin-only hidden href="/admin-stats.html">网站统计</a>
-    </nav>
+
     <div class="right">
         <label id="scope-control" hidden>范围 <select id="observation-scope"><option value="mine">仅本人</option><option value="all">全站（管理员）</option></select></label>
         <span class="pill" id="process-window">本次启动以来</span>
@@ -424,7 +420,7 @@ function renderClients(items) {
         const lastClientError = item.lastClientError ? `${item.lastClientError.exception || ''}: ${item.lastClientError.message || ''}` : '';
         return `<tr>
             <td>${connectionLabel(item)}</td>
-            <td>${statusPill(item.status)}</td>
+            <td>${statusPill(item.status)}<div class="muted" title="${esc(absoluteTime(item.lastUsedAt))}">在途 ${fmt(item.activeLeases || 0)} · 最近使用 ${relativeTime(item.lastUsedAt)}</div></td>
             <td class="num">${fmt(item.consecutiveFailures)}</td>
             <td class="num" title="${esc(absoluteTime(item.lastSuccessAt))}">${relativeTime(item.lastSuccessAt)}</td>
             <td class="num" title="${esc(absoluteTime(item.lastProbeAt))}">${relativeTime(item.lastProbeAt)}</td>
@@ -529,6 +525,8 @@ function statusPill(status) {
         idle: ['warn', '待确认'],
         dead: ['bad', '不可用'],
         reconnect_cooldown: ['warn', '重连冷却中'],
+        idle_evicted: ['', '空闲已释放 · 按需恢复'],
+        in_use: ['', '调用中'],
         circuit_open: ['bad', '熔断中'],
         unknown: ['', '未知']
     };

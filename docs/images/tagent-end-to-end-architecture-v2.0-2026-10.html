@@ -1,0 +1,418 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TAgent 2.0 端到端架构</title><style>html,body{margin:0;background:#060d1f}svg{display:block;width:100%;height:auto} @media print{@page{size:landscape;margin:0}svg{max-height:100vh}}</style><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="3840" height="3200" viewBox="0 0 1920 1600" role="img" aria-labelledby="title desc"><title id="title">TAgent 2.0 · 端到端架构</title><desc id="desc">基于 2026 年 10 月本地代码的架构总览。涵盖用户工作台、模型与知识、三种运行策略、MCP 工具治理、人机协作、产物、持久运行、后台任务、EvalOps、存储与观测。</desc><defs>
+  <radialGradient id="bgGrad" cx="50%" cy="38%" r="78%">
+    <stop offset="0%" stop-color="#0b1830"/>
+    <stop offset="60%" stop-color="#071124"/>
+    <stop offset="100%" stop-color="#050b1a"/>
+  </radialGradient>
+
+  <filter id="fB" x="-40%" y="-40%" width="180%" height="180%"><feDropShadow dx="0" dy="0" stdDeviation="6" flood-color="#4da3ff" flood-opacity="0.55"/></filter>
+  <filter id="fC" x="-40%" y="-40%" width="180%" height="180%"><feDropShadow dx="0" dy="0" stdDeviation="6" flood-color="#2fd9ec" flood-opacity="0.5"/></filter>
+  <filter id="fP" x="-40%" y="-40%" width="180%" height="180%"><feDropShadow dx="0" dy="0" stdDeviation="6" flood-color="#b06bff" flood-opacity="0.5"/></filter>
+  <filter id="fG" x="-40%" y="-40%" width="180%" height="180%"><feDropShadow dx="0" dy="0" stdDeviation="6" flood-color="#eebf5a" flood-opacity="0.5"/></filter>
+  <filter id="fGold2" x="-40%" y="-40%" width="180%" height="180%"><feDropShadow dx="0" dy="0" stdDeviation="9" flood-color="#ffcf6e" flood-opacity="0.6"/></filter>
+  <filter id="fPk" x="-40%" y="-40%" width="180%" height="180%"><feDropShadow dx="0" dy="0" stdDeviation="6" flood-color="#ff79c6" flood-opacity="0.5"/></filter>
+  <filter id="fGr" x="-40%" y="-40%" width="180%" height="180%"><feDropShadow dx="0" dy="0" stdDeviation="6" flood-color="#4fd48a" flood-opacity="0.5"/></filter>
+
+  <marker id="mW" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#dfe9ff"/></marker>
+  <marker id="mC" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#35e0f2"/></marker>
+  <marker id="mP" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#c087ff"/></marker>
+  <marker id="mO" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#f7a83c"/></marker>
+  <marker id="mG" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#eebf5a"/></marker>
+  <marker id="mBl" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7fb8ff"/></marker>
+  <marker id="mPk" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#ff8fd0"/></marker>
+  <marker id="mGr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5ce08f"/></marker>
+
+  <!-- ============ icons (stroke = currentColor) ============ -->
+  <g id="icPerson" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round">
+    <circle cx="0" cy="-9" r="10"/><path d="M-17,19 C-17,3 17,3 17,19"/>
+  </g>
+  <g id="icMonitor" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="-19" y="-16" width="38" height="26" rx="3"/><path d="M-4,-9 L6,-3 L-4,3 Z"/><path d="M0,10 v7 M-9,17 h18"/>
+  </g>
+  <g id="icRouter" fill="none" stroke="currentColor" stroke-width="2.6">
+    <path d="M0,-11 L11,0 L0,11 L-11,0 Z"/>
+    <circle cx="0" cy="-17" r="4.5"/><circle cx="17" cy="0" r="4.5"/><circle cx="0" cy="17" r="4.5"/><circle cx="-17" cy="0" r="4.5"/>
+  </g>
+  <g id="icBolt" fill="currentColor" stroke="none">
+    <path d="M2,-13 L-8,2 L-1,2 L-3,13 L8,-2 L1,-2 Z"/>
+  </g>
+  <g id="icLoop" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round">
+    <path d="M8.5,-6 A10.5,10.5 0 1 0 10.5,2"/><path d="M9,-11 L9.5,-5.5 L4,-4.5" fill="none"/>
+  </g>
+  <g id="icFlow" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linejoin="round">
+    <rect x="-5" y="-13" width="10" height="8" rx="2"/><rect x="-15" y="5" width="10" height="8" rx="2"/><rect x="5" y="5" width="10" height="8" rx="2"/>
+    <path d="M0,-5 v4 M-10,5 v-2 h20 v2 M0,-1 v0"/>
+  </g>
+  <g id="icClipboard" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="-15" y="-17" width="30" height="38" rx="4"/><rect x="-7" y="-21" width="14" height="8" rx="3"/>
+    <path d="M-7,2 L-2,8 L9,-5"/>
+  </g>
+  <g id="icBrain" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M-2,-17 C-9,-17 -12,-12 -11,-8 C-16,-7 -17,0 -13,3 C-16,8 -11,14 -5,13 C-4,17 3,18 5,14 C11,16 16,11 14,6 C18,2 17,-5 12,-7 C13,-13 7,-18 2,-16 C1,-17 0,-17 -2,-17 Z"/>
+    <path d="M-5,-10 C-2,-8 -2,-4 -5,-2 M4,-9 C7,-6 6,-2 3,0 M-6,5 C-3,7 1,6 2,3 M7,4 C9,6 9,9 7,10"/>
+  </g>
+  <g id="icTools" fill="none" stroke="currentColor" stroke-linecap="round">
+    <path d="M-14,-14 L-6,-6" stroke-width="6.5"/>
+    <path d="M-6,-6 L11,11" stroke-width="3"/>
+    <path d="M3,-11 a7,7 0 1 1 8,8" stroke-width="3"/>
+    <path d="M7,-7 L-11,11" stroke-width="3"/>
+    <path d="M-11,11 l-3.5,3.5" stroke-width="5.5"/>
+  </g>
+  <g id="icCloudWifi" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round">
+    <path d="M-8,10 h-3 a7,7 0 0 1 -1,-14 a10,10 0 0 1 19,-3 a8,8 0 0 1 4,1"/>
+    <path d="M2,6 a10,10 0 0 1 14,0 M5,11 a6,6 0 0 1 8,0"/><circle cx="9" cy="16" r="1.8" fill="currentColor"/>
+  </g>
+  <g id="icPuzzle" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linejoin="round">
+    <path d="M-13,-6 h6.5 a5.5,5.5 0 1 1 11,0 H13 v20 h-26 z"/>
+  </g>
+  <g id="icDb" fill="none" stroke="currentColor" stroke-width="2.8">
+    <ellipse cx="0" cy="-11" rx="13" ry="5"/><path d="M-13,-11 v22 a13,5 0 0 0 26,0 v-22"/><path d="M-13,0 a13,5 0 0 0 26,0"/>
+  </g>
+  <g id="icWrenchGear" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M-15,-10 A6.5,6.5 0 1 1 -8,-16 L-10,-13 L-7,-10 L-4,-12 A6.5,6.5 0 0 1 -15,-10 Z" transform="rotate(42)"/>
+    <path d="M-12,12 L-1,1"/>
+    <circle cx="8" cy="8" r="5"/><path d="M8,0 v3 M8,13 v3 M0,8 h3 M13,8 h3 M2.5,2.5 l2,2 M11.5,11.5 l2,2 M13.5,2.5 l-2,2 M4.5,11.5 l-2,2"/>
+  </g>
+  <g id="icDocs" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linejoin="round" stroke-linecap="round">
+    <rect x="-13" y="-15" width="20" height="26" rx="3"/><rect x="-7" y="-10" width="20" height="26" rx="3"/>
+    <path d="M-2,-3 h10 M-2,3 h10 M-2,9 h7"/>
+  </g>
+  <g id="icLayers" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linejoin="round">
+    <path d="M0,-14 L15,-7 L0,0 L-15,-7 Z"/><path d="M-15,0 L0,7 L15,0"/><path d="M-15,7 L0,14 L15,7"/>
+  </g>
+  <g id="icApprove" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="-16" y="-16" width="32" height="32" rx="7"/><circle cx="0" cy="-5" r="5"/><path d="M-9,10 C-9,1 9,1 9,10"/>
+  </g>
+  <g id="icTarget" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round">
+    <circle cx="0" cy="0" r="12"/><circle cx="0" cy="0" r="4.5"/><path d="M0,-17 v5 M0,12 v5 M-17,0 h5 M12,0 h5"/>
+  </g>
+  <g id="icFF" fill="currentColor" stroke="none">
+    <path d="M-13,-9 L-1,0 L-13,9 Z"/><path d="M1,-9 L13,0 L1,9 Z"/>
+  </g>
+  <g id="icStop" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M-6,-14 h12 l8,8 v12 l-8,8 h-12 l-8,-8 v-12 Z"/><path d="M-6,0 h12"/>
+  </g>
+  <g id="icAskChat" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linejoin="round">
+    <rect x="-15" y="-14" width="30" height="22" rx="5"/><path d="M-7,8 v7 l8,-7"/>
+    <text x="0" y="2.5" text-anchor="middle" font-size="15" font-weight="bold" fill="currentColor" stroke="none">?</text>
+  </g>
+  <g id="icPersonCheck" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="-4" cy="-8" r="8"/><path d="M-16,14 C-16,2 8,2 8,14"/><path d="M6,4 L11,9 L19,-1"/>
+  </g>
+  <g id="icRack" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linejoin="round">
+    <rect x="-16" y="-15" width="32" height="30" rx="3"/><path d="M-16,-5 h32 M-16,5 h32"/>
+    <circle cx="10" cy="-10" r="1.6" fill="currentColor"/><circle cx="10" cy="0" r="1.6" fill="currentColor"/><circle cx="10" cy="10" r="1.6" fill="currentColor"/>
+    <path d="M-11,-10 h8 M-11,0 h8 M-11,10 h8"/>
+  </g>
+  <g id="icCopy" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linejoin="round">
+    <rect x="-12" y="-12" width="18" height="20" rx="3"/><path d="M-4,-16 h13 a3,3 0 0 1 3,3 v17"/>
+  </g>
+  <g id="icDocLines" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linejoin="round" stroke-linecap="round">
+    <rect x="-11" y="-14" width="22" height="28" rx="3"/><path d="M-5,-6 h10 M-5,0 h10 M-5,6 h6"/>
+  </g>
+  <g id="icPulse" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="0" cy="0" r="14"/><path d="M-10,1 h5 l3,-7 l4,12 l3,-6 h5"/>
+  </g>
+  <g id="icChart" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="0" cy="0" r="14"/><path d="M-8,5 L-3,-1 L2,3 L8,-6"/>
+  </g>
+  <g id="icNet" fill="none" stroke="currentColor" stroke-width="2.6">
+    <circle cx="-10" cy="8" r="4.5"/><circle cx="1" cy="-10" r="4.5"/><circle cx="12" cy="6" r="4.5"/>
+    <path d="M-7,4.5 L-1.5,-6.5 M4.5,-7 L9.5,2.5 M-5.5,8.5 L7.5,6.5"/>
+  </g>
+
+  <!-- ===== v5 新增图标 ===== -->
+  <g id="icImage" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linejoin="round">
+    <rect x="-15" y="-12" width="30" height="24" rx="3"/>
+    <circle cx="-6" cy="-4" r="3.2"/>
+    <path d="M-15,8 L-4,-2 L3,5 L8,1 L15,8"/>
+  </g>
+  <g id="icCloudUp" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M-9,7 h-2 a7,7 0 0 1 -1,-14 a10,10 0 0 1 19,-3 a7.5,7.5 0 0 1 3,14.5 h-3"/>
+    <path d="M0,15 v-13 M-5,7 L0,2 L5,7"/>
+  </g>
+  <g id="icEye" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linejoin="round">
+    <path d="M-17,0 C-10,-9 10,-9 17,0 C10,9 -10,9 -17,0 Z"/><circle cx="0" cy="0" r="4.5"/>
+  </g>
+  <g id="icMemEdit" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M-13,-13 h17 M-13,-13 v26 h18 v-8"/>
+    <path d="M-8,-6 h9 M-8,0 h7 M-8,6 h5"/>
+    <path d="M13,-9 l5,5 l-11,11 h-5 v-5 Z"/>
+  </g>
+  <g id="icShield" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M0,-16 L13,-11 v10 C13,7 6,14 0,16 C-6,14 -13,7 -13,-3 v-10 Z"/>
+    <path d="M-6,-1 L-1.5,4 L7,-6"/>
+  </g>
+  <g id="icReplay" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M-13,-1 A13,13 0 1 1 -5,11"/>
+    <path d="M-18,-6 L-13,-1 L-8,-6"/>
+    <path d="M-2,-6 L6,0 L-2,6 Z" fill="currentColor" stroke="none"/>
+  </g>
+  <g id="icLease" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linejoin="round" stroke-linecap="round">
+    <rect x="-13" y="-3" width="26" height="18" rx="4"/>
+    <path d="M-7,-3 v-6 a7,7 0 0 1 14,0 v6"/>
+    <circle cx="0" cy="6" r="2.4" fill="currentColor" stroke="none"/>
+  </g>
+  <g id="icClock" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round">
+    <circle cx="0" cy="0" r="14"/><path d="M0,-8 V1 L6,5"/>
+  </g>
+  <g id="icFileWatch" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M-14,-15 h13 l7,7 v13 h-20 Z"/><path d="M-1,-15 v7 h7"/>
+    <circle cx="8" cy="10" r="6.5"/><path d="M12.8,14.8 L17,19"/>
+  </g>
+  <g id="icHourglass" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M-10,-15 h20 M-10,15 h20"/>
+    <path d="M-8,-15 v5 L0,0 L8,-10 v-5"/><path d="M-8,15 v-5 L0,0 L8,10 v5"/>
+  </g>
+  <g id="icReturn" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M-16,-13 h32 v18 a4,4 0 0 1 -4,4 h-19 l-9,7 Z"/>
+    <path d="M8,-4 h-14 M-1,-9 L-6,-4 L-1,1"/>
+  </g>
+  <g id="icNlp" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round">
+    <rect x="-16" y="-13" width="28" height="20" rx="5"/>
+    <path d="M-9,7 v6 l7,-6"/><path d="M-9,-6 h13 M-9,0 h9"/>
+    <path d="M15,-16 l1.6,4.4 l4.4,1.6 l-4.4,1.6 l-1.6,4.4 l-1.6,-4.4 l-4.4,-1.6 l4.4,-1.6 Z" fill="currentColor" stroke="none"/>
+  </g>
+</defs><style>text{font-family:'Microsoft YaHei','PingFang SC',sans-serif;letter-spacing:0} .mono{font-family:Consolas,monospace}</style>
+<rect width="1920" height="1600" fill="url(#bgGrad)"/>
+<g fill="none" stroke="#153253" stroke-width="1.3" opacity=".48"><path d="M0 74H22V346H15V672H24V1062H12V1402H25V1572H220"/><path d="M1920 76H1898V349H1906V687H1895V1064H1907V1394H1898V1580H1730"/><path d="M1270 0V22H1370V45H1450"/><path d="M600 1600V1578H790V1590H900"/></g>
+<circle cx="22" cy="74" r="3" fill="#1b3d63"/>
+<circle cx="15" cy="346" r="3" fill="#1b3d63"/>
+<circle cx="24" cy="672" r="3" fill="#1b3d63"/>
+<circle cx="12" cy="1062" r="3" fill="#1b3d63"/>
+<circle cx="25" cy="1402" r="3" fill="#1b3d63"/>
+<circle cx="1898" cy="76" r="3" fill="#1b3d63"/>
+<circle cx="1906" cy="349" r="3" fill="#1b3d63"/>
+<circle cx="1895" cy="687" r="3" fill="#1b3d63"/>
+<circle cx="1907" cy="1064" r="3" fill="#1b3d63"/>
+<circle cx="1898" cy="1394" r="3" fill="#1b3d63"/>
+<text x="40" y="49" font-size="35" fill="#edf5ff" font-weight="750" text-anchor="start">TAgent 2.0</text>
+<text x="276" y="49" font-size="30" fill="#65adff" font-weight="700" text-anchor="start">端到端架构</text>
+<text x="40" y="79" font-size="17" fill="#9fb4d1" font-weight="400" text-anchor="start">用户工作台  ·  Agent 编排  ·  工具治理  ·  可追溯运行</text>
+<rect x="1630" y="29" width="250" height="27" rx="7" fill="#0c1b31" stroke="#65adff" stroke-width="1.4"/>
+<text x="1755" y="48" font-size="14.5" fill="#65adff" font-weight="500" text-anchor="middle" data-max-width="236">2026.10  ·  当前实现</text>
+<rect x="40" y="110" width="540" height="217" rx="15" fill="#0a1729" stroke="#65adff" stroke-width="1.45" stroke-dasharray="8 7" filter="url(#fB)"/>
+<rect x="41" y="111" width="538" height="46" rx="14" fill="#65adff" fill-opacity=".07"/>
+<use href="#icLayers" transform="translate(68 135) scale(0.65)" color="#65adff"/>
+<text x="91" y="142" font-size="22" fill="#65adff" font-weight="700" text-anchor="start" data-max-width="470">用户工作台与版本</text>
+<rect x="58" y="168" width="504" height="64" rx="9" fill="#0b192c" stroke="#65adff" stroke-width="1.4"/>
+<use href="#icPerson" transform="translate(83 200) scale(0.65)" color="#65adff"/>
+<text x="107" y="193" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="440">公共 Agent → 私有工作台</text>
+<text x="107" y="216" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="440">按模式配置：模型 / Prompt / MCP 连接 / Advisor</text>
+<rect x="58" y="243" width="504" height="64" rx="9" fill="#0b192c" stroke="#65adff" stroke-width="1.4"/>
+<use href="#icClipboard" transform="translate(83 275) scale(0.65)" color="#65adff"/>
+<text x="107" y="268" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="440">草稿 → 启用版本 → 运行绑定</text>
+<text x="107" y="291" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="440">节点调试 · 配置历史 · 用户隔离</text>
+<rect x="606" y="110" width="540" height="217" rx="15" fill="#0a1729" stroke="#ba8aff" stroke-width="1.45" stroke-dasharray="8 7" filter="url(#fP)"/>
+<rect x="607" y="111" width="538" height="46" rx="14" fill="#ba8aff" fill-opacity=".07"/>
+<use href="#icBrain" transform="translate(634 135) scale(0.65)" color="#ba8aff"/>
+<text x="657" y="142" font-size="22" fill="#ba8aff" font-weight="700" text-anchor="start" data-max-width="470">模型接入与运行治理</text>
+<rect x="624" y="168" width="246" height="64" rx="9" fill="#0b192c" stroke="#ba8aff" stroke-width="1.4"/>
+<text x="639" y="193" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="216">平台模型 / 个人 API</text>
+<text x="639" y="216" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="216">密钥加密 · 请求时鉴权</text>
+<rect x="882" y="168" width="246" height="64" rx="9" fill="#0b192c" stroke="#ba8aff" stroke-width="1.4"/>
+<text x="897" y="193" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="216">用户额度 / 并发</text>
+<text x="897" y="216" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="216">Run 预算 · 上下文管理</text>
+<text x="628" y="270" font-size="17" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="492">辅助模型需单独授权 · 个人主模型不共用密钥</text>
+<text x="628" y="300" font-size="17" fill="#ba8aff" font-weight="500" text-anchor="start" data-max-width="492">Token 预留 → 实际用量结算 · 独立记账</text>
+<rect x="1172" y="110" width="708" height="217" rx="15" fill="#0a1729" stroke="#5dd99d" stroke-width="1.45" stroke-dasharray="8 7" filter="url(#fGr)"/>
+<rect x="1173" y="111" width="706" height="46" rx="14" fill="#5dd99d" fill-opacity=".07"/>
+<use href="#icDocs" transform="translate(1200 135) scale(0.65)" color="#5dd99d"/>
+<text x="1223" y="142" font-size="22" fill="#5dd99d" font-weight="700" text-anchor="start" data-max-width="638">知识库与四层记忆</text>
+<text x="1192" y="181" font-size="18" fill="#edf5ff" font-weight="500" text-anchor="start" data-max-width="668">知识入库：上传 → 解析分块 → 索引 → 发布</text>
+<text x="1192" y="216" font-size="18" fill="#edf5ff" font-weight="500" text-anchor="start" data-max-width="668">检索：PgVector + ES BM25 → 融合 / 重排</text>
+<text x="1192" y="251" font-size="18" fill="#edf5ff" font-weight="500" text-anchor="start" data-max-width="668">记忆：短期会话 / 工作 / 长期 / 情景</text>
+<text x="1192" y="295" font-size="16.5" fill="#5dd99d" font-weight="400" text-anchor="start" data-max-width="668">按用户检索 · 已发布知识可见 · 会话摘要压缩</text>
+<path d="M310 327 V352 H573 V425" fill="none" stroke="#65adff" stroke-width="1.6" stroke-linejoin="round" stroke-dasharray="6 5" marker-end="url(#mBl)"/>
+<text x="324" y="348" font-size="14.5" fill="#65adff" font-weight="400" text-anchor="start">配置版本 / 绑定范围</text>
+<path d="M876 327 V364 H1312 V425" fill="none" stroke="#ba8aff" stroke-width="1.6" stroke-linejoin="round" stroke-dasharray="6 5" marker-end="url(#mP)"/>
+<text x="959" y="356" font-size="14.5" fill="#ba8aff" font-weight="400" text-anchor="start">模型与治理</text>
+<path d="M1534 327 V349 H1422 V425" fill="none" stroke="#5dd99d" stroke-width="1.6" stroke-linejoin="round" stroke-dasharray="6 5" marker-end="url(#mGr)"/>
+<text x="1548" y="352" font-size="14.5" fill="#5dd99d" font-weight="400" text-anchor="start">上下文增强</text>
+<text x="40" y="391" font-size="19" fill="#65adff" font-weight="700" text-anchor="start">运行主链</text>
+<text x="1540" y="391" font-size="14.5" fill="#9fb4d1" font-weight="400" text-anchor="start">实线：执行 / 调用   虚线：配置 / 协作</text>
+<rect x="40" y="426" width="130" height="174" rx="11" fill="#0a172b" stroke="#65adff" stroke-width="1.4" filter="url(#fB)"/>
+<use href="#icPerson" transform="translate(105 463) scale(1.05)" color="#65adff"/>
+<text x="105" y="502" font-size="21" fill="#edf5ff" font-weight="700" text-anchor="middle" data-max-width="108">用户请求</text>
+<text x="105" y="531" font-size="17" fill="#9fb4d1" font-weight="400" text-anchor="middle" data-max-width="108">文本 / 图片</text>
+<rect x="204" y="426" width="200" height="174" rx="11" fill="#0a172b" stroke="#65adff" stroke-width="1.4" filter="url(#fB)"/>
+<use href="#icMonitor" transform="translate(304 463) scale(1.05)" color="#65adff"/>
+<text x="304" y="502" font-size="21" fill="#edf5ff" font-weight="700" text-anchor="middle" data-max-width="178">安全入口</text>
+<text x="304" y="531" font-size="17" fill="#9fb4d1" font-weight="400" text-anchor="middle" data-max-width="178">身份 · 归属 · 幂等</text>
+<text x="304" y="556" font-size="17" fill="#9fb4d1" font-weight="400" text-anchor="middle" data-max-width="178">先建立 SSE / ACK</text>
+<rect x="438" y="426" width="270" height="174" rx="11" fill="#0a172b" stroke="#ba8aff" stroke-width="1.4" filter="url(#fP)"/>
+<use href="#icRouter" transform="translate(573 463) scale(1.05)" color="#ba8aff"/>
+<text x="573" y="502" font-size="21" fill="#edf5ff" font-weight="700" text-anchor="middle" data-max-width="248">Dispatch / 路由与装配</text>
+<text x="573" y="531" font-size="17" fill="#9fb4d1" font-weight="400" text-anchor="middle" data-max-width="248">异步准备 · 可选 Agent 路由</text>
+<text x="573" y="556" font-size="17" fill="#9fb4d1" font-weight="400" text-anchor="middle" data-max-width="248">绑定配置版本 · Armory</text>
+<rect x="742" y="386" width="440" height="259" rx="15" fill="#0a1729" stroke="#ba8aff" stroke-width="1.45" stroke-dasharray="8 7" filter="url(#fP)"/>
+<rect x="743" y="387" width="438" height="46" rx="14" fill="#ba8aff" fill-opacity=".07"/>
+<use href="#icFlow" transform="translate(770 411) scale(0.65)" color="#ba8aff"/>
+<text x="793" y="418" font-size="22" fill="#ba8aff" font-weight="700" text-anchor="start" data-max-width="370">Fixed · Auto · Flow</text>
+<rect x="760" y="441" width="404" height="48" rx="9" fill="#0b192c" stroke="#ba8aff" stroke-width="1.4"/>
+<use href="#icBolt" transform="translate(785 465) scale(0.65)" color="#ba8aff"/>
+<text x="809" y="479" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="340">Fixed：配置 Client 链顺序执行</text>
+<rect x="760" y="500" width="404" height="48" rx="9" fill="#0b192c" stroke="#ba8aff" stroke-width="1.4"/>
+<use href="#icLoop" transform="translate(785 524) scale(0.65)" color="#ba8aff"/>
+<text x="809" y="538" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="340">Auto：分析 → 执行 ⇄ 质检 → 汇总</text>
+<rect x="760" y="559" width="404" height="66" rx="9" fill="#0b192c" stroke="#ba8aff" stroke-width="1.4"/>
+<use href="#icFlow" transform="translate(785 592) scale(0.65)" color="#ba8aff"/>
+<text x="809" y="584" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="340">Flow：工具分析 → 规划 → DAG</text>
+<text x="809" y="607" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="340">代码解析依赖 · 可选审阅 · 就绪即调度</text>
+<rect x="1216" y="426" width="275" height="174" rx="11" fill="#0a172b" stroke="#ba8aff" stroke-width="1.4" filter="url(#fP)"/>
+<use href="#icBrain" transform="translate(1353.5 463) scale(1.05)" color="#ba8aff"/>
+<text x="1353.5" y="502" font-size="21" fill="#edf5ff" font-weight="700" text-anchor="middle" data-max-width="253">Advisor + LLM</text>
+<text x="1353.5" y="531" font-size="17" fill="#9fb4d1" font-weight="400" text-anchor="middle" data-max-width="253">上下文 · 记忆 · RAG</text>
+<text x="1353.5" y="556" font-size="17" fill="#9fb4d1" font-weight="400" text-anchor="middle" data-max-width="253">模型推理 ↔ 工具调用</text>
+<rect x="1525" y="426" width="355" height="174" rx="11" fill="#0a172b" stroke="#65adff" stroke-width="1.4" filter="url(#fB)"/>
+<use href="#icCloudWifi" transform="translate(1702.5 463) scale(1.05)" color="#65adff"/>
+<text x="1702.5" y="502" font-size="21" fill="#edf5ff" font-weight="700" text-anchor="middle" data-max-width="333">运行事件 / SSE</text>
+<text x="1702.5" y="531" font-size="17" fill="#9fb4d1" font-weight="400" text-anchor="middle" data-max-width="333">RunEventPublisher → 前端</text>
+<text x="1702.5" y="556" font-size="17" fill="#9fb4d1" font-weight="400" text-anchor="middle" data-max-width="333">正文 · 工具 · 步骤状态 · 阶段进度</text>
+<path d="M173 513 H198" fill="none" stroke="#edf5ff" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#mW)"/>
+<path d="M407 513 H432" fill="none" stroke="#edf5ff" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#mW)"/>
+<path d="M711 513 H736" fill="none" stroke="#edf5ff" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#mW)"/>
+<path d="M1185 513 H1210" fill="none" stroke="#edf5ff" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#mW)"/>
+<path d="M1494 513 H1519" fill="none" stroke="#edf5ff" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#mW)"/>
+<path d="M438 654 V674 H1491 V654" fill="none" stroke="#f0bd62" stroke-width="2.2" stroke-linejoin="round"/>
+<rect x="779" y="660" width="372" height="28" rx="7" fill="#0b1527"/>
+<text x="965" y="679" font-size="17" fill="#f0bd62" font-weight="500" text-anchor="middle">运行预算 · 取消信号 · 上下文保护</text>
+<path d="M279 727 V649 H963 V647" fill="none" stroke="#f0bd62" stroke-width="1.6" stroke-linejoin="round" stroke-dasharray="6 5" marker-end="url(#mG)"/>
+<text x="296" y="704" font-size="14.5" fill="#f0bd62" font-weight="400" text-anchor="start">交互 / 审阅 / 干预</text>
+<path d="M1285 601 V722" fill="none" stroke="#36d7e9" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#mC)"/>
+<path d="M1338 722 V601" fill="none" stroke="#36d7e9" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#mC)"/>
+<text x="1360" y="704" font-size="14.5" fill="#36d7e9" font-weight="400" text-anchor="start">调用 / 结果</text>
+<path d="M1492 558 H1509 V704 H1628 V722" fill="none" stroke="#f28fc6" stroke-width="1.6" stroke-linejoin="round" stroke-dasharray="6 5" marker-end="url(#mPk)"/>
+<rect x="40" y="727" width="478" height="303" rx="15" fill="#0a1729" stroke="#f0bd62" stroke-width="1.45" stroke-dasharray="8 7" filter="url(#fG)"/>
+<rect x="41" y="728" width="476" height="46" rx="14" fill="#f0bd62" fill-opacity=".07"/>
+<use href="#icAskChat" transform="translate(68 752) scale(0.65)" color="#f0bd62"/>
+<text x="91" y="759" font-size="22" fill="#f0bd62" font-weight="700" text-anchor="start" data-max-width="408">人机协作</text>
+<rect x="58" y="785" width="442" height="66" rx="9" fill="#0b192c" stroke="#f0bd62" stroke-width="1.4"/>
+<use href="#icAskChat" transform="translate(83 818) scale(0.65)" color="#f0bd62"/>
+<text x="107" y="810" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="378">ask_user：用户补充信息</text>
+<text x="107" y="833" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="378">绑定当前 user + run → 后续节点共享</text>
+<rect x="58" y="865" width="442" height="66" rx="9" fill="#0b192c" stroke="#f0bd62" stroke-width="1.4"/>
+<use href="#icClipboard" transform="translate(83 898) scale(0.65)" color="#f0bd62"/>
+<text x="107" y="890" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="378">Flow 计划确认 / 编辑</text>
+<text x="107" y="913" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="378">高风险工具审批 · 明确的等待与反馈</text>
+<text x="59" y="971" font-size="16" fill="#f0bd62" font-weight="500" text-anchor="start" data-max-width="440">steer 引导 · answer_now 收束 · cancel 取消</text>
+<text x="59" y="1006" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="440">补充信息进入运行上下文，不是全局长期记忆</text>
+<rect x="546" y="727" width="826" height="303" rx="15" fill="#0a1729" stroke="#36d7e9" stroke-width="1.45" stroke-dasharray="8 7" filter="url(#fC)"/>
+<rect x="547" y="728" width="824" height="46" rx="14" fill="#36d7e9" fill-opacity=".07"/>
+<use href="#icTools" transform="translate(574 752) scale(0.65)" color="#36d7e9"/>
+<text x="597" y="759" font-size="22" fill="#36d7e9" font-weight="700" text-anchor="start" data-max-width="756">动态工具与 MCP 治理</text>
+<rect x="564" y="785" width="169" height="63" rx="9" fill="#0b192c" stroke="#36d7e9" stroke-width="1.4"/>
+<text x="579" y="810" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="139">request_tool</text>
+<text x="579" y="833" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="139">缺失能力请求</text>
+<rect x="762" y="785" width="193" height="63" rx="9" fill="#0b192c" stroke="#36d7e9" stroke-width="1.4"/>
+<text x="777" y="810" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="163">授权工具目录</text>
+<text x="777" y="833" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="163">受 MCP 绑定约束</text>
+<rect x="984" y="785" width="370" height="63" rx="9" fill="#0b192c" stroke="#36d7e9" stroke-width="1.4"/>
+<text x="999" y="810" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="340">相关性筛选 → 按需装配</text>
+<text x="999" y="833" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="340">精确名称 / 语义匹配 · 不凑数装配</text>
+<path d="M737 816 H755" fill="none" stroke="#36d7e9" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#mC)"/>
+<path d="M959 816 H977" fill="none" stroke="#36d7e9" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#mC)"/>
+<rect x="564" y="865" width="260" height="63" rx="9" fill="#0b192c" stroke="#36d7e9" stroke-width="1.4"/>
+<text x="579" y="890" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="230">Robust ToolManager</text>
+<text x="579" y="913" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="230">阶段权限 · 预算 · 审批</text>
+<rect x="853" y="865" width="293" height="63" rx="9" fill="#0b192c" stroke="#36d7e9" stroke-width="1.4"/>
+<text x="868" y="890" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="263">MCP Registry / 调用租约</text>
+<text x="868" y="913" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="263">容量 · 探活重连 · 空闲回收</text>
+<rect x="1175" y="865" width="179" height="63" rx="9" fill="#0b192c" stroke="#36d7e9" stroke-width="1.4"/>
+<text x="1190" y="890" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="149">外部 MCP</text>
+<text x="1190" y="913" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="149">授权连接调用</text>
+<path d="M828 896 H846" fill="none" stroke="#36d7e9" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#mC)"/>
+<path d="M1150 896 H1168" fill="none" stroke="#36d7e9" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#mC)"/>
+<text x="566" y="966" font-size="17" fill="#36d7e9" font-weight="600" text-anchor="start" data-max-width="784">工具结果压缩 + resultRef → inspect_tool_result 按需回读</text>
+<text x="566" y="1006" font-size="16" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="784">分析 / 规划看能力目录 · 同 MCP 串行 / 跨 MCP 并行</text>
+<rect x="1400" y="727" width="480" height="303" rx="15" fill="#0a1729" stroke="#f28fc6" stroke-width="1.45" stroke-dasharray="8 7" filter="url(#fPk)"/>
+<rect x="1401" y="728" width="478" height="46" rx="14" fill="#f28fc6" fill-opacity=".07"/>
+<use href="#icDocs" transform="translate(1428 752) scale(0.65)" color="#f28fc6"/>
+<text x="1451" y="759" font-size="22" fill="#f28fc6" font-weight="700" text-anchor="start" data-max-width="410">产物与反馈</text>
+<rect x="1418" y="785" width="444" height="66" rx="9" fill="#0b192c" stroke="#f28fc6" stroke-width="1.4"/>
+<use href="#icDocLines" transform="translate(1443 818) scale(0.65)" color="#f28fc6"/>
+<text x="1467" y="810" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="380">create_artifact</text>
+<text x="1467" y="833" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="380">内置工具生成 · 与外部 MCP 分开</text>
+<rect x="1418" y="865" width="444" height="66" rx="9" fill="#0b192c" stroke="#f28fc6" stroke-width="1.4"/>
+<use href="#icCopy" transform="translate(1443 898) scale(0.65)" color="#f28fc6"/>
+<text x="1467" y="890" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="380">Markdown / 表格 CSV / 代码文件</text>
+<text x="1467" y="913" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="380">不可变版本 · 预览 · 下载 · 用户反馈</text>
+<text x="1420" y="974" font-size="18" fill="#f28fc6" font-weight="600" text-anchor="start" data-max-width="434">代码产物仅保存，不执行</text>
+<text x="1420" y="1007" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="434">反馈可选择转为评测草稿，人工审核后发布</text>
+<path d="M40 1192 H30 V408 H462 V425" fill="none" stroke="#5dd99d" stroke-width="1.6" stroke-linejoin="round" stroke-dasharray="6 5" marker-end="url(#mGr)"/>
+<text x="44" y="1071" font-size="14.5" fill="#5dd99d" font-weight="400" text-anchor="start">后台触发 → 复用执行链</text>
+<path d="M1702 601 H1890 V1056 H997 V1095" fill="none" stroke="#65adff" stroke-width="1.6" stroke-linejoin="round" stroke-dasharray="6 5" marker-end="url(#mBl)"/>
+<text x="1009" y="1080" font-size="14.5" fill="#65adff" font-weight="400" text-anchor="start">运行事件 / 检查点</text>
+<path d="M1639 1032 V1095" fill="none" stroke="#f28fc6" stroke-width="1.6" stroke-linejoin="round" stroke-dasharray="6 5" marker-end="url(#mPk)"/>
+<text x="1653" y="1074" font-size="14.5" fill="#f28fc6" font-weight="400" text-anchor="start">人工发布用例</text>
+<rect x="40" y="1100" width="478" height="208" rx="15" fill="#0a1729" stroke="#5dd99d" stroke-width="1.45" stroke-dasharray="8 7" filter="url(#fGr)"/>
+<rect x="41" y="1101" width="476" height="46" rx="14" fill="#5dd99d" fill-opacity=".07"/>
+<use href="#icClipboard" transform="translate(68 1125) scale(0.65)" color="#5dd99d"/>
+<text x="91" y="1132" font-size="22" fill="#5dd99d" font-weight="700" text-anchor="start" data-max-width="408">后台任务与收件箱</text>
+<rect x="58" y="1156" width="442" height="63" rx="9" fill="#0b192c" stroke="#5dd99d" stroke-width="1.4"/>
+<use href="#icLoop" transform="translate(83 1187.5) scale(0.65)" color="#5dd99d"/>
+<text x="107" y="1181" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="378">定时一次 / CRON / 文件变化</text>
+<text x="107" y="1204" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="378">触发任务 → 复用 Agent 执行链</text>
+<text x="58" y="1254" font-size="16.5" fill="#edf5ff" font-weight="500" text-anchor="start" data-max-width="442">收件箱：待确认 / 待补充 / 完成 / 失败</text>
+<text x="58" y="1288" font-size="15.5" fill="#5dd99d" font-weight="400" text-anchor="start" data-max-width="442">跨页面通知 · 全部已读不等于批准</text>
+<rect x="546" y="1100" width="826" height="208" rx="15" fill="#0a1729" stroke="#36d7e9" stroke-width="1.45" stroke-dasharray="8 7" filter="url(#fC)"/>
+<rect x="547" y="1101" width="824" height="46" rx="14" fill="#36d7e9" fill-opacity=".07"/>
+<use href="#icLayers" transform="translate(574 1125) scale(0.65)" color="#36d7e9"/>
+<text x="597" y="1132" font-size="22" fill="#36d7e9" font-weight="700" text-anchor="start" data-max-width="756">运行回放与持久历史</text>
+<rect x="564" y="1156" width="250" height="63" rx="9" fill="#0b192c" stroke="#36d7e9" stroke-width="1.4"/>
+<text x="579" y="1181" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="220">Redis Stream</text>
+<text x="579" y="1204" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="220">事件游标 · 重连去重</text>
+<rect x="834" y="1156" width="250" height="63" rx="9" fill="#0b192c" stroke="#36d7e9" stroke-width="1.4"/>
+<text x="849" y="1181" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="220">Redis Snapshot</text>
+<text x="849" y="1204" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="220">步骤快照 · 重做上下文</text>
+<rect x="1104" y="1156" width="250" height="63" rx="9" fill="#0b192c" stroke="#36d7e9" stroke-width="1.4"/>
+<text x="1119" y="1181" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="220">MySQL History</text>
+<text x="1119" y="1204" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="220">状态 · 回答 · 有界诊断</text>
+<text x="566" y="1254" font-size="16" fill="#edf5ff" font-weight="500" text-anchor="start" data-max-width="784">断线不取消 · 步骤重做创建新 Run · 失败 / 取消也可查</text>
+<text x="566" y="1288" font-size="15.5" fill="#36d7e9" font-weight="400" text-anchor="start" data-max-width="784">阶段进度不入持久事件 · 进程中断不自动重放外部操作</text>
+<rect x="1400" y="1100" width="480" height="208" rx="15" fill="#0a1729" stroke="#65adff" stroke-width="1.45" stroke-dasharray="8 7" filter="url(#fB)"/>
+<rect x="1401" y="1101" width="478" height="46" rx="14" fill="#65adff" fill-opacity=".07"/>
+<use href="#icTarget" transform="translate(1428 1125) scale(0.65)" color="#65adff"/>
+<text x="1451" y="1132" font-size="22" fill="#65adff" font-weight="700" text-anchor="start" data-max-width="410">EvalOps 评测闭环</text>
+<rect x="1418" y="1156" width="444" height="63" rx="9" fill="#0b192c" stroke="#65adff" stroke-width="1.4"/>
+<use href="#icChart" transform="translate(1443 1187.5) scale(0.65)" color="#65adff"/>
+<text x="1467" y="1181" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="380">反馈草稿 → 发布用例 → 同链执行</text>
+<text x="1467" y="1204" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="380">规则评分 / LLM Judge / Trace</text>
+<text x="1420" y="1254" font-size="16.5" fill="#edf5ff" font-weight="500" text-anchor="start" data-max-width="438">代码版本绑定 · 历史对比 · 评测会话回看</text>
+<text x="1420" y="1288" font-size="15.5" fill="#65adff" font-weight="400" text-anchor="start" data-max-width="438">用例反馈改进系统，不自动训练模型</text>
+<text x="40" y="1342" font-size="19" fill="#65adff" font-weight="700" text-anchor="start">数据与文件</text>
+<text x="1650" y="1342" font-size="15" fill="#9fb4d1" font-weight="400" text-anchor="start">各模块按职责读写</text>
+<rect x="40" y="1360" width="440" height="73" rx="9" fill="#0b192c" stroke="#65adff" stroke-width="1.4"/>
+<use href="#icDb" transform="translate(65 1396.5) scale(0.65)" color="#65adff"/>
+<text x="89" y="1385" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="376">MySQL</text>
+<text x="89" y="1408" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="376">配置 · 版本 · 历史 · 额度 · 产物</text>
+<rect x="506" y="1360" width="440" height="73" rx="9" fill="#0b192c" stroke="#36d7e9" stroke-width="1.4"/>
+<use href="#icDb" transform="translate(531 1396.5) scale(0.65)" color="#36d7e9"/>
+<text x="555" y="1385" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="376">Redis</text>
+<text x="555" y="1408" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="376">会话 · 事件 · 快照 · 工具原文</text>
+<rect x="972" y="1360" width="442" height="73" rx="9" fill="#0b192c" stroke="#5dd99d" stroke-width="1.4"/>
+<use href="#icDb" transform="translate(997 1396.5) scale(0.65)" color="#5dd99d"/>
+<text x="1021" y="1385" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="378">PgVector + Elasticsearch</text>
+<text x="1021" y="1408" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="378">向量检索 · BM25 · 工具目录</text>
+<rect x="1440" y="1360" width="440" height="73" rx="9" fill="#0b192c" stroke="#f28fc6" stroke-width="1.4"/>
+<use href="#icDocs" transform="translate(1465 1396.5) scale(0.65)" color="#f28fc6"/>
+<text x="1489" y="1385" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="376">文件存储</text>
+<text x="1489" y="1408" font-size="15.5" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="376">知识原件 · 多模态附件</text>
+<rect x="40" y="1460" width="1840" height="96" rx="15" fill="#0a1729" stroke="#65adff" stroke-width="1.45" stroke-dasharray="8 7" filter="url(#fB)"/>
+<rect x="41" y="1461" width="1838" height="46" rx="14" fill="#65adff" fill-opacity=".07"/>
+<use href="#icPulse" transform="translate(68 1485) scale(0.65)" color="#65adff"/>
+<text x="91" y="1492" font-size="22" fill="#65adff" font-weight="700" text-anchor="start" data-max-width="1770">观测与运维</text>
+<rect x="295" y="1480" width="400" height="54" rx="9" fill="#0b192c" stroke="#65adff" stroke-width="1.4"/>
+<use href="#icPulse" transform="translate(320 1507) scale(0.65)" color="#65adff"/>
+<text x="344" y="1518" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="336">Prometheus / Grafana</text>
+<rect x="725" y="1480" width="265" height="54" rx="9" fill="#0b192c" stroke="#65adff" stroke-width="1.4"/>
+<use href="#icChart" transform="translate(750 1507) scale(0.65)" color="#65adff"/>
+<text x="774" y="1518" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="201">ELK</text>
+<rect x="1020" y="1480" width="316" height="54" rx="9" fill="#0b192c" stroke="#65adff" stroke-width="1.4"/>
+<use href="#icNet" transform="translate(1045 1507) scale(0.65)" color="#65adff"/>
+<text x="1069" y="1518" font-size="18" fill="#edf5ff" font-weight="600" text-anchor="start" data-max-width="252">Jaeger / OTLP</text>
+<text x="1365" y="1502" font-size="17" fill="#edf5ff" font-weight="500" text-anchor="start" data-max-width="486">本人：用量 / MCP 观测</text>
+<text x="1365" y="1533" font-size="16" fill="#9fb4d1" font-weight="400" text-anchor="start" data-max-width="486">管理员：站点访问 / 注册统计</text>
+<text x="40" y="1585" font-size="13" fill="#6684aa" font-weight="500" text-anchor="start">TAgent · Architecture overview</text>
+<text x="1880" y="1585" font-size="13" fill="#6684aa" font-weight="400" text-anchor="end">依据本地当前实现绘制 · 2026-10-10</text>
+</svg></html>

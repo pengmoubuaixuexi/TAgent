@@ -13,7 +13,6 @@ import org.springframework.ai.transformer.splitter.TextSplitter;
 import org.springframework.ai.vectorstore.pgvector.PgVectorStore;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -44,8 +43,14 @@ public class AiAgentConfig {
     public EmbeddingModel embeddingModel(@Value("${agent.embedding.base-url}") String baseUrl,
                                          @Value("${agent.embedding.api-key}") String apiKey,
                                          @Value("${agent.embedding.model:BAAI/bge-m3}") String model,
-                                         @Value("${agent.embedding.embeddings-path:}") String embeddingsPath) {
+                                         @Value("${agent.embedding.embeddings-path:}") String embeddingsPath,
+                                         cn.bugstack.ai.domain.agent.service.model.ModelCredentialRequestAuthorizer credentialRequests) {
         OpenAiApi openAiApi = OpenAiApi.builder()
+                .restClientBuilder(org.springframework.web.client.RestClient.builder()
+                        .requestInterceptor(credentialRequests.platformAuxiliary("EMBEDDING"))
+                        .requestFactory(cn.bugstack.ai.domain.agent.service.execute.common.ModelRequestGuard.requestFactory())
+                        .requestInterceptor(cn.bugstack.ai.domain.agent.service.execute.common.ModelRequestGuard.synchronous(
+                                cn.bugstack.ai.domain.agent.service.model.ModelUsageContext.api(null,"EMBEDDING",baseUrl))))
                 .baseUrl(baseUrl)
                 .apiKey(apiKey)
                 .embeddingsPath(OpenAiCompatibleApiSupport.embeddingsPath(baseUrl, embeddingsPath))
@@ -56,14 +61,27 @@ public class AiAgentConfig {
         return new OpenAiEmbeddingModel(openAiApi, MetadataMode.EMBED, embeddingOptions);
     }
 
-    /** RAG 知识库专用向量表 */
-    @Bean("vectorStore")
-    @ConditionalOnBean(name = "pgVectorJdbcTemplate")
+    /**
+     * RAG requires PostgreSQL and MySQL publication metadata. Declare both stores unconditionally:
+     * ConditionalOnBean on ordinary user configurations depends on registration order and can let
+     * Boot silently install an unfiltered store against the primary MySQL template. Method
+     * dependencies resolve after all configuration definitions have been registered.
+     */
+    @Bean("ragVectorStore")
     public PgVectorStore pgVectorStore(@Qualifier("pgVectorJdbcTemplate") JdbcTemplate jdbcTemplate,
-                                       @Qualifier("embeddingModel") EmbeddingModel embeddingModel) {
+                                       @Qualifier("embeddingModel") EmbeddingModel embeddingModel,
+                                       @Value("${agent.rag.vector-table:${spring.ai.vectorstore.pgvector.table-name:vector_store}}") String vectorTable) {
         return PgVectorStore.builder(jdbcTemplate, embeddingModel)
-                .vectorTableName("vector_store_openai")
+                .vectorTableName(vectorTable)
                 .build();
+    }
+
+    @Bean("vectorStore")
+    @org.springframework.context.annotation.Primary
+    public org.springframework.ai.vectorstore.VectorStore publishedRagVectorStore(
+            @Qualifier("ragVectorStore") PgVectorStore raw,
+            cn.bugstack.ai.domain.agent.service.rag.RagDocumentVisibility visibility) {
+        return new cn.bugstack.ai.infrastructure.adapter.repository.rag.ingestion.PublishedRagVectorStore(raw, visibility);
     }
 
     /**
@@ -71,7 +89,6 @@ public class AiAgentConfig {
      * enabled=false 时不注册该 bean，SemanticCacheAdvisor 不会被创建。
      */
     @Bean("semanticCacheService")
-    @ConditionalOnBean(name = "pgVectorJdbcTemplate")
     @ConditionalOnProperty(name = "agent.semantic-cache.enabled", havingValue = "true")
     public ISemanticCacheService semanticCacheService(
             @Qualifier("pgVectorJdbcTemplate") JdbcTemplate jdbcTemplate,

@@ -55,7 +55,7 @@ import java.util.stream.Collectors;
 public class EvalRunService {
 
     private static final long HARD_CASE_TIMEOUT_MS = TimeUnit.MINUTES.toMillis(30);
-    private static final String TRACE_SCHEMA_VERSION = "eval-trace-v2-old-compatible";
+    private static final String TRACE_SCHEMA_VERSION = "eval-trace-v3-json-values";
     private static final DateTimeFormatter TRACE_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
 
     private final IAiEvalOpsDao dao;
@@ -347,16 +347,42 @@ public class EvalRunService {
         if (cancelledRuns.contains(run.getEvalRunId())) return;
 
         long latency = System.currentTimeMillis() - startedMs;
-        String answer = finalAnswer(snapshot);
+        LocalDateTime finishedAt = LocalDateTime.now();
+        AiEvalCaseResult finished;
+        String answer = null;
+        try {
+            answer = finalAnswer(snapshot);
+            finished = completedCaseResult(evalCase, stored, agentRunId, sessionId, config, stmSnapshot,
+                    snapshot, answer, terminalStatus, error, started, startedMs, latency, finishedAt);
+        } catch (RuntimeException diagnosticFailure) {
+            if (diagnosticFailure instanceof java.util.concurrent.CancellationException
+                    || diagnosticFailure instanceof org.springframework.dao.DataAccessException) throw diagnosticFailure;
+            if (cancelledRuns.contains(run.getEvalRunId())) return;
+            log.error("Eval case evidence capture failed evalRunId={} resultId={} agentRunId={}",
+                    run.getEvalRunId(), stored.getResultId(), agentRunId, diagnosticFailure);
+            finished = incompleteCaseResult(stored, agentRunId, sessionId, snapshot, answer, terminalStatus, error,
+                    latency, finishedAt, diagnosticFailure);
+        }
+        if (cancelledRuns.contains(run.getEvalRunId())) return;
+        // Database failures still fail the run. Only in-memory diagnostic failures are isolated per case.
+        dao.finishCaseResult(finished);
+        dao.refreshRunProgress(run.getEvalRunId());
+    }
+
+    private AiEvalCaseResult completedCaseResult(AiEvalCase evalCase, AiEvalCaseResult stored,
+                                                 String agentRunId, String sessionId, EvalCaseConfig config,
+                                                 JSONObject stmSnapshot, RunSnapshot snapshot, String answer, String terminalStatus,
+                                                 String error, LocalDateTime started, long startedMs, long latency,
+                                                 LocalDateTime finishedAt) {
         List<RunEventRecord> events = snapshot == null || snapshot.getTimelineEvents() == null ? List.of() : snapshot.getTimelineEvents();
         EvalRuleEngine.RuleResult score = ruleEngine.evaluate(EvalRuleEngine.Observation.builder()
                 .config(config).agentId(snapshot == null ? null : snapshot.getAgentId())
                 .strategy(snapshot == null ? null : snapshot.getAgentType()).status(terminalStatus)
                 .answer(answer).latencyMs(latency).events(events).build());
 
-        LocalDateTime finishedAt = LocalDateTime.now();
         Map<String, Object> trace = new LinkedHashMap<>();
         trace.put("traceSchemaVersion", TRACE_SCHEMA_VERSION);
+        trace.put("traceCompleteness", "COMPLETE");
         trace.put("no", evalCase.getSequenceNo());
         trace.put("category", evalCase.getCategory());
         trace.put("question", evalCase.getQuestion());
@@ -391,10 +417,10 @@ public class EvalRunService {
         // 保留新版可恢复运行快照，旧版兼容字段则供 Judge 和人工审查稳定消费。
         trace.put("runSnapshot", snapshot);
         trace.put("capturedAt", finishedAt.toString());
-        AiEvalCaseResult finished = AiEvalCaseResult.builder()
+        return AiEvalCaseResult.builder()
                 .resultId(stored.getResultId()).status(terminalStatus).agentRunId(agentRunId).sessionId(sessionId)
                 .agentId(snapshot == null ? null : snapshot.getAgentId()).strategy(snapshot == null ? null : snapshot.getAgentType())
-                .finalAnswer(answer).traceJson(JSON.toJSONString(trace)).signalsJson(JSON.toJSONString(score.getSignals()))
+                .finalAnswer(answer).traceJson(EvalTraceCodec.write(trace)).signalsJson(JSON.toJSONString(score.getSignals()))
                 .routeScore(decimal(score.getRouteScore())).answerScore(decimal(score.getAnswerScore()))
                 .stepScore(decimal(score.getStepScore())).toolScore(decimal(score.getToolScore()))
                 .groundingScore(decimal(score.getGroundingScore())).memoryScore(decimal(score.getMemoryScore()))
@@ -402,9 +428,38 @@ public class EvalRunService {
                 .safetyScore(decimal(score.getSafetyScore())).overallScore(decimal(score.getOverallScore()))
                 .grade(score.getGrade()).warningsJson(JSON.toJSONString(score.getWarnings()))
                 .latencyMs(latency).errorMessage(error).finishedAt(finishedAt).build();
-        if (cancelledRuns.contains(run.getEvalRunId())) return;
-        dao.finishCaseResult(finished);
-        dao.refreshRunProgress(run.getEvalRunId());
+    }
+
+    private static AiEvalCaseResult incompleteCaseResult(AiEvalCaseResult stored, String agentRunId,
+                                                         String sessionId, RunSnapshot snapshot, String answer, String executionStatus,
+                                                         String executionError, long latency, LocalDateTime finishedAt,
+                                                         RuntimeException failure) {
+        String detail = message(failure);
+        if (detail.length() > 2000) detail = detail.substring(0, 2000) + "…[截断]";
+        String error = "评测证据保存失败，Trace 不完整，未生成规则评分：" + detail;
+        Map<String, Object> trace = new LinkedHashMap<>();
+        trace.put("traceSchemaVersion", TRACE_SCHEMA_VERSION);
+        trace.put("traceCompleteness", "INCOMPLETE");
+        trace.put("status", "ERROR");
+        trace.put("executionStatus", executionStatus);
+        trace.put("executionError", executionError == null || executionError.length() <= 2000
+                ? executionError : executionError.substring(0, 2000) + "…[截断]");
+        trace.put("agentRunId", agentRunId);
+        trace.put("sessionId", sessionId);
+        trace.put("capturedAt", finishedAt.toString());
+        trace.put("traceError", Map.of("stage", "CASE_DIAGNOSTICS", "type", failure.getClass().getName(),
+                "message", detail, "originalTracePersisted", false));
+        // Do not manufacture empty evidence or retain quality scores based on an unsaved trace.
+        trace.put("omittedFields", List.of("case", "evalSpec", "stmSnapshot", "finalAnswer", "events", "steps",
+                "toolEvidences", "runSnapshot", "signals"));
+        return AiEvalCaseResult.builder().resultId(stored.getResultId()).status("ERROR")
+                .agentRunId(agentRunId).sessionId(sessionId)
+                .agentId(snapshot == null ? null : snapshot.getAgentId())
+                .strategy(snapshot == null ? null : snapshot.getAgentType())
+                .finalAnswer(answer).traceJson(EvalTraceCodec.write(trace))
+                .signalsJson("{\"traceCompleteness\":\"INCOMPLETE\",\"ruleEvaluation\":\"UNAVAILABLE\"}")
+                .warningsJson(JSON.toJSONString(List.of(error)))
+                .latencyMs(latency).errorMessage(error).finishedAt(finishedAt).build();
     }
 
     private Map<String, Object> runView(AiEvalRun run) {
@@ -468,7 +523,18 @@ public class EvalRunService {
         view.put("errorMessage", result.getErrorMessage());
         view.put("startedAt", result.getStartedAt());
         view.put("finishedAt", result.getFinishedAt());
-        if (includeTrace) view.put("trace", parseJson(result.getTraceJson()));
+        if (includeTrace) {
+            try {
+                JSONObject trace = EvalTraceCodec.read(result.getTraceJson());
+                view.put("trace", trace);
+                if (trace.containsKey("traceCompleteness") && !"COMPLETE".equals(trace.getString("traceCompleteness"))) {
+                    view.put("traceError", blankToDefault(result.getErrorMessage(), "评测 Trace 不完整，缺少可评分证据"));
+                }
+            } catch (IllegalArgumentException error) {
+                view.put("trace", result.getTraceJson());
+                view.put("traceError", error.getMessage());
+            }
+        }
         return view;
     }
 

@@ -17,6 +17,8 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseBodyEmitter
 
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -53,15 +55,25 @@ public class WorkspaceExecutionGuardTest {
         WorkspaceExecutionGuard guard = new WorkspaceExecutionGuard();
         ThreadPoolExecutor pool = mock(ThreadPoolExecutor.class);
         IExecuteStrategy strategy = mock(IExecuteStrategy.class);
-        doThrow(new IllegalStateException("fixture failure")).when(strategy).execute(any(), any());
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        doAnswer(call -> {
+            entered.countDown();
+            assertTrue(release.await(5, TimeUnit.SECONDS));
+            throw new IllegalStateException("fixture failure");
+        }).when(strategy).execute(any(), any());
         AtomicReference<Runnable> queued = new AtomicReference<>();
         doAnswer(call -> { queued.set(call.getArgument(0)); return null; }).when(pool).execute(any());
         var dispatcher = dispatcher(guard, pool, strategy);
         dispatcher.dispatch(command(), new ResponseBodyEmitter());
-        assertThrows(WorkspaceExecutionGuard.BusyException.class, () -> guard.beginUpdate(Set.of("agent-a")));
         var worker = Executors.newSingleThreadExecutor();
-        try { worker.submit(queued.get()).get(5, TimeUnit.SECONDS); }
-        finally { worker.shutdownNow(); }
+        try {
+            var running = worker.submit(queued.get());
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            assertThrows(WorkspaceExecutionGuard.BusyException.class, () -> guard.beginUpdate(Set.of("agent-a")));
+            release.countDown();
+            running.get(5, TimeUnit.SECONDS);
+        } finally { release.countDown(); worker.shutdownNow(); }
         assertNull(dispatcher.activeRunId("session-a"));
         guard.beginUpdate(Set.of("agent-a")).close();
     }
@@ -76,13 +88,24 @@ public class WorkspaceExecutionGuardTest {
         guard.beginUpdate(Set.of("agent-a")).close();
     }
 
-    @Test public void synchronousAssemblyFailureReleasesConfigurationLease() {
+    @Test public void asynchronousAssemblyFailureReleasesConfigurationLease() throws Exception {
         WorkspaceExecutionGuard guard = new WorkspaceExecutionGuard();
-        var dispatcher = dispatcher(guard, mock(ThreadPoolExecutor.class), mock(IExecuteStrategy.class));
+        ThreadPoolExecutor pool = mock(ThreadPoolExecutor.class);
+        AtomicReference<Runnable> queued = new AtomicReference<>();
+        doAnswer(call -> { queued.set(call.getArgument(0)); return null; }).when(pool).execute(any());
+        var dispatcher = dispatcher(guard, pool, mock(IExecuteStrategy.class));
         ArmoryService armory = mock(ArmoryService.class);
-        doThrow(new IllegalStateException("fixture assembly")).when(armory).ensureArmed("agent-a");
+        doAnswer(call -> {
+            assertThrows(WorkspaceExecutionGuard.BusyException.class, () -> guard.beginUpdate(Set.of("agent-a")));
+            throw new IllegalStateException("fixture assembly");
+        }).when(armory).ensureArmed("agent-a");
         ReflectionTestUtils.setField(dispatcher, "armoryService", armory);
-        assertThrows(IllegalStateException.class, () -> dispatcher.dispatch(command(), new ResponseBodyEmitter()));
+        var command = command();
+        dispatcher.dispatch(command, new ResponseBodyEmitter());
+        assertEquals(command.getRunId(), dispatcher.activeRunId("session-a"));
+        verifyNoInteractions(armory);
+        queued.get().run();
+        verify(armory).ensureArmed("agent-a");
         assertNull(dispatcher.activeRunId("session-a"));
         guard.beginUpdate(Set.of("agent-a")).close();
     }
@@ -106,6 +129,6 @@ public class WorkspaceExecutionGuardTest {
 
     private ExecuteCommandEntity command() {
         return ExecuteCommandEntity.builder().userId("alice").aiAgentId("agent-a")
-                .sessionId("session-a").runId("run-a").message("test").build();
+                .sessionId("session-a").runId("guard-test-" + UUID.randomUUID()).message("test").build();
     }
 }

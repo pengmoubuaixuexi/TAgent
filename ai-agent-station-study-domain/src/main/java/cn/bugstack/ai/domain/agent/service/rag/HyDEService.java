@@ -44,6 +44,7 @@ public class HyDEService {
                 return result.trim();
             }
         } catch (Exception e) {
+            cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.rethrowCancellation(e);
             log.debug("HyDE generation failed: {}", e.getMessage());
         }
         return null;

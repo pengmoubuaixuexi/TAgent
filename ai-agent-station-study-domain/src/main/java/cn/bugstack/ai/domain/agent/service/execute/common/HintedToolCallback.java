@@ -15,7 +15,7 @@ import org.springframework.ai.tool.metadata.ToolMetadata;
  * <p>
  * 当 hint 为空时，{@link #getToolDefinition()} 直接返回原 ToolDefinition——零开销 wrap。
  */
-public class HintedToolCallback implements ToolCallback {
+public class HintedToolCallback implements ToolCallback, McpClientRegistry.OriginalToolName {
 
     private static final String HINT_PREFIX = "\n\n提示: ";
 
@@ -33,6 +33,11 @@ public class HintedToolCallback implements ToolCallback {
     @Override
     public ToolDefinition getToolDefinition() {
         return decoratedDefinition != null ? decoratedDefinition : delegate.getToolDefinition();
+    }
+
+    @Override
+    public String getOriginalToolName() {
+        return McpClientRegistry.originalToolName(delegate);
     }
 
     @Override

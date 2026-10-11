@@ -92,6 +92,7 @@ public class LlmQueryDecomposer implements IQueryDecomposer {
                     query.substring(0, Math.min(50, query.length())), cleaned.size());
             return cleaned;
         } catch (Exception e) {
+            cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.rethrowCancellation(e);
             log.debug("Query decomposition failed: {}", e.getMessage());
             return Collections.singletonList(query);
         }

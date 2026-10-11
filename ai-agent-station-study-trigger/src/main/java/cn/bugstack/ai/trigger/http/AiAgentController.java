@@ -173,9 +173,8 @@ public class AiAgentController implements IAiAgentService {
                 userInputGate.reset(sessionId);
             }
 
-            // 2026-05-07 #2 TTFT 优化：emitter 创建后立即吐一个 ack 事件，
-            // 让浏览器 Network 面板第一个 chunk 在 < 50ms 出现。后续 IntentRouter / advisor
-            // 任何阻塞都不会影响"已连接"的视觉反馈，前端立刻把"思考中..."替换为已连接动画
+            // ACK is flushed when MVC receives this emitter. Dispatch only performs admission here;
+            // routing, Agent assembly and MCP initialization run on the background worker.
             try {
                 Map<String, Object> ack = new LinkedHashMap<>();
                 ack.put("sessionId", sessionId != null ? sessionId : "");
@@ -304,7 +303,7 @@ public class AiAgentController implements IAiAgentService {
                     .planReviewEnabled(request.getPlanReviewEnabled())
                     .build();
 
-            // 3. 调度处理
+            // 3. Admit and queue the run, then return the emitter so preparation progress reaches SSE.
             agentDispatchService.dispatch(executeCommandEntity, emitter);
 
             return emitter;
@@ -332,6 +331,8 @@ public class AiAgentController implements IAiAgentService {
     @RequestMapping(value = "flow/plan-review/confirm", method = RequestMethod.POST)
     public ResponseBodyEmitter confirmFlowPlanReview(@RequestBody FlowPlanReviewConfirmRequestDTO request,
                                                      HttpServletResponse response) {
+        boolean admitted = false;
+        String previousRun = MDC.get("runId"), previousAgentRun = MDC.get("agent.run_id");
         try {
             response.setContentType("text/event-stream");
             response.setCharacterEncoding("UTF-8");
@@ -342,6 +343,31 @@ public class AiAgentController implements IAiAgentService {
 
             String sessionId = request != null ? request.getSessionId() : null;
             String runId = request != null ? request.getRunId() : null;
+            List<FlowPlanReviewStep> steps = toPlanReviewSteps(request != null ? request.getSteps() : null);
+            FlowPlanReviewPreparedPlan preparedPlan = flowPlanReviewService.prepareApprovedPlan(runId, sessionId, steps);
+            if (!preparedPlan.isReady()) {
+                // A rejected subscription does not own the run. In particular, a duplicate confirmation
+                // must not finish the already executing run or close its existing subscribers.
+                ResponseBodyEmitter rejected = new ResponseBodyEmitter();
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("runId", runId);
+                payload.put("sessionId", sessionId);
+                payload.put("errorCode", preparedPlan.getErrorCode());
+                payload.put("errors", preparedPlan.getErrors());
+                payload.put("warnings", preparedPlan.getWarnings());
+                if (preparedPlan.getState() != null) {
+                    payload.put("status", preparedPlan.getState().getStatus());
+                    payload.put("lastError", preparedPlan.getState().getLastError());
+                    payload.put("attemptCount", preparedPlan.getState().getAttemptCount());
+                }
+                sendSseObject(rejected, "plan_review_error", payload);
+                sendSseObject(rejected, "message",
+                        cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity.createErrorResult(
+                                String.join("; ", preparedPlan.getErrors()), sessionId));
+                rejected.complete();
+                return rejected;
+            }
+            admitted = true;
             ResponseBodyEmitter emitter =
                     new cn.bugstack.ai.domain.agent.service.execute.event.RunAwareResponseBodyEmitter(
                             Long.MAX_VALUE, runId, sessionId, runEventPublisher);
@@ -366,37 +392,18 @@ public class AiAgentController implements IAiAgentService {
             ack.put("timestamp", System.currentTimeMillis());
             runEventPublisher.publish(runId, sessionId, "ack", ack);
 
-            List<FlowPlanReviewStep> steps = toPlanReviewSteps(request != null ? request.getSteps() : null);
-            FlowPlanReviewPreparedPlan preparedPlan = flowPlanReviewService.prepareApprovedPlan(
-                    request != null ? request.getRunId() : null,
-                    sessionId,
-                    steps);
-            if (!preparedPlan.isReady()) {
-                Map<String, Object> payload = new LinkedHashMap<>();
-                payload.put("runId", request != null ? request.getRunId() : null);
-                payload.put("sessionId", sessionId);
-                payload.put("errorCode", preparedPlan.getErrorCode());
-                payload.put("errors", preparedPlan.getErrors());
-                payload.put("warnings", preparedPlan.getWarnings());
-                if (preparedPlan.getState() != null) {
-                    payload.put("status", preparedPlan.getState().getStatus());
-                    payload.put("lastError", preparedPlan.getState().getLastError());
-                    payload.put("attemptCount", preparedPlan.getState().getAttemptCount());
-                }
-                sendSseObject(emitter, "plan_review_error", payload);
-                sendSseObject(emitter, "message",
-                        cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity.createErrorResult(
-                                String.join("; ", preparedPlan.getErrors()), sessionId));
-                emitter.complete();
-                return emitter;
-            }
-
             flowPlanReviewResumeService.resumeReviewedPlan(preparedPlan.getState(), preparedPlan.getValidation(), emitter);
             return emitter;
         } catch (Exception e) {
             log.error("Flow plan review confirm failed", e);
-            if (request != null && request.getRunId() != null) {
-                runEventPublisher.finishRun(request.getRunId());
+            if (admitted && request != null && request.getRunId() != null) {
+                try {
+                    flowPlanReviewService.markExecutionFailed(request.getRunId(), "计划恢复调度失败，请重新发起任务");
+                } catch (RuntimeException stateError) {
+                    log.warn("Flow plan review failure status unavailable runId={}", request.getRunId());
+                } finally {
+                    runEventPublisher.finishRun(request.getRunId());
+                }
             }
             ResponseBodyEmitter errorEmitter = new ResponseBodyEmitter();
             try {
@@ -407,6 +414,9 @@ public class AiAgentController implements IAiAgentService {
             } catch (Exception ignored) {
             }
             return errorEmitter;
+        } finally {
+            if (previousRun == null) MDC.remove("runId"); else MDC.put("runId", previousRun);
+            if (previousAgentRun == null) MDC.remove("agent.run_id"); else MDC.put("agent.run_id", previousAgentRun);
         }
     }
 

@@ -71,6 +71,19 @@ public class ToolCallProgressEmitter {
         this.approvalChannelRegistry = registry;
     }
 
+    /** Route only to the explicitly trusted run. Never include source code or argument bodies. */
+    public void emitArtifactProgress(Map<String, Object> context, String phase, String message, int attempt) {
+        if (context == null || runEventPublisher == null) return;
+        Object run = context.get("agent.run_id"), session = context.get("sessionId");
+        if (!(run instanceof String runId) || runId.isBlank()) return;
+        try {
+            runEventPublisher.publish(runId, session instanceof String s ? s : null, "artifact_progress",
+                    Map.of("runId", runId, "phase", phase, "message", message, "attempt", attempt));
+        } catch (RuntimeException ignored) {
+            log.debug("[ToolCallProgress] artifact progress delivery unavailable");
+        }
+    }
+
     public void emitStart(String sessionId, String toolName, String input) {
         emitStart(sessionId, toolName, input, null);
     }

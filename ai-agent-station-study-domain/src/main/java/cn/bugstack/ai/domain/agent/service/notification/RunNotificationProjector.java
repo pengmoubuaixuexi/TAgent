@@ -43,6 +43,23 @@ public class RunNotificationProjector {
                 case "human_approval_required" -> publishApproval(userId, runId, sessionId, snapshot, payload);
                 case "user_input_result" -> resolve(userId, payload.getString("inputId"), payload.getString("status"));
                 case "human_approval_result" -> resolve(userId, payload.getString("approvalId"), payload.getString("status"));
+                case "message" -> {
+                    // A step error/summary is not a terminal run. Plan review deliberately has no complete frame.
+                    if (payload.get("step") != null || !blank(payload.getString("subType"))) return;
+                    String type = payload.getString("type");
+                    if ("complete".equals(type) && Boolean.TRUE.equals(payload.getBoolean("completed"))) {
+                        publishTerminal(userId, runId, sessionId, snapshot, true, null, false);
+                    } else if ("error".equals(type)) {
+                        publishTerminal(userId, runId, sessionId, snapshot, false, payload.getString("content"), false);
+                    }
+                }
+                case "plan_review_status" -> {
+                    String status = payload.getString("status");
+                    if ("COMPLETED".equals(status) || "FAILED".equals(status)) {
+                        publishTerminal(userId, runId, sessionId, snapshot,
+                                "COMPLETED".equals(status), payload.getString("lastError"), "COMPLETED".equals(status));
+                    }
+                }
                 default -> {
                 }
             }
@@ -50,6 +67,43 @@ public class RunNotificationProjector {
             // Notification projection is never allowed to break the run event stream.
             log.warn("[Notification] projection failed runId={} type={}: {}", runId, eventType, e.getMessage());
         }
+    }
+
+    private void publishTerminal(String userId, String runId, String sessionId, RunSnapshot snapshot,
+                                 boolean completed, String error, boolean reviewedExecutionCompleted) {
+        if (blank(runId) || snapshot == null || !userId.equals(snapshot.getUserId())) return;
+        // Snapshot ownership/session are authoritative. Never use a frame's claimed owner/session.
+        String ownedSession = snapshot.getSessionId();
+        if (blank(ownedSession) || !ownedSession.equals(sessionId)) return;
+        if (RunSnapshotService.STATUS_CANCELLED.equals(snapshot.getStatus())) return;
+        // A failed terminal can be followed by duplicate cleanup/complete frames. Do not turn it green.
+        String id = NotificationService.terminalId(userId, runId);
+        AgentNotification existing = notificationService.find(userId, id).orElse(null);
+        if (completed && !reviewedExecutionCompleted && (RunSnapshotService.STATUS_FAILED.equals(snapshot.getStatus())
+                || existing != null && existing.getType() == AgentNotification.Type.TASK_FAILED)) return;
+        notificationService.publish(NotificationCommand.builder()
+                .notificationId(id).userId(userId)
+                .sessionId(ownedSession).runId(runId)
+                // Keep the plan-review reference intact: its resolver also uses the plain runId.
+                .referenceId("run-terminal:" + runId)
+                .type(completed ? AgentNotification.Type.TASK_COMPLETED : AgentNotification.Type.TASK_FAILED)
+                .status(completed ? AgentNotification.Status.TASK_COMPLETED : AgentNotification.Status.TASK_FAILED)
+                .title(runTitle(snapshot, completed ? "已完成" : "执行未完成"))
+                .summary(completed ? "结果已就绪，点击查看回答与产物" : failureSummary(error))
+                .metadata(Map.of("executionStatus", completed ? "COMPLETED" : "FAILED"))
+                .build());
+    }
+
+    /** Inbox previews must not expose provider bodies, credentials, URLs or stack traces. */
+    public static String failureSummary(String error) {
+        String text = error == null ? "" : error.toLowerCase(java.util.Locale.ROOT);
+        if (text.contains("budget") || text.contains("预算") || text.contains("额度"))
+            return "任务因可用额度或上下文预算不足而停止，点击查看详情";
+        if (text.contains("timeout") || text.contains("timed out") || text.contains("超时"))
+            return "模型或工具等待超时，点击查看已完成部分与详情";
+        if (text.contains("429") || text.contains("rate limit") || text.contains("频率"))
+            return "服务调用受到频率限制，点击查看详情后重试";
+        return "任务执行未完成，点击查看已完成部分与失败详情";
     }
 
     private void publishAskUser(String userId,
@@ -131,7 +185,9 @@ public class RunNotificationProjector {
         return "user_input_required".equals(eventType)
                 || "human_approval_required".equals(eventType)
                 || "user_input_result".equals(eventType)
-                || "human_approval_result".equals(eventType);
+                || "human_approval_result".equals(eventType)
+                || "message".equals(eventType)
+                || "plan_review_status".equals(eventType);
     }
 
     private static boolean blank(String value) {

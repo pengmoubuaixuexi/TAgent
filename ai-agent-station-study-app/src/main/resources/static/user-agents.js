@@ -8,7 +8,7 @@
     const yes = value => value === true || value === 1 || value === '1';
     const usableMcp = m => !!m && (m.usable === undefined ? yes(m.status) : yes(m.usable));
     const state = {options:null, agents:[], mcps:[], tools:{}, agent:null, selected:0, tab:'prompt', dirty:false,
-        busy:false, draft:null, scenes:{}, mcp:null, mcpDirty:false, links:[]};
+        busy:false, draft:null, scenes:{}, mcp:null, mcpDirty:false, links:[], savedDraft:null, activeAgent:null, versions:[]};
     const editable = () => state.agent && (!state.agent.agentId || yes(state.agent.editable));
     const node = () => state.agent?.nodes?.[state.selected];
     const executable = n => ['DEFAULT','PRECISION_EXECUTOR_CLIENT','EXECUTOR_CLIENT'].includes(n.role);
@@ -20,7 +20,7 @@
     function notify(message, kind='') { $('notice').textContent=message; $('notice').className='notice '+kind; }
     function dirty() { state.dirty=true; renderSaveState(); }
     function renderSaveState() {
-        $('save-state').textContent=state.dirty?'未保存':state.agent?.agentId?'已保存 · v'+state.agent.version:'私人配置';
+        $('save-state').textContent=state.dirty?'未保存':state.savedDraft?.revision?'草稿已保存 · 当前启用 v'+state.agent.version:state.agent?.agentId?'已启用 · v'+state.agent.version:'私人配置';
         $('save-state').className='ta-tag'+(state.dirty?' dirty-tag':'');
     }
     async function request(path, options={}) {
@@ -37,6 +37,10 @@
         $('agent-fields').disabled=blocked||!editable();
         ['new-agent','reload','manage-mcps','agent-select'].forEach(id=>$(id).disabled=blocked);
         $('save-agent').disabled=blocked||!editable()||!state.options?.models?.length;
+        $('publish-agent').disabled=blocked||!editable()||state.dirty||!state.savedDraft?.revision;
+        $('show-versions').disabled=blocked;
+        $('run-debug').disabled=blocked||!state.activeAgent?.nodes?.some(n=>n.nodeId===node()?.nodeId)||!editable();
+        $('debug-input').disabled=blocked;$('debug-upstream').disabled=blocked;$('debug-tools').disabled=blocked;
         $('archive-agent').disabled=blocked;
         $('generate-draft').disabled=blocked||!editable()||!state.options?.models?.length;
         $('draft-requirement').disabled=blocked||!editable(); $('draft-model').disabled=blocked||!editable();
@@ -61,7 +65,11 @@
         const models=state.options?.models||[];
         const retired=selected&&!models.some(m=>m.modelId===selected);
         return (retired?'<option value="'+esc(selected)+'" selected>原模型已停用，请重新选择</option>':'')+
-            (models.map(m=>'<option value="'+esc(m.modelId)+'" '+(m.modelId===selected?'selected':'')+'>'+esc(m.modelName)+(m.tier?' · '+esc(m.tier):'')+'</option>').join('')||'<option value="">暂无开放模型</option>');
+            (models.map(m=>'<option value="'+esc(m.modelId)+'" '+(m.modelId===selected?'selected':'')+'>'+esc(m.modelName)+' · '+(m.providerSource==='USER_BYOK'?'个人连接':'平台模型')+(m.tier?' · '+esc(m.tier):'')+'</option>').join('')||'<option value="">暂无开放模型</option>');
+    }
+    function modelHint(selected) {
+        const model=state.options?.models?.find(m=>m.modelId===selected);
+        return model?(model.providerSource==='USER_BYOK'?'当前使用个人模型连接':'当前使用平台模型')+' · 每个节点独立选择':'暂无可用模型，请<a href="/models.html">添加个人模型连接</a>。';
     }
     function template(strategy) {
         const t=state.options.templates.find(t=>t.strategy===strategy);
@@ -69,7 +77,15 @@
     }
     function newAgent() {
         state.agent={name:'',description:'',strategy:'fixed',status:1,schemaVersion:2,editable:true,nodes:template('fixed')};
-        state.dirty=false;state.draft=null;state.scenes={};state.selected=0;state.tab='prompt';renderAgent();
+        state.dirty=false;state.draft=null;state.savedDraft=null;state.activeAgent=null;state.versions=[];state.scenes={};state.selected=0;state.tab='prompt';clearVersionAndDebug();renderAgent();
+    }
+    function clearVersionAndDebug() { $('version-panel').hidden=true;$('version-detail').hidden=true;$('debug-result').hidden=true;$('debug-status').textContent=''; }
+    async function openAgent(id) {
+        const active=await request('/agents/'+endpoint(id));
+        const saved=yes(active.editable)?await request('/agents/'+endpoint(id)+'/draft'):null;
+        state.activeAgent=copy(active);state.savedDraft=saved;
+        state.agent=saved?.config?{...copy(saved.config),agentId:active.agentId,version:active.version,editable:active.editable}:active;
+        state.selected=0;state.tab='prompt';state.dirty=false;state.draft=null;state.scenes={};clearVersionAndDebug();renderAgent();
     }
     function renderList() {
         $('agent-select').innerHTML='<option value="">新建 Agent</option>'+state.agents.map(a=>'<option value="'+esc(a.agentId)+'">'+esc(a.name)+' · '+esc(a.strategy.toUpperCase())+(yes(a.editable)?'':' · 预置')+'</option>').join('');
@@ -82,6 +98,10 @@
         $('readonly-note').hidden=!!editable();$('agent-fields').hidden=!editable();
         $('start-chat').hidden=!a.agentId;$('start-chat').href='/?agentId='+endpoint(a.agentId||'');
         $('archive-agent').hidden=!a.agentId;
+        $('save-agent').textContent=a.agentId?'保存草稿':'创建并启用';
+        $('publish-agent').hidden=!a.agentId||!editable();$('show-versions').hidden=!a.agentId||!editable();
+        $('node-debug').hidden=!a.agentId||!editable();
+        renderDebugLabel();
         $('draft-mode').textContent='按当前 '+a.strategy.toUpperCase()+' 模式生成';
         if(editable()){drawGraph();renderInspector();}
         renderDraft();refreshEnabled();
@@ -129,9 +149,10 @@
         return `<div class="ta-field"><label for="${id}">${label}</label><textarea id="${id}" class="ta-input" rows="${rows}" maxlength="${max}">${esc(value)}</textarea></div>`;
     }
     function renderInspector() {
+        renderDebugLabel();
         const n=node();if(!n)return;const mode=state.agent.strategy;
         const tabs=[['prompt','Prompt'],['tools','MCP 连接'],['advisors','Advisor'],['io','输入输出']];
-        $('ta-inspector').innerHTML=`<div class="ta-inspector-heading"><span class="ta-node-number">${state.selected+1}</span><div><h3>${esc(n.name)}</h3><p class="ta-muted">仅修改这个节点</p></div></div><div class="ta-field"><label for="node-name">节点名称</label><input id="node-name" class="ta-input" maxlength="50" value="${esc(n.name)}"></div><div class="ta-field"><label for="node-model">本节点模型</label><select id="node-model" class="ta-input">${modelOptions(n.modelId)}</select><span class="ta-muted">当前使用平台模型 · 每个节点独立选择</span></div><div class="ta-subtabs" role="tablist" aria-label="节点配置分类">${tabs.map(([id,label])=>`<button type="button" class="ta-subtab" id="tab-${id}" data-tab="${id}" role="tab" aria-selected="${state.tab===id}" aria-controls="node-content">${label}</button>`).join('')}</div><div id="node-content" role="tabpanel" aria-labelledby="tab-${state.tab}"></div>`;
+        $('ta-inspector').innerHTML=`<div class="ta-inspector-heading"><span class="ta-node-number">${state.selected+1}</span><div><h3>${esc(n.name)}</h3><p class="ta-muted">仅修改这个节点</p></div></div><div class="ta-field"><label for="node-name">节点名称</label><input id="node-name" class="ta-input" maxlength="50" value="${esc(n.name)}"></div><div class="ta-field"><label for="node-model">本节点模型</label><select id="node-model" class="ta-input">${modelOptions(n.modelId)}</select><span id="node-model-hint" class="ta-muted">${modelHint(n.modelId)}</span></div><div class="ta-subtabs" role="tablist" aria-label="节点配置分类">${tabs.map(([id,label])=>`<button type="button" class="ta-subtab" id="tab-${id}" data-tab="${id}" role="tab" aria-selected="${state.tab===id}" aria-controls="node-content">${label}</button>`).join('')}</div><div id="node-content" role="tabpanel" aria-labelledby="tab-${state.tab}"></div>`;
         let html='';
         if(state.tab==='prompt') html=field('node-prompt',n.role==='EXECUTOR_CLIENT'?'最终整合 Prompt':'节点系统 Prompt',n.systemPrompt)+
             (n.role==='EXECUTOR_CLIENT'?field('node-task-prompt','子任务执行指令',n.taskPrompt,4):'')+
@@ -156,14 +177,14 @@
             const restricted=restrictedBinding(binding);
             return `<div class="ta-tool-group ${binding?'ta-mcp-bound':''}" data-connection="${esc(m.mcpId)}"><div class="ta-tool-title"><strong>${esc(m.name)}</strong><span class="ta-tag">${usableMcp(m)?(yes(m.editable)?esc(m.transportType):'平台托管'):'不可用'}</span>${binding?'<span class="ta-tag ta-bound-tag">已绑定 MCP</span>':''}</div><p class="ta-note">${restricted?'保留原有的逐工具授权限制。':binding?'模型会在运行时按需加载此连接的具体工具。':'直接绑定此连接，无需先发现或逐个选择工具。'}</p><div class="ta-mcp-actions">${binding?`<button type="button" class="ta-btn" data-unbind="${esc(m.mcpId)}">解除绑定</button>`:`<button type="button" class="ta-btn ta-primary" data-bind-mcp="${esc(m.mcpId)}" ${!usableMcp(m)?'disabled':''}>绑定到当前节点</button>`}${state.mcps.some(c=>c.mcpId===m.mcpId)?`<button type="button" class="ta-link" data-edit-mcp="${esc(m.mcpId)}">${yes(m.editable)?'编辑连接':'查看平台连接'}</button>`:''}</div>${restricted?`<div class="ta-legacy-binding"><strong>旧配置 · 限定工具</strong><p>${(binding.toolNames||[]).map(name=>'<code>'+esc(name)+'</code>').join(' ')||'未授权具体工具'}</p><p class="ta-note">直接保存会保留以上限制。转换后将授权此连接的全部工具，包括以后新增的工具。</p><button type="button" class="ta-btn" data-convert-binding="${esc(m.mcpId)}" ${!usableMcp(m)?'disabled':''}>改为按连接绑定</button></div>`:''}${!usableMcp(m)?'<p class="ta-note">'+esc(m.unavailableReason||'连接已停用，请检查状态或联系管理员。')+'</p>':''}<details class="ta-tool-preview" ${known?'open':''}><summary>查看工具 · 可选诊断</summary><p class="ta-note">预览不会改变绑定或授权范围；无需执行此操作也能保存 Agent。</p><button type="button" class="ta-btn" data-discover="${esc(m.mcpId)}" ${!usableMcp(m)?'disabled':''}>读取 / 刷新工具列表</button>${known?`<ul>${known.map(t=>`<li><strong>${esc(t.name)}</strong><p>${esc(t.description)}</p></li>`).join('')}</ul>${!known.length?'<p class="ta-note">未返回工具，可稍后重试。</p>':''}`:''}</details></div>`;
         }).join('');
-        html+='<button type="button" class="ta-btn" id="inline-add-mcp">＋ 添加 MCP 连接</button><p class="ta-note">连接保存在“我的 MCP”中，每个节点独立绑定。保存 Agent 后生效。</p>';
+        html+='<button type="button" class="ta-btn" id="inline-add-mcp">＋ 添加 MCP 连接</button><p class="ta-note">连接保存在“我的 MCP”中，每个节点独立绑定。保存并启用后生效。</p>';
         return html;
     }
     function renderInheritedFlowTools() {
         const executor=state.agent.nodes[flowExecutorIndex()];
         if(!executor)return '<section class="ta-inherited-mcp"><div class="ta-section-head"><strong>未找到执行器节点</strong><span class="ta-tag">只读</span></div><p class="ta-note">当前 Flow 配置缺少执行器，暂时无法显示共享的 MCP 授权。请重新加载完整配置。</p><button type="button" class="ta-btn ta-primary" id="configure-flow-executor" disabled>前往执行器配置</button></section>';
         const bindings=executor.mcpBindings||[],publicPool=yes(executor.usePublicTools);
-        return `<section class="ta-inherited-mcp" aria-label="来自执行器的 MCP 配置"><div class="ta-section-head"><strong>来自「${esc(executor.name)}」</strong><span class="ta-tag">只读共享</span></div><p class="ta-note">能力分析与步骤规划读取执行器授权的工具范围，实际工具调用由执行器完成。请统一在执行器中修改。</p><div class="ta-inherited-pool"><strong>公共工具池</strong><span class="ta-tag ${publicPool?'ta-bound-tag':''}" data-inherited-pool>${publicPool?'已开启':'已关闭'}</span><p class="ta-note">${publicPool?'执行器可从公共工具池按需寻找工具，与下方显式绑定的连接一同构成可用范围。':'执行器只使用明确绑定并授权的 MCP 连接。'}</p></div><div class="ta-section-head"><strong>执行器已绑定 MCP · ${bindings.length}</strong></div>${bindings.length?`<ul class="ta-inherited-connections">${bindings.map(binding=>{const m=state.mcps.find(m=>m.mcpId===binding.mcpId);return `<li data-inherited-binding><div class="ta-section-head"><strong>${esc(m?.name||'已保存的连接（当前不可用）')}</strong><span class="ta-tag ${usableMcp(m)?'ta-bound-tag':''}">${usableMcp(m)?'可使用':'不可用'}</span></div><p class="ta-note">${restrictedBinding(binding)?'旧配置：仅授权 '+(binding.toolNames||[]).length+' 个指定工具，原有限制保持不变。':'按连接授权，具体工具在运行时按需加载。'}</p></li>`;}).join('')}</ul>`:`<p class="ta-note" data-inherited-empty>${publicPool?'尚未显式绑定连接，当前仅允许从公共工具池按需选择。':'执行器尚未绑定 MCP，公共工具池也未开启。'}</p>`}<button type="button" class="ta-btn ta-primary" id="configure-flow-executor">前往执行器配置 MCP</button><p class="ta-note ta-inherited-draft">这里同步显示当前编辑内容；未保存的修改需保存 Agent 后才在运行时生效。</p></section>`;
+        return `<section class="ta-inherited-mcp" aria-label="来自执行器的 MCP 配置"><div class="ta-section-head"><strong>来自「${esc(executor.name)}」</strong><span class="ta-tag">只读共享</span></div><p class="ta-note">能力分析与步骤规划读取执行器授权的工具范围，实际工具调用由执行器完成。请统一在执行器中修改。</p><div class="ta-inherited-pool"><strong>公共工具池</strong><span class="ta-tag ${publicPool?'ta-bound-tag':''}" data-inherited-pool>${publicPool?'已开启':'已关闭'}</span><p class="ta-note">${publicPool?'执行器可从公共工具池按需寻找工具，与下方显式绑定的连接一同构成可用范围。':'执行器只使用明确绑定并授权的 MCP 连接。'}</p></div><div class="ta-section-head"><strong>执行器已绑定 MCP · ${bindings.length}</strong></div>${bindings.length?`<ul class="ta-inherited-connections">${bindings.map(binding=>{const m=state.mcps.find(m=>m.mcpId===binding.mcpId);return `<li data-inherited-binding><div class="ta-section-head"><strong>${esc(m?.name||'已保存的连接（当前不可用）')}</strong><span class="ta-tag ${usableMcp(m)?'ta-bound-tag':''}">${usableMcp(m)?'可使用':'不可用'}</span></div><p class="ta-note">${restrictedBinding(binding)?'旧配置：仅授权 '+(binding.toolNames||[]).length+' 个指定工具，原有限制保持不变。':'按连接授权，具体工具在运行时按需加载。'}</p></li>`;}).join('')}</ul>`:`<p class="ta-note" data-inherited-empty>${publicPool?'尚未显式绑定连接，当前仅允许从公共工具池按需选择。':'执行器尚未绑定 MCP，公共工具池也未开启。'}</p>`}<button type="button" class="ta-btn ta-primary" id="configure-flow-executor">前往执行器配置 MCP</button><p class="ta-note ta-inherited-draft">这里同步显示当前编辑内容；修改保存为草稿后，需启用草稿才在运行时生效。</p></section>`;
     }
     function renderAdvisors(n) {
         return state.options.advisors.map(option=>{
@@ -192,7 +213,7 @@
         $('select-managed-tools').hidden=!m;
         const alreadyBound=node()?.mcpBindings?.some(b=>b.mcpId===m?.mcpId);
         $('select-managed-tools').textContent=alreadyBound?'已绑定到当前节点':'绑定到当前节点';
-        $('mcp-bind-note').textContent=!editable()?'请先打开可编辑的 Agent。':!executable(node())?'当前角色不执行业务工具，请先关闭窗口并选择执行节点。':'绑定到「'+node().name+'」节点，保存 Agent 后生效。';
+        $('mcp-bind-note').textContent=!editable()?'请先打开可编辑的 Agent。':!executable(node())?'当前角色不执行业务工具，请先关闭窗口并选择执行节点。':'绑定到「'+node().name+'」节点，保存并启用后生效。';
         $('clear-secret-row').hidden=!m?.hasSecret;
         $('mcp-secret-note').textContent=m?.hasSecret?'已有凭据；留空保留，填写替换，勾选可清除。':'保存后不回显凭据。';
         $('remove-mcp').hidden=!m||!yes(m.editable);
@@ -242,7 +263,7 @@
     });
     root.addEventListener('change',event=>{
         if(!editable()||state.busy)return;const el=event.target,n=node();
-        if(el.id==='node-model'){n.modelId=el.value;dirty();}
+        if(el.id==='node-model'){n.modelId=el.value;dirty();$('node-model-hint').innerHTML=modelHint(n.modelId);}
         if(el.id==='agent-enabled'){state.agent.status=el.checked?1:0;dirty();}
         if(el.id==='node-public-tools'){n.usePublicTools=el.checked;dirty();drawGraph();}
         if(el.dataset.advisor){const type=el.dataset.advisor;n.advisors=n.advisors.filter(a=>a.type!==type);if(el.checked)n.advisors.push({type,...(type==='ChatMemory'?{maxMessages:20}:{}),...(['RagAnswer','LongTermMemory','EpisodicMemory'].includes(type)?{topK:4}:{}),...(type==='RagAnswer'?{knowledgeTag:''}:{})});dirty();drawGraph();renderInspector();}
@@ -252,6 +273,15 @@
         const b=event.target.closest('button');if(!b||state.busy)return;
         if(b.dataset.node!==undefined){state.selected=Number(b.dataset.node);drawGraph();renderInspector();}
         if(b.dataset.tab){state.tab=b.dataset.tab;renderInspector();}
+        if(b.dataset.viewVersion)work(async()=>{
+            const data=await request('/agents/'+endpoint(state.agent.agentId)+'/versions/compare?from='+endpoint(b.dataset.viewVersion)+'&to='+endpoint(state.agent.version));
+            $('version-detail').hidden=false;$('version-detail').innerHTML='<strong>v'+esc(b.dataset.viewVersion)+' → 当前启用 v'+esc(state.agent.version)+'</strong><pre>'+esc(JSON.stringify(data,null,2))+'</pre>';
+        });
+        if(b.dataset.restoreVersion&&discard()&&confirm('将 v'+b.dataset.restoreVersion+' 恢复为草稿？当前已启用版本不会改变。'))work(async()=>{
+            const id=state.agent.agentId;
+            await send('/agents/'+endpoint(id)+'/versions/'+endpoint(b.dataset.restoreVersion)+'/restore','POST',{baseVersion:state.agent.version,draftRevision:state.savedDraft?.revision||0});
+            await openAgent(id);notify('历史版本已恢复为草稿。核对配置后再启用。','success');
+        });
         if(b.id==='configure-flow-executor'&&flowExecutorIndex()>=0){state.selected=flowExecutorIndex();state.tab='tools';drawGraph();renderInspector();}
         if(b.dataset.mode&&editable()&&b.dataset.mode!==state.agent.strategy){
             state.scenes[state.agent.strategy]=copy(state.agent.nodes);state.agent.strategy=b.dataset.mode;
@@ -274,7 +304,7 @@
     $('agent-select').addEventListener('change',()=>{
         const id=$('agent-select').value;if(!discard()){$('agent-select').value=state.agent?.agentId||'';return;}
         if(!id){newAgent();return;}
-        work(async()=>{state.agent=await request('/agents/'+endpoint(id));state.selected=0;state.tab='prompt';state.dirty=false;state.draft=null;state.scenes={};renderAgent();});
+        work(()=>openAgent(id));
     });
     $('new-agent').onclick=()=>{if(discard())newAgent();};$('reload').onclick=load;
     $('save-agent').onclick=()=>work(async()=>{
@@ -283,9 +313,45 @@
         for(const n of a.nodes){if(!n.name.trim()||!n.systemPrompt.trim()||!n.modelId)throw new Error('请为每个节点填写名称、Prompt 并选择模型');if(n.advisors.some(v=>v.type==='RagAnswer'&&!v.knowledgeTag))throw new Error('请为知识库 Advisor 选择本人的知识库');}
         const body=copy(a);
         for(const n of body.nodes)n.mcpBindings=n.mcpBindings.map(binding=>yes(binding.allTools)?connectionBinding(binding.mcpId):binding);
-        const saved=await send('/agents'+(a.agentId?'/'+endpoint(a.agentId):''),a.agentId?'PUT':'POST',body);
-        state.agent=saved;state.dirty=false;state.scenes={};state.agents=await request('/agents');renderAgent();notify('Agent 已保存。节点配置将在下一次运行时生效。','success');
+        if(a.agentId) {
+            body.draftRevision=state.savedDraft?.revision||0;
+            state.savedDraft=await send('/agents/'+endpoint(a.agentId)+'/draft','PUT',body);
+            state.dirty=false;renderSaveState();notify('草稿已保存，当前对话继续使用已启用版本。核对后点击“启用草稿”。','success');
+        } else {
+            const saved=await send('/agents','POST',body);
+            state.agents=await request('/agents');await openAgent(saved.agentId);notify('Agent 已创建并启用。后续修改先保存为草稿。','success');
+        }
     });
+    $('publish-agent').onclick=()=>work(async()=>{
+        if(state.dirty||!state.savedDraft?.revision)throw new Error('请先保存当前草稿');
+        const id=state.agent.agentId;
+        await send('/agents/'+endpoint(id)+'/publish','POST',{baseVersion:state.savedDraft.baseVersion,draftRevision:state.savedDraft.revision});
+        state.agents=await request('/agents');await openAgent(id);notify('新版本已启用，下一次对话和节点调试使用此版本。','success');
+    });
+    $('show-versions').onclick=()=>work(async()=>{
+        state.versions=await request('/agents/'+endpoint(state.agent.agentId)+'/versions');
+        $('version-panel').hidden=false;
+        $('version-list').innerHTML=state.versions.map(v=>`<div class="ta-version-row"><strong>v${esc(v.version)}</strong><span>${esc(v.note||'配置快照')}</span><span class="ta-muted">${esc(v.createdAt||'')}</span><button type="button" class="ta-btn" data-view-version="${esc(v.version)}">查看差异</button><button type="button" class="ta-btn" data-restore-version="${esc(v.version)}">恢复为草稿</button></div>`).join('')||'<p class="ta-note">暂无历史版本。</p>';
+    });
+    function renderDebugLabel() {
+        if(!$('debug-version'))return;
+        const current=node(), active=state.activeAgent?.nodes?.find(n=>n.nodeId===current?.nodeId);
+        $('debug-version').textContent=active?active.name+' · 已启用 v'+state.activeAgent.version:'此节点尚未启用';
+        $('run-debug').disabled=state.busy||!active;
+    }
+    $('debug-form').onsubmit=event=>{event.preventDefault();work(async()=>{
+        const current=node(),active=state.activeAgent?.nodes?.find(n=>n.nodeId===current?.nodeId);
+        if(!active)throw new Error('此节点尚未启用，请先保存草稿并启用');
+        $('debug-status').textContent='运行中…调试时间预算 120 秒';$('debug-result').hidden=true;
+        try {
+            const data=await send('/agents/'+endpoint(state.agent.agentId)+'/nodes/'+endpoint(active.nodeId)+'/debug','POST',{
+                version:state.activeAgent.version,input:$('debug-input').value,upstream:$('debug-upstream').value,allowReadOnlyTools:$('debug-tools').checked});
+            $('debug-status').textContent=(data.status==='COMPLETED'?'完成':'未完成')+' · '+data.elapsedMs+' ms';
+            $('debug-result').hidden=false;
+            $('debug-result').innerHTML=`<div class="ta-debug-output"><strong>${esc(data.status)}</strong><pre>${esc(data.output||data.error||'没有输出')}</pre></div>`+
+                [['实际系统 Prompt',data.systemPrompt],['实际用户输入',data.userPrompt],['知识来源',data.sources],['工具调用',data.tools],['用量与预算',data.usage]].map(([title,value])=>`<details><summary>${title}</summary><pre>${esc(typeof value==='string'?value:JSON.stringify(value||[],null,2))}</pre></details>`).join('');
+        } catch(e) {$('debug-status').textContent='调试失败';throw e;}
+    });};
     $('archive-agent').onclick=()=>{if(state.agent.agentId&&confirm('归档此 Agent？历史对话保留。'))work(async()=>{await send('/agents/'+endpoint(state.agent.agentId),'DELETE');state.agents=await request('/agents');newAgent();notify('Agent 已归档。');});};
     $('draft-form').onsubmit=event=>{event.preventDefault();work(async()=>{notify('正在生成节点骨架，画布配置会保留…');state.draft=await send('/draft','POST',{requirement:$('draft-requirement').value.trim(),modelId:$('draft-model').value,strategy:state.agent.strategy});renderDraft();notify('骨架已生成。检查预览后，可以应用到画布。','success');});};
     $('manage-mcps').onclick=()=>openMcp(state.mcps.find(m=>yes(m.editable))||state.mcps[0]||null);
@@ -298,7 +364,7 @@
         if(state.busy||!editable()||!executable(node())||!usableMcp(state.mcps.find(m=>m.mcpId===id)))return;
         if(node().mcpBindings.some(b=>b.mcpId===id))return;
         node().mcpBindings.push(connectionBinding(id));state.tab='tools';dirty();drawGraph();renderInspector();
-        notify('已绑定 MCP 到「'+node().name+'」节点。保存 Agent 后生效。','success');
+        notify('已绑定 MCP 到「'+node().name+'」节点。保存并启用后生效。','success');
     }
     $('select-managed-tools').onclick=()=>{
         if(state.busy||!editable()||!executable(node())||!usableMcp(state.mcp))return;

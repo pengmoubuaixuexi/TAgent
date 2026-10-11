@@ -10,7 +10,6 @@ import cn.bugstack.wrench.design.framework.tree.StrategyHandler;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.tool.ToolCallback;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -45,13 +44,12 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
 
         // 获取规划客户端
         ChatClient planningChatClient = getChatClientByClientId(aiAgentClientFlowConfigVO.getClientId());
-        List<ToolCallback> dynamicToolCallbacks = resolveAgentDynamicToolCallbacks(requestParameter, aiAgentClientFlowConfigVO.getClientId());
         AiAgentClientFlowConfigVO executorConfig = dynamicContext.getAiAgentClientFlowConfigVOMap()
                 .get(AiClientTypeEnumVO.EXECUTOR_CLIENT.getCode());
         String executorClientId = executorConfig != null ? executorConfig.getClientId() : aiAgentClientFlowConfigVO.getClientId();
-        List<ToolCallback> executorDynamicToolCallbacks = resolveAgentDynamicToolCallbacks(requestParameter, executorClientId);
+        // Planning reads metadata only; it must not repeat Step1 tool search or pre-load callbacks.
         cn.bugstack.ai.domain.agent.service.execute.common.ExecutorToolCatalog v2Catalog =
-                storeExecutorToolCatalogSnapshot(dynamicContext, FLOW_TOOL_CATALOG_V2_KEY, executorClientId, executorDynamicToolCallbacks, 2);
+                storeExecutorToolCatalogSnapshot(dynamicContext, FLOW_TOOL_CATALOG_V2_KEY, executorClientId, List.of(), 2);
         List<String> v1ToV2Drift = compareExecutorToolCatalogLineage(dynamicContext, FLOW_TOOL_CATALOG_V1_KEY, v2Catalog);
         if (!v1ToV2Drift.isEmpty()) {
             log.warn("[ExecutorToolCatalog] V1->V2 lineage drift: {}", v1ToV2Drift);
@@ -63,16 +61,7 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         final String toolRuntimeForPrompt = renderToolRuntimeForPrompt(v2Catalog, executorClientId);
         java.util.function.Supplier<String> planningPromptSupplier = () -> {
             String planningPrompt = buildStructuredPlanningPrompt(effectiveTaskForStep(requestParameter, dynamicContext, 2), mcpToolsAnalysisForPrompt, toolRuntimeForPrompt);
-            String refined = planningPrompt + "\n\n## ⚠️ 工具映射验证反馈\n" +
-                    "\n\n**请根据上述验证反馈重新生成规划，确保：**\n" +
-                    "1. 只使用验证报告中列出的有效工具\n" +
-                    "2. 工具名称必须完全匹配（区分大小写）\n" +
-                    "3. 每个步骤明确指定使用的MCP工具\n" +
-                    "4. 避免使用不存在或无效的工具";
-            // 规划阶段属非执行步，但若发现工具不够可经豁免提示主动 request_tool 预装给后续执行步（功能关则空串、零注入）。
-            // 注意：要真正生效，规划客户端的 DB 系统提示里"禁止调用任何工具"需改成"禁止调用业务/执行类工具"，
-            // 否则 system 的硬禁止会压过本 user 豁免，模型把调用写成文本（说而不做）。见 8013_p2。
-            return appendCurrentTimeContext(refined + metaToolPromptHint(
+            return appendCurrentTimeContext(planningPrompt + metaToolPromptHint(
                     cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_STEP2_PLANNING,
                     requestParameter.getSessionId()));
         };
@@ -83,14 +72,13 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         if (step2MaxTokens > 0) {
             step2OptionsBuilder.maxTokens(step2MaxTokens);
         }
-        if (!dynamicToolCallbacks.isEmpty()) {
-            step2OptionsBuilder.toolCallbacks(toRequestToolCallbacks(aiAgentClientFlowConfigVO.getClientId(), dynamicToolCallbacks));
-        }
         final org.springframework.ai.openai.OpenAiChatOptions step2Opts = step2OptionsBuilder.build();
         final ChatClient step2Client = planningChatClient;
         // 引导回复：被打断则折入新想法重做本步（思考不关、工具不变）
         String planningResult = callStepWithSteer(
-                p -> step2Client.prompt().user(p)
+                p -> step2Client.prompt()
+                        .messages(new org.springframework.ai.chat.messages.SystemMessage(FLOW_READ_ONLY_TOOL_PROTOCOL))
+                        .user(p)
                         .advisors(a -> a.param(
                                 cn.bugstack.ai.domain.agent.service.multimodal.MultimodalMessageAdvisor.CURRENT_IMAGES_CONTEXT_KEY,
                                 requestParameter.getImages()))
@@ -150,17 +138,19 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         prompt.append("## 🧰 已装载工具与授权 MCP 能力目录（含参数说明）\n");
         prompt.append(toolRuntime).append("\n\n");
         prompt.append("绑定目录中的工具可以规划为后续执行时按需装载，但不能写成已经调用。只在运行时确认不可用后才说明失败；未装载不等于无能力。\n");
+        prompt.append("本阶段只读目录，不开放 request_tool，不连接、装载或试调用工具；需要澄清用户需求时可以使用实际提供的 ask_user。\n");
 
         // 3. 工具映射验证 - 使用动态获取的工具信息
         prompt.append("## ✅ 工具映射验证要求\n");
         prompt.append("**重要提醒：** 在生成执行步骤时，必须严格遵循以下工具映射规则：\n\n");
 
         prompt.append("### 可用工具范围\n");
-        prompt.append("- 只能使用上方 MCP 分析结果中明确列为可用/有效的工具。\n");
+        prompt.append("- 工具名称以授权 MCP 目录和已装载清单为准；分析报告遗漏的目录工具仍可规划，不能把未装载误判为不可用。\n");
+        prompt.append("- 目录缺失、截断或未覆盖的能力标记为待执行阶段发现/核实，仅写能力目标，不编造具体工具名，也不保证公共工具池一定有相应能力。\n");
         prompt.append("- 禁止编造工具名、服务名、发布目的地、通知渠道或平台动作。\n");
         prompt.append("- 除非用户明确要求发布、分享或通知，否则不要规划发布/分享/通知步骤。\n");
         prompt.append("- 除非工具明确可用且用户明确要求相关动作，否则不要使用 BaiduSearch、CSDN、Weixin/Wechat 或任何平台写操作工具。\n");
-        prompt.append("- 如果没有合适的外部搜索工具，请规划基于已有知识的回答，或只使用当前 Agent 自身领域工具。\n\n");
+        prompt.append("- 基础知识可直接回答；需要实时数据但工具尚待发现时，保留执行阶段核实和失败降级路径，不能用已有知识冒充实时查询结果。\n\n");
 
         prompt.append("### 工具选择原则\n");
         prompt.append("- **精确匹配**: 每个步骤的首选工具和可替代工具都必须使用上述工具清单中的确切函数名称\n");
@@ -173,16 +163,16 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         prompt.append("## 📝 执行计划要求\n");
         prompt.append("请基于上述用户详细需求、MCP工具分析结果和工具映射验证要求，生成精确的执行计划：\n\n");
         prompt.append("### 核心要求\n");
-        prompt.append("1. **完整保留用户需求**: 必须将用户请求中的所有详细信息完整传递到每个执行步骤中\n");
-        prompt.append("2. **严格遵循MCP分析结果**: 必须根据工具能力分析中的匹配度和推荐方案制定步骤\n");
-        prompt.append("3. **精确工具映射**: 每个步骤必须使用确切的函数名称，不允许使用模糊或错误的工具名\n");
+        prompt.append("1. **保留相关需求**: 整份计划覆盖完整用户需求，每个步骤只写本步骤相关参数和约束，不在每一步复制整段用户请求或完整工具目录\n");
+        prompt.append("2. **根据能力制定步骤**: 参考分析结果，以授权目录为准；目录尚未覆盖的能力明确留待执行阶段发现\n");
+        prompt.append("3. **精确工具映射**: 已知工具使用确切函数名称；未知能力写明“待发现”，不编造函数名\n");
         prompt.append("4. **参数完整性**: 所有工具调用必须包含用户原始需求中的完整参数信息\n");
         prompt.append("5. **依赖关系明确**: 基于MCP分析结果中的执行策略建议安排步骤顺序\n");
         prompt.append("6. **合理粒度**: 避免过度细分，每个步骤应该是完整且独立的功能单元\n\n");
 
         // 4. 格式规范 - 通用化任务格式
         prompt.append("### 格式规范\n");
-        prompt.append("请使用以下Markdown格式生成3-5个执行步骤：\n");
+        prompt.append("请按任务实际需要使用以下Markdown格式生成执行步骤；简单任务可以只有1步，常规任务建议不超过5步，不为凑数增加核验或重复查询步骤：\n");
         prompt.append("```markdown\n");
         prompt.append("# 执行步骤规划\n\n");
         prompt.append("[ ] 第1步：[步骤描述]\n");
@@ -194,7 +184,7 @@ public class Step2PlanningNode extends AbstractExecuteSupport {
         prompt.append("- **优先级**: [HIGH/MEDIUM/LOW]\n");
         prompt.append("- **预估时长**: [分钟数]分钟\n");
         prompt.append("- **目标能力**: [本步骤真正要获取/处理/生成的能力目标，例如“获取景点POI、地址、坐标”]\n");
-        prompt.append("- **首选工具**: [优先尝试的工具函数名称；这是建议，不是唯一允许工具]\n");
+        prompt.append("- **首选工具**: [目录中的工具函数名称；纯知识步骤填“无需工具”，未发现的能力填“待发现”；这是建议，不是唯一允许工具]\n");
         prompt.append("- **可替代工具**: [当首选工具字段不足/失败/空结果时可补足目标的工具函数名称；没有则填“无”]\n");
         prompt.append("- **工具匹配度**: [引用MCP分析结果中的匹配度评估]\n");
         // 2026-05-07：DAG 解析依赖此格式，必须严格按指定写法（不要自由发挥）
