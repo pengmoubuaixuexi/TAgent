@@ -31,7 +31,7 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 >
 > 当前暂时提供公网 IP 访问，后续将上线正式域名，届时会在此更新访问地址。注册后既可以体验预配置的各类 Agent，也可以进入“我的 Agent”自行搭建 Fixed、Auto、Flow 三种模式的 Agent，按节点配置 System Prompt、MCP 连接和 Advisor，并关联自己的 RAG 知识库。个人 Agent 配置、知识检索和使用观测按用户隔离。
 >
-> 目前处于试用阶段，平台提供的模型主要为 `mimo-v2.5` 和 `deepseek-v4-flash`，受平台试用额度限制。**v2.0.0 已支持个人 OpenAI 兼容模型连接**：配置自己的接口、模型和 API Key，密钥加密保存。路由、记忆摘要、向量检索等平台辅助服务需要单独授权，不会借用个人主模型密钥。个人模型与 MCP 连接均受部署方允许域名限制。[Agent 工作区](docs/dev-ops/USER_AGENT_WORKSPACE.md) · [模型连接与加密配置](docs/dev-ops/MODEL_CONNECTIONS.md)。
+> 目前处于试用阶段，平台提供的模型主要为 `mimo-v2.5` 和 `deepseek-v4-flash`，受平台试用额度限制。**v2.0.0 已支持个人 OpenAI 兼容模型连接**：配置自己的接口、模型和 API Key，密钥加密保存。路由、记忆摘要、向量检索等平台辅助服务需要单独授权，不会借用个人主模型密钥。个人模型与 MCP 连接均受部署方允许域名限制。[Agent 工作区](docs/dev-ops/USER_AGENT_WORKSPACE.md) · [模型连接与加密配置](docs/dev-ops/MODEL_CONNECTIONS.md)，项目提供了图片理解能力，但是这与模型的能力有关，如果想要体用图片理解功能可以使用测试Agent运行，其搭配的是mimo-v2.5具有图片理解能力。
 
 ## 🆕 v2.0.0：从配置到运行，再到可保存的结果
 
