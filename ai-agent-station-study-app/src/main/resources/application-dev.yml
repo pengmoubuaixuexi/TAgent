@@ -70,7 +70,7 @@ spring:
       chat:
         completions-path: ${LLM_COMPLETIONS_PATH:/chat/completions}
         options:
-          model: ${LLM_MODEL:mimo-v2.5-pro}
+          model: ${LLM_MODEL:mimo-v2.6-pro}
       embedding:
         embeddings-path: ${EMBEDDING_PATH:/embeddings}
         enabled: false   # 禁用 Spring AI 自动创建的 EmbeddingModel，使用自定义 bean 走 SiliconFlow
@@ -113,7 +113,7 @@ agent:
   llm:
     base-url: ${LLM_BASE_URL:https://token-plan-sgp.xiaomimimo.com/v1}
     api-key: ${LLM_API_KEY:}
-    model: ${LLM_MODEL:mimo-v2.5-pro}
+    model: ${LLM_MODEL:mimo-v2.6-pro}
     completions-path: ${LLM_COMPLETIONS_PATH:/chat/completions}
     embeddings-path: ${LLM_EMBEDDINGS_PATH:/embeddings}
   mcp:
@@ -300,17 +300,35 @@ agent:
     base-url: ${LLM_BASE_URL:https://token-plan-sgp.xiaomimimo.com/v1}
     api-key: ${LLM_API_KEY:}
     entries:
-      # 2026-05-07：small 走非推理版 mimo-v2.5（router/rewrite 类轻任务，pro 思考延迟太重）
-      - { id: "router-small",  model: "${LLM_SMALL_MODEL:mimo-v2.5}",  tier: small }
-      - { id: "router-medium", model: "${LLM_MODEL:mimo-v2.5-pro}",    tier: medium }
-      - { id: "router-large",  model: "${LLM_MODEL:mimo-v2.5-pro}",    tier: large }
-    # P1.4 7.3 Contextual Retrieval：入库前用小模型为每个 chunk 生成上下文前缀，拼到正文头部（召回率 +49%）
-    # client-id 指向 router-small（已装配的小模型 ChatClient）；enabled=false 时跳过
-    rag:
-      contextual-retrieval:
-        enabled: true
-        client-id: "router-small"
-        max-chunk-chars: 2000
+      # small 走非推理版 mimo-v2.6-flash（router/rewrite 类轻任务，pro 思考延迟太重）
+      - { id: "router-small",  model: "${LLM_SMALL_MODEL:mimo-v2.6-flash}",  tier: small }
+      - { id: "router-medium", model: "${LLM_MODEL:mimo-v2.6-pro}",    tier: medium }
+      - { id: "router-large",  model: "${LLM_MODEL:mimo-v2.6-pro}",    tier: large }
+  # 知识库入库：每个 parent 一次模型调用生成标题与全部 child 上下文；rule = 不调模型，只用文件名 + Markdown 标题
+  rag:
+    # Contextual Retrieval：child 前缀拼到正文头部参与向量化与 BM25；parent-title：parent 小标题用于引用展示。
+    # 两者由 enrichment 在同一次模型调用中生成；client-id 指向 router-small。路径必须是 agent.rag.*，不能挂在 router-pool 下。
+    contextual-retrieval:
+      enabled: true
+      client-id: "router-small"
+      max-chunk-chars: 2000
+    parent-title:
+      enabled: true
+      max-title-chars: 30
+    enrichment:
+      mode: llm
+      concurrency: 4               # 同时处理的 parent 数
+    ingestion:                     # 入库独立预算，不占用对话任务 run-budget
+      max-model-calls: 1000
+      max-seconds: 1800
+      max-tokens: 3000000
+    quota:                         # 普通用户知识库配额；管理员不受限
+      enabled: true
+      max-files: 50
+      max-total-mb: 200
+      daily-ingestions: 20         # 每天新提交 + 重试（北京时间零点重置）
+      max-pending: 3
+      max-parents-per-file: 300
   # Embedding：SiliconFlow（和 chat 分开，chat 走 mimo）
   embedding:
     base-url: ${EMBEDDING_BASE_URL:https://api.siliconflow.cn/v1}

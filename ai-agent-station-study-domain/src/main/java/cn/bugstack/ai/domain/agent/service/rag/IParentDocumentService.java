@@ -29,6 +29,15 @@ public interface IParentDocumentService {
                String knowledgeTag, String source, String userId, String title);
 
     /**
+     * 断点续做：返回已完整写入的 parent。parent 行在 child 写入向量库之后才落库，
+     * 所以行存在且原文、归属一致，就说明它的 child 已全部写入。
+     *
+     * @param parentTexts parentId → 本次切分出的 parent 原文
+     * @return parentId → 已存的小标题（可能为 null，调用方据此识别增强失败的 parent）
+     */
+    java.util.Map<String, String> completedParents(java.util.Map<String, String> parentTexts, String userId, String knowledgeTag);
+
+    /**
      * 根据子文档列表查找对应的父文档，去重后返回父文档文本列表。
      *
      * @param childDocs 向量检索返回的子文档（metadata 需含 parent_id）

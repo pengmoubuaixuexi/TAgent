@@ -8,7 +8,11 @@ import org.springframework.stereotype.Repository;
 
 import java.sql.Timestamp;
 import java.time.Clock;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -16,6 +20,8 @@ import java.util.UUID;
 /** Every externally addressed read/update includes the authenticated owner. Leases fence worker updates. */
 @Repository
 public class RagIngestionRepository {
+    /** Daily knowledge quotas reset at midnight for the site's users, while timestamps stay in UTC. */
+    private static final ZoneId QUOTA_ZONE = ZoneId.of("Asia/Shanghai");
     private final JdbcTemplate db;
     private final Clock clock;
     private static final RowMapper<RagIngestionTask> ROW = (row, index) -> new RagIngestionTask(
@@ -23,7 +29,7 @@ public class RagIngestionRepository {
             row.getString("file_name"), row.getString("file_hash"), row.getLong("file_size"), row.getString("source_path"),
             row.getString("dedup_key"), row.getString("status"), row.getString("stage"), row.getInt("progress"), row.getInt("chunk_count"),
             row.getInt("attempt"), row.getString("last_error"), row.getString("lease_token"), time(row.getTimestamp("lease_until")),
-            time(row.getTimestamp("created_at")), time(row.getTimestamp("updated_at")));
+            time(row.getTimestamp("created_at")), time(row.getTimestamp("updated_at")), row.getString("resume_fingerprint"));
 
     @org.springframework.beans.factory.annotation.Autowired
     public RagIngestionRepository(@Qualifier("mysqlJdbcTemplate") JdbcTemplate db) { this(db, Clock.systemUTC()); }
@@ -115,12 +121,15 @@ public class RagIngestionRepository {
                 """, now().plusMinutes(2), task.taskId(), task.owner(), task.leaseToken());
     }
 
-    public boolean complete(RagIngestionTask task) {
+    public boolean complete(RagIngestionTask task) { return complete(task, null); }
+
+    /** A succeeded task keeps an optional quality warning in last_error; the view exposes it as a warning, not an error. */
+    public boolean complete(RagIngestionTask task, String warning) {
         return db.update("""
-                UPDATE ai_rag_ingestion_task SET status='SUCCEEDED',stage='SUCCEEDED',progress=100,last_error=NULL,
+                UPDATE ai_rag_ingestion_task SET status='SUCCEEDED',stage='SUCCEEDED',progress=100,last_error=?,
                   lease_token=NULL,lease_until=NULL,updated_at=?
                 WHERE task_id=? AND owner_user_id=? AND lease_token=? AND status='PROCESSING'
-                """, now(), task.taskId(), task.owner(), task.leaseToken()) == 1;
+                """, warning, now(), task.taskId(), task.owner(), task.leaseToken()) == 1;
     }
 
     public void fail(RagIngestionTask task, String message) {
@@ -130,12 +139,53 @@ public class RagIngestionRepository {
                 """, message, now(), task.taskId(), task.owner(), task.leaseToken());
     }
 
-    public boolean retry(String owner, String id) {
+    /** Records which split / enrichment the running attempt writes, so a later retry can reuse its completed parents. */
+    public boolean saveFingerprint(RagIngestionTask task, String fingerprint) {
         return db.update("""
-                UPDATE ai_rag_ingestion_task SET status='QUEUED',stage='QUEUED',progress=0,last_error=NULL,updated_at=?
-                WHERE task_id=? AND owner_user_id=? AND status='FAILED' AND lease_token IS NULL
-                """, now(), id, owner) == 1;
+                UPDATE ai_rag_ingestion_task SET resume_fingerprint=?,lease_until=?,updated_at=?
+                WHERE task_id=? AND owner_user_id=? AND lease_token=? AND status='PROCESSING'
+                """, fingerprint, now().plusMinutes(2), now(), task.taskId(), task.owner(), task.leaseToken()) == 1;
     }
+
+    public boolean retry(String owner, String id) {
+        // retry_day_count is assigned before retry_day, so it still compares against the previous day.
+        LocalDate day = quotaDay();
+        return db.update("""
+                UPDATE ai_rag_ingestion_task SET status='QUEUED',stage='QUEUED',progress=0,last_error=NULL,updated_at=?,
+                  retry_day_count=CASE WHEN retry_day=? THEN retry_day_count+1 ELSE 1 END,retry_day=?
+                WHERE task_id=? AND owner_user_id=? AND status='FAILED' AND lease_token IS NULL
+                """, now(), day, day, id, owner) == 1;
+    }
+
+    public record Usage(int files, long bytes, int today, int pending) { }
+
+    /**
+     * Files and bytes count published files plus unfinished tasks that still hold a retained source.
+     * Today counts new submissions (excluding instant duplicates) and retries since 00:00 Beijing time.
+     */
+    public Usage usage(String owner) {
+        Map<String, Long> sizes = new HashMap<>();
+        db.query("SELECT rag_id,file_size FROM ai_client_rag_order WHERE user_id=?",
+                (org.springframework.jdbc.core.RowCallbackHandler) row -> sizes.put(row.getString(1), row.getLong(2)), owner);
+        int pending = 0;
+        for (Map<String, Object> row : db.queryForList("""
+                SELECT rag_id,file_size,status FROM ai_rag_ingestion_task WHERE owner_user_id=?
+                AND status IN ('QUEUED','PROCESSING','CANCEL_REQUESTED','FAILED','DELETING','DELETE_FAILED')
+                """, owner)) {
+            sizes.putIfAbsent(String.valueOf(row.get("rag_id")), ((Number) row.get("file_size")).longValue());
+            if (List.of("QUEUED", "PROCESSING", "CANCEL_REQUESTED").contains(String.valueOf(row.get("status")))) pending++;
+        }
+        Integer submitted = db.queryForObject("""
+                SELECT COUNT(*) FROM ai_rag_ingestion_task WHERE owner_user_id=? AND created_at>=?
+                AND NOT (status='SUCCEEDED' AND attempt=0)
+                """, Integer.class, owner, quotaDay().atStartOfDay(QUOTA_ZONE).withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime());
+        Integer retried = db.queryForObject("SELECT COALESCE(SUM(retry_day_count),0) FROM ai_rag_ingestion_task WHERE owner_user_id=? AND retry_day=?",
+                Integer.class, owner, quotaDay());
+        return new Usage(sizes.size(), sizes.values().stream().mapToLong(Long::longValue).sum(),
+                (submitted == null ? 0 : submitted) + (retried == null ? 0 : retried), pending);
+    }
+
+    private LocalDate quotaDay() { return clock.instant().atZone(QUOTA_ZONE).toLocalDate(); }
 
     public boolean requestCancel(String owner, String id) {
         return db.update("""

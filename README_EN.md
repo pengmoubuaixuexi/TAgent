@@ -27,11 +27,17 @@ It is not another one-call model wrapper. TAgent makes the complete Agent-reques
 
 *This repository is a sanitized public version without real API keys, runtime logs, chat histories, temporary reports, database backups, or personal data.*
 
-> **🌐 Try TAgent: [http://49.232.209.30:8099](http://49.232.209.30:8099)**
+> **🌐 Try TAgent: [https://tagentapp.cn](https://tagentapp.cn)**
 >
-> Access is temporarily provided through the public IP address; this link will be updated when the domain is available. After registering, you can try preconfigured Agents or open “My Agents” to build Fixed, Auto, and Flow Agents. Configure System Prompts, MCP connections, and Advisors per node, and connect your own RAG knowledge base. Personal Agent configuration, knowledge retrieval, and usage observations are scoped to each user.
+> After registering, you can try preconfigured Agents or open “My Agents” to build Fixed, Auto, and Flow Agents. Configure System Prompts, MCP connections, and Advisors per node, and connect your own RAG knowledge base. Personal Agent configuration, knowledge retrieval, and usage observations are scoped to each user.
 >
-> The service is currently a trial, with platform-provided models primarily `mimo-v2.5` and `deepseek-v4-flash`, subject to platform allowances. **v2.0.0 supports personal OpenAI-compatible model connections** with encrypted API keys. Platform helpers such as routing, memory summaries, and embeddings require separate consent and do not reuse a personal chat-model key. Personal model and MCP endpoints follow the operator's domain allowlists. See [Agent workspaces (Chinese)](docs/dev-ops/USER_AGENT_WORKSPACE.md) and [model connections](docs/dev-ops/MODEL_CONNECTIONS.md).
+> The service is currently a trial, with platform-provided models primarily `mimo-v2.6-flash` and `deepseek-v4-flash`, subject to platform allowances. **v2.0.0 supports personal OpenAI-compatible model connections** with encrypted API keys. Platform helpers such as routing, memory summaries, and embeddings require separate consent and do not reuse a personal chat-model key. Personal model and MCP endpoints follow the operator's domain allowlists. See [Agent workspaces (Chinese)](docs/dev-ops/USER_AGENT_WORKSPACE.md) and [model connections](docs/dev-ops/MODEL_CONNECTIONS.md).
+
+## 🆕 v2.1.0: Faster Knowledge Ingestion with Clear Quotas
+
+- **Faster ingestion:** one model call per parent block produces its title and the retrieval context of every child chunk, and parent blocks run concurrently. A paper of about 170 chunks that used to hit the 30-minute limit now finishes in about 3 minutes.
+- **Resumable retries:** a retry skips blocks that were fully written. If the enrichment model is unavailable, the file is still indexed and the task says how many blocks lack context.
+- **Per-user quotas:** limits on files, storage, daily ingestions (retries included), queued tasks, and file size in blocks, with usage shown on the knowledge page; administrators are exempt. Upgrading requires [V070](docs/dev-ops/sql-migrations/V070__knowledge_ingestion_resume_and_quota.sql); see the [upgrade guide (Chinese)](docs/dev-ops/V2_UPGRADE.md#v210-升级).
 
 ## 🆕 v2.0.0: Configure, Run, and Keep the Result
 
@@ -102,7 +108,7 @@ User Request
 | **Three Agent Modes** | Fixed (configured sequential Client chain), Auto (analyze-execute loop), Flow (DAG orchestration) |
 | **Personal Agent Workspace** | Mode-specific nodes, model/Prompt/MCP/Advisor settings, drafts, enabled versions, comparisons, and node debugging |
 | **Personal Models and Allowances** | Encrypted OpenAI-compatible API keys, separate platform-helper consent, persistent allowances and known/unknown usage |
-| **Knowledge Management** | Ingestion progress, retry, chunk previews, retrieval tests, owner and publication filtering |
+| **Knowledge Management** | Ingestion progress, resumable retry, chunk previews, retrieval tests, per-user quotas and publication filtering |
 | **Artifacts and Feedback** | Versioned Markdown, CSV, and code downloads; opt-in feedback-to-evaluation drafts |
 | **Database-Driven Assembly** | Agent, Client, Model, Prompt, Advisor, RAG, MCP relationships configured via DB |
 | **Unified Agent Router** | Single LLM call to select Agent and infer missing tool capabilities |

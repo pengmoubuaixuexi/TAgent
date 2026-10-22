@@ -82,7 +82,7 @@ spring:
       chat:
         completions-path: ${LLM_COMPLETIONS_PATH:/chat/completions}
         options:
-          model: ${LLM_MODEL:mimo-v2.5-pro}
+          model: ${LLM_MODEL:mimo-v2.6-pro}
       embedding:
         embeddings-path: ${EMBEDDING_PATH:/embeddings}
         enabled: false
@@ -240,6 +240,20 @@ agent:
     - id: router-large
       tier: large
   rag:
+    enrichment:
+      mode: llm
+      concurrency: 4
+    ingestion:
+      max-model-calls: 1000
+      max-seconds: 1800
+      max-tokens: 3000000
+    quota:
+      enabled: true
+      max-files: 50
+      max-total-mb: 200
+      daily-ingestions: 20
+      max-pending: 3
+      max-parents-per-file: 300
     contextual-retrieval:
       enabled: true
       client-id: router-small

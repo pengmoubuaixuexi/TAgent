@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   const $=id=>document.getElementById(id), api='/api/v1/knowledge';
-  const labels={QUEUED:'等待处理',PROCESSING:'处理中',VERIFYING:'校验原件',CLEANING:'清理上次未完成的片段',PARSING:'提取与切分文本',ENRICHING:'生成片段上下文',VECTORIZING:'写入向量索引',INDEXING:'写入关键词索引',PUBLISHING:'发布文件目录',SUCCEEDED:'已入库',FAILED:'入库失败',CANCEL_REQUESTED:'正在停止入库',CANCELLING:'正在停止入库',DELETING:'正在清理',DELETE_FAILED:'等待清理 / 删除失败',DELETED:'已删除'};
+  const labels={QUEUED:'等待处理',PROCESSING:'处理中',VERIFYING:'校验原件',CLEANING:'清理上次未完成的片段',PARSING:'提取与切分文本',ENRICHING:'生成上下文并写入索引',VECTORIZING:'写入向量索引',INDEXING:'写入关键词索引',PUBLISHING:'发布文件目录',SUCCEEDED:'已入库',FAILED:'入库失败',CANCEL_REQUESTED:'正在停止入库',CANCELLING:'正在停止入库',DELETING:'正在清理',DELETE_FAILED:'等待清理 / 删除失败',DELETED:'已删除'};
   let timer, loading=false, reloadRequested=false, previewSequence=0, preview={id:null,page:0,total:0};
   const el=(tag,text,cls)=>{const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(cls)node.className=cls;return node;};
   function notice(text,error=false){$('notice').textContent=text;$('notice').className='notice'+(error?' error':'');}
@@ -13,7 +13,15 @@
   }
   const send=(path,method,body)=>request(path,{method,...(body?{headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{})});
   function button(text,fn,danger=false){const b=el('button',text,danger?'danger':'');b.type='button';b.addEventListener('click',async()=>{b.disabled=true;try{await fn();}catch(e){notice(e.message,true);}finally{b.disabled=false;}});return b;}
+  function renderQuota(q){
+    const node=$('quota');if(!q){node.textContent='';return;}
+    if(q.unlimited){node.textContent='管理员账户不受知识库配额限制';return;}
+    const mb=b=>(b/1048576).toFixed(1);
+    node.textContent=`文件 ${q.files}/${q.maxFiles} · 空间 ${mb(q.bytes)}/${mb(q.maxBytes)} MB · 今日入库 ${q.today}/${q.dailyIngestions} 次 · 排队中 ${q.pending}/${q.maxPending}`;
+    node.title=`单个文件最多切分 ${q.maxParentsPerFile} 个段落；重试也计入每日次数，北京时间零点重置。`;
+  }
   function render(data){
+    renderQuota(data.quota);
     const rows=$('file-list');rows.replaceChildren();
     const represented=new Set(data.tasks.map(t=>t.fileId));
     const files=[...data.tasks,...data.files.filter(f=>!represented.has(f.ragId)).map(f=>({...f,fileId:f.ragId,status:'SUCCEEDED',stage:'SUCCEEDED',legacy:true}))];
@@ -29,6 +37,7 @@
       state.append(el('div',labels[file.status]||file.status,'state '+file.status));
       if(file.status==='PROCESSING'){state.append(el('div',labels[file.stage]||'处理中','tag'));const p=el('progress');p.max=100;p.value=file.progress||0;p.setAttribute('aria-label','入库进度');state.append(p);}
       if(file.error)state.append(el('div',file.error,'row-error'));
+      if(file.warning)state.append(el('div',file.warning,'row-warning'));
       if(file.updatedAt)state.append(el('div',new Date(file.updatedAt).toLocaleString(),'tag'));
       counts.append(el('div',file.chunkCount?file.chunkCount+' 个片段':'—'),el('div',file.attempt?'第 '+file.attempt+' 次处理':file.legacy?'已有文件':'尚未执行','tag'));
       const group=el('div',undefined,'actions');

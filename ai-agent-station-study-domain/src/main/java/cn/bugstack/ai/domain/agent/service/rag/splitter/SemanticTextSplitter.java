@@ -32,7 +32,11 @@ public class SemanticTextSplitter extends TextSplitter {
 
     private static final Pattern HEADING_LINE = Pattern.compile("^#{1,6}\\s+.+$");
     private static final Pattern PARAGRAPH_BREAK = Pattern.compile("\\n\\s*\\n");
-    private static final Pattern SENTENCE_END = Pattern.compile("(?<=[。！？!?\\.])\\s*");
+    /**
+     * 零宽切点：中文句末标点后直接切；英文 . ! ? 后必须跟空白才算句末，避免切开 3.5、Fig.3、URL。
+     * 不消耗字符，句子重新拼接后英文句间空格不丢失。
+     */
+    private static final Pattern SENTENCE_END = Pattern.compile("(?<=[。！？])|(?<=[.!?])(?=\\s)");
     /** Markdown 图片引用：![alt](path or url)。不 greedy，避免吃掉后面的正文 */
     private static final Pattern MARKDOWN_IMAGE = Pattern.compile("!\\[[^\\]]*\\]\\([^)]*\\)");
     /** 代码块围栏 ``` 或 ~~~，独占一行 */

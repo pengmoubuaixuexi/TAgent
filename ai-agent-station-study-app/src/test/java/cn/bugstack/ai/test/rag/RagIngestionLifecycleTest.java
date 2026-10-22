@@ -41,8 +41,12 @@ public class RagIngestionLifecycleTest {
         String sql = Files.readString(migration).replaceAll("(?m)^--.*$", "").replace("SET NAMES utf8mb4;", "")
                 .replace(" ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin", "");
         db.execute(sql);
-        db.execute("CREATE TABLE ai_client_rag_order(id BIGINT AUTO_INCREMENT PRIMARY KEY,rag_id VARCHAR(64),rag_name VARCHAR(255),"
+        db.execute("CREATE TABLE ai_client_rag_order(id BIGINT AUTO_INCREMENT PRIMARY KEY,rag_id VARCHAR(64),rag_name VARCHAR(50) NOT NULL,"
                 + "knowledge_tag VARCHAR(128),file_hash VARCHAR(64),file_size BIGINT,user_id VARCHAR(64),status INT,create_time DATETIME)");
+        for (String statement : Files.readString(migration.resolveSibling("V070__knowledge_ingestion_resume_and_quota.sql"))
+                .replaceAll("(?m)^--.*$", "").replace("SET NAMES utf8mb4;", "").split(";")) {
+            if (!statement.isBlank()) db.execute(statement);
+        }
         records = new RagIngestionRepository(db, clock);
         root = temp.newFolder("private").toPath();
         sources = new RagUploadStorage(root.toString(), 1024);
@@ -100,7 +104,13 @@ public class RagIngestionLifecycleTest {
     @Test public void explicitRetryClearsPartialStableScopeBeforeNewModelWork() throws Exception {
         AtomicInteger calls = new AtomicInteger();
         doAnswer(call -> {
-            if (calls.incrementAndGet() == 1) throw new IllegalStateException("SYNTHETIC_BACKEND_SECRET");
+            RagIngestionObserver observer = call.getArgument(4);
+            if (calls.incrementAndGet() == 1) {
+                assertFalse(observer.prepare("split-a"));
+                verifyNoInteractions(deletion);
+                throw new IllegalStateException("SYNTHETIC_BACKEND_SECRET");
+            }
+            assertFalse("a changed split must not reuse earlier parents", observer.prepare("split-b"));
             verify(deletion).deleteIngestionFile(argThat(scope -> "alice".equals(scope.userId()) && "kb".equals(scope.knowledgeTag())));
             return null;
         }).when(engine).storeRagFile(anyString(), anyString(), anyList(), anyString(), any());
@@ -111,12 +121,112 @@ public class RagIngestionLifecycleTest {
         var done = await("alice", task.taskId(), "SUCCEEDED"); assertEquals(2, done.attempt()); assertEquals(2, calls.get());
     }
 
+    @Test public void parserLinkageFailureIsRecordedWithoutWaitingForLeaseExpiry() throws Exception {
+        doAnswer(call -> {
+            ((RagIngestionObserver) call.getArgument(4)).progress("PARSING", 10, 0);
+            throw new NoClassDefFoundError("org/apache/commons/lang3/SystemProperties");
+        }).doNothing().when(engine).storeRagFile(anyString(), anyString(), anyList(), anyString(), any());
+        var task = submit("alice"); service.tick();
+        var failed = await("alice", task.taskId(), "FAILED");
+        assertEquals("PARSING", failed.stage());
+        assertNull(failed.leaseToken());
+        assertTrue(failed.error().contains("组件加载失败"));
+        assertFalse(failed.error().contains("org/apache"));
+        assertNotNull(sources.open(failed));
+        service.retry("alice", task.taskId());
+        assertEquals(2, await("alice", task.taskId(), "SUCCEEDED").attempt());
+    }
+
     @Test public void failedCleanupBlocksRetryWithoutStartingModels() throws Exception {
         var task = submit("alice"); var claimed = records.claimNext(); records.fail(claimed, "test failure");
         doThrow(new RagStorageException("片段清理失败，请恢复存储后重试")).when(deletion).deleteIngestionFile(any());
+        AtomicInteger modelWork = new AtomicInteger();
+        doAnswer(call -> {
+            ((RagIngestionObserver) call.getArgument(4)).prepare("split-a"); // the engine prepares before any model call
+            modelWork.incrementAndGet();
+            return null;
+        }).when(engine).storeRagFile(anyString(), anyString(), anyList(), anyString(), any());
         service.retry("alice", task.taskId()); service.tick();
         var failed = await("alice", task.taskId(), "FAILED");
-        assertTrue(failed.error().contains("清理失败")); verifyNoInteractions(engine); assertNotNull(sources.open(failed));
+        assertTrue(failed.error().contains("清理失败")); assertEquals(0, modelWork.get()); assertNotNull(sources.open(failed));
+    }
+
+    @Test public void retryWithSameFingerprintResumesWithoutClearingCompletedParents() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        doAnswer(call -> {
+            RagIngestionObserver observer = call.getArgument(4);
+            if (calls.incrementAndGet() == 1) {
+                assertFalse(observer.prepare("split-a"));
+                throw new IllegalStateException("partial failure");
+            }
+            assertTrue(observer.prepare("split-a"));
+            return null;
+        }).when(engine).storeRagFile(anyString(), anyString(), anyList(), anyString(), any());
+        var task = submit("alice"); service.tick();
+        assertEquals("split-a", await("alice", task.taskId(), "FAILED").resumeFingerprint());
+        service.retry("alice", task.taskId()); service.tick();
+        await("alice", task.taskId(), "SUCCEEDED");
+        verifyNoInteractions(deletion);
+    }
+
+    @Test public void qualityWarningIsShownOnSucceededTaskInsteadOfError() throws Exception {
+        doAnswer(call -> {
+            ((RagIngestionObserver) call.getArgument(4)).warn("已入库，但有 3/3 个段落未生成标题和上下文");
+            return null;
+        }).when(engine).storeRagFile(anyString(), anyString(), anyList(), anyString(), any());
+        var task = submit("alice"); service.tick();
+        var view = service.view(await("alice", task.taskId(), "SUCCEEDED"));
+        assertNull(view.get("error"));
+        assertTrue(String.valueOf(view.get("warning")).contains("3/3"));
+    }
+
+    @Test public void longFileNamesFitTheDirectoryAfterMigration() {
+        String name = "x".repeat(200) + ".pdf";
+        db.update("INSERT INTO ai_client_rag_order(rag_id,rag_name,user_id,knowledge_tag,status,create_time) VALUES('long',?,'alice','kb',1,CURRENT_TIMESTAMP)", name);
+        assertEquals(name, db.queryForObject("SELECT rag_name FROM ai_client_rag_order WHERE rag_id='long'", String.class));
+    }
+
+    @Test public void ingestionRunsWithDedicatedBudgetAndParentLimit() throws Exception {
+        var limits = new RunBudgetRegistry.Limits(Duration.ofMinutes(5), 7, 1, 1234L);
+        var quota = new RagIngestionQuota(records, owner -> false, new RagIngestionQuota.Limits(true, 50, 1 << 20, 20, 3, 42));
+        service.close();
+        service = new RagIngestionService(records, sources, engine, deletion, new RunBudgetRegistry(), policy, quota, limits);
+        doAnswer(call -> {
+            assertEquals(1234L, RunBudgetRegistry.find(Map.of()).snapshot().get("maxTokens"));
+            assertEquals(42, ((RagIngestionObserver) call.getArgument(4)).maxParents());
+            return null;
+        }).when(engine).storeRagFile(anyString(), anyString(), anyList(), anyString(), any());
+        var task = submit("alice"); service.tick();
+        await("alice", task.taskId(), "SUCCEEDED");
+    }
+
+    @Test public void quotaLimitsPendingFilesDailyIngestionsAndSpaceButNotAdministrators() throws Exception {
+        var quota = new RagIngestionQuota(records, "admin"::equals, new RagIngestionQuota.Limits(true, 3, 40, 3, 2, 300));
+        service.close();
+        service = new RagIngestionService(records, sources, engine, deletion, new RunBudgetRegistry(), policy, quota,
+                new RunBudgetRegistry.Limits(Duration.ofMinutes(5), 10, 1, 10_000L));
+        var first = service.submit("alice", "kb", named("a.txt", "first")); service.submit("alice", "kb", named("b.txt", "second"));
+        var pending = assertThrows(RagStorageException.class, () -> service.submit("alice", "kb", named("c.txt", "third")));
+        assertTrue(pending.getMessage().contains("排队或处理中"));
+        assertEquals(2, ((Number) ((Map<?, ?>) service.list("alice").get("quota")).get("pending")).intValue());
+
+        records.fail(records.claimNext(), "test failure");
+        service.retry("alice", first.taskId());          // two submissions + one retry = today's three ingestions
+        records.fail(records.claimNext(), "test failure"); // frees a pending slot, so the daily limit is what blocks next
+        var daily = assertThrows(RagStorageException.class, () -> service.submit("alice", "kb", named("d.txt", "fourth")));
+        assertTrue(daily.getMessage().contains("今天的入库次数已用完"));
+        assertThrows(RagStorageException.class, () -> service.retry("alice", first.taskId()));
+        try (var paths = Files.list(root)) { assertEquals("rejected uploads leave no source behind", 2, paths.count()); }
+
+        var space = assertThrows(RagStorageException.class, () -> service.submit("bob", "kb", named("big.txt", "x".repeat(41))));
+        assertTrue(space.getMessage().contains("知识库空间不足"));
+        for (int i = 0; i < 4; i++) service.submit("admin", "kb", named("admin" + i + ".txt", "admin file " + i));
+        assertEquals(Boolean.TRUE, ((Map<?, ?>) service.list("admin").get("quota")).get("unlimited"));
+        assertNotNull(first);
+    }
+
+    private MockMultipartFile named(String name, String content) {
+        return new MockMultipartFile("file", name, "text/plain", content.getBytes());
     }
 
     @Test public void corruptedSourceCannotAdmitRetryOrModelCalls() throws Exception {

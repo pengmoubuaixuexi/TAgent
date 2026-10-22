@@ -49,18 +49,7 @@ public class ParentDocumentService implements IParentDocumentService {
                 || !java.util.Objects.equals(existing.getKnowledgeTag(), knowledgeTag))) {
             throw new cn.bugstack.ai.domain.agent.service.rag.RagStorageException("文档归属冲突，未覆盖已有资料。");
         }
-        // 1. 存 parent 到 MySQL（含 title）
-        AiParentDocument po = AiParentDocument.builder()
-                .parentId(parentId)
-                .content(parentText)
-                .knowledgeTag(knowledgeTag)
-                .source(source)
-                .title(title != null && !title.isBlank() ? title : null)
-                .userId(userId)
-                .build();
-        parentDocumentDao.insert(po);
-
-        // 2. 给每个 child 标记 parent_id / knowledge / source / user_id / title，写入 PgVector
+        // 1. 给每个 child 标记 parent_id / knowledge / source / user_id / title，写入 PgVector
         // title 也注入 child metadata，让 BM25 路径回收的 child Document 也能直接展示精炼标题
         for (Document child : childDocs) {
             child.getMetadata().put("parent_id", parentId);
@@ -75,8 +64,36 @@ public class ParentDocumentService implements IParentDocumentService {
         }
         vectorStore.accept(childDocs);
 
+        // 2. child 全部写入后再存 parent 到 MySQL（含 title）：parent 行同时是断点续做的完成标记
+        AiParentDocument po = AiParentDocument.builder()
+                .parentId(parentId)
+                .content(parentText)
+                .knowledgeTag(knowledgeTag)
+                .source(source)
+                .title(title != null && !title.isBlank() ? title : null)
+                .userId(userId)
+                .build();
+        parentDocumentDao.insert(po);
+
         log.info("[ParentDoc] stored parent={} children={} tag={} userId={} title='{}'",
                 parentId, childDocs.size(), knowledgeTag, userId, title);
+    }
+
+    @Override
+    public Map<String, String> completedParents(Map<String, String> parentTexts, String userId, String knowledgeTag) {
+        if (parentTexts == null || parentTexts.isEmpty()) return Map.of();
+        Map<String, String> completed = new HashMap<>();
+        List<String> ids = new ArrayList<>(parentTexts.keySet());
+        for (int from = 0; from < ids.size(); from += 500) {
+            for (AiParentDocument stored : parentDocumentDao.findByParentIds(ids.subList(from, Math.min(ids.size(), from + 500)))) {
+                if (java.util.Objects.equals(stored.getUserId(), userId)
+                        && java.util.Objects.equals(stored.getKnowledgeTag(), knowledgeTag)
+                        && java.util.Objects.equals(stored.getContent(), parentTexts.get(stored.getParentId()))) {
+                    completed.put(stored.getParentId(), stored.getTitle());
+                }
+            }
+        }
+        return completed;
     }
 
     @Override

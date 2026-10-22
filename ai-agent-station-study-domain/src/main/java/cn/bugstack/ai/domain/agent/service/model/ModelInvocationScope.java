@@ -13,6 +13,9 @@ public final class ModelInvocationScope implements AutoCloseable {
     private final String ownedRun;
     private String systemOwner;
     private ModelInvocationScope(RunBudgetRegistry registry, String user, String purpose) {
+        this(registry, user, purpose, null);
+    }
+    private ModelInvocationScope(RunBudgetRegistry registry, String user, String purpose, RunBudgetRegistry.Limits limits) {
         if (user == null || user.isBlank()) throw new SecurityException("缺少模型调用身份");
         previous = MDC.getCopyOfContextMap();
         var existing = RunBudgetRegistry.find(Map.of());
@@ -22,7 +25,7 @@ public final class ModelInvocationScope implements AutoCloseable {
             ownedRun = null;
         } else {
             ownedRun = "model:" + purpose + ":" + UUID.randomUUID();
-            registry.start(ownedRun, user);
+            if (limits == null) registry.start(ownedRun, user); else RunBudgetRegistry.start(ownedRun, user, limits);
             MDC.put("runId", ownedRun);
             MDC.put("agent.run_id", ownedRun);
         }
@@ -31,6 +34,10 @@ public final class ModelInvocationScope implements AutoCloseable {
     }
     public static ModelInvocationScope open(RunBudgetRegistry registry, String user, String purpose) {
         return new ModelInvocationScope(registry, user, purpose);
+    }
+    /** Same as {@link #open} but a newly started run uses dedicated limits (e.g. knowledge ingestion). */
+    public static ModelInvocationScope open(RunBudgetRegistry registry, String user, String purpose, RunBudgetRegistry.Limits limits) {
+        return new ModelInvocationScope(registry, user, purpose, limits);
     }
     /** Only server-owned lifecycle entry points may establish a system-funded operation. */
     public static ModelInvocationScope openSystem(RunBudgetRegistry registry, SystemPurpose purpose) {

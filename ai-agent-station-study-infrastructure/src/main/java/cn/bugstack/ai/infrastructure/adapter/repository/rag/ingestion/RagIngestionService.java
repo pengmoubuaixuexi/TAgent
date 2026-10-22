@@ -7,10 +7,12 @@ import cn.bugstack.ai.domain.agent.service.model.ModelInvocationScope;
 import cn.bugstack.ai.domain.agent.service.model.ModelProviderAccess;
 import cn.bugstack.ai.domain.agent.service.rag.IRagFileDeletionService;
 import cn.bugstack.ai.domain.agent.service.rag.RagFileScope;
+import cn.bugstack.ai.domain.agent.service.rag.RagIngestionObserver;
 import cn.bugstack.ai.domain.agent.service.rag.RagStorageException;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -31,6 +33,9 @@ public class RagIngestionService implements AutoCloseable {
     private final IRagFileDeletionService deletion;
     private final RunBudgetRegistry budgets;
     private final ModelProviderAccess providers;
+    private final RagIngestionQuota quota;
+    /** Ingestion has its own budget instead of sharing the chat run limits (60 model calls by default). */
+    private final RunBudgetRegistry.Limits ingestionLimits;
     private final ScheduledExecutorService coordinator = Executors.newSingleThreadScheduledExecutor(r -> daemon(r, "rag-ingestion-coordinator"));
     private final ExecutorService worker = new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS,
             new ArrayBlockingQueue<>(1), r -> daemon(r, "rag-ingestion-worker"), new ThreadPoolExecutor.AbortPolicy());
@@ -47,8 +52,25 @@ public class RagIngestionService implements AutoCloseable {
 
     public RagIngestionService(RagIngestionRepository tasks, RagUploadStorage sources, IRagService rag,
             IRagFileDeletionService deletion, RunBudgetRegistry budgets, ModelProviderAccess providers) {
+        this(tasks, sources, rag, deletion, budgets, providers, new RagIngestionQuota(tasks, owner -> true, RagIngestionQuota.Limits.DISABLED),
+                new RunBudgetRegistry.Limits(Duration.ofMinutes(30), 1000, 1, 3_000_000L));
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public RagIngestionService(RagIngestionRepository tasks, RagUploadStorage sources, IRagService rag,
+            IRagFileDeletionService deletion, RunBudgetRegistry budgets, ModelProviderAccess providers, RagIngestionQuota quota,
+            @Value("${agent.rag.ingestion.max-seconds:1800}") long maxSeconds,
+            @Value("${agent.rag.ingestion.max-model-calls:1000}") int maxModelCalls,
+            @Value("${agent.rag.ingestion.max-tokens:3000000}") long maxTokens) {
+        this(tasks, sources, rag, deletion, budgets, providers, quota,
+                new RunBudgetRegistry.Limits(Duration.ofSeconds(maxSeconds), maxModelCalls, 1, maxTokens));
+    }
+
+    public RagIngestionService(RagIngestionRepository tasks, RagUploadStorage sources, IRagService rag,
+            IRagFileDeletionService deletion, RunBudgetRegistry budgets, ModelProviderAccess providers, RagIngestionQuota quota,
+            RunBudgetRegistry.Limits ingestionLimits) {
         this.tasks = tasks; this.sources = sources; this.rag = rag; this.deletion = deletion;
-        this.budgets = budgets; this.providers = providers;
+        this.budgets = budgets; this.providers = providers; this.quota = quota; this.ingestionLimits = ingestionLimits;
     }
     private static Thread daemon(Runnable task, String name) { Thread thread = new Thread(task, name); thread.setDaemon(true); return thread; }
 
@@ -65,12 +87,13 @@ public class RagIngestionService implements AutoCloseable {
         RagUploadStorage.Stored source = sources.save(id, file);
         try {
             String existing = tasks.existingFileId(owner, tag, source.hash());
+            if (existing == null) quota.checkSubmit(owner, source.bytes());
             String state = existing == null ? "QUEUED" : "SUCCEEDED";
             RagIngestionTask proposed = new RagIngestionTask(id, owner,
                     existing == null ? RagFileScope.stableId(owner, tag, source.hash()) : existing,
                     tag, file.getOriginalFilename(), source.hash(), source.bytes(), source.path(),
                     digest(owner + "\u0000" + tag + "\u0000" + source.hash()), state, state, existing == null ? 0 : 100,
-                    0, 0, null, null, null, null, null);
+                    0, 0, null, null, null, null, null, null);
             RagIngestionTask saved = tasks.insert(proposed);
             if (!id.equals(saved.taskId())) sources.delete(source.path());
             return saved;
@@ -90,7 +113,8 @@ public class RagIngestionService implements AutoCloseable {
     public Map<String, Object> list(String owner) {
         requireOwner(owner);
         return Map.of("tasks", tasks.list(owner).stream().map(this::view).toList(), "files", tasks.files(owner),
-                "indexProvider", "平台向量索引服务", "retryPolicy", "失败保留原件，重试会重新执行入库并可能产生模型用量。");
+                "quota", quota.view(owner), "indexProvider", "平台向量索引服务",
+                "retryPolicy", "失败保留原件；重试会跳过已完成的段落，只处理剩余部分，仍可能产生模型用量。");
     }
 
     public Map<String, Object> view(RagIngestionTask task) {
@@ -98,7 +122,9 @@ public class RagIngestionService implements AutoCloseable {
         out.put("taskId", task.taskId()); out.put("fileId", task.ragId()); out.put("fileName", task.fileName());
         out.put("knowledgeTag", task.knowledgeTag()); out.put("fileSize", task.fileSize());
         out.put("status", task.status()); out.put("stage", task.stage()); out.put("progress", task.progress());
-        out.put("chunkCount", task.chunkCount()); out.put("attempt", task.attempt()); out.put("error", task.error());
+        out.put("chunkCount", task.chunkCount()); out.put("attempt", task.attempt());
+        boolean succeeded = "SUCCEEDED".equals(task.status());
+        out.put("error", succeeded ? null : task.error()); out.put("warning", succeeded ? task.error() : null);
         out.put("updatedAt", task.updatedAt() == null ? null : task.updatedAt().atOffset(ZoneOffset.UTC).toString());
         return out;
     }
@@ -108,6 +134,7 @@ public class RagIngestionService implements AutoCloseable {
         if (!"FAILED".equals(task.status())) throw new RagStorageException("只有失败的任务可以重试；正在取消或删除的任务请先完成清理。");
         providers.requirePlatformAuxiliary(owner, "EMBEDDING");
         sources.open(task); // Verify the retained file before admitting any new model work.
+        quota.checkRetry(owner);
         if (!tasks.retry(owner, id)) throw new RagStorageException("任务状态已变化，请刷新后重试。");
         return requireTask(owner, id);
     }
@@ -179,7 +206,8 @@ public class RagIngestionService implements AutoCloseable {
             RagIngestionTask next = tasks.claimNext();
             if (next == null) return;
             Active accepted = new Active(next); active = accepted;
-            try { worker.submit(() -> execute(accepted)); }
+            // No discarded Future: unexpected fatal errors must reach the uncaught handler.
+            try { worker.execute(() -> execute(accepted)); }
             catch (RejectedExecutionException rejected) { active = null; tasks.fail(next, "入库队列繁忙，请稍后重试。"); }
         } catch (Exception error) {
             if (System.currentTimeMillis() - lastFailureLog > 60_000) {
@@ -192,29 +220,41 @@ public class RagIngestionService implements AutoCloseable {
     private void execute(Active accepted) {
         RagIngestionTask task = accepted.task;
         accepted.thread = Thread.currentThread();
-        try (var scope = ModelInvocationScope.open(budgets, task.owner(), "KNOWLEDGE_INGESTION")) {
+        try (var scope = ModelInvocationScope.open(budgets, task.owner(), "KNOWLEDGE_INGESTION", ingestionLimits)) {
             accepted.budget = RunBudgetRegistry.find(Map.of());
             providers.requirePlatformAuxiliary(task.owner(), "EMBEDDING");
             var file = sources.open(task);
-            // A failed attempt may have written only part of its stable file scope. Clear that scope
-            // before rebuilding, so a changed splitter cannot leave obsolete child chunks behind.
-            // If publication already completed before the task state update failed, preserve it:
-            // RagService's content hash check will finish the task without calling models again.
-            if (task.attempt() > 1 && tasks.existingFileId(task.owner(), task.knowledgeTag(), task.fileHash()) == null) {
-                if (!tasks.progress(task, "CLEANING", 5, 0)) throw new CancellationException("Ingestion lease no longer active");
-                accepted.budget.checkActive();
-                deletion.deleteIngestionFile(new RagFileScope(task.ragId(), task.owner(), task.knowledgeTag(), task.fileName(), false));
-            }
-            rag.storeRagFile(task.fileName(), task.knowledgeTag(), List.of(file), task.owner(), (stage, progress, chunks) -> {
-                if (Thread.currentThread().isInterrupted()) throw new CancellationException("Ingestion cancelled");
-                accepted.budget.checkActive();
-                if (!tasks.progress(task, stage, progress, chunks)) throw new CancellationException("Ingestion lease no longer active");
+            int maxParents = quota.maxParents(task.owner());
+            var warning = new java.util.concurrent.atomic.AtomicReference<String>();
+            rag.storeRagFile(task.fileName(), task.knowledgeTag(), List.of(file), task.owner(), new RagIngestionObserver() {
+                @Override public void progress(String stage, int progress, int chunks) {
+                    if (Thread.currentThread().isInterrupted()) throw new CancellationException("Ingestion cancelled");
+                    accepted.budget.checkActive();
+                    if (!tasks.progress(task, stage, progress, chunks)) throw new CancellationException("Ingestion lease no longer active");
+                }
+                // A failed attempt may have written only part of its stable file scope. With the same fingerprint
+                // its completed parents are reused; otherwise clear that scope first, so a changed splitter cannot
+                // leave obsolete child chunks behind. A file whose publication already completed never gets here:
+                // RagService's content hash check finishes the task without calling models again.
+                @Override public boolean prepare(String fingerprint) {
+                    if (fingerprint.equals(task.resumeFingerprint())) return true;
+                    if (task.attempt() > 1) {
+                        progress("CLEANING", 5, 0);
+                        deletion.deleteIngestionFile(new RagFileScope(task.ragId(), task.owner(), task.knowledgeTag(), task.fileName(), false));
+                    }
+                    if (!tasks.saveFingerprint(task, fingerprint)) throw new CancellationException("Ingestion lease no longer active");
+                    return false;
+                }
+                @Override public int maxParents() { return maxParents; }
+                @Override public void warn(String message) { warning.set(message); }
             });
-            tasks.complete(task);
-        } catch (Exception error) {
-            log.warn("Knowledge ingestion failed task={} stage retained: {}", task.taskId(), error.getClass().getSimpleName());
+            tasks.complete(task, warning.get());
+        } catch (Exception | LinkageError error) {
+            log.warn("Knowledge ingestion failed task={} stage retained", task.taskId(), error);
             Thread.interrupted(); // Permit the final durable state update after a cancelled transport call.
-            tasks.fail(task, safeMessage(error, "入库未完成，可能有部分片段已写入；原件已保留，请重试或删除。"));
+            tasks.fail(task, error instanceof LinkageError
+                    ? "文档处理组件加载失败，请联系管理员修复服务依赖；原件已保留。"
+                    : safeMessage(error, "入库未完成，可能有部分片段已写入；原件已保留，请重试或删除。"));
         } finally {
             Thread.interrupted();
             try { tasks.releaseCancelled(task); }
@@ -229,7 +269,7 @@ public class RagIngestionService implements AutoCloseable {
     private static void requireOwner(String owner) {
         if (owner == null || owner.isBlank()) throw new SecurityException("请先登录。");
     }
-    private static String safeMessage(Exception error, String fallback) {
+    private static String safeMessage(Throwable error, String fallback) {
         String message = error instanceof RagStorageException || error instanceof SecurityException || error instanceof RunBudgetExceededException
                 ? error.getMessage() : fallback;
         return message == null ? fallback : message.substring(0, Math.min(900, message.length()));

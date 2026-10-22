@@ -1,4 +1,4 @@
-# TAgent v2.0.0 升级指南
+# TAgent v2 升级指南
 
 v2.0.0 在个人 Agent 工作区上增加个人模型连接、版本管理、知识入库、持久运行历史、产物和用量账本。版本号对应本次功能里程碑；上线效果仍取决于部署配置和外部模型、MCP 服务。
 
@@ -67,3 +67,30 @@ mvn -pl ai-agent-station-study-trigger -am clean test-compile
 ```
 
 完整本地验证入口为 `docs/dev-ops/verify_v2_local.ps1`，只接受脚本指定的隔离 MySQL 与 Redis。脚本默认离线 Maven 构建，需要提前准备依赖缓存；浏览器套件需要安装 Playwright，并通过 `CHROME_PATH` 指定可用 Chromium/Chrome（Windows 默认路径见各套件）。真实隔离存储、HTTPS 模板和恢复检查有独立前提，不要连接生产数据库运行测试。
+
+## v2.1.0 升级
+
+v2.1.0 加快知识库入库，支持失败后续做，并增加按用户的知识库配额。只需在 v2.0.0（已完成 V064–V069）的基础上执行一个迁移：
+
+1. 备份 MySQL。
+2. 执行 [V070](sql-migrations/V070__knowledge_ingestion_resume_and_quota.sql)：`ai_rag_ingestion_task` 新增 `resume_fingerprint`、`retry_day`、`retry_day_count`，`ai_client_rag_order.rag_name` 放宽到 255。只执行一次。
+3. 再启动新版本。顺序不能反：新版本查询入库任务时依赖新增列。
+
+新增配置均有默认值，可不修改现有配置：
+
+| 配置 | 默认值 | 说明 |
+|---|---|---|
+| `agent.rag.enrichment.mode` | `llm` | `llm`：每个父块一次模型调用生成标题和子块上下文；`rule`：不调模型，只用文件名和 Markdown 标题 |
+| `agent.rag.enrichment.concurrency` | `4` | 同时处理的父块数 |
+| `agent.rag.ingestion.max-model-calls` / `max-seconds` / `max-tokens` | `1000` / `1800` / `3000000` | 入库独立预算，不占用对话任务预算 |
+| `agent.rag.quota.enabled` | `true` | 普通用户配额开关，管理员不受限 |
+| `agent.rag.quota.max-files` / `max-total-mb` | `50` / `200` | 每人文件数与总容量 |
+| `agent.rag.quota.daily-ingestions` | `20` | 每天新提交与重试次数之和，北京时间零点重置 |
+| `agent.rag.quota.max-pending` | `3` | 同时排队或处理中的文件数 |
+| `agent.rag.quota.max-parents-per-file` | `300` | 单个文件切分后的父块上限 |
+
+注意：
+
+- 标题与上下文仍分别受 `agent.rag.parent-title.enabled` 和 `agent.rag.contextual-retrieval.enabled` 控制，这两项必须位于 `agent.rag.*` 下。
+- V070 之前失败的入库任务没有续做记录，第一次重试会整份重新处理。
+- 若入库增强模型返回 4xx（例如模型名不存在），同一文件的其余段落不再请求模型，文件照常入库，任务显示未生成上下文的段落数；修复模型后重试失败任务即可重新生成。

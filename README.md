@@ -27,11 +27,17 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 
 *本仓库是脱敏后的公开版本，不包含真实密钥、运行日志、历史对话、临时报告、数据库备份和个人文件。*
 
-> **🌐 在线体验：[http://49.232.209.30:8099](http://49.232.209.30:8099)**
+> **🌐 在线体验：[https://tagentapp.cn](https://tagentapp.cn)**
 >
-> 当前暂时提供公网 IP 访问，后续将上线正式域名，届时会在此更新访问地址。注册后既可以体验预配置的各类 Agent，也可以进入“我的 Agent”自行搭建 Fixed、Auto、Flow 三种模式的 Agent，按节点配置 System Prompt、MCP 连接和 Advisor，并关联自己的 RAG 知识库。个人 Agent 配置、知识检索和使用观测按用户隔离。
+> 注册后既可以体验预配置的各类 Agent，也可以进入“我的 Agent”自行搭建 Fixed、Auto、Flow 三种模式的 Agent，按节点配置 System Prompt、MCP 连接和 Advisor，并关联自己的 RAG 知识库。个人 Agent 配置、知识检索和使用观测按用户隔离。
 >
-> 目前处于试用阶段，平台提供的模型主要为 `mimo-v2.5` 和 `deepseek-v4-flash`，受平台试用额度限制。**v2.0.0 已支持个人 OpenAI 兼容模型连接**：配置自己的接口、模型和 API Key，密钥加密保存。路由、记忆摘要、向量检索等平台辅助服务需要单独授权，不会借用个人主模型密钥。个人模型与 MCP 连接均受部署方允许域名限制。[Agent 工作区](docs/dev-ops/USER_AGENT_WORKSPACE.md) · [模型连接与加密配置](docs/dev-ops/MODEL_CONNECTIONS.md)，项目提供了图片理解能力，但是这与模型的能力有关，如果想要体用图片理解功能可以使用测试Agent运行，其搭配的是mimo-v2.5具有图片理解能力。
+> 目前处于试用阶段，平台提供的模型主要为 `mimo-v2.6-flash` 和 `deepseek-v4-flash`，受平台试用额度限制。**v2.0.0 已支持个人 OpenAI 兼容模型连接**：配置自己的接口、模型和 API Key，密钥加密保存。路由、记忆摘要、向量检索等平台辅助服务需要单独授权，不会借用个人主模型密钥。个人模型与 MCP 连接均受部署方允许域名限制。[Agent 工作区](docs/dev-ops/USER_AGENT_WORKSPACE.md) · [模型连接与加密配置](docs/dev-ops/MODEL_CONNECTIONS.md)，项目提供了图片理解能力，但是这与模型的能力有关，如果想要体验图片理解功能可以使用测试Agent运行，其搭配的是mimo-v2.6-flash具有图片理解能力。
+
+## 🆕 v2.1.0：知识库入库更快，并有清晰的配额
+
+- **入库提速**：每个父块只调用一次模型，同时生成小标题和全部子块的检索上下文，并发处理多个父块；同一篇约 170 个片段的论文从 30 分钟超时缩短到约 3 分钟。
+- **失败可续做**：重试时跳过已完整写入的段落；增强模型不可用时文件仍会入库，并明确提示有多少段落未生成上下文。
+- **按用户配额**：文件数、存储空间、每日入库次数（含重试）、排队数量和单文件规模均有上限，知识库页面显示用量；管理员不受限。升级需执行 [V070](docs/dev-ops/sql-migrations/V070__knowledge_ingestion_resume_and_quota.sql)，详见[升级指南](docs/dev-ops/V2_UPGRADE.md#v210-升级)。
 
 ## 🆕 v2.0.0：从配置到运行，再到可保存的结果
 
@@ -95,7 +101,7 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 | **三种 Agent 模式** | Fixed 按配置的 Client 链顺序执行、Auto 分析执行闭环、Flow DAG 编排 |
 | **个人 Agent 工作区** | 按模式配置节点、Prompt、模型、MCP 与 Advisor；草稿、启用版本、版本比较和节点调试 |
 | **个人模型与额度** | 加密保存 OpenAI 兼容 API Key，单独授权平台辅助服务，持久记录本人额度及实际/未知用量 |
-| **知识库管理** | 入库进度、失败重试、片段预览和检索测试，按用户与发布状态过滤 |
+| **知识库管理** | 入库进度、失败续做、片段预览和检索测试，按用户配额与发布状态过滤 |
 | **产物与反馈** | Markdown、CSV、代码文件与版本下载；反馈主动转为评测草稿 |
 | **数据库驱动装配** | Agent、Client、Model、Prompt、Advisor、RAG、MCP 关系由数据库配置 |
 | **统一 Agent 路由** | 一次模型调用选择 Agent，并输出可能缺失的工具能力；已选 Agent 也可按配置预推断 |

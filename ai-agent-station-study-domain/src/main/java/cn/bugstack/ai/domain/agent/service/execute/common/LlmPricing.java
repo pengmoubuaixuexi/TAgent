@@ -29,7 +29,10 @@ public final class LlmPricing {
         PRICES.put("claude-sonnet-4-6",       new double[]{0.0030, 0.0150});
         PRICES.put("claude-haiku-4-5",        new double[]{0.0008, 0.0040});
         // 国产模型（CNY 价 -> USD 取近似汇率 7.2 折算，截至 2026-05）
-        // mimo-v2.5-pro：思考增强版，主对话用；mimo-v2.5：路由/分类小模型
+        // mimo-v2.6-pro：思考增强版，主对话用；mimo-v2.6-flash：路由/分类小模型
+        // 2026-10 由 v2.5 升级而来，单价与 v2.5-pro / v2.5 相同；v2.5 保留给历史调用记录估算
+        PRICES.put("mimo-v2.6-pro",           new double[]{0.0010, 0.0020});
+        PRICES.put("mimo-v2.6-flash",         new double[]{0.0003, 0.0006});
         PRICES.put("mimo-v2.5-pro",           new double[]{0.0010, 0.0020});
         PRICES.put("mimo-v2.5",               new double[]{0.0003, 0.0006});
         // DeepSeek：v0.5.0 切换后的主 LLM
