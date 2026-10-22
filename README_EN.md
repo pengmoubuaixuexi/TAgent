@@ -33,12 +33,6 @@ It is not another one-call model wrapper. TAgent makes the complete Agent-reques
 >
 > The service is currently a trial, with platform-provided models primarily `mimo-v2.6-flash` and `deepseek-v4-flash`, subject to platform allowances. **v2.0.0 supports personal OpenAI-compatible model connections** with encrypted API keys. Platform helpers such as routing, memory summaries, and embeddings require separate consent and do not reuse a personal chat-model key. Personal model and MCP endpoints follow the operator's domain allowlists. See [Agent workspaces (Chinese)](docs/dev-ops/USER_AGENT_WORKSPACE.md) and [model connections](docs/dev-ops/MODEL_CONNECTIONS.md).
 
-## 🆕 v2.1.0: Faster Knowledge Ingestion with Clear Quotas
-
-- **Faster ingestion:** one model call per parent block produces its title and the retrieval context of every child chunk, and parent blocks run concurrently. A paper of about 170 chunks that used to hit the 30-minute limit now finishes in about 3 minutes.
-- **Resumable retries:** a retry skips blocks that were fully written. If the enrichment model is unavailable, the file is still indexed and the task says how many blocks lack context.
-- **Per-user quotas:** limits on files, storage, daily ingestions (retries included), queued tasks, and file size in blocks, with usage shown on the knowledge page; administrators are exempt. Upgrading requires [V070](docs/dev-ops/sql-migrations/V070__knowledge_ingestion_resume_and_quota.sql); see the [upgrade guide (Chinese)](docs/dev-ops/V2_UPGRADE.md#v210-升级).
-
 ## 🆕 v2.0.0: Configure, Run, and Keep the Result
 
 - **Personal Agents and models:** configure mode-specific nodes from public Agents, keep drafts separate from enabled versions, compare versions, restore to a draft, and debug individual nodes. Personal model credentials are encrypted and owner-scoped.
@@ -357,6 +351,17 @@ Query Planning
   -> Inject numbered citations
   -> rag_evidence SSE
 ```
+
+Ingestion pipeline:
+
+```text
+Tika parsing -> parent blocks (heading / paragraph / sentence boundaries) -> child chunks
+  -> one small-model call per parent: a short title plus retrieval context for every child (or a rule mode without model calls)
+  -> parents are written concurrently to Elasticsearch and PgVector; the parent text is stored last as the completion marker
+  -> the file is published, and only then used for retrieval
+```
+
+A retry skips fully written parents. Ingestion has its own budget, and each user has limits on files, storage, daily ingestions, and queued tasks (administrators are exempt).
 
 Dynamic tool matching and RAG document retrieval are separate pipelines:
 - Dynamic tools: authorized exact-name matching, PgVector candidates with relevance checks, and bounded name/description fallback
