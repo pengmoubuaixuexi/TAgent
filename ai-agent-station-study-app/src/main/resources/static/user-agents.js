@@ -62,8 +62,12 @@
     }
     function discard() {return !state.dirty||confirm('有尚未保存的 Agent 配置，是否放弃这些修改？');}
     function modelOptions(selected) {
-        const models=state.options?.models||[];
-        const retired=selected&&!models.some(m=>m.modelId===selected);
+        const all=state.options?.models||[];
+        const retired=selected&&!all.some(m=>m.modelId===selected);
+        // Every preset agent owns an identical platform row: list each platform model once, keeping the node's own row.
+        const unique=new Map();
+        for(const m of all){const key=m.providerSource==='USER_BYOK'?m.modelId:[m.apiId,m.modelName,m.modelType,m.tier].join('|');if(!unique.has(key)||m.modelId===selected)unique.set(key,m);}
+        const models=[...unique.values()];
         return (retired?'<option value="'+esc(selected)+'" selected>原模型已停用，请重新选择</option>':'')+
             (models.map(m=>'<option value="'+esc(m.modelId)+'" '+(m.modelId===selected?'selected':'')+'>'+esc(m.modelName)+' · '+(m.providerSource==='USER_BYOK'?'个人连接':'平台模型')+(m.tier?' · '+esc(m.tier):'')+'</option>').join('')||'<option value="">暂无开放模型</option>');
     }
@@ -171,7 +175,8 @@
         if(!executable(n)) return '<p class="ta-note">此角色不执行业务工具。请在执行节点配置 MCP；Flow 的能力分析与规划读取执行器授权的工具清单。</p>';
         const connections=[...state.mcps];
         for(const binding of n.mcpBindings)if(!connections.some(m=>m.mcpId===binding.mcpId))connections.push({mcpId:binding.mcpId,name:'已保存的连接（当前不可用）',status:0,usable:false});
-        let html=`<label class="ta-check ta-public-pool"><input id="node-public-tools" type="checkbox" ${n.usePublicTools?'checked':''}><span><strong>允许使用公共工具池</strong><small>允许模型从平台公共工具池按需寻找工具，不会把整个工具池预先绑定到节点。下方是你明确绑定的 MCP 连接；关闭此开关不会移除这些绑定。</small></span></label><div class="ta-section-head"><strong>已绑定 MCP · ${n.mcpBindings.length}</strong><span class="ta-muted">按连接授权 · 运行时按需加载</span></div>`;
+        let html=`<label class="ta-check ta-public-pool"><input id="node-code-execution" type="checkbox" ${n.codeExecution!==false?'checked':''}><span><strong>允许运行 Python 代码</strong><small>需要计算、统计、画图或生成 Excel/Word/PDF 时，模型可以在隔离沙箱里运行代码（不能联网，单次 60 秒）。生成的文件会保存为你的产物。</small></span></label>`;
+        html+=`<label class="ta-check ta-public-pool"><input id="node-public-tools" type="checkbox" ${n.usePublicTools?'checked':''}><span><strong>允许使用公共工具池</strong><small>允许模型从平台公共工具池按需寻找工具，不会把整个工具池预先绑定到节点。下方是你明确绑定的 MCP 连接；关闭此开关不会移除这些绑定。</small></span></label><div class="ta-section-head"><strong>已绑定 MCP · ${n.mcpBindings.length}</strong><span class="ta-muted">按连接授权 · 运行时按需加载</span></div>`;
         html+=connections.map(m=>{
             const binding=n.mcpBindings.find(b=>b.mcpId===m.mcpId), known=state.tools[m.mcpId];
             const restricted=restrictedBinding(binding);
@@ -191,7 +196,12 @@
             const a=n.advisors.find(a=>a.type===option.type);let settings='';
             if(a?.type==='ChatMemory')settings=`<label>上下文消息数<input class="ta-input" type="number" min="2" max="100" data-param="maxMessages" data-type="${a.type}" value="${a.maxMessages}"></label>`;
             if(a&&['RagAnswer','LongTermMemory','EpisodicMemory'].includes(a.type))settings+=`<label>检索条数<input class="ta-input" type="number" min="1" max="20" data-param="topK" data-type="${a.type}" value="${a.topK}"></label>`;
-            if(a?.type==='RagAnswer')settings+=`<label>本人的知识库<select class="ta-input" data-param="knowledgeTag" data-type="${a.type}"><option value="">请选择知识库</option>${state.options.knowledge.map(k=>`<option value="${esc(k.knowledgeTag)}" ${k.knowledgeTag===a.knowledgeTag?'selected':''}>${esc(k.name||k.knowledgeTag)}</option>`).join('')}</select></label>`;
+            if(a?.type==='RagAnswer'){
+                const selected=state.options.knowledge.find(k=>k.knowledgeTag===a.knowledgeTag);
+                settings+=`<label>本人的知识库<select class="ta-input" data-param="knowledgeTag" data-type="${a.type}"><option value="">请选择知识库</option>${state.options.knowledge.map(k=>`<option value="${esc(k.knowledgeTag)}" ${k.knowledgeTag===a.knowledgeTag?'selected':''}>${esc(k.knowledgeTag)}${Number.isInteger(k.documentCount)?'（'+k.documentCount+' 个文档）':''}</option>`).join('')}</select><small>检索该标签下已入库文档中的相关片段，不代表每次回答都会引用全部文档。</small></label>`;
+                if(selected&&Array.isArray(selected.documents))settings+=`<details class="ta-knowledge-documents"><summary>查看文档列表（${selected.documents.length}）</summary><ul>${selected.documents.map(name=>`<li>${esc(name)}</li>`).join('')}</ul></details>`;
+                settings+='<a class="ta-knowledge-manage" href="/knowledge.html" target="_blank" rel="noopener">前往知识库管理 ↗</a>';
+            }
             return `<div class="ta-advisor"><label class="ta-check"><input type="checkbox" data-advisor="${esc(option.type)}" ${a?'checked':''}><span><strong>${esc(option.name)}</strong><small>${esc(option.description)}</small></span></label>${settings?'<div class="ta-advisor-settings">'+settings+'</div>':''}</div>`;
         }).join('');
     }
@@ -266,8 +276,9 @@
         if(el.id==='node-model'){n.modelId=el.value;dirty();$('node-model-hint').innerHTML=modelHint(n.modelId);}
         if(el.id==='agent-enabled'){state.agent.status=el.checked?1:0;dirty();}
         if(el.id==='node-public-tools'){n.usePublicTools=el.checked;dirty();drawGraph();}
+        if(el.id==='node-code-execution'){n.codeExecution=el.checked;dirty();}
         if(el.dataset.advisor){const type=el.dataset.advisor;n.advisors=n.advisors.filter(a=>a.type!==type);if(el.checked)n.advisors.push({type,...(type==='ChatMemory'?{maxMessages:20}:{}),...(['RagAnswer','LongTermMemory','EpisodicMemory'].includes(type)?{topK:4}:{}),...(type==='RagAnswer'?{knowledgeTag:''}:{})});dirty();drawGraph();renderInspector();}
-        if(el.dataset.param){const a=n.advisors.find(a=>a.type===el.dataset.type);a[el.dataset.param]=el.dataset.param==='knowledgeTag'?el.value:Number(el.value);dirty();}
+        if(el.dataset.param){const a=n.advisors.find(a=>a.type===el.dataset.type);a[el.dataset.param]=el.dataset.param==='knowledgeTag'?el.value:Number(el.value);dirty();if(el.dataset.param==='knowledgeTag')renderInspector();}
     });
     root.addEventListener('click',event=>{
         const b=event.target.closest('button');if(!b||state.busy)return;

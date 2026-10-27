@@ -105,9 +105,10 @@ agent:
     max-model-calls: ${AGENT_RUN_BUDGET_MAX_MODEL_CALLS:60}
     max-tool-calls: ${AGENT_RUN_BUDGET_MAX_TOOL_CALLS:100}
     max-tokens: ${AGENT_RUN_BUDGET_MAX_TOKENS:500000}
+    overrun-ratio: 0.2
   context:
     max-input-tokens: ${AGENT_CONTEXT_MAX_INPUT_TOKENS:128000}
-    default-output-limit: ${AGENT_CONTEXT_DEFAULT_OUTPUT_LIMIT:8192}
+    default-output-limit: 25600
     # 可按供应商的精确模型名配置已核实的总上下文窗口（输入 + 输出）；空表只使用应用输入上限。
     model-context-windows: {}
   llm:
@@ -240,7 +241,7 @@ agent:
     ttl-seconds: 3600
   # P2.8 17.2 Event Log：步骤事件日志（LLM 调用 input/output 入库可重放）
   event-log:
-    enabled: true
+    enabled: false
   # P2.2 11.2 Plan DAG：flow 路径启用步骤并行执行
   plan-dag:
     enabled: true
@@ -346,6 +347,43 @@ agent:
     timeout-seconds: 10
 
 # TAgent扳手通用组件配置
+  attachments:
+    storage: ${TAGENT_ATTACHMENT_STORAGE:auto}
+    local-dir: ${TAGENT_ATTACHMENT_DIR:./data/chat-files}
+    cache-dir: ${TAGENT_ATTACHMENT_CACHE_DIR:./data/chat-files-cache}
+    max-file-bytes: 52428800
+    inline-chars: 8192
+    inline-total-chars: 32768
+    pending-ttl-hours: 24
+    cleanup:
+      max-total-bytes: ${TAGENT_ATTACHMENT_MAX_TOTAL_BYTES:10737418240}
+      interval-ms: 3600000
+    parse:
+      threads: 2
+      queue: 32
+  sandbox:
+    enabled: ${TAGENT_SANDBOX_ENABLED:false}
+    url: ${TAGENT_SANDBOX_URL:http://127.0.0.1:18088}
+    token: ${TAGENT_SANDBOX_TOKEN:}
+    exec-timeout-seconds: 60
+    poll-interval-ms: 700
+  trace:
+    enabled: ${TAGENT_TRACE_ENABLED:true}
+    retention-days: ${TAGENT_TRACE_RETENTION_DAYS:0}
+    queue-capacity: 20000
+  model-failover:
+    retry:
+      attempts: 3
+      initial-backoff-ms: 1000
+      max-backoff-ms: 8000
+    health:
+      window-seconds: 60
+      failure-threshold: 5
+      failure-rate: 0.5
+      min-samples: 4
+    probe:
+      enabled: true
+      interval-ms: 60000
 xfg:
   wrench:
     task:
@@ -383,7 +421,7 @@ resilience4j:
   retry:
     instances:
       llmCall:
-        max-attempts: 3
+        max-attempts: 1
         # 注意：这里不配 wait-duration。yml 的 wait-duration 会被转成一个 intervalFunction，
         # 而 ResilienceConfig.llmCallRetryCustomizer 又会设一次 intervalFunction
         # (指数退避 + ±50% 抖动)，两份冲突会抛 "intervalFunction was configured twice"。

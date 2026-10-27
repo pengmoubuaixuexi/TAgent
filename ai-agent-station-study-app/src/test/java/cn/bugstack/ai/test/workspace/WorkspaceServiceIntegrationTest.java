@@ -548,6 +548,21 @@ public class WorkspaceServiceIntegrationTest {
         expectStatus(HttpStatus.NOT_FOUND,()->service.mcpTools(bob,mcp,true));
     }
 
+    @Test public void improvementCandidatesRunOnlyWhenNamedExplicitly() {
+        var config=cn.bugstack.ai.trigger.workspace.WorkspaceTemplates.upgrade(agentConfig("fixed"),json);
+        String visible=(String)service.saveAgent(alice,null,config).get("agentId");
+        String candidate=service.createCandidate(alice,"Fixture",config);
+        var access=new WorkspaceAccessRepository(db);
+        assertTrue("an evaluation that names the candidate may run it",access.ownsAgent(alice,candidate));
+        assertFalse("never offered for selection or routing",access.ownedAgentIds(alice).contains(candidate));
+        assertTrue(access.ownedAgentIds(alice).contains(visible));
+        assertFalse(service.agents(alice).stream().anyMatch(a->candidate.equals(a.get("agentId"))));
+        expectStatus(HttpStatus.NOT_FOUND,()->service.agent(alice,candidate));
+        assertFalse(access.ownsAgent(bob,candidate));
+        service.archiveCandidate(alice,candidate);
+        assertFalse(access.ownsAgent(alice,candidate));
+    }
+
     @Test public void invalidRoleOrderAndForeignNodeResourcesFailAtomically() {
         var wrong=cn.bugstack.ai.trigger.workspace.WorkspaceTemplates.upgrade(agentConfig("auto"),json);
         ((ObjectNode)wrong.path("nodes").get(0)).put("role","EXECUTOR_CLIENT");

@@ -14,7 +14,8 @@ import java.util.Set;
  */
 public enum ToolCapabilityProfile {
     NONE(EnumSet.noneOf(ToolCapability.class)),
-    ARTIFACT_ONLY(EnumSet.of(ToolCapability.CREATE_ARTIFACT)),
+    /** 交付阶段（Auto Step4 / Flow 最终整合）：保存产物；改进引用的产物时需要读取附件原文。 */
+    ARTIFACT_ONLY(EnumSet.of(ToolCapability.CREATE_ARTIFACT, ToolCapability.READ_ATTACHMENT)),
     DISCOVERY_ONLY(EnumSet.of(ToolCapability.REQUEST_TOOL)),
     CLARIFICATION_ONLY(EnumSet.of(ToolCapability.ASK_USER)),
     INTERACTIVE_META(EnumSet.of(ToolCapability.ASK_USER, ToolCapability.REQUEST_TOOL)),

@@ -1,0 +1,103 @@
+# Code sandbox alerts (2026-10, batch 3). Shown under Alerting in Grafana; add a contact point to receive them.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: sandbox
+    folder: TAgent
+    interval: 1m
+    rules:
+      - uid: sandbox-runner-down
+        title: 沙箱服务不可达
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model: {refId: A, instant: true, expr: 'max(up{job="sandbox-runner"}) or vector(0)'}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions: [{evaluator: {type: lt, params: [1]}}]
+        for: 5m
+        noDataState: Alerting
+        execErrState: Error
+        annotations: {summary: "sandbox-runner 已 5 分钟无法抓取指标，Agent 的 run_python 会失败"}
+      - uid: sandbox-queue-wait
+        title: 沙箱排队过久
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model: {refId: A, instant: true, expr: 'histogram_quantile(0.95, sum by (le) (rate(sandbox_queue_wait_seconds_bucket[10m])))'}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions: [{evaluator: {type: gt, params: [30]}}]
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        annotations: {summary: "最近 10 分钟 95% 的沙箱任务排队超过 30 秒，考虑增加 SANDBOX_WORKERS 或排查长任务"}
+      - uid: sandbox-busy
+        title: 沙箱繁忙拒绝
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 900, to: 0}
+            datasourceUid: prometheus
+            model: {refId: A, instant: true, expr: 'sum(increase(sandbox_executions_total{status="BUSY"}[15m])) or vector(0)'}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions: [{evaluator: {type: gt, params: [0]}}]
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations: {summary: "有沙箱任务排队 60 秒仍未开始，被以「沙箱繁忙」拒绝"}
+      - uid: sandbox-killed
+        title: 沙箱超时或内存超限偏多
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 900, to: 0}
+            datasourceUid: prometheus
+            model: {refId: A, instant: true, expr: 'sum(increase(sandbox_executions_total{status=~"TIMEOUT|OOM|KILLED"}[15m])) or vector(0)'}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions: [{evaluator: {type: gt, params: [5]}}]
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations: {summary: "15 分钟内超过 5 次沙箱运行因超时或内存超限被终止"}
+      - uid: sandbox-disk-limit
+        title: 沙箱磁盘保护触发
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 900, to: 0}
+            datasourceUid: prometheus
+            model: {refId: A, instant: true, expr: 'sum(increase(sandbox_executions_total{status="DISK_LIMIT"}[15m])) or vector(0)'}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions: [{evaluator: {type: gt, params: [0]}}]
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations: {summary: "沙箱已因 Run 临时目录超限或磁盘剩余空间不足终止执行，请检查磁盘用量"}

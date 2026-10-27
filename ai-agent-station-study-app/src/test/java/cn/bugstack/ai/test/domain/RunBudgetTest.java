@@ -58,20 +58,49 @@ public class RunBudgetTest {
         return RunBudgetRegistry.start(UUID.randomUUID().toString(), "owner",
                 new RunBudgetRegistry.Limits(Duration.ofSeconds(30), models, tools, tokens));
     }
-    @Test public void parallelReservationsCannotSpendTheSameTokens() throws Exception {
+    @Test public void parallelCallsAreAdmittedOnUsageAndStopBeyondTheCeiling() throws Exception {
         var budget = state(100, 100, 1000);
         var workers = Executors.newFixedThreadPool(8);
         AtomicInteger admitted = new AtomicInteger();
+        var reservations = new java.util.concurrent.ConcurrentLinkedQueue<RunBudgetRegistry.Reservation>();
         try {
             var jobs = new java.util.ArrayList<java.util.concurrent.Future<?>>();
             for (int i=0; i<20; i++) jobs.add(workers.submit(() -> {
-                try { budget.reserveModel(80, 20); admitted.incrementAndGet(); }
-                catch (RunBudgetExceededException expected) {}
+                try { reservations.add(budget.reserveModel(80, 25600)); admitted.incrementAndGet(); }
+                catch (RunBudgetExceededException unexpected) {}
             }));
             for (var job : jobs) job.get();
-            assertEquals(10, admitted.get());
-            assertEquals(1000L, budget.snapshot().get("reservedTokens"));
+            assertEquals("calls in flight do not hold the output limit", 20, admitted.get());
+            assertEquals("only input estimates are held", 1600L, budget.snapshot().get("reservedTokens"));
+            reservations.forEach(r -> r.settle(80L));
+            assertThrows("usage beyond 120% of the budget stops the run", RunBudgetExceededException.class, () -> budget.reserveModel(1, 1));
         } finally { workers.shutdownNow(); }
+    }
+    @Test public void budgetWarnsAtEightyMarksAtTheBudgetAndStopsBeyondTheCeiling() {
+        var events = new java.util.ArrayList<String>();
+        RunBudgetRegistry.listener(new RunBudgetRegistry.Listener() {
+            @Override public void warned(RunBudgetRegistry.State state, long used, long budget) { events.add("warned " + used + "/" + budget); }
+            @Override public void reached(RunBudgetRegistry.State state, String reason) { events.add("reached " + reason); }
+        });
+        try {
+            var budget = state(100, 100, 1000);
+            budget.reserveModel(100, 25600).settle(700L);
+            assertTrue(events.isEmpty());
+            budget.reserveModel(100, 25600).settle(150L);
+            budget.reserveModel(100, 25600).settle(10L);
+            assertEquals("warned once", java.util.List.of("warned 850/1000"), events);
+            assertNull(budget.budgetReached());
+            budget.reserveModel(100, 25600).settle(200L);
+            assertEquals("本次任务的 Token 预算（1000）已用完", budget.budgetReached());
+            assertEquals(2, events.size());
+            // Marked, the phase in progress may still call the model, up to the hard ceiling.
+            budget.reserveModel(100, 25600).settle(100L);
+            assertEquals(2, events.size());
+            budget.reserveModel(100, 25600).settle(100L);
+            var stop = assertThrows(RunBudgetExceededException.class, () -> budget.reserveModel(1, 1));
+            assertTrue(stop.getMessage(), stop.getMessage().contains("120%"));
+            assertEquals(1200L, budget.snapshot().get("hardTokens"));
+        } finally { RunBudgetRegistry.listener(null); }
     }
     @Test public void retryAndToolsNeverResetCounters() {
         var budget = state(2, 2, 1000);
@@ -88,7 +117,8 @@ public class RunBudgetTest {
         first.settle(150L); first.settle(10L);
         var unknown = budget.reserveModel(100, 100);
         unknown.settle(null); unknown.settle(null);
-        assertEquals(350L, budget.snapshot().get("reservedTokens"));
+        // The unknown call keeps its input estimate as usage; the output limit was never held.
+        assertEquals(250L, budget.snapshot().get("reservedTokens"));
         assertEquals(150L, budget.snapshot().get("confirmedTokens"));
         assertEquals(1, budget.snapshot().get("unknownUsageCalls"));
     }

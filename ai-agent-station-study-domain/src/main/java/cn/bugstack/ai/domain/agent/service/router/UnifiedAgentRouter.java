@@ -156,6 +156,14 @@ public class UnifiedAgentRouter {
     }
 
     public RouteDecision routeDecision(String query) {
+        return routeDecision(query, java.util.Set.of());
+    }
+
+    /**
+     * @param sourceAgentIds agents that produced the artifacts the user referenced; choosing one of them is
+     *                       kept even below the low-confidence threshold
+     */
+    public RouteDecision routeDecision(String query, java.util.Set<String> sourceAgentIds) {
         if (query == null || query.isBlank()) return null;
 
         List<AiAgentVO> agents = ownedAgents();
@@ -171,7 +179,7 @@ public class UnifiedAgentRouter {
         }
 
         RouteDecision decision = parseRouteDecision(result, agents);
-        decision = normalizeRouteDecision(decision);
+        decision = normalizeRouteDecision(decision, sourceAgentIds == null ? java.util.Set.of() : sourceAgentIds);
         if (decision != null && decision.agentId() != null) {
             log.info("[UnifiedRouter] route hit query='{}' -> agent='{}' missingTools={} confidence={}",
                     query, decision.agentId(), decision.missingToolDescs(), decision.confidence());
@@ -187,9 +195,10 @@ public class UnifiedAgentRouter {
      * <ul>
      *     <li>默认不把路由阶段的 missing_tool_descs 传给执行层，避免 description 误差直接变成错误补工具。</li>
      *     <li>低置信度专用 Agent 降级到同策略通用 Agent：Fixed→8011、Auto→8012、Flow→8013。</li>
+     *     <li>选中的正是用户所引用产物的来源 Agent 时不降级：接着处理自己的产物最合适。</li>
      * </ul>
      */
-    private RouteDecision normalizeRouteDecision(RouteDecision decision) {
+    private RouteDecision normalizeRouteDecision(RouteDecision decision, java.util.Set<String> sourceAgentIds) {
         if (decision == null || decision.agentId() == null || decision.agentId().isBlank()) {
             return decision;
         }
@@ -199,6 +208,11 @@ public class UnifiedAgentRouter {
                 : new RouteDecision(decision.agentId(), List.of(), decision.confidence(), decision.rawResponse());
 
         if (!isLowConfidence(normalized.confidence())) {
+            return normalized;
+        }
+        if (sourceAgentIds.contains(normalized.agentId())) {
+            log.info("[UnifiedRouter] low confidence kept: agent={} produced the referenced artifact, confidence={}",
+                    normalized.agentId(), normalized.confidence());
             return normalized;
         }
 

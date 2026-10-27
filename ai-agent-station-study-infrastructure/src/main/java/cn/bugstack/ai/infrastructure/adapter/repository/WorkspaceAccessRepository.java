@@ -17,10 +17,16 @@ public class WorkspaceAccessRepository implements IWorkspaceAccessRepository {
             WHERE m.platform_enabled=1 AND m.status=1 AND a.status=1 AND a.secret_ref IS NULL
             """, String.class));
     }
+    /** Agents the user may pick or be routed to; improvement candidates are excluded. */
     @Override public Set<String> ownedAgentIds(String userId) {
+        return runnableAgentIds(userId, false);
+    }
+    /** Candidates run only when an evaluation names them explicitly. */
+    private Set<String> runnableAgentIds(String userId, boolean includeCandidates) {
         if (userId == null || userId.isBlank()) return Set.of();
         return new LinkedHashSet<>(jdbc.queryForList("""
             SELECT a.agent_id FROM ai_agent a WHERE a.owner_user_id=? AND a.status=1 AND a.archived=0
+            AND (? OR a.channel IS NULL OR a.channel<>'candidate')
             AND (a.source_agent_id IS NULL OR EXISTS
               (SELECT 1 FROM ai_agent s WHERE s.agent_id=a.source_agent_id AND s.is_public=1 AND s.status=1 AND s.archived=0))
             AND NOT EXISTS (
@@ -35,7 +41,7 @@ public class WorkspaceAccessRepository implements IWorkspaceAccessRepository {
                  (m.source_model_id IS NOT NULL AND (origin.model_id IS NULL OR origin.status<>1 OR origin.api_id<>m.api_id OR
                     NOT ((origin.platform_enabled=1 AND p.secret_ref IS NULL) OR
                          (origin.owner_user_id=a.owner_user_id AND p.owner_user_id=a.owner_user_id AND p.secret_ref IS NOT NULL))))))
-            """, String.class, userId));
+            """, String.class, userId, includeCandidates));
     }
     @Override public Set<String> ownedMcpIds(String userId) {
         if (userId == null || userId.isBlank()) return Set.of();
@@ -56,7 +62,7 @@ public class WorkspaceAccessRepository implements IWorkspaceAccessRepository {
         return result;
     }
     @Override public boolean ownsAgent(String userId, String agentId) {
-        return agentId != null && ownedAgentIds(userId).contains(agentId);
+        return agentId != null && runnableAgentIds(userId, true).contains(agentId);
     }
     @Override public Set<String> agentMcpIds(String userId, String agentId) {
         if (!ownsAgent(userId, agentId)) return Set.of();

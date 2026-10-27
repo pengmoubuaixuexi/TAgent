@@ -30,6 +30,8 @@ public class RunSnapshot {
     private String originalMessage;
     /** Stable metadata only; never contains BASE64 bytes or expiring access URLs. */
     private List<ChatImageRef> images;
+    /** File and artifact attachments of the user message: metadata only, never extracted text. */
+    private List<cn.bugstack.ai.domain.agent.model.entity.ChatFileRef> attachments;
     private String sourceRunId;
     private Integer redoFromStep;
     private String status;

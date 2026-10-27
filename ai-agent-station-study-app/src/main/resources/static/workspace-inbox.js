@@ -33,7 +33,7 @@
       const rows = await json(api + '?limit=100&includeArchived=false');
       if (owner !== userId || version !== refreshVersion) return;
       items = Array.isArray(rows) ? rows : [];
-      render(); broadcast();
+      render(); broadcast(); modelAlerts.show(items);
     } catch (error) {
       if (version !== refreshVersion) return;
       if (error.status === 401 || error.status === 403) { items = []; userId = null; render(); broadcast(); }
@@ -89,6 +89,8 @@
     panel.addEventListener('keydown', event => { if (event.key === 'Escape') close(); });
   }
   function label(item) {
+    if (item.type === 'MODEL_RECOVERED' || item.type === 'MODEL_UNAVAILABLE' && item.status === 'RESOLVED') return '模型已恢复';
+    if (item.type === 'MODEL_UNAVAILABLE') return '模型不可用';
     if (item.type === 'TASK_COMPLETED') return '任务已完成';
     if (item.type === 'TASK_FAILED') return '任务未完成';
     if (pending(item)) return item.type === 'PLAN_REVIEW' ? '待确认计划' : item.type === 'TOOL_APPROVAL' ? '待审批' : '待回答';
@@ -107,7 +109,7 @@
     for (const item of visible) {
       const card = el('article', '', 'workspace-inbox-item' + (unread(item) ? ' unread' : ''));
       card.dataset.notificationId = item.notificationId;
-      const link = el('a'); link.href = '/index.html?notificationId=' + encodeURIComponent(item.notificationId);
+      const link = el('a'); link.href = modelLink(item) || '/index.html?notificationId=' + encodeURIComponent(item.notificationId);
       link.append(el('strong', item.title || 'Agent 通知'), el('p', item.summary || ''), el('small', label(item)));
       // Navigating alone is not an acknowledgement: chat marks read only after opening the owned target.
       card.append(link);
@@ -123,6 +125,49 @@
       list.append(card);
     }
   }
+  // Model health links point to the model pages; only same-origin paths are followed.
+  function modelLink(item) {
+    const link = item && item.metadata && item.metadata.link;
+    return ['MODEL_UNAVAILABLE', 'MODEL_RECOVERED'].includes(String(item.type || '')) && typeof link === 'string'
+      && link.startsWith('/') && !link.startsWith('//') ? link : null;
+  }
+  // A card pops up once per outage (metadata.popupKey); repeated failures only update the inbox entry.
+  const modelAlerts = (() => {
+    const storageKey = 'tagent_model_alerts_shown';
+    let host;
+    function shown() { try { return new Set(JSON.parse(localStorage.getItem(storageKey) || '[]')); } catch (_) { return new Set(); } }
+    function remember(keys) { try { localStorage.setItem(storageKey, JSON.stringify([...keys].slice(-200))); } catch (_) { /* private mode */ } }
+    function card(item) {
+      if (!host) { host = el('div', '', 'model-alerts'); host.setAttribute('role', 'status'); host.setAttribute('aria-live', 'polite'); document.body.append(host); }
+      const recovered = item.type === 'MODEL_RECOVERED';
+      const box = el('article', '', 'model-alert' + (recovered ? ' recovered' : ''));
+      const summary = String(item.summary || '');
+      box.append(el('strong', item.title || (recovered ? '模型已恢复' : '模型暂不可用')), el('p', summary.length > 220 ? summary.slice(0, 220) + '…' : summary));
+      const actions = el('div', '', 'model-alert-actions');
+      const link = modelLink(item);
+      if (link) { const view = el('a', '查看'); view.href = link; actions.append(view); }
+      const dismiss = el('button', '知道了'); dismiss.type = 'button';
+      dismiss.onclick = async () => {
+        box.remove();
+        try { await fetch(api + '/' + encodeURIComponent(item.notificationId) + '/ack', {method:'POST', headers:{Accept:'application/json'}}); } catch (_) { /* stays unread */ }
+        void refresh();
+      };
+      actions.append(dismiss); box.append(actions); host.append(box);
+    }
+    function show(list) {
+      const keys = shown(); let changed = false;
+      for (const item of list || []) {
+        if (!['MODEL_UNAVAILABLE', 'MODEL_RECOVERED'].includes(String(item.type || ''))) continue;
+        if (!unread(item) || item.status === 'RESOLVED' || Date.now() - Number(item.createdAt || 0) > 24 * 3600 * 1000) continue;
+        const key = String((item.metadata && item.metadata.popupKey) || item.notificationId);
+        if (keys.has(key)) continue;
+        keys.add(key); changed = true; card(item);
+      }
+      if (changed) remember(keys);
+    }
+    return {show};
+  })();
+  window.TAgentModelAlerts = modelAlerts;
   window.TAgentInbox = {
     open() {
       if (window.TAgentChatInbox) return window.TAgentChatInbox.open();

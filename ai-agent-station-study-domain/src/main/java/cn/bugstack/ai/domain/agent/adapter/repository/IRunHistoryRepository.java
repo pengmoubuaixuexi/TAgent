@@ -12,7 +12,9 @@ public interface IRunHistoryRepository {
     void status(String runId,String status,String error);
     void answer(String userId,String runId,String answer);
     Optional<Map<String,Object>> findOwned(String userId,String runId);
-    List<Map<String,Object>> listOwned(String userId,int offset,int limit);
+    default List<Map<String,Object>> listOwned(String userId,int offset,int limit){return listOwned(userId,null,offset,limit);}
+    /** @param keyword matched against the question; blank lists every run */
+    List<Map<String,Object>> listOwned(String userId,String keyword,int offset,int limit);
     /** Bounded metadata only, for discovering runs when chat memory or Redis replay is absent. */
     List<Map<String,Object>> listOwnedSession(String userId,String sessionId,int offset,int limit);
 }

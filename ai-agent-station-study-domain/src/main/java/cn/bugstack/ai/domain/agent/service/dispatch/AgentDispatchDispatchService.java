@@ -74,6 +74,17 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
     @Autowired(required = false)
     private cn.bugstack.ai.domain.agent.service.execute.event.RunPreparationProgress preparationProgress;
 
+    /** 附件：本次消息的附件交给提示词与 read_attachment；会话里更早的附件也允许读取。 */
+    @Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.attachment.RunAttachmentRegistry runAttachments;
+
+    @Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.attachment.IChatFileService chatFileService;
+
+    /** 运行结束删除沙箱里本次运行的共享工作目录。 */
+    @Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.sandbox.ISandboxService sandboxService;
+
     private final java.util.Set<String> cancelledRuns = ConcurrentHashMap.newKeySet();
 
     /** A browser connection is only a subscriber; the session owns the run. */
@@ -161,6 +172,7 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
             if (runSnapshotService != null) runSnapshotService.startRun(requestParameter, "ROUTING", null);
             // Reserve before queueing: a cancel immediately after ACK also cancels preparation.
             if (runBudgets != null) runBudgets.start(__runId, requestParameter.getUserId());
+            registerAttachments(requestParameter);
             if (preparationProgress != null) preparationProgress.start(__runId, __needSid);
             threadPoolExecutor.execute(() -> executeOwned(requestParameter, emitter));
         } catch (RuntimeException failure) {
@@ -202,7 +214,8 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
             // 1. 如果前端没选 agent（aiAgentId 为空），走统一路由
             if (agentId == null || agentId.isBlank()) {
                 if (unifiedAgentRouter != null) {
-                    RouteDecision routeDecision = unifiedAgentRouter.routeDecision(requestParameter.getMessage());
+                    RouteDecision routeDecision = unifiedAgentRouter.routeDecision(routingMessage(requestParameter),
+                            cn.bugstack.ai.domain.agent.service.attachment.ChatFileManifest.sourceAgentIds(requestParameter.getAttachments()));
                     agentId = routeDecision != null ? routeDecision.agentId() : null;
                     if (agentId == null) {
                         var allowed = workspaceAccess.ownedAgentIds(requestParameter.getUserId());
@@ -227,7 +240,7 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
                 }
             } else if (unifiedAgentRouter != null && dynamicToolInferenceEnabled) {
                 // M1：前端已选定 agent，不走路由，但仍推断该 agent 可能缺失的工具能力（可多条），给动态补挂用
-                java.util.List<String> missing = unifiedAgentRouter.inferMissingTool(agentId, requestParameter.getMessage());
+                java.util.List<String> missing = unifiedAgentRouter.inferMissingTool(agentId, routingMessage(requestParameter));
                 if (missing != null && !missing.isEmpty()) {
                     if (mcpToolCatalogService != null) {
                         mcpToolCatalogService.setNeeds(requestParameter.getSessionId(), String.join("\n", missing));
@@ -314,6 +327,8 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
                         cancelledRuns.remove(__runId);
                         activeRunBySession.remove(__needSid, __runId);
                         runEventPublisher.finishRun(__runId);
+                        // A plan waiting for review keeps its sandbox files for the resumed phase.
+                        if (sandboxService != null && !reviewPaused) sandboxService.releaseRun(__runId);
                     }
                 }
                 // A resumed phase must not overtake the initial phase's cleanup.
@@ -322,6 +337,24 @@ public class AgentDispatchDispatchService implements IAgentDispatchService {
                 if (previousMdc == null) org.slf4j.MDC.clear(); else org.slf4j.MDC.setContextMap(previousMdc);
             }
         }
+    }
+
+    private void registerAttachments(ExecuteCommandEntity request) {
+        if (runAttachments == null) return;
+        java.util.List<cn.bugstack.ai.domain.agent.model.entity.ChatFileRef> sessionFiles = java.util.List.of();
+        try {
+            if (chatFileService != null) sessionFiles = chatFileService.sessionIndex(request.getUserId(), request.getSessionId());
+        } catch (RuntimeException unavailable) {
+            log.warn("[Dispatch] attachment lookup unavailable runId={}: {}", request.getRunId(), unavailable.toString());
+        }
+        runAttachments.register(request.getRunId(), request.getUserId(), request.getSessionId(),
+                request.getAttachments(), sessionFiles);
+    }
+
+    /** The router sees file names and kinds, never attachment content. */
+    private static String routingMessage(ExecuteCommandEntity request) {
+        String message = request.getMessage() == null ? "" : request.getMessage();
+        return message + cn.bugstack.ai.domain.agent.service.attachment.ChatFileManifest.routingHint(request.getAttachments());
     }
 
     private void checkPreparationActive(String runId) {

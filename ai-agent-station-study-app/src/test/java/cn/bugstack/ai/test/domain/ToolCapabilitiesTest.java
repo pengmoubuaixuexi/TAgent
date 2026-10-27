@@ -21,8 +21,12 @@ public class ToolCapabilitiesTest {
         assertEquals(java.util.Set.of(ToolCapability.ASK_USER, ToolCapability.REQUEST_TOOL),
                 ToolCapabilityProfile.INTERACTIVE_META.capabilities());
         assertEquals(java.util.Set.of(ToolCapability.BUSINESS_TOOL), ToolCapabilityProfile.BUSINESS_ONLY.capabilities());
-        assertEquals(java.util.Set.of(ToolCapability.CREATE_ARTIFACT), ToolCapabilityProfile.ARTIFACT_ONLY.capabilities());
-        assertEquals(java.util.Set.of(ToolCapability.BUSINESS_TOOL, ToolCapability.ASK_USER, ToolCapability.REQUEST_TOOL, ToolCapability.CREATE_ARTIFACT),
+        // Delivery steps save artifacts and may read the attached original they are revising.
+        assertEquals(java.util.Set.of(ToolCapability.CREATE_ARTIFACT, ToolCapability.READ_ATTACHMENT),
+                ToolCapabilityProfile.ARTIFACT_ONLY.capabilities());
+        // Only execution steps (ALL) may run code in the sandbox.
+        assertEquals(java.util.Set.of(ToolCapability.BUSINESS_TOOL, ToolCapability.ASK_USER, ToolCapability.REQUEST_TOOL,
+                        ToolCapability.CREATE_ARTIFACT, ToolCapability.READ_ATTACHMENT, ToolCapability.RUN_CODE),
                 ToolCapabilityProfile.ALL.capabilities());
     }
 

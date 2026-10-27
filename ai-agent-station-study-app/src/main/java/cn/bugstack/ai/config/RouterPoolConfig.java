@@ -5,7 +5,6 @@ import cn.bugstack.ai.domain.agent.model.valobj.AiClientApiVO;
 import cn.bugstack.ai.domain.agent.model.valobj.AiClientModelVO;
 import cn.bugstack.ai.domain.agent.model.valobj.enums.AiAgentEnumVO;
 import cn.bugstack.ai.domain.agent.model.valobj.enums.ModelTierEnumVO;
-import cn.bugstack.ai.domain.agent.service.support.OpenAiCompatibleApiSupport;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
@@ -41,7 +40,8 @@ import java.util.stream.Collectors;
  *   <li>逐个尝试构建，某个 model 装配失败（api 缺失等）则试同档下一个；</li>
  *   <li>同档全部失败 → 升档（small→medium→large）继续；到 LARGE 仍失败则跳过该 entry。</li>
  * </ul>
- * 运行期上游故障的同档 failover 不在本期范围（见 codex 对话 v1 第一期/第二期划分）。
+ * 运行期上游故障（2026-10-24 起）：每次请求经请求层降级，在平台模型清单内按同档 → 更高档 → 更低档切换，
+ * 网络波动只重试；见 {@code ModelConnections#assembleHelper}。
  * <p>
  * 装配时机：{@link ApplicationReadyEvent}（等 OpenAi auto-config / 数据源就绪后再访问 DB）。
  */
@@ -63,7 +63,7 @@ public class RouterPoolConfig implements ApplicationListener<ApplicationReadyEve
     private cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository workspaceAccess;
 
     @Resource
-    private cn.bugstack.ai.domain.agent.service.model.ModelCredentialRequestAuthorizer credentialRequests;
+    private cn.bugstack.ai.domain.agent.service.model.failover.ModelConnections modelConnections;
 
     @Override
     public void onApplicationEvent(ApplicationReadyEvent event) {
@@ -126,28 +126,17 @@ public class RouterPoolConfig implements ApplicationListener<ApplicationReadyEve
         }
         AiClientApiVO api = apis.get(0);
         String baseUrl = api.getBaseUrl();
-        var usageContext=cn.bugstack.ai.domain.agent.service.model.ModelUsageContext.api(api.getApiId(),"CHAT_HELPER",baseUrl);
 
-        OpenAiApi openAiApi = OpenAiApi.builder()
-                .restClientBuilder(org.springframework.web.client.RestClient.builder()
-                        .requestInterceptor(credentialRequests.platformAuxiliary("CHAT_HELPER"))
-                        .requestInterceptor(credentialRequests.synchronous(api.getApiId()))
-                        .requestFactory(cn.bugstack.ai.domain.agent.service.execute.common.ModelRequestGuard.requestFactory()).requestInterceptor(
-                        cn.bugstack.ai.domain.agent.service.execute.common.ModelRequestGuard.synchronous(usageContext)))
-                .baseUrl(baseUrl)
-                .apiKey("managed-at-request-boundary")
-                .webClientBuilder(org.springframework.web.reactive.function.client.WebClient.builder()
-                        .filter(new cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter(null).withUsageContext(usageContext))
-                        .filter(credentialRequests.streaming(api.getApiId(),"CHAT_HELPER")))
-                .completionsPath(OpenAiCompatibleApiSupport.chatCompletionsPath(baseUrl, api.getCompletionsPath()))
-                .embeddingsPath(OpenAiCompatibleApiSupport.embeddingsPath(baseUrl, api.getEmbeddingsPath()))
-                .build();
+        // Same guards as before (platform helper permission, credentials, budget and accounting as CHAT_HELPER),
+        // plus request-layer failover; transient retries happen only there.
+        OpenAiApi openAiApi = modelConnections.assembleHelper(api, "CHAT_HELPER");
 
         OpenAiChatModel chatModel = OpenAiChatModel.builder()
                 .openAiApi(openAiApi)
                 .defaultOptions(OpenAiChatOptions.builder()
                         .model(model.getModelName())
                         .build())
+                .retryTemplate(org.springframework.retry.support.RetryTemplate.builder().maxAttempts(1).build())
                 .build();
 
         // Base URL is an assembly snapshot; credentials and revocation are resolved at every request.

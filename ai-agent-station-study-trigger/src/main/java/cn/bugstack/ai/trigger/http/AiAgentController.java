@@ -72,6 +72,13 @@ public class AiAgentController implements IAiAgentService {
     private cn.bugstack.ai.domain.agent.service.multimodal.IChatImageAttachmentService imageAttachmentService;
 
     @Resource
+    private cn.bugstack.ai.infrastructure.adapter.repository.attachment.ChatFileService chatFileService;
+
+    /** Run traces hold a conversation's complete messages and go with it. */
+    @Resource
+    private cn.bugstack.ai.infrastructure.adapter.repository.trace.RunTraceStore runTraceStore;
+
+    @Resource
     private IFlowPlanReviewResumeService flowPlanReviewResumeService;
 
     @org.springframework.beans.factory.annotation.Autowired(required = false)
@@ -285,12 +292,15 @@ public class AiAgentController implements IAiAgentService {
                     runId,
                     request.getMessage(),
                     imageInputs);
+            List<cn.bugstack.ai.domain.agent.model.entity.ChatFileRef> fileRefs =
+                    bindFiles(request, userId, attachmentConversationId, runId);
 
             // 2. 构建执行命令实体
             ExecuteCommandEntity executeCommandEntity = ExecuteCommandEntity.builder()
                     .aiAgentId(effectiveAgentId)
                     .message(request.getMessage())
                     .images(imageRefs)
+                    .attachments(fileRefs)
                     .sessionId(request.getSessionId())
                     .runId(runId)
                     .sourceRunId(request.getSourceRunId())
@@ -319,7 +329,11 @@ public class AiAgentController implements IAiAgentService {
             }
             ResponseBodyEmitter errorEmitter = new ResponseBodyEmitter();
             try {
-                errorEmitter.send("请求处理异常：" + e.getMessage());
+                // An SSE error frame, so the chat page shows why the message was not run
+                // (e.g. an attachment that expired or belongs to another conversation).
+                sendSseObject(errorEmitter, "message",
+                        cn.bugstack.ai.domain.agent.model.entity.AutoAgentExecuteResultEntity.createErrorResult(
+                                "请求处理异常：" + e.getMessage(), request == null ? null : request.getSessionId()));
                 errorEmitter.complete();
             } catch (Exception ex) {
                 log.error("发送错误信息失败：{}", ex.getMessage(), ex);
@@ -712,6 +726,32 @@ public class AiAgentController implements IAiAgentService {
         }
     }
 
+    /** A redo keeps the attachments of its source run; files and artifacts picked for this message follow them. */
+    private List<cn.bugstack.ai.domain.agent.model.entity.ChatFileRef> bindFiles(
+            AutoAgentRequestDTO request, String userId, String conversationId, String runId) {
+        List<cn.bugstack.ai.domain.agent.model.entity.ChatFileInput> inputs = request.getAttachments() == null
+                ? List.of()
+                : request.getAttachments().stream().filter(java.util.Objects::nonNull)
+                .map(a -> cn.bugstack.ai.domain.agent.model.entity.ChatFileInput.builder()
+                        .attachmentId(a.getAttachmentId()).artifactId(a.getArtifactId()).revision(a.getRevision()).build())
+                .toList();
+        boolean redo = request.getSourceRunId() != null && !request.getSourceRunId().isBlank();
+        if (userId == null || userId.isBlank()) {
+            if (!inputs.isEmpty()) throw new IllegalArgumentException("请先登录后再添加附件");
+            return List.of();
+        }
+        List<cn.bugstack.ai.domain.agent.model.entity.ChatFileRef> inherited = redo
+                ? chatFileService.copyRun(userId, request.getSourceRunId(), runId) : List.of();
+        if (inputs.isEmpty()) return inherited;
+        List<cn.bugstack.ai.domain.agent.model.entity.ChatFileRef> bound =
+                chatFileService.bindToRun(userId, conversationId, request.getSessionId(), runId, inputs);
+        if (inherited.isEmpty()) return bound;
+        java.util.Map<String, cn.bugstack.ai.domain.agent.model.entity.ChatFileRef> merged = new java.util.LinkedHashMap<>();
+        inherited.forEach(ref -> merged.put(ref.getAttachmentId(), ref));
+        bound.forEach(ref -> merged.putIfAbsent(ref.getAttachmentId(), ref));
+        return List.copyOf(merged.values());
+    }
+
     private ChatImageInput toChatImageInput(ChatImageInputDTO input) {
         return ChatImageInput.builder()
                 .sourceType(input.getSourceType())
@@ -1015,9 +1055,11 @@ public class AiAgentController implements IAiAgentService {
                         .build();
             }
             int deletedAttachments = imageAttachmentService.deleteOwnedByConversation(conversationId, userId);
+            int deletedFiles = chatFileService.deleteByConversation(conversationId, userId);
+            int deletedTraces = runTraceStore.deleteSession(userId, conversationId.substring(conversationId.lastIndexOf(':') + 1));
             log.info("删除会话历史 conversationId={} userId={} rows={}", conversationId, userId, deleted);
-            log.info("删除会话图片 conversationId={} userId={} rows={}",
-                    conversationId, userId, deletedAttachments);
+            log.info("删除会话图片、附件与运行轨迹 conversationId={} userId={} images={} files={} traces={}",
+                    conversationId, userId, deletedAttachments, deletedFiles, deletedTraces);
             return Response.<Boolean>builder()
                     .code(ResponseCode.SUCCESS.getCode())
                     .info(ResponseCode.SUCCESS.getInfo())
@@ -1071,6 +1113,7 @@ public class AiAgentController implements IAiAgentService {
 
             List<Map<String, Object>> messages = new java.util.ArrayList<>(rows.size());
             Long oldestId = null;
+            Map<String, cn.bugstack.ai.domain.agent.model.entity.ChatFileRef> fileStates = historyFileStates(rows);
             for (var r : rows) {
                 Map<String, Object> m = new java.util.HashMap<>();
                 m.put("id", r.getId());
@@ -1080,6 +1123,7 @@ public class AiAgentController implements IAiAgentService {
                 // 展示点脱敏：DB 里存的是 USER + ASSISTANT 原文
                 m.put("content", PiiMasker.mask(r.getContent()));
                 m.put("images", toHistoryImages(r.getContentParts(), r.getUserId()));
+                m.put("files", toHistoryFiles(r.getContentParts(), fileStates));
                 m.put("createdAt", r.getCreatedAt() != null ? r.getCreatedAt().toString() : null);
                 messages.add(m);
                 if (oldestId == null) oldestId = r.getId();
@@ -1097,6 +1141,60 @@ public class AiAgentController implements IAiAgentService {
             log.error("查询会话消息失败", e);
             return Response.<Map<String, Object>>builder()
                     .code(ResponseCode.UN_ERROR.getCode()).info(e.getMessage()).data(java.util.Map.of()).build();
+        }
+    }
+
+    /** Current state of the attachments on this page of messages, e.g. PURGED by the platform cleanup. */
+    private Map<String, cn.bugstack.ai.domain.agent.model.entity.ChatFileRef> historyFileStates(
+            List<cn.bugstack.ai.infrastructure.dao.po.AiChatMemory> rows) {
+        java.util.Map<String, List<String>> idsByOwner = new java.util.HashMap<>();
+        for (var r : rows) {
+            if (r.getUserId() == null || r.getContentParts() == null || !r.getContentParts().contains("\"file\"")) continue;
+            for (var file : decodeFileParts(r.getContentParts())) {
+                idsByOwner.computeIfAbsent(r.getUserId(), k -> new ArrayList<>()).add(String.valueOf(file.get("attachmentId")));
+            }
+        }
+        Map<String, cn.bugstack.ai.domain.agent.model.entity.ChatFileRef> states = new java.util.HashMap<>();
+        idsByOwner.forEach((owner, ids) -> chatFileService.describe(owner, ids)
+                .forEach(ref -> states.put(ref.getAttachmentId(), ref)));
+        return states;
+    }
+
+    private List<Map<String, Object>> toHistoryFiles(String contentParts,
+                                                     Map<String, cn.bugstack.ai.domain.agent.model.entity.ChatFileRef> states) {
+        if (contentParts == null || !contentParts.contains("\"file\"")) return List.of();
+        List<Map<String, Object>> files = new ArrayList<>();
+        for (Map<String, Object> part : decodeFileParts(contentParts)) {
+            var state = states.get(String.valueOf(part.get("attachmentId")));
+            Map<String, Object> file = new LinkedHashMap<>(part);
+            // A missing row was deleted together with its content; show it like a purged one.
+            file.put("status", state == null ? "PURGED" : state.getStatus());
+            files.add(file);
+        }
+        return files;
+    }
+
+    private List<Map<String, Object>> decodeFileParts(String contentParts) {
+        try {
+            com.alibaba.fastjson.JSONArray parts = JSON.parseArray(contentParts);
+            List<Map<String, Object>> files = new ArrayList<>();
+            for (int i = 0; i < parts.size(); i++) {
+                com.alibaba.fastjson.JSONObject part = parts.getJSONObject(i);
+                if (part == null || !"file".equals(part.getString("type")) || part.getString("attachmentId") == null) continue;
+                Map<String, Object> file = new LinkedHashMap<>();
+                file.put("attachmentId", part.getString("attachmentId"));
+                file.put("kind", part.getString("kind"));
+                file.put("fileName", part.getString("name"));
+                file.put("fileKind", part.getString("fileKind"));
+                file.put("size", part.getLong("size"));
+                file.put("artifactId", part.getString("artifactId"));
+                file.put("artifactRevision", part.getInteger("artifactRevision"));
+                files.add(file);
+            }
+            return files;
+        } catch (Exception e) {
+            log.warn("parse chat file parts failed: {}", e.getMessage());
+            return List.of();
         }
     }
 

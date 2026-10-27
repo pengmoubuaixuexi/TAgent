@@ -58,6 +58,9 @@ public class EvalJudgeService {
     @org.springframework.beans.factory.annotation.Autowired(required=false)
     @org.springframework.beans.factory.annotation.Qualifier("mysqlJdbcTemplate")
     private org.springframework.jdbc.core.JdbcTemplate modelDb;
+    /** Complete run traces; when a case's run has one, the judge sees full tool results instead of stored previews. */
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private cn.bugstack.ai.infrastructure.adapter.repository.trace.RunTraceStore runTraces;
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build();
     private final ExecutorService coordinators = Executors.newCachedThreadPool(runnable -> {
         Thread thread = new Thread(runnable, "eval-judge-coordinator");
@@ -283,7 +286,7 @@ public class EvalJudgeService {
             if (!reconstructed.isBlank()) stmContext = "[旧评测兼容回溯；不是执行时 STM 快照]\n" + reconstructed;
         }
         String prompt = buildPrompt(evalCase, result,
-                extractMemoryContext(trace), extractToolContext(trace), stmContext,
+                extractMemoryContext(trace), toolContext(trace, result.getAgentRunId()), stmContext,
                 extractRagContext(trace), extractStepContext(trace), trace.getString("startTime"));
         var reply = call(api, job.getModelId(), prompt, job.getJudgeJobId(), result.getResultId());
         String raw = reply.raw();
@@ -598,6 +601,27 @@ public class EvalJudgeService {
             }
         }
         return value.toString();
+    }
+
+    /** Tool calls from the run trace (complete results), else the evidence stored with the evaluation result. */
+    String toolContext(JSONObject trace, String agentRunId) {
+        if (runTraces != null && agentRunId != null && !agentRunId.isBlank()) {
+            try {
+                StringBuilder value = new StringBuilder();
+                for (Map<String, Object> node : runTraces.nodes(agentRunId)) {
+                    if (!"TOOL".equals(node.get("kind")) || value.length() >= 40_000) continue;
+                    var detail = runTraces.node(agentRunId, ((Number) node.get("seq")).intValue());
+                    if (detail == null) continue;
+                    appendEvidence(value, "- 工具[" + node.get("name") + "] 状态=" + node.get("status") + "\n  输入="
+                            + blankToDefault(detail.path("arguments").asText(null), "(无)") + "\n  返回="
+                            + blankToDefault(detail.path("result").asText(null), "(无)") + "\n", 40_000);
+                }
+                if (!value.isEmpty()) return value.toString();
+            } catch (RuntimeException unavailable) {
+                log.debug("run trace unavailable for judge runId={}: {}", agentRunId, unavailable.toString());
+            }
+        }
+        return extractToolContext(trace);
     }
 
     static String extractToolContext(JSONObject trace) {

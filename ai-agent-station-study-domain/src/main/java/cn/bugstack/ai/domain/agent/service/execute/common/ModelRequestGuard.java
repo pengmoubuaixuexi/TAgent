@@ -234,6 +234,30 @@ public final class ModelRequestGuard {
         };
     }
 
+    /** One synchronous chat request of a run, as sent; embeddings and helper scopes without a run are not traced. */
+    private static void trace(RunBudgetRegistry.State budget, ModelUsageContext usageContext, byte[] sent, long started,
+                              int status, byte[] answer, Throwable failure) {
+        if (budget == null || !cn.bugstack.ai.domain.agent.service.trace.RunTrace.enabled()) return;
+        try {
+            Map<String, Object> request = JSON.readValue(sent, MAP);
+            if (!(request.get("messages") instanceof List<?>)) return;
+            boolean ok = failure == null && status >= 200 && status < 300;
+            var reply = ok ? cn.bugstack.ai.domain.agent.service.trace.ModelReplies.fromJson(answer) : null;
+            String error = failure != null ? failure.getClass().getSimpleName() + ": " + failure.getMessage()
+                    : ok ? null : cn.bugstack.ai.domain.agent.service.trace.ModelReplies.errorText(answer);
+            StreamingActivityTracker.Activity activity = StreamingActivityTracker.current();
+            String purpose = usageContext == null || usageContext.purpose() == null ? org.slf4j.MDC.get("modelPurpose") : usageContext.purpose();
+            String step = activity != null ? activity.callLabel() : org.slf4j.MDC.get("step") != null ? org.slf4j.MDC.get("step") : purpose;
+            cn.bugstack.ai.domain.agent.service.trace.RunTrace.model(new cn.bugstack.ai.domain.agent.service.trace.RunTrace.ModelExchange(
+                    budget.runId(), budget.ownerUserId(), step, usageContext == null ? null : usageContext.apiId(), purpose,
+                    started, System.currentTimeMillis() - started, request, status, reply,
+                    ok ? cn.bugstack.ai.domain.agent.service.trace.RunTrace.OUTCOME_OK : cn.bugstack.ai.domain.agent.service.trace.RunTrace.OUTCOME_ERROR,
+                    error));
+        } catch (Exception ignored) {
+            // The trace never changes the outcome of a model request.
+        }
+    }
+
     public static Long usage(Map<String, Object> response) {
         if (!(response.get("usage") instanceof Map<?, ?> usage)) return null;
         if (usage.get("total_tokens") instanceof Number total) return total.longValue();
@@ -257,11 +281,20 @@ public final class ModelRequestGuard {
             RunBudgetRegistry.Reservation reservation = prepared.reservation();
             ClientHttpResponse response = null;
             boolean handedOff = false;
+            long started = System.currentTimeMillis();
             try {
-                response = execution.execute(request, prepared.body());
+                try {
+                    response = execution.execute(request, prepared.body());
+                } catch (IOException | RuntimeException failure) {
+                    trace(budget, usageContext, prepared.body(), started, 0, null, failure);
+                    throw failure;
+                }
                 byte[] bytes = response.getBody().readAllBytes();
+                trace(budget, usageContext, prepared.body(), started, response.getStatusCode().value(), bytes, null);
                 Long tokens = null;
                 try { tokens = usage(JSON.readValue(bytes, MAP)); } catch (Exception ignored) {}
+                // A rejected request (4xx) was never processed: release the estimate instead of holding it as unknown.
+                if (tokens == null && response.getStatusCode().is4xxClientError()) tokens = 0L;
                 if (reservation != null) reservation.settle(tokens);
                 if(prepared.usageTicket()!=null)prepared.usageTicket().settle(tokens,response.getStatusCode().is2xxSuccessful()?"SUCCESS":"ERROR");
                 if (budget != null) budget.checkActive();

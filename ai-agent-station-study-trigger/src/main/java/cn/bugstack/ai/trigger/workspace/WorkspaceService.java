@@ -41,17 +41,29 @@ public class WorkspaceService {
     }
     public Map<String,Object> options(String user) {
         return Map.of("models", models(user), "templates", WorkspaceTemplates.templates(),
-                "advisors", WorkspaceTemplates.advisors(), "knowledge", db.queryForList("""
-                    SELECT knowledge_tag AS knowledgeTag, MAX(rag_name) AS name FROM ai_client_rag_order
-                    WHERE user_id=? AND status=1 GROUP BY knowledge_tag ORDER BY knowledge_tag
-                    """, user), "mcpAllowedHosts", policy.allowedHosts());
+                "advisors", WorkspaceTemplates.advisors(), "knowledge", knowledgeOptions(user),
+                "mcpAllowedHosts", policy.allowedHosts());
+    }
+    private List<Map<String,Object>> knowledgeOptions(String user) {
+        Map<String,List<String>> documentsByTag = new LinkedHashMap<>();
+        for (var row : db.queryForList("""
+                SELECT knowledge_tag AS knowledgeTag, rag_name AS fileName FROM ai_client_rag_order
+                WHERE user_id=? AND status=1 ORDER BY knowledge_tag,rag_name,rag_id
+                """, user)) {
+            documentsByTag.computeIfAbsent((String) row.get("knowledgeTag"), key -> new ArrayList<>())
+                    .add((String) row.get("fileName"));
+        }
+        List<Map<String,Object>> options = new ArrayList<>();
+        documentsByTag.forEach((tag, documents) -> options.add(Map.of(
+                "knowledgeTag", tag, "name", tag, "documentCount", documents.size(), "documents", documents)));
+        return options;
     }
     public List<Map<String,Object>> models() {
         return models(null);
     }
     public List<Map<String,Object>> models(String user) {
         return db.queryForList("""
-                SELECT m.model_id AS modelId,m.model_name AS modelName,m.model_type AS modelType,m.tier,
+                SELECT m.model_id AS modelId,m.model_name AS modelName,m.model_type AS modelType,m.tier,m.api_id AS apiId,
                        CASE WHEN a.secret_ref IS NULL THEN 'PLATFORM' ELSE 'USER_BYOK' END AS providerSource
                 FROM ai_client_model m JOIN ai_client_api a ON a.api_id=m.api_id
                 WHERE m.status=1 AND a.status=1 AND
@@ -66,7 +78,7 @@ public class WorkspaceService {
                 REPLACE(strategy,'AgentExecuteStrategy','') AS strategy,status,
                 (workspace_config IS NOT NULL AND source_agent_id IS NULL) AS editable,
                 workspace_version AS version,source_agent_id AS sourceAgentId
-                FROM ai_agent WHERE owner_user_id=? AND archived=0 AND (source_agent_id IS NULL OR source_agent_id<>'workspace-builder') ORDER BY create_time DESC
+                FROM ai_agent WHERE owner_user_id=? AND archived=0 AND (source_agent_id IS NULL OR source_agent_id<>'workspace-builder') AND (channel IS NULL OR channel<>'candidate') ORDER BY create_time DESC
                 """, user);
     }
     public Map<String,Object> agent(String user,String id) {
@@ -167,6 +179,9 @@ public class WorkspaceService {
             boolean usePublic=n.path("usePublicTools").asBoolean(false);
             if(usePublic&&!WorkspaceTemplates.executable(role))throw bad("仅执行节点可以启用公共工具库");
             node.put("usePublicTools",usePublic);
+            // run_python is on for execution nodes unless the owner turns it off; other roles never run code.
+            if(n.has("codeExecution")&&!n.path("codeExecution").isBoolean())throw bad("代码运行开关必须为布尔值");
+            node.put("codeExecution",WorkspaceTemplates.executable(role)&&n.path("codeExecution").asBoolean(true));
             if (!WorkspaceTemplates.executable(role) && !node.path("mcpBindings").isEmpty())
                 throw bad("分析、规划、质检和总结节点不执行业务工具，请在执行节点配置 MCP");
             nodes.add(node);
@@ -226,6 +241,31 @@ public class WorkspaceService {
         }
         return clean;
     }
+    /**
+     * A hidden agent built from a draft configuration so that an evaluation can run the draft. Only an
+     * explicit run reaches it: it is not listed, not routed to and not editable, and never counts as published.
+     */
+    @Transactional public String createCandidate(String user,String sourceName,JsonNode config) {
+        lockUser(user);
+        if(db.queryForObject("SELECT COUNT(*) FROM ai_agent WHERE owner_user_id=? AND archived=0 AND channel='candidate'",Integer.class,user)>=3)
+            throw conflict("同时进行的改进验证太多，请等其中一项完成后再试");
+        ObjectNode clean=validateAgent(user,config);
+        clean.put("status",1);
+        String name=(sourceName==null?"Agent":sourceName)+"（改进候选）";
+        clean.put("name",name.length()>80?name.substring(0,80):name);
+        String id=id("wa");
+        db.update("""
+            INSERT INTO ai_agent(agent_id,agent_name,description,channel,strategy,status,owner_user_id,workspace_config)
+            VALUES(?,?,?,'candidate',?,1,?,?)
+            """,id,clean.path("name").asText(),"改进建议的验证版本，不在列表中显示",
+                WorkspaceTemplates.strategyBean(clean.path("strategy").asText()),user,clean.toString());
+        buildGraph(user,id,clean);
+        return id;
+    }
+    @Transactional public void archiveCandidate(String user,String id) {
+        if(id!=null && db.update("UPDATE ai_agent SET archived=1,status=0,workspace_version=workspace_version+1 WHERE agent_id=? AND owner_user_id=? AND channel='candidate' AND archived=0",id,user)==1)
+            afterCommit(() -> armory.invalidateAgent(id));
+    }
     @Transactional public void archiveAgent(String user,String id) {
         lockUser(user); ownedAgent(user,id,true); holdUpdate(Set.of(id));
         db.update("UPDATE ai_agent SET archived=1,status=0,workspace_version=workspace_version+1 WHERE agent_id=? AND owner_user_id=?",id,user);
@@ -242,7 +282,8 @@ public class WorkspaceService {
             if (!sourceCapabilities.isObject() && !sourceCapabilities.isNull()) throw bad("平台模型能力配置无效，请联系管理员");
             ObjectNode capabilities=sourceCapabilities.isNull()?json.createObjectNode():(ObjectNode)sourceCapabilities;
             ObjectNode scope=capabilities.putObject("workspaceNode").put("agentId",agentId).put("clientId",client)
-                    .put("nodeId",node.path("nodeId").asText()).put("taskPrompt",node.path("taskPrompt").asText());
+                    .put("nodeId",node.path("nodeId").asText()).put("taskPrompt",node.path("taskPrompt").asText())
+                    .put("codeExecution",node.path("codeExecution").asBoolean(true));
             scope.set("mcpBindings",node.path("mcpBindings").deepCopy());
             var publicIds=scope.putArray("publicMcpIds");
             if(node.path("usePublicTools").asBoolean(false)) access.publicMcpOrigins(user).keySet().forEach(publicIds::add);
@@ -449,7 +490,7 @@ public class WorkspaceService {
         return Boolean.TRUE.equals(value) || value instanceof Number n && n.intValue()==1 || "1".equals(value);
     }
     private Map<String,Object> ownedAgent(String user,String id,boolean lock) {
-        var rows=db.queryForList("SELECT * FROM ai_agent WHERE agent_id=? AND owner_user_id=? AND archived=0"+(lock?" FOR UPDATE":""),id,user);
+        var rows=db.queryForList("SELECT * FROM ai_agent WHERE agent_id=? AND owner_user_id=? AND archived=0 AND (channel IS NULL OR channel<>'candidate')"+(lock?" FOR UPDATE":""),id,user);
         if(rows.isEmpty()) throw notFound(); return rows.get(0);
     }
     private Map<String,Object> ownedMcp(String user,String id) {
@@ -468,7 +509,7 @@ public class WorkspaceService {
             throw forbidden("账户不可用");
     }
     private void checkAgentLimit(String user) {
-        if(db.queryForObject("SELECT COUNT(*) FROM ai_agent WHERE owner_user_id=? AND archived=0 AND source_agent_id IS NULL",Integer.class,user)>=30) throw bad("最多保留 30 个个人 Agent");
+        if(db.queryForObject("SELECT COUNT(*) FROM ai_agent WHERE owner_user_id=? AND archived=0 AND source_agent_id IS NULL AND (channel IS NULL OR channel<>'candidate')",Integer.class,user)>=30) throw bad("最多保留 30 个个人 Agent");
     }
     private JsonNode parse(Object value) {
         try { return json.readTree(value==null?"{}":value.toString()); }

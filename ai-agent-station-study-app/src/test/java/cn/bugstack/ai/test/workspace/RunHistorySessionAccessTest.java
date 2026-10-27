@@ -48,7 +48,7 @@ public class RunHistorySessionAccessTest {
         sql=new SqlSessionFactoryBuilder().build(config).openSession(true);
         access=new ConversationAccess(sql.getMapper(IConversationOwnerDao.class),mock(ObjectProvider.class));
         history=new JdbcRunHistoryRepository(db,new ObjectMapper());
-        mvc=MockMvcBuilders.standaloneSetup(new RunHistoryController(history,access)).build();
+        mvc=MockMvcBuilders.standaloneSetup(new RunHistoryController(history,access,null)).build();
     }
 
     @After public void close(){sql.close();}
@@ -65,7 +65,7 @@ public class RunHistorySessionAccessTest {
 
     @Test public void failedAndCancelledRunsAreDiscoverableBeforeAnyChatTurnAndAfterRestart() throws Exception {
         run("r1","alice",SESSION,"FAILED");run("r2","alice",SESSION,"CANCELLED");
-        mvc=MockMvcBuilders.standaloneSetup(new RunHistoryController(new JdbcRunHistoryRepository(db,new ObjectMapper()),access)).build();
+        mvc=MockMvcBuilders.standaloneSetup(new RunHistoryController(new JdbcRunHistoryRepository(db,new ObjectMapper()),access,null)).build();
         mvc.perform(get("/api/v1/history/session/{sessionId}",SESSION).principal(auth("alice","USER")))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.code").value("0000"))
                 .andExpect(jsonPath("$.data.length()").value(2)).andExpect(jsonPath("$.data[0].runId").value("r2"))
@@ -110,7 +110,7 @@ public class RunHistorySessionAccessTest {
         IRunHistoryRepository repository=mock(IRunHistoryRepository.class);
         ConversationAccess guard=mock(ConversationAccess.class);
         when(repository.listOwnedSession("alice",SESSION,0,50)).thenReturn(List.of());
-        mvc=MockMvcBuilders.standaloneSetup(new RunHistoryController(repository,guard)).build();
+        mvc=MockMvcBuilders.standaloneSetup(new RunHistoryController(repository,guard,null)).build();
         mvc.perform(get("/api/v1/history/session/{sessionId}",SESSION).principal(auth("alice","USER")))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.data.length()").value(0));
         var ordered=inOrder(guard,repository);

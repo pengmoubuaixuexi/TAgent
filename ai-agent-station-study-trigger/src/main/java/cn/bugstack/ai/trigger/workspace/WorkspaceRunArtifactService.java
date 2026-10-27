@@ -44,10 +44,13 @@ public class WorkspaceRunArtifactService implements RunArtifactService {
                         +"MARKDOWN 示例：{\"title\":\"行程\",\"format\":\"MARKDOWN\",\"content\":{\"markdown\":\"# 行程\\n正文\"}}。"
                         +"TABLE 示例：{\"title\":\"预算\",\"format\":\"TABLE\",\"content\":{\"columns\":[\"项目\",\"金额\"],\"rows\":[[\"交通\",\"100\"]]}}。"
                         +"CODE 示例：{\"title\":\"示例代码\",\"format\":\"CODE\",\"content\":{\"filename\":\"hello.py\",\"language\":\"python\",\"code\":\"print('hello')\\n\"}}。"
-                        +"只填写所选格式的字段，提交完整正文，不要仅写保存声明或复制无关工具日志。来源运行和用户由系统填写，无需提供。相同成果不要重复创建。")
+                        +"只填写所选格式的字段，提交完整正文，不要仅写保存声明或复制无关工具日志。来源运行和用户由系统填写，无需提供。相同成果不要重复创建。"
+                        +"修改用户在对话中引用的产物时，填写附件清单给出的 baseArtifactId 和 baseRevision，并提交修改后的完整内容（format 与原产物相同），系统会保存为该产物的下一个版本；不要为修改另建新产物。")
                 .inputSchema("""
                     {"type":"object","additionalProperties":false,"required":["title","format","content"],"properties":{
                       "title":{"type":"string","minLength":1,"maxLength":160},
+                      "baseArtifactId":{"type":"string","maxLength":64,"description":"仅在修改已有产物时填写：附件清单中的 artifactId"},
+                      "baseRevision":{"type":"integer","minimum":1,"description":"仅在修改已有产物时填写：所基于的版本号（附件清单中的 revision）"},
                       "format":{"type":"string","enum":["MARKDOWN","TABLE","CODE"],"description":"MARKDOWN 文档、TABLE 表格或 CODE 单个代码文件"},
                       "content":{"type":"object","additionalProperties":false,"description":"必须是对象。MARKDOWN 必须且只填写 markdown 字符串；TABLE 必须且只填写 columns、rows 字符串数组；CODE 必须且只填写 filename、language、code 字符串。不要混合不同格式的字段。",
                         "properties":{"markdown":{"type":"string","minLength":1,"maxLength":190000,"description":"MARKDOWN 的必填字段，完整 Markdown 正文；使用 JSON 字符串保存换行和引号"},
@@ -80,11 +83,24 @@ public class WorkspaceRunArtifactService implements RunArtifactService {
                 String at=location==null?"":"（第 "+location.getLineNr()+" 行，第 "+location.getColumnNr()+" 列）";
                 return error("INVALID_ARGUMENTS","产物参数必须是单个有效 JSON 对象"+at+"。content 必须为对象；Markdown 示例：{\"content\":{\"markdown\":\"# 标题\\n正文\"}}。正文的换行、引号和反斜杠必须按 JSON 转义，不要输出原始正文或代码围栏。");
             }
-            Map<String,Object> saved=outcomes.createFromTool(userId,runId,toolCallId,body);
+            boolean revise=body!=null&&body.isObject()&&(body.has("baseArtifactId")||body.has("baseRevision"));
+            Map<String,Object> saved=revise?outcomes.reviseFromTool(userId,runId,sessionId,toolCallId,body)
+                    :outcomes.createFromTool(userId,runId,toolCallId,body);
             Map<String,Object> result=metadata(saved);
+            // The card belongs to this run even when the artifact was first created by an earlier one.
+            if(revise)result.put("sourceRunId",runId);
             boolean created=Boolean.TRUE.equals(saved.get("created"));result.put("ok",true);result.put("replayed",!created);
             if(created) publishAfterCommit(runId,sessionId,result);
             return encode(result);
+        } catch(WorkspaceOutcomeService.VersionConflict conflict) {
+            Map<String,Object> error=new LinkedHashMap<>();
+            error.put("ok",false);error.put("error","ARTIFACT_VERSION_CONFLICT");error.put("artifactId",conflict.artifactId);
+            error.put("baseRevision",conflict.baseRevision);error.put("currentRevision",conflict.currentRevision);
+            error.put("message",conflict.getReason());
+            error.put("nextAction","先告诉用户：这个产物在此期间被修改过（现在是第 "+conflict.currentRevision+" 版），本次修改没有保存。"
+                    +"如果用户的要求仍然适用，用 read_attachment（latest=true）读取最新版本，基于它重新修改，并用 baseRevision="
+                    +conflict.currentRevision+" 保存；拿不准时询问用户。不要声称已经保存。");
+            return encode(error);
         } catch(ResponseStatusException invalid) {
             String reason=invalid.getReason()==null?"产物无法保存，请检查正文和任务归属":invalid.getReason();
             return error(invalid.getStatusCode().value()==409?"ARTIFACT_CONFLICT":"ARTIFACT_REJECTED",reason.substring(0,Math.min(300,reason.length())));
@@ -98,16 +114,30 @@ public class WorkspaceRunArtifactService implements RunArtifactService {
         }
     }
 
+    /** Card metadata for a saved artifact; published as artifact_created after the transaction commits when it is new. */
+    public Map<String,Object> announce(String runId,String sessionId,Map<String,Object> saved) {
+        Map<String,Object> result=metadata(saved);
+        if(Boolean.TRUE.equals(saved.get("created")))publishAfterCommit(runId,sessionId,result);
+        return result;
+    }
+
     private Map<String,Object> metadata(Map<String,Object> saved) {
         Map<String,Object> result=new LinkedHashMap<>();
         for(String key:new String[]{"artifactId","revision","title","format","runId","agentId","agentVersion"})result.put(key,saved.get(key));
+        if(saved.get("baseRevision")!=null)result.put("baseRevision",saved.get("baseRevision"));
         if("CODE".equals(saved.get("format"))&&saved.get("content") instanceof JsonNode content) {
             result.put("filename",content.path("filename").asText());result.put("language",content.path("language").asText());
+        }
+        if("FILE".equals(saved.get("format"))&&saved.get("content") instanceof JsonNode content) {
+            result.put("filename",content.path("filename").asText());result.put("mimeType",content.path("mimeType").asText());
+            result.put("size",content.path("size").asLong());
         }
         String id=escape(String.valueOf(saved.get("artifactId"))),run=escape(String.valueOf(saved.get("runId")));
         int revision=((Number)saved.get("revision")).intValue();
         String api="/api/v1/workspace/outcomes/artifacts/"+id;
-        result.put("previewUrl","/outcomes.html?runId="+run+"&artifactId="+id+"&revision="+revision);
+        result.put("previewUrl","/outcomes.html?runId="+run+"&artifactId="+id+"&revision="+revision
+                // Files (images, spreadsheets) have no line diff; their versions are browsed one at a time.
+                +(saved.get("baseRevision") instanceof Number base&&!"FILE".equals(saved.get("format"))?"&compare="+base.intValue():""));
         result.put("contentUrl",api+"?revision="+revision);
         result.put("downloadUrl",api+"/export?revision="+revision);
         return result;

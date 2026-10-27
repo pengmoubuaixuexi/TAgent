@@ -44,14 +44,28 @@ public class MultimodalMessageAdvisor implements BaseAdvisor {
 
     private final boolean imageInputSupported;
 
+    /** Called with the request's ToolContext when this turn's images reach a text-only model as links. */
+    private final java.util.function.Consumer<Map<String, Object>> textOnlyNotice;
+
     public MultimodalMessageAdvisor(boolean imageInputSupported) {
+        this(imageInputSupported, null);
+    }
+
+    public MultimodalMessageAdvisor(boolean imageInputSupported,
+                                    java.util.function.Consumer<Map<String, Object>> textOnlyNotice) {
         this.imageInputSupported = imageInputSupported;
+        this.textOnlyNotice = textOnlyNotice;
     }
 
     @Override
     public ChatClientRequest before(ChatClientRequest request, AdvisorChain chain) {
         ChatClientRequest withCurrentImages = attachCurrentImages(request);
-        return imageInputSupported ? withCurrentImages : projectToText(withCurrentImages);
+        if (imageInputSupported) return withCurrentImages;
+        if (textOnlyNotice != null && withCurrentImages != request
+                && withCurrentImages.prompt().getOptions() instanceof org.springframework.ai.model.tool.ToolCallingChatOptions options) {
+            textOnlyNotice.accept(options.getToolContext());
+        }
+        return projectToText(withCurrentImages);
     }
 
     @Override

@@ -91,6 +91,14 @@ spring:
         enabled: true
         preload-enabled: false
 agent:
+  run-budget:
+    # 按已用量准入、不预扣输出上限；预算用完后做完当前阶段再停并基于已完成结果作答，
+    # 超过预算 20% 才当场停止。每日平台额度同样处理，超出部分记到第二天（V075）。
+    overrun-ratio: 0.2
+  context:
+    # 请求没写输出上限时补的值；思考类模型的思考和正文共用它（8192 会截断长汇总步骤）。
+    # 也计入发请求前的额度预占，所以不设成服务商上限 131072。
+    default-output-limit: 25600
   mcp:
     return-error-on-failure: true
     disable-tools-on-nonexec-steps: false
@@ -134,6 +142,30 @@ agent:
       object-prefix: ${TAGENT_OSS_OBJECT_PREFIX:chat-images}
       signed-url-ttl-seconds: ${TAGENT_OSS_SIGNED_URL_TTL_SECONDS:1800}
       migrate-legacy-on-startup: ${TAGENT_OSS_MIGRATE_LEGACY_ON_STARTUP:false}
+  # 聊天附件（2026-10 第二批）：上传的文件与引用的产物。原文存 OSS（没配 OSS 时存本地数据目录），
+  # 解析出的文字是本地缓存，随时可以从原文重建。不设用户上限，只有下面的平台兜底清理。
+  attachments:
+    storage: ${TAGENT_ATTACHMENT_STORAGE:auto}   # auto（有 OSS 用 OSS）| oss | local
+    local-dir: ${TAGENT_ATTACHMENT_DIR:./data/chat-files}
+    cache-dir: ${TAGENT_ATTACHMENT_CACHE_DIR:./data/chat-files-cache}
+    max-file-bytes: 52428800       # 单个文件 50MB；每条消息最多 10 个
+    inline-chars: 8192             # 8KB 以内的文字直接放进上下文，其余用 read_attachment 读取
+    inline-total-chars: 32768
+    pending-ttl-hours: 24          # 上传后一直没发送的附件
+    cleanup:
+      max-total-bytes: ${TAGENT_ATTACHMENT_MAX_TOTAL_BYTES:10737418240}   # 总量超过后按最后使用时间清理；0 表示不清理
+      interval-ms: 3600000
+    parse:
+      threads: 2
+      queue: 32
+  # 代码沙箱（2026-10 第三批）：独立的 sandbox-runner 服务为每次运行创建用完即删、不能联网的容器。
+  # 应用不接触 Docker，只通过内部地址和共享令牌调用 runner；runner 那边限制排队与运行时长、内存和输出大小。
+  sandbox:
+    enabled: ${TAGENT_SANDBOX_ENABLED:false}
+    url: ${TAGENT_SANDBOX_URL:http://sandbox-runner:8000}
+    token: ${TAGENT_SANDBOX_TOKEN:}
+    exec-timeout-seconds: 60
+    poll-interval-ms: 700
   memory-cache:
     enabled: true
     ttl-seconds: 3600
@@ -172,8 +204,15 @@ agent:
   idempotency:
     enabled: true
     ttl-seconds: 3600
+  # 第四批起改用运行轨迹（ai_run_trace）：ai_event_log 停写，旧数据保留到备份后删表（待确认）。
   event-log:
-    enabled: true
+    enabled: false
+  # 完整运行轨迹：每次模型请求（含失败）、工具调用及完整结果、关键运行事件。retention-days=0 表示长期保留；
+  # 设定天数后，有反馈、进入评测或被改进建议引用的运行仍会保留。
+  trace:
+    enabled: ${TAGENT_TRACE_ENABLED:true}
+    retention-days: ${TAGENT_TRACE_RETENTION_DAYS:0}
+    queue-capacity: 20000
   tool-progress:
     result-preview:
       enabled: true
@@ -192,6 +231,19 @@ agent:
   streaming:
     idle-timeout-seconds: 120
     retry-max-attempts: 3
+  model-failover:
+    retry:
+      attempts: 3
+      initial-backoff-ms: 1000
+      max-backoff-ms: 8000
+    health:
+      window-seconds: 60
+      failure-threshold: 5
+      failure-rate: 0.5
+      min-samples: 4
+    probe:
+      enabled: true
+      interval-ms: 60000
   thinking-vis:
     enabled: true
   intervention:
@@ -302,7 +354,7 @@ resilience4j:
   retry:
     instances:
       llmCall:
-        max-attempts: 3
+        max-attempts: 1
         retry-exceptions:
         - java.io.IOException
         - java.net.SocketTimeoutException

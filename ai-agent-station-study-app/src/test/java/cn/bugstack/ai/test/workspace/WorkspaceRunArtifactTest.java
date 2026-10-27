@@ -38,9 +38,7 @@ public class WorkspaceRunArtifactTest {
         var source=new DriverManagerDataSource("jdbc:h2:mem:"+UUID.randomUUID()+";MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1","sa","");
         db=new JdbcTemplate(source);tx=new TransactionTemplate(new DataSourceTransactionManager(source));
         db.execute("CREATE TABLE admin_user(user_id VARCHAR PRIMARY KEY,status INT)");db.update("INSERT INTO admin_user VALUES('alice',1),('bob',1)");
-        Path migration=Path.of("../docs/dev-ops/sql-migrations/V069__artifacts_feedback.sql");
-        if(!Files.exists(migration))migration=Path.of("docs/dev-ops/sql-migrations/V069__artifacts_feedback.sql");
-        for(String sql:Files.readString(migration).replace("JSON NOT NULL","CLOB NOT NULL").replace(" ENGINE=InnoDB DEFAULT CHARSET=utf8mb4","").split(";"))if(!sql.isBlank())db.execute(sql);
+        ArtifactTestSchema.apply(db);
         history=mock(IRunHistoryRepository.class);events=mock(RunEventPublisher.class);
         when(history.findOwned(anyString(),anyString())).thenReturn(Optional.empty());
         when(history.findOwned("alice",run)).thenReturn(Optional.of(Map.of("runId",run,"userId","alice","agentId","travel-agent","agentVersion",7,"status","RUNNING")));
@@ -170,6 +168,133 @@ public class WorkspaceRunArtifactTest {
         RunBudgetRegistry.find(run).cancel();
         assertThrows(CancellationException.class,()->tool.create("cancelled",body().toString(),scope));
         assertEquals(0,count());verifyNoInteractions(events);
+    }
+
+    /** An artifact saved by an earlier, finished run that the user attached to this conversation. */
+    String attachedArtifact(String markdown)throws Exception {
+        String earlier="run-earlier-"+UUID.randomUUID();
+        when(history.findOwned("alice",earlier)).thenReturn(Optional.of(Map.of("runId",earlier,"status","COMPLETED")));
+        ObjectNode first=body().put("runId",earlier);first.set("content",json.createObjectNode().put("markdown",markdown));
+        String id=(String)tx.execute(status->outcomes.save("alice",null,first)).get("artifactId");
+        db.update("INSERT INTO ai_chat_file(attachment_id,owner_user_id,session_id,kind,status,artifact_id) VALUES(?,?,?,?,?,?)",
+                "f_ref_"+id.substring(0,8),"alice","session-a","ARTIFACT","ACTIVE",id);
+        return id;
+    }
+    ObjectNode revision(String id,int base,String markdown){
+        ObjectNode edit=body().put("baseArtifactId",id).put("baseRevision",base);
+        edit.set("content",json.createObjectNode().put("markdown",markdown));return edit;
+    }
+
+    @Test public void attachedArtifactIsRevisedAsTheNextVersionWithProvenance()throws Exception {
+        String id=attachedArtifact("# 周报\n## 第二节\n简略");
+        JsonNode saved=call("revise-a",revision(id,1,"# 周报\n## 第二节\n详细展开的内容"));
+        assertTrue(saved.toString(),saved.path("ok").asBoolean());
+        assertEquals(id,saved.path("artifactId").asText());assertEquals(2,saved.path("revision").asInt());
+        assertEquals(1,saved.path("baseRevision").asInt());assertEquals(run,saved.path("sourceRunId").asText());
+        assertTrue(saved.path("previewUrl").asText().endsWith("&compare=1"));
+        assertEquals(1,count());
+        var row=db.queryForMap("SELECT source_kind,source_run_id,base_revision,source_attachment_id FROM ai_run_artifact_revision WHERE artifact_id=? AND revision=2",id);
+        assertEquals("AGENT",row.get("source_kind"));assertEquals(run,row.get("source_run_id"));
+        assertEquals(1,((Number)row.get("base_revision")).intValue());assertNotNull(row.get("source_attachment_id"));
+        assertEquals("# 周报\n## 第二节\n简略",((JsonNode)outcomes.artifact("alice",id,1).get("content")).path("markdown").asText());
+        assertEquals("USER",db.queryForObject("SELECT source_kind FROM ai_run_artifact_revision WHERE artifact_id=? AND revision=1",String.class,id));
+        // Replays (same call, or the same output under a new call ID) do not add versions.
+        assertTrue(call("revise-a",revision(id,1,"# 周报\n## 第二节\n详细展开的内容")).path("replayed").asBoolean());
+        assertEquals(2,call("revise-b",revision(id,1,"# 周报\n## 第二节\n详细展开的内容")).path("revision").asInt());
+        assertEquals(2,db.queryForObject("SELECT current_revision FROM ai_run_artifact WHERE artifact_id=?",Integer.class,id).intValue());
+        // The run's own revision is listed with the run, so its card survives a page refresh.
+        var listed=outcomes.list("alice",run).stream().filter(a->id.equals(a.get("artifactId"))).findFirst().orElseThrow();
+        assertEquals(2,listed.get("revision"));assertEquals(run,listed.get("sourceRunId"));
+        // The card previews that revision and checks it against its run, which did not create the artifact.
+        var detail=outcomes.artifact("alice",id,2);
+        assertNotEquals(run,detail.get("runId"));assertEquals(run,detail.get("sourceRunId"));assertEquals(1,((Number)detail.get("baseRevision")).intValue());
+        assertNull(outcomes.artifact("alice",id,1).get("sourceRunId"));
+        verify(events,times(1)).publish(eq(run),eq("session-a"),eq("artifact_created"),any());
+    }
+
+    @Test public void editedMeanwhileArtifactReturnsAVersionConflictToReport()throws Exception {
+        String id=attachedArtifact("v1");
+        ObjectNode manual=body().put("revision",1);manual.set("content",json.createObjectNode().put("markdown","用户手工改成 v2"));
+        tx.execute(status->outcomes.save("alice",id,manual));
+        JsonNode conflict=call("revise-late",revision(id,1,"基于 v1 的修改"));
+        assertEquals("ARTIFACT_VERSION_CONFLICT",conflict.path("error").asText());
+        assertEquals(2,conflict.path("currentRevision").asInt());assertEquals(1,conflict.path("baseRevision").asInt());
+        assertTrue(conflict.path("nextAction").asText().contains("latest=true"));
+        assertEquals("用户手工改成 v2",((JsonNode)outcomes.artifact("alice",id,0).get("content")).path("markdown").asText());
+        assertTrue(call("revise-rebased",revision(id,2,"基于 v2 的修改")).path("ok").asBoolean());
+    }
+
+    @Test public void onlyArtifactsAttachedHereOrCreatedByThisRunCanBeRevised()throws Exception {
+        String earlier="run-other-"+UUID.randomUUID();
+        when(history.findOwned("alice",earlier)).thenReturn(Optional.of(Map.of("runId",earlier,"status","COMPLETED")));
+        ObjectNode first=body().put("runId",earlier);
+        String unattached=(String)tx.execute(status->outcomes.save("alice",null,first)).get("artifactId");
+        assertEquals("ARTIFACT_REJECTED",call("revise-x",revision(unattached,1,"改")).path("error").asText());
+        assertEquals("ARTIFACT_REJECTED",call("revise-y",revision("not-mine",1,"改")).path("error").asText());
+        String created=call("create",body()).path("artifactId").asText();
+        assertTrue("a run may revise what it created",call("revise-own",revision(created,1,"第二版")).path("ok").asBoolean());
+        ObjectNode table=revision(created,2,"x");table.put("format","TABLE");
+        table.set("content",json.readTree("{\"columns\":[\"a\"],\"rows\":[]}"));
+        assertTrue(call("revise-format",table).path("message").asText().contains("format"));
+    }
+
+    /** Sandbox outputs: stored bytes behind a reference, downloadable, previewable, never editable. */
+    @Test public void sandboxOutputsBecomeReadOnlyFileArtifacts()throws Exception {
+        var store=mock(cn.bugstack.ai.trigger.workspace.ArtifactFileStore.class);
+        java.util.Map<String,byte[]> blobs=new java.util.HashMap<>();
+        when(store.put(anyString(),any(),anyString())).thenAnswer(inv->{byte[] b=inv.getArgument(1);String key="artifact-files/u-test/"+"%064x".formatted(b.length);
+            blobs.put(key,b);return new cn.bugstack.ai.trigger.workspace.ArtifactFileStore.Stored(key,"%064x".formatted(b.length),b.length);});
+        when(store.read(anyString())).thenAnswer(inv->blobs.get((String)inv.getArgument(0)));
+        Path tmp=Files.createTempDirectory("preview");
+        when(store.copy(anyString())).thenAnswer(inv->{Path f=tmp.resolve(UUID.randomUUID().toString());Files.write(f,blobs.get((String)inv.getArgument(0)));return f;});
+        outcomes.setFileSupport(store,new cn.bugstack.ai.infrastructure.adapter.repository.attachment.ChatFilePreviewer(
+                new cn.bugstack.ai.infrastructure.adapter.repository.attachment.ChatFileParser(),tmp.toString()));
+        byte[] png={(byte)0x89,'P','N','G',1,2,3};
+        var image=tx.execute(st->outcomes.createFileFromTool("alice",run,"call-x#0","../趋势.png","image/png",png));
+        assertEquals("FILE",image.get("format"));assertEquals("趋势.png",image.get("title"));
+        assertTrue(Boolean.TRUE.equals(image.get("created")));
+        String imageId=(String)image.get("artifactId");
+        assertFalse("replays are one artifact",Boolean.TRUE.equals(tx.execute(st->outcomes.createFileFromTool("alice",run,"call-x#0","趋势.png","image/png",png)).get("created")));
+        assertArrayEquals(png,outcomes.export("alice",imageId,1).bytes());
+        assertEquals("application/octet-stream",outcomes.export("alice",imageId,1).contentType());
+        assertEquals("image/png",outcomes.inlineImage("alice",imageId,1).mimeType());
+        assertEquals("image",outcomes.preview("alice",imageId,1).get("kind"));
+        assertThrows(org.springframework.web.server.ResponseStatusException.class,()->outcomes.export("bob",imageId,1));
+        // Redrawing the same file name in this run revises that artifact instead of adding a second one.
+        byte[] redrawn={(byte)0x89,'P','N','G',4,5,6,7};
+        var revised=tx.execute(st->outcomes.createFileFromTool("alice",run,"call-y#0","趋势.png","image/png",redrawn));
+        assertEquals(imageId,revised.get("artifactId"));assertEquals(2,revised.get("revision"));assertEquals(1,((Number)revised.get("baseRevision")).intValue());
+        assertTrue(Boolean.TRUE.equals(revised.get("created")));
+        assertArrayEquals(redrawn,outcomes.export("alice",imageId,2).bytes());assertArrayEquals(png,outcomes.export("alice",imageId,1).bytes());
+        var replay=tx.execute(st->outcomes.createFileFromTool("alice",run,"call-y#0","趋势.png","image/png",redrawn));
+        assertFalse("a replayed call adds no revision",Boolean.TRUE.equals(replay.get("created")));assertEquals(2,replay.get("revision"));
+        var unchanged=tx.execute(st->outcomes.createFileFromTool("alice",run,"call-z#0","趋势.png","image/png",redrawn));
+        assertFalse("identical content adds no revision",Boolean.TRUE.equals(unchanged.get("created")));assertEquals(2,unchanged.get("revision"));
+        assertEquals(1,db.queryForObject("SELECT COUNT(*) FROM ai_run_artifact WHERE owner_user_id='alice' AND run_id=? AND title='趋势.png'",Integer.class,run).intValue());
+        var cardOfRevision=tool.announce(run,"session-a",revised);
+        assertFalse("files have no line diff",String.valueOf(cardOfRevision.get("previewUrl")).contains("compare="));
+
+        byte[] csv="月份,金额\n1月,100\n2月,200\n".getBytes(StandardCharsets.UTF_8);
+        var table=tx.execute(st->outcomes.createFileFromTool("alice",run,"call-x#1","汇总.csv","text/csv",csv));
+        String tableId=(String)table.get("artifactId");
+        var preview=outcomes.preview("alice",tableId,1);
+        assertEquals("table",preview.get("kind"));
+        assertTrue(preview.toString(),preview.toString().contains("月份"));
+        assertThrows("tables are never served inline",org.springframework.web.server.ResponseStatusException.class,()->outcomes.inlineImage("alice",tableId,1));
+        ObjectNode edit=json.createObjectNode().put("title","改名").put("format","MARKDOWN").put("revision",1);
+        edit.set("content",json.createObjectNode().put("markdown","x"));
+        assertThrows("file artifacts cannot be edited",org.springframework.web.server.ResponseStatusException.class,()->tx.execute(st->outcomes.save("alice",tableId,edit)));
+        var card=tool.announce(run,"session-a",table);
+        assertEquals("汇总.csv",card.get("filename"));assertEquals("text/csv",card.get("mimeType"));
+        var listed=outcomes.list("alice",run).stream().filter(r->tableId.equals(r.get("artifactId"))).findFirst().orElseThrow();
+        assertEquals("chat cards restored from the run list still name the file","汇总.csv",listed.get("filename"));
+        assertEquals((long)csv.length,listed.get("size"));
+
+        db.update("INSERT INTO ai_run_artifact(artifact_id,owner_user_id,run_id,title,format,current_revision) VALUES('doc-kept','alice',?,'笔记','MARKDOWN',1)",run);
+        assertEquals("account deletion removes FILE artifacts",2,outcomes.deleteFilesOf("alice"));
+        verify(store,times(3)).delete(anyString()); // both revisions of the redrawn image and the table
+        assertThrows(org.springframework.web.server.ResponseStatusException.class,()->outcomes.export("alice",tableId,1));
+        assertEquals(Integer.valueOf(1),db.queryForObject("SELECT COUNT(*) FROM ai_run_artifact WHERE owner_user_id='alice'",Integer.class));
     }
 
     @Test public void providerSchemaUsesPortableObjectFieldsAndRejectsFinishedHistory()throws Exception {

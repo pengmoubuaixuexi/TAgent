@@ -94,3 +94,32 @@ v2.1.0 加快知识库入库，支持失败后续做，并增加按用户的知�
 - 标题与上下文仍分别受 `agent.rag.parent-title.enabled` 和 `agent.rag.contextual-retrieval.enabled` 控制，这两项必须位于 `agent.rag.*` 下。
 - V070 之前失败的入库任务没有续做记录，第一次重试会整份重新处理。
 - 若入库增强模型返回 4xx（例如模型名不存在），同一文件的其余段落不再请求模型，文件照常入库，任务显示未生成上下文的段落数；修复模型后重试失败任务即可重新生成。
+
+## v2.2.0 升级
+
+本次包含模型故障切换、统一附件、Python 沙箱、持久运行轨迹与改进验证。原先四批开发计划合并发布为 v2.2.0。
+
+1. 先停止应用写入，备份 MySQL、原有文件/索引/向量存储、旧镜像、配置和固定的 `MODEL_SECRET_MASTER_KEY`。保留同一恢复点；不要升级时重新生成主密钥。
+2. 确认 V070 已完成，按顺序仅执行缺失的迁移：
+
+   | 迁移 | 变更 |
+   |---|---|
+   | [V071](sql-migrations/V071__model_catalog_and_health.sql) | 模型清单和健康表，规范已有档位并初始化候选；核对平台发布范围和个人模型归属 |
+   | [V072](sql-migrations/V072__chat_files_and_artifact_provenance.sql) | 附件及运行关联表，产物修订来源字段与索引 |
+   | [V073](sql-migrations/V073__run_trace.sql) | 运行轨迹及大字段存储表 |
+   | [V074](sql-migrations/V074__improvement_suggestions.sql) | 改进建议、候选草稿与对比评测关联 |
+   | [V075](sql-migrations/V075__usage_day_carried_tokens.sql) | 日用量账本新增 `carried_tokens` |
+
+   DDL 不保证整份幂等；部分执行失败后先检查表、列与索引，不要盲目重跑。线上已完成迁移的实例应跳过。
+3. 合并配置示例中的 `agent.attachments`、`agent.sandbox`、`agent.trace` 和 `agent.model-failover`；保留本实例额度、密钥、域名及存储设置。使用请求层重试后将 `resilience4j.retry.instances.llmCall.max-attempts` 设为 `1`，避免重复叠加。
+4. 沙箱启用步骤见 [部署说明](../../sandbox-runner/README.md)。构建两个镜像并设置共享令牌；应用 `.env` 设置 `TAGENT_SANDBOX_ENABLED=true`。执行镜像是 build-only 服务，不要把它作为常驻服务启动。
+5. 启动后核对登录/普通用户权限、附件上传解析与读取、产物执行与下载、真实模型响应及历史轨迹；确认 Prometheus 抓取、Grafana 告警规则。只通过编译不代表外部模型和目标服务器已验收。
+
+新配置与边界：
+
+- 附件 `storage=auto`：配置 OSS 时使用 OSS，否则使用持久应用数据目录。单文件默认 50 MiB，每条消息最多 10 个；总原文容量默认 10 GiB，超过时按最后使用时间清理。不要承诺附件永久保留。
+- 轨迹默认启用且 `retention-days=0` 表示长期保留。可设置保留天数；有反馈、评测或改进引用的轨迹保留。新模板停写旧 `ai_event_log`，不自动删旧数据。
+- `agent.run-budget.overrun-ratio=0.2` 允许阶段收尾，达到硬边界后停止；平台日额度超出部分记录到次日账本。它不增加配置的日额度或单任务目标额度。
+- `agent.context.default-output-limit=25600` 是未指定输出上限时的默认值，并不证明所有模型支持该长度；按实际服务商调整。
+- 模型候选只在相同归属内选择，需正确登记模型能力与档位；改进建议必须有完整有效的对比评测并由用户确认，不能当作自动发布。
+- 新版已经写入后，回退需评估数据库、产物和用量数据的兼容性；不能仅换旧 JAR 就假定恢复成功。

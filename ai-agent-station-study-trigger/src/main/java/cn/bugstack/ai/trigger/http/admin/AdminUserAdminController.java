@@ -40,6 +40,14 @@ public class AdminUserAdminController implements IAdminUserAdminService {
     @Resource
     private org.springframework.security.crypto.password.PasswordEncoder accountPasswordEncoder;
 
+    /** 删除账号时一并删除该用户的聊天附件（原文与解析缓存）、文件类产物（代码运行生成的文件）和运行轨迹。 */
+    @Resource
+    private cn.bugstack.ai.infrastructure.adapter.repository.attachment.ChatFileService chatFileService;
+    @Resource
+    private cn.bugstack.ai.trigger.workspace.WorkspaceOutcomeService outcomeService;
+    @Resource
+    private cn.bugstack.ai.infrastructure.adapter.repository.trace.RunTraceStore runTraceStore;
+
     @Override
     @PostMapping("/create")
     public Response<Boolean> createAdminUser(@RequestBody AdminUserRequestDTO request) {
@@ -144,7 +152,9 @@ public class AdminUserAdminController implements IAdminUserAdminService {
         try {
             log.info("根据ID删除管理员用户请求：{}", id);
             
+            AdminUser account = adminUserDao.queryById(id);
             int result = adminUserDao.deleteById(id);
+            if (result > 0 && account != null) deleteUserFiles(account.getUserId());
             
             return Response.<Boolean>builder()
                     .code(ResponseCode.SUCCESS.getCode())
@@ -168,6 +178,7 @@ public class AdminUserAdminController implements IAdminUserAdminService {
             log.info("根据用户ID删除管理员用户请求：{}", userId);
             
             int result = adminUserDao.deleteByUserId(userId);
+            if (result > 0) deleteUserFiles(userId);
             
             return Response.<Boolean>builder()
                     .code(ResponseCode.SUCCESS.getCode())
@@ -181,6 +192,17 @@ public class AdminUserAdminController implements IAdminUserAdminService {
                     .info(ResponseCode.UN_ERROR.getInfo())
                     .data(false)
                     .build();
+        }
+    }
+
+    private void deleteUserFiles(String userId) {
+        try {
+            int files = chatFileService.deleteByUser(userId);
+            int artifacts = outcomeService.deleteFilesOf(userId);
+            int traces = runTraceStore.deleteUser(userId);
+            log.info("删除账号附件 userId={} files={} fileArtifacts={} traces={}", userId, files, artifacts, traces);
+        } catch (RuntimeException e) {
+            log.warn("删除账号附件失败 userId={}: {}", userId, e.toString());
         }
     }
 

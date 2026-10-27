@@ -146,6 +146,11 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
             if (!answerNow) summaryPrompt += "\n若用户要求可下载文档或表格，使用本轮提供的 create_artifact 保存完整成果；已有相同产物不重复创建。无需搜索文件写入 MCP 或让用户复制粘贴，不编造保存成功或下载地址。";
             // P0-B2b-Step3：质量未通过/未验证时，要求最终交付向用户明示局限，且不泄露内部流程
             summaryPrompt += qualityDeliveryDirective(dynamicContext.getQualityVerificationStatus());
+            Object budgetStop = dynamicContext.getValue(BUDGET_STOP_KEY);
+            if (budgetStop != null) {
+                summaryPrompt += "\n" + budgetStop + "，任务提前结束、没有开始新一轮执行。请基于已完成的执行结果作答，"
+                        + "在开头用一句话说明预算已用完，并指出还没有完成的部分；不要编造未执行步骤的结果。";
+            }
 
             // 立即回答可观测：在 LLM 调用前写一条标记行，记录"中断点 + 改写后的完整 finalize 输入"，LLM 失败也留痕。
             if (answerNow) {
@@ -210,6 +215,17 @@ public class Step4LogExecutionSummaryNode extends AbstractExecuteSupport {
             saveEpisodicMemory(requestParameter, summaryResult, dynamicContext);
 
         } catch (Exception e) {
+            String history = dynamicContext.getExecutionHistory() == null ? "" : dynamicContext.getExecutionHistory().toString().trim();
+            if (cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.isBudgetFailure(e) && !history.isBlank()) {
+                // Past the hard ceiling no model call is allowed; the completed rounds are still the user's answer.
+                log.warn("[Budget][auto] 总结请求被预算硬顶拒绝，直接交付已完成的执行结果: {}", e.getMessage());
+                String answer = cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.UNSUMMARIZED_NOTICE + "\n\n"
+                        + OutputFilter.cleanForUser(cn.bugstack.ai.domain.agent.service.security.PiiMasker.mask(history));
+                dynamicContext.setValue("finalSummary", answer);
+                if (conversationTurnMemoryService != null) conversationTurnMemoryService.saveFinalTurn(requestParameter, answer);
+                sendSummaryResult(dynamicContext, answer, requestParameter.getSessionId());
+                return;
+            }
             log.error("生成最终总结报告时出现异常: {}", e.getMessage(), e);
         }
     }

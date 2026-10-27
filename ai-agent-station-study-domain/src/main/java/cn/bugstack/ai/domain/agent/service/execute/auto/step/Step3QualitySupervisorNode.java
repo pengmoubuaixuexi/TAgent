@@ -305,6 +305,14 @@ public class Step3QualitySupervisorNode extends AbstractExecuteSupport {
             return getBean("step4LogExecutionSummaryNode");
         }
 
+        // A round (execution + quality check) is one phase: with the budget used up, start no new round.
+        String budget = cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.reachedFor(requestParameter.getRunId());
+        if (budget != null) {
+            dynamicContext.setValue(BUDGET_STOP_KEY, budget);
+            log.info("[Budget][auto] {} → 不再开始新一轮，进入总结", budget);
+            return getBean("step4LogExecutionSummaryNode");
+        }
+
         // P1.2 Reflexion：critique 还在说明上一步 doApply 已决定要回 Step2
         Object critique = dynamicContext.getValue(CTX_REFLEXION_CRITIQUE);
         if (reflexionEnabled && critique != null) {

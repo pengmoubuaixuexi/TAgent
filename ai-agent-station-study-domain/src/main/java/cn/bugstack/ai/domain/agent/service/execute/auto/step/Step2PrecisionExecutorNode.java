@@ -67,7 +67,8 @@ public class Step2PrecisionExecutorNode extends AbstractExecuteSupport{
                         agentToolRegistry != null ? agentToolRegistry.getTools(executorClientId) : List.of())
                 : List.of();
         if (agentToolRegistry != null && executorClientId != null) {
-            executionPrompt += "\n\n**【可用工具清单】**\n" + agentToolRegistry.describeToolsForPrompt(executorClientId, dynamicToolCallbacks);
+            executionPrompt += "\n\n**【可用工具清单】**\n" + agentToolRegistry.describeToolsForPrompt(executorClientId, dynamicToolCallbacks,
+                    requestToolAvailable(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.AUTO_STEP2_EXECUTION));
         }
 
         // P1.2 / T11 C Reflexion：上一轮 Step3 评审 FAIL 把 critique 喂回来，前置到 prompt 让模型针对反馈修正

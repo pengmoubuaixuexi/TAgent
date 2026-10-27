@@ -40,6 +40,7 @@ public class PersonalModelConnectionTest {
         db.execute("CREATE TABLE ai_client_model(model_id VARCHAR(64) PRIMARY KEY,api_id VARCHAR(64),owner_user_id VARCHAR(64),model_name VARCHAR(128),model_type VARCHAR(32),model_usage VARCHAR(32),tier VARCHAR(32),capabilities_json VARCHAR(100),status INT,platform_enabled INT,source_model_id VARCHAR(64),create_time TIMESTAMP,update_time TIMESTAMP)");
         db.execute("CREATE TABLE ai_model_secret(secret_ref VARCHAR(64) PRIMARY KEY,api_id VARCHAR(64) UNIQUE,owner_user_id VARCHAR(64),display_name VARCHAR(100),ciphertext TEXT,credential_version INT,status INT,verified_at TIMESTAMP,create_time TIMESTAMP DEFAULT NOW(),update_time TIMESTAMP DEFAULT NOW())");
         db.execute("CREATE TABLE ai_user_model_policy(user_id VARCHAR(64) PRIMARY KEY,platform_auxiliaries_enabled INT,update_time TIMESTAMP DEFAULT NOW())");
+        db.execute("CREATE TABLE ai_model_catalog(id BIGINT AUTO_INCREMENT PRIMARY KEY,owner_scope VARCHAR(64),api_id VARCHAR(64),model_name VARCHAR(64),tier VARCHAR(16),sort_order INT DEFAULT 100,capabilities_json VARCHAR(500),enabled INT DEFAULT 1,UNIQUE(owner_scope,api_id,model_name))");
         cipher=new ModelSecretCipher(Base64.getEncoder().encodeToString(new byte[32]));
         endpoints=new PersonalModelEndpointPolicy("api.openai.com") {
             @Override protected InetAddress[] resolve(String host) throws UnknownHostException {return new InetAddress[]{InetAddress.getByAddress(new byte[]{1,1,1,1})};}

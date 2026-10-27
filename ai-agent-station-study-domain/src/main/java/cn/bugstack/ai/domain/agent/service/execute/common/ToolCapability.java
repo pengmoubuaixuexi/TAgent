@@ -8,5 +8,9 @@ public enum ToolCapability {
     BUSINESS_TOOL,
     ASK_USER,
     REQUEST_TOOL,
-    CREATE_ARTIFACT
+    CREATE_ARTIFACT,
+    /** read_attachment：只读用户随消息提供的附件，无副作用。 */
+    READ_ATTACHMENT,
+    /** run_python：在隔离沙箱里运行代码，只开放给执行步骤（ALL）。 */
+    RUN_CODE
 }

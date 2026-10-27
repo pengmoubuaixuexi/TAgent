@@ -134,6 +134,33 @@ public class FlowBoundMcpCapabilitiesTest {
         verify(callback,never()).call(anyString());verifyNoInteractions(registry,vectors);
     }
 
+    @Test public void emptyFlowCatalogDistinguishesPlanningExecutionAndUnavailableDiscovery() {
+        var step = new cn.bugstack.ai.domain.agent.service.execute.flow.step.Step4ExecuteStepsNode();
+        var catalogService = mock(cn.bugstack.ai.domain.agent.service.router.McpToolCatalogService.class);
+        ReflectionTestUtils.setField(step, "dynamicMcpToolCatalogService", catalogService);
+        ReflectionTestUtils.setField(step, "requestToolEnabled", true);
+        var empty = ExecutorToolCatalog.from(List.of(), ExecutorToolCatalog.Source.RESIDENT, 1);
+        String planning = ReflectionTestUtils.invokeMethod(step, "renderToolRuntimeForPrompt", empty, "executor");
+        assertTrue(planning.contains("本阶段只分析或规划，不调用 request_tool"));
+        assertTrue(planning.contains("待发现"));
+        String execution = ReflectionTestUtils.invokeMethod(step, "renderToolRuntimeForPrompt", empty, "executor",
+                cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_DAG_EXECUTION);
+        assertTrue(execution.contains("先调用 request_tool"));
+        assertFalse(execution.contains("自身知识"));
+        String finalize = ReflectionTestUtils.invokeMethod(step, "renderToolRuntimeForPrompt", empty, "executor",
+                cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.answerNow(true));
+        assertFalse(finalize.contains("request_tool"));
+        for (boolean servicePresent : new boolean[]{true, false}) {
+            ReflectionTestUtils.setField(step, "requestToolEnabled", !servicePresent);
+            ReflectionTestUtils.setField(step, "dynamicMcpToolCatalogService", servicePresent ? catalogService : null);
+            String unavailable = ReflectionTestUtils.invokeMethod(step, "renderToolRuntimeForPrompt", empty, "executor",
+                    cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_DAG_EXECUTION);
+            assertFalse(unavailable.contains("request_tool"));
+            assertTrue(unavailable.contains("如实说明限制"));
+        }
+        verify(catalogService, never()).resolveDynamicToolCallbacks(any(), any(), any(), any(), any(), any());
+    }
+
     @Test public void onlyConfiguredAnalysisAndPlanningRolesCanInspectTheirExecutorGrant() {
         when(repo.queryMcpToolCatalogByMcpId("platform")).thenReturn(List.of(tool("maps_weather")));
         var roles=Map.of("TOOL_MCP_CLIENT","analysis","PLANNING_CLIENT","planning",

@@ -168,12 +168,12 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
      */
     private static final ThreadLocal<String> CURRENT_RUN_ID = new ThreadLocal<>();
     private static final ThreadLocal<String> CURRENT_CALL_ID = new ThreadLocal<>();
-    static final String SESSION_CONTEXT_KEY = "agent.reasoning_session";
-    static final String RUN_CONTEXT_KEY = "agent.reasoning_run";
-    static final String CALL_CONTEXT_KEY = "agent.reasoning_call";
+    public static final String SESSION_CONTEXT_KEY = "agent.reasoning_session";
+    public static final String RUN_CONTEXT_KEY = "agent.reasoning_run";
+    public static final String CALL_CONTEXT_KEY = "agent.reasoning_call";
 
-    /** Capture the lexical scope before an advisor moves subscription to another thread. */
-    static Map<String, String> captureContext() {
+    /** Capture the lexical scope before an advisor (or a model retry) moves subscription to another thread. */
+    public static Map<String, String> captureContext() {
         String sessionId = resolveSessionId();
         String runKey = resolveReasoningKey(sessionId);
         String callKey = CURRENT_CALL_ID.get();
@@ -363,6 +363,10 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
         // Names only: argument fragments may contain private document/code contents.
         Map<Integer, String> toolCallNames = new HashMap<>();
         java.util.concurrent.atomic.AtomicReference<Long> usage = new java.util.concurrent.atomic.AtomicReference<>();
+        // A rejected request (4xx) was never processed: settle it at zero rather than as unknown usage.
+        if (response.statusCode().is4xxClientError()) usage.set(0L);
+        // Spring AI cancels the body after [DONE]; such a stream completed and settles as SUCCESS.
+        java.util.concurrent.atomic.AtomicBoolean finished = new java.util.concurrent.atomic.AtomicBoolean();
 
         Flux<DataBuffer> wrappedBody = originalBody
                 .map(buffer -> {
@@ -372,7 +376,7 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
                     StreamingActivityTracker.checkActive(streamingActivity);
                     try {
                         for (String event : sseBuffer.accept(bytes)) {
-                            processSseEvent(event, reasoningBuffer, toolCallIds, toolCallNames, byToolCall, usage, streamingActivity);
+                            processSseEvent(event, reasoningBuffer, toolCallIds, toolCallNames, byToolCall, usage, finished, streamingActivity);
                         }
                         if(reasoningBuffer.length()>0 && toolReasonings.containsKey(reasoningKey)) {
                             if(LATEST_REASONING.size()>MAX_LATEST_SESSIONS) LATEST_REASONING.clear();
@@ -387,7 +391,7 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
                 })
                 .doOnComplete(() -> {
                     if (!sseBuffer.remainder().isEmpty()) {
-                        processSseEvent(sseBuffer.remainder(), reasoningBuffer, toolCallIds, toolCallNames, byToolCall, usage, streamingActivity);
+                        processSseEvent(sseBuffer.remainder(), reasoningBuffer, toolCallIds, toolCallNames, byToolCall, usage, finished, streamingActivity);
                     }
                     // The model's tool loop can subscribe to the next request from onComplete.
                     // Release this request's estimate before forwarding completion, not in doFinally.
@@ -421,7 +425,7 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
             wrappedBody=Flux.usingWhen(Mono.just(usageTicket),ignored->body,
                     ticket->settleUsage(ticket,usage.get(),response.statusCode().is2xxSuccessful()?"SUCCESS":"ERROR"),
                     (ticket,error)->settleUsage(ticket,usage.get(),"ERROR"),
-                    ticket->settleUsage(ticket,usage.get(),"CANCELLED"));
+                    ticket->settleUsage(ticket,usage.get(),finished.get()&&response.statusCode().is2xxSuccessful()?"SUCCESS":"CANCELLED"));
         }
         return ClientResponse.from(response).body(wrappedBody).build();
     }
@@ -457,10 +461,12 @@ public class ReasoningContentFilter implements ExchangeFilterFunction {
     private void processSseEvent(String event, StringBuilder reasoningBuffer,
                                  Map<Integer, String> toolCallIds, Map<Integer, String> toolCallNames, Map<String, String> byToolCall,
                                  java.util.concurrent.atomic.AtomicReference<Long> usage,
+                                 java.util.concurrent.atomic.AtomicBoolean finished,
                                  StreamingActivityTracker.Activity streamingActivity) {
         for (String line : event.split("\n")) {
             if (!line.startsWith("data:")) continue;
             String json = line.substring(5).trim();
+            if ("[DONE]".equals(json)) finished.set(true);
             if (json.isEmpty() || "[DONE]".equals(json)) continue;
             try {
                 Map<String, Object> chunk = OBJECT_MAPPER.readValue(json, MAP_TYPE);

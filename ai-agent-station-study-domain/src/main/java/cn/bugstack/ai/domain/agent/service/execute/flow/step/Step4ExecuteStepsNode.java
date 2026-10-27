@@ -106,7 +106,9 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
     public String doApply(ExecuteCommandEntity request, DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext) {
         checkCancelled(dynamicContext);
         // 立即回答（在 step4 执行前点的）：跳过 DAG 执行，直接基于"计划 + 已有产出 + 半截思考"整合作答
-        if (dynamicContext.isFinalizeRequested()) {
+        String budgetBeforeExecution = budgetStop(request);
+        if (budgetBeforeExecution != null) dynamicContext.setValue(BUDGET_STOP_KEY, budgetBeforeExecution);
+        if (dynamicContext.isFinalizeRequested() || budgetBeforeExecution != null) {
             refreshDynamicToolContext(request, dynamicContext);
             return finalizeNow(request, dynamicContext);
         }
@@ -154,8 +156,8 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             // 按顺序执行规划步骤
             executeStepsInOrder(executorChatClient, stepsMap, dynamicContext, request);
 
-            // 立即回答（在 DAG 执行途中点的）：已停止调度未启动子步，这里基于已完成产出直接整合作答
-            if (dynamicContext.isFinalizeRequested()) {
+            // 立即回答（在 DAG 执行途中点的）或预算用完后跳过了步骤：基于已完成产出直接整合作答
+            if (dynamicContext.isFinalizeRequested() || dynamicContext.getValue(BUDGET_STOP_KEY) != null) {
                 return finalizeNow(request, dynamicContext);
             }
 
@@ -269,6 +271,11 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             }
             String stepKey = "第" + stepNumber + "步";
             String stepContent = resolveStepContent(stepsMap, stepKey);
+            String budget = budgetStop(request);
+            if (budget != null) {
+                outcomes.put(stepNumber, recordBudgetSkippedStep(stepNumber, stepKey, stepContent, budget, dynamicContext));
+                continue;
+            }
             Set<Integer> blockers = deps.getOrDefault(stepNumber, Collections.emptySet()).stream()
                     .filter(dependency -> {
                         DagStepOutcome outcome = outcomes.get(dependency);
@@ -295,7 +302,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             }
         }
         List<DagStepOutcome> unsuccessful = outcomes.values().stream()
-                .filter(outcome -> !outcome.isSuccessful())
+                .filter(outcome -> !outcome.isSuccessful() && outcome.status != DagStepStatus.SKIPPED)
                 .toList();
         if (!dynamicContext.isFinalizeRequested() && !unsuccessful.isEmpty()) {
             throw new FlowDagExecutionException("Flow sequential execution failed: " + unsuccessful);
@@ -345,6 +352,11 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                     }
                     if (dynamicContext.isFinalizeRequested()) {
                         return DagStepOutcome.skipped(stepNumber);
+                    }
+                    // Steps already running finish; a step that has not started is skipped once the budget is used up.
+                    String budget = budgetStop(request);
+                    if (budget != null) {
+                        return recordBudgetSkippedStep(stepNumber, stepKey, stepContent, budget, dynamicContext);
                     }
                     Set<Integer> blockers = dependencyFutures.entrySet().stream()
                             .filter(entry -> !entry.getValue().join().isSuccessful())
@@ -456,6 +468,30 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                 dynamicContext.getValue("sessionId"));
         log.warn("[DAG] 第{}步 BLOCKED blockers={}", stepNumber, blockers);
         return DagStepOutcome.blocked(stepNumber, blockers);
+    }
+
+    private DagStepOutcome recordBudgetSkippedStep(Integer stepNumber,
+                                                   String stepKey,
+                                                   String stepContent,
+                                                   String reason,
+                                                   DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext) {
+        String message = stepKey + " 未执行：" + reason;
+        dynamicContext.setValue("step" + stepNumber + "Status", "SKIPPED");
+        dynamicContext.setValue(BUDGET_STOP_KEY, reason);
+        recordRunStep(dynamicContext,
+                "flow_step4_execute_step_" + stepNumber,
+                displayNameForStep(dynamicContext, stepNumber, stepKey),
+                "flow_step4_execution",
+                stepNumber,
+                message + (stepContent == null || stepContent.isBlank() ? "" : "\n" + stepContent),
+                cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_BLOCKED);
+        sendStepEnd(dynamicContext,
+                "flow_step4_execute_step_" + stepNumber,
+                message,
+                "blocked",
+                dynamicContext.getValue("sessionId"));
+        log.info("[Budget][flow] 第{}步 未执行：{}", stepNumber, reason);
+        return DagStepOutcome.skipped(stepNumber);
     }
 
     private void recordFailedStep(Integer stepNumber,
@@ -798,9 +834,10 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         if (executorClientId != null && agentToolRegistry != null) {
             cn.bugstack.ai.domain.agent.service.execute.common.ExecutorToolCatalog catalog =
                     snapshotExecutorToolCatalog(executorClientId, dynamicToolCallbacks, 3);
-            sb.append("**【可用工具清单】**\n").append(renderToolRuntimeForPrompt(catalog, executorClientId)).append("\n\n");
+            sb.append("**【可用工具清单】**\n").append(renderToolRuntimeForPrompt(catalog, executorClientId,
+                    cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_DAG_EXECUTION)).append("\n\n");
             sb.append("**工具选择说明（重要）:**\n");
-            sb.append("- 当前已装载的工具可直接调用；绑定能力目录中的其他工具需先通过 request_tool 按确切工具名称装载，再调用。\n");
+            sb.append("- 当前已装载的工具可直接调用；仅在本阶段提供 request_tool 时，才可申请装载目录中的其他工具。\n");
             sb.append("- 【步骤内容】里的“使用工具/首选工具”是规划阶段给出的首选建议，不是唯一允许工具。\n");
             sb.append("- 如果首选工具返回字段不足、失败、空结果，或无法完成本步骤目标，可以改用【可用工具清单】中的其他相关工具补足，这不算偏离步骤。\n");
             sb.append("- 工具不足时先检查绑定能力目录并申请对应工具；只有真实无法装载/调用时才说明缺失，并基于已取得的数据输出结果。\n\n");
@@ -1119,7 +1156,8 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                 cn.bugstack.ai.domain.agent.service.execute.common.ExecutorToolCatalog catalog =
                         snapshotExecutorToolCatalog(clientId, dynamicToolCallbacks, 3);
                 prompt += "\n\n**【可用工具清单】**\n"
-                        + renderToolRuntimeForPrompt(catalog, clientId)
+                        + renderToolRuntimeForPrompt(catalog, clientId,
+                                cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.answerNow(attachTools))
                         + "\n如需补足信息可调用上述工具后再作答；不需要则直接作答。";
             }
             prompt = appendCurrentTimeContext(prompt);
@@ -1172,7 +1210,9 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                 if (hasEffort) ob.reasoningEffort(answerNowReasoningEffort);
                 spec = spec.options(ob.build());
             }
-            String answer = callStepWithStreaming(spec, dynamicContext, "flow_step4_answer_now", "立即回答",
+            boolean budgetStopped = dynamicContext.getValue(BUDGET_STOP_KEY) != null;
+            String answer = callStepWithStreaming(spec, dynamicContext, "flow_step4_answer_now",
+                    budgetStopped ? "基于已完成结果作答" : "立即回答",
                     cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.answerNow(attachTools),
                     prompt, request.getSessionId());
             if (answer == null || answer.isBlank()) answer = "（当前可用信息不足，无法立即作答。）";
@@ -1196,6 +1236,18 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             log.info("[AnswerNow][flow] 立即回答整合完成 len={}", answer.length());
             return "立即回答完成";
         } catch (Exception e) {
+            String completed = collectStepResults(dynamicContext);
+            if (cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.isBudgetFailure(e) && !completed.isBlank()) {
+                // Past the hard ceiling no model call is allowed; the completed steps are still the user's answer.
+                log.warn("[Budget][flow] 整合请求被预算硬顶拒绝，直接交付已完成步骤的结果: {}", e.getMessage());
+                String answer = cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.UNSUMMARIZED_NOTICE + "\n\n" + completed;
+                sendSseResult(dynamicContext, AutoAgentExecuteResultEntity.createSummaryResult(answer, request.getSessionId()));
+                if (conversationTurnMemoryService != null) conversationTurnMemoryService.saveFinalTurn(request, answer);
+                sendCompleteResult(dynamicContext, request.getSessionId());
+                dynamicContext.setStep(dynamicContext.getStep() + 1);
+                dynamicContext.setCompleted(true);
+                return "已交付已完成步骤的结果";
+            }
             log.error("[AnswerNow][flow] 立即回答失败", e);
             return "立即回答失败: " + e.getMessage();
         }
@@ -1204,7 +1256,12 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
     /** 立即回答（flow）：收集用户问题 + 计划(stepsMap) + 已完成子步产出 + 半截思考。 */
     private String buildFlowAnswerNowPrompt(DefaultFlowAgentExecuteStrategyFactory.DynamicContext ctx, ExecuteCommandEntity request) {
         StringBuilder sb = new StringBuilder();
-        sb.append("用户在执行过程中点击了【立即回答】，要求基于目前已有的（可能不完整的）信息立刻作答。\n\n");
+        Object budgetStop = ctx.getValue(BUDGET_STOP_KEY);
+        if (budgetStop != null) {
+            sb.append(budgetStop).append("，计划中尚未开始的步骤不再执行。请基于目前已完成的产出作答。\n\n");
+        } else {
+            sb.append("用户在执行过程中点击了【立即回答】，要求基于目前已有的（可能不完整的）信息立刻作答。\n\n");
+        }
         sb.append("**用户原始问题:**\n").append(userRequestForFlowPrompt(request, ctx)).append("\n\n");
 
         @SuppressWarnings("unchecked")
@@ -1224,7 +1281,8 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             sb.append("**已完成步骤的真实产出:**\n").append(stepResults).append("\n\n");
         }
 
-        String partialReasoning = cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter
+        // A budget stop interrupts nothing: steps in progress finished, so there is no half-finished thinking.
+        String partialReasoning = budgetStop != null ? null : cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter
                 .getLatestReasoning(request.getSessionId());
         if (partialReasoning != null && !partialReasoning.isBlank()) {
             String pr = partialReasoning.length() > 4000 ? partialReasoning.substring(0, 4000) + "...(截断)" : partialReasoning;
@@ -1233,7 +1291,9 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
 
         sb.append("**要求:**\n");
         sb.append("1. 立即基于以上信息直接回答用户原始问题，给出尽可能完整、有用的答案。\n");
-        sb.append("2. 未执行/信息不足的部分简要说明，不要编造工具结果。\n");
+        sb.append(budgetStop != null
+                ? "2. 在回答开头用一句话说明：任务预算已用完，部分步骤没有执行；并列出缺少的内容，不要编造工具结果。\n"
+                : "2. 未执行/信息不足的部分简要说明，不要编造工具结果。\n");
         sb.append("3. 不要输出\"状态/输出数据/Step N\"等流程化内容，直接给成品答案，用清晰 Markdown。\n");
         return sb.toString();
     }

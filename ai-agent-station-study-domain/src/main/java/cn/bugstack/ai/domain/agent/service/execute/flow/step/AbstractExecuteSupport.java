@@ -201,13 +201,28 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
     }
 
     protected String renderToolRuntimeForPrompt(ExecutorToolCatalog catalog, String clientId) {
+        return renderToolRuntimeForPrompt(catalog, clientId,
+                cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityPolicies.FLOW_STEP1_TOOL_ANALYSIS);
+    }
+
+    protected String renderToolRuntimeForPrompt(ExecutorToolCatalog catalog, String clientId,
+            cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityProfile profile) {
         String rendered = cn.bugstack.ai.domain.agent.service.prompt.RuntimeToolPromptComposer.renderToolRuntime(catalog);
         String bound = dynamicMcpToolCatalogService==null?"":dynamicMcpToolCatalogService.describeBoundMcpCapabilities(clientId);
-        if (rendered != null && !rendered.isBlank()) return rendered + (bound==null?"":bound);
+        boolean discovery = requestToolEnabled && dynamicMcpToolCatalogService != null;
+        boolean requestHere = discovery && profile != null
+                && profile.allows(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapability.REQUEST_TOOL);
+        String discoveryHint = requestHere
+                ? "当前已装载工具无法满足所需实时数据、联网信息或其他外部能力时，先调用 request_tool，在 needs 中描述所缺能力，装载真实工具后再调用；已有可用工具直接调用，不要用常识猜测替代查询。"
+                : discovery && profile == cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityProfile.CLARIFICATION_ONLY
+                    ? "本阶段只分析或规划，不调用 request_tool；未列出的所需外部能力标为待发现，留待执行阶段按需装载和查询。"
+                    : "本阶段未开放动态装载，请利用已有证据及实际提供的工具处理，缺少实时或外部数据时如实说明限制。";
+        if (rendered != null && !rendered.isBlank()) return rendered + (bound==null?"":bound)
+                + "\n" + discoveryHint;
         return "<tool_runtime>\n"
                 + "  <no_tools client_id=\"" + escapeXml(clientId) + "\">"
                 + "当前尚未装载业务 MCP 工具，不代表未配置或没有能力。"
-                + (requestToolEnabled ? "分析/规划直接阅读下方目录，执行阶段再按需装载并调用工具；不要虚构调用结果。" : "当前未开放动态装载，请如实说明限制，不要虚构调用结果。")
+                + discoveryHint + "不要虚构调用结果。"
                 + "</no_tools>\n"
                 + "</tool_runtime>" + (bound==null?"":bound);
     }
@@ -339,14 +354,29 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
         }
     }
 
+    /** Context key holding why the run stopped starting new steps (its budget or the daily quota). */
+    protected static final String BUDGET_STOP_KEY = "budgetStopReason";
+
+    /** Why this run should start no new phase, or null. */
+    protected String budgetStop(ExecuteCommandEntity req) {
+        return req == null ? null : cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.reachedFor(req.getRunId());
+    }
+
     /**
      * 立即回答路由钩子（flow）：finalizeRequested 置位时直接跳 Step4，由其顶部 finalizeNow 分支基于
      * "计划 + 已完成产出 + 半截思考"整合作答，短路剩余步骤。未置位返 null → 原流程逐字节不变。
      */
     protected String checkFinalizeRoute(ExecuteCommandEntity req,
                                         DefaultFlowAgentExecuteStrategyFactory.DynamicContext ctx) throws Exception {
-        if (!ctx.isFinalizeRequested()) return null;
-        log.info("[AnswerNow][flow] finalize requested → 跳 Step4 直接整合");
+        String budget = budgetStop(req);
+        if (!ctx.isFinalizeRequested() && budget == null) return null;
+        if (budget != null) {
+            // Each Flow stage is a phase: with the budget used up, skip to Step4, which answers from what is done.
+            ctx.setValue(BUDGET_STOP_KEY, budget);
+            log.info("[Budget][flow] {} → 跳 Step4 基于已完成结果作答", budget);
+        } else {
+            log.info("[AnswerNow][flow] finalize requested → 跳 Step4 直接整合");
+        }
         cn.bugstack.wrench.design.framework.tree.StrategyHandler<ExecuteCommandEntity,
                 DefaultFlowAgentExecuteStrategyFactory.DynamicContext, String> step4 = getBean("step4ExecuteStepsNode");
         return step4.apply(req, ctx);

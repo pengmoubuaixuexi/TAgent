@@ -71,6 +71,13 @@ public class AiClientNode extends AbstractArmorySupport {
     @Resource
     private cn.bugstack.ai.domain.agent.service.prompt.RunUserInputAdvisor runUserInputAdvisor;
 
+    /** 当前消息的附件清单（文件与引用的产物），所有节点模式共用。 */
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.attachment.RunAttachmentAdvisor runAttachmentAdvisor;
+
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.attachment.AttachmentNotices attachmentNotices;
+
     @Value("${agent.mcp.return-error-on-failure:true}")
     private boolean returnToolErrorOnFailure;
 
@@ -189,9 +196,10 @@ public class AiClientNode extends AbstractArmorySupport {
             // 无 ctx.envelope.* 时 no-op；不需要改 DB advisor 配置。
             advisors.add(new ContextEnvelopeRenderAdvisor());
             advisors.add(runUserInputAdvisor);
+            advisors.add(runAttachmentAdvisor);
             boolean imageInputSupported = configuredModel != null && configuredModel.supportsImageInput();
             advisors.add(new cn.bugstack.ai.domain.agent.service.multimodal.MultimodalMessageAdvisor(
-                    imageInputSupported));
+                    imageInputSupported, attachmentNotices::imagesNotSupported));
             log.info("[AiClientNode] clientId={} model={} imageInputSupported={}",
                     aiClientVO.getClientId(),
                     configuredModel == null ? aiClientVO.getModelBeanName() : configuredModel.getModelName(),

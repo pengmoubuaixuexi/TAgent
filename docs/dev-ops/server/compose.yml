@@ -21,6 +21,8 @@ services:
     environment:
       JAVA_OPTS: "-Xms128m -Xmx768m -XX:MaxDirectMemorySize=128m -XX:+ExitOnOutOfMemoryError"
       TZ: Asia/Shanghai
+      TAGENT_SANDBOX_URL: http://sandbox-runner:8000
+      TAGENT_SANDBOX_TOKEN: ${SANDBOX_TOKEN:-}
     volumes:
       - ./application-cloud.yml:/app/config/application-cloud.yml:ro
       - app-data:/app/data
@@ -121,6 +123,7 @@ services:
       - grafana-data:/var/lib/grafana
       - ./grafana-datasource.yml:/etc/grafana/provisioning/datasources/default.yml:ro
       - ../grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ../grafana/provisioning/alerting:/etc/grafana/provisioning/alerting:ro
     mem_limit: 256m
   jaeger:
     <<: *service
@@ -172,6 +175,27 @@ services:
     <<: *service
     build: {context: ., dockerfile: markitdown.Dockerfile}
     mem_limit: 256m
+  # Code sandbox (2026-10, batch 3). Only the runner talks to Docker; it starts one throwaway
+  # container per execution from the fixed image below: no network, read-only root, 512 MB, 60 s.
+  # Internal network only: never publish its port.
+  sandbox-runner:
+    <<: *service
+    build: {context: ../../../sandbox-runner}
+    environment:
+      SANDBOX_TOKEN: ${SANDBOX_TOKEN:-}
+      SANDBOX_IMAGE: tagent-sandbox-python:1
+      SANDBOX_VOLUME: tagent-sandbox-work
+      SANDBOX_WORKERS: ${SANDBOX_WORKERS:-3}
+      SANDBOX_MIN_FREE_DISK_MB: ${SANDBOX_MIN_FREE_DISK_MB:-512}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - sandbox-work:/sandbox-root
+    mem_limit: 256m
+  # Build-only: `docker compose build sandbox-python` produces the execution image the runner uses.
+  sandbox-python:
+    profiles: [build-only]
+    build: {context: ../../../sandbox-runner/python-image}
+    image: tagent-sandbox-python:1
   # Optional database consoles: SSH tunnel only; never publish on 0.0.0.0.
   phpmyadmin:
     <<: *service
@@ -196,6 +220,7 @@ services:
     ports: ["127.0.0.1:8081:8081"]
     mem_limit: 128m
 volumes:
+  sandbox-work: {name: tagent-sandbox-work}
   mysql-data:
   pg-data:
   redis-data:

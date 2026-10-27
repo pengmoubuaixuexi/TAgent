@@ -72,6 +72,14 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private cn.bugstack.ai.domain.agent.service.execute.common.ToolCallLedger toolCallLedger;
 
+    /** 计划确认后继续执行：附件从运行记录重新登记，不依赖暂停期间的内存状态。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.attachment.IChatFileService chatFileService;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.attachment.RunAttachmentRegistry runAttachments;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private cn.bugstack.ai.domain.agent.service.sandbox.ISandboxService sandboxService;
+
     /** per-session 活跃执行上下文，用于支持 cancelExecute() */
     private final ConcurrentHashMap<String, DefaultFlowAgentExecuteStrategyFactory.DynamicContext> activeContexts = new ConcurrentHashMap<>();
 
@@ -168,6 +176,7 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
                     .redoTargetStepContextPrompt(state.getRedoTargetStepContextPrompt())
                     .userId(state.getUserId())
                     .tenantId(state.getTenantId())
+                    .attachments(resumedAttachments(state))
                     .maxStep(4)
                     .build();
             DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext =
@@ -284,6 +293,7 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
                             if (runId != null && mcpToolCatalogService != null) cleanupResume("tools",runId,()->mcpToolCatalogService.cleanupRun(runId));
                             cleanupResume("reasoning",runId,()->cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearRun(runId));
                             if (runId != null && toolCallLedger != null) cleanupResume("evidence",runId,()->toolCallLedger.clear(runId));
+                            if (runId != null && sandboxService != null) cleanupResume("sandbox",runId,()->sandboxService.releaseRun(runId));
                         }
                     } finally {
                         clearMdc("agentId", "agentVersion", "sessionId", "runId", "agent.run_id", "userId", "tenantId");
@@ -292,6 +302,21 @@ public class FlowAgentExecuteStrategy implements IExecuteStrategy, IFlowPlanRevi
                 }
             }
         });
+    }
+
+    private java.util.List<cn.bugstack.ai.domain.agent.model.entity.ChatFileRef> resumedAttachments(FlowPlanReviewState state) {
+        if (chatFileService == null || state.getRunId() == null || state.getUserId() == null) return java.util.List.of();
+        try {
+            var files = chatFileService.forRun(state.getUserId(), state.getRunId());
+            if (runAttachments != null) {
+                runAttachments.register(state.getRunId(), state.getUserId(), state.getSessionId(), files,
+                        chatFileService.sessionIndex(state.getUserId(), state.getSessionId()));
+            }
+            return files;
+        } catch (RuntimeException unavailable) {
+            log.warn("[FlowPlanReview] attachments unavailable on resume runId={}: {}", state.getRunId(), unavailable.toString());
+            return java.util.List.of();
+        }
     }
 
     private void cleanupResume(String resource,String runId,Runnable cleanup) {

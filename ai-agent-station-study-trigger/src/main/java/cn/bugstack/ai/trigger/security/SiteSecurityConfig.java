@@ -34,10 +34,10 @@ public class SiteSecurityConfig {
                         .permitAll()
                         .requestMatchers("/", "/index.html", "/auth.js", "/favicon.ico", "/error",
                                 "/workspace-nav.js", "/workspace-nav.css", "/workspace-inbox.js", "/workspace-inbox.css",
-                                "/run-artifacts.js", "/run-artifacts.css").permitAll()
+                                "/run-artifacts.js", "/run-artifacts.css", "/chat-attachments.js", "/chat-attachments.css").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/v1/auth/csrf").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/v1/auth/login", "/api/v1/auth/register").permitAll()
-                        .requestMatchers("/admin-stats.html", "/api/v1/observe/site-stats", "/agent-config.html",
+                        .requestMatchers("/admin-stats.html", "/admin-models.html", "/api/v1/observe/site-stats", "/agent-config.html",
                                 "/api/v1/agent/query_agent_config/**",
                                 "/api/v1/agent/armory_api", "/api/v1/agent/armory_agent",
                                 "/actuator/**", "/ops/**").hasRole("ADMIN")

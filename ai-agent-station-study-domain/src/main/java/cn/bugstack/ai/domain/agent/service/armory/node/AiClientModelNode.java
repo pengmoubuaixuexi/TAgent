@@ -70,6 +70,19 @@ public class AiClientModelNode extends AbstractArmorySupport {
     @org.springframework.context.annotation.Lazy
     private cn.bugstack.ai.domain.agent.service.execute.common.RunArtifactService runArtifactService;
 
+    /** read_attachment：附件读取服务（基础设施层实现）与运行级附件登记。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    @org.springframework.context.annotation.Lazy
+    private cn.bugstack.ai.domain.agent.service.attachment.IChatFileService chatFileService;
+
+    @Resource
+    private cn.bugstack.ai.domain.agent.service.attachment.RunAttachmentRegistry runAttachmentRegistry;
+
+    /** run_python：沙箱服务（触发层实现，未配置沙箱时 available()=false）。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    @org.springframework.context.annotation.Lazy
+    private cn.bugstack.ai.domain.agent.service.sandbox.ISandboxService sandboxService;
+
     @Value("${agent.mcp.return-error-on-failure:true}")
     private boolean returnToolErrorOnFailure;
 
@@ -230,11 +243,17 @@ public class AiClientModelNode extends AbstractArmorySupport {
             robustMgr.setToolCallProgressEmitter(toolCallProgressEmitter);
             robustMgr.setToolResultReferenceService(toolResultReferenceService);
             robustMgr.setRunArtifactService(runArtifactService);
+            robustMgr.setChatFileService(chatFileService, runAttachmentRegistry);
+            robustMgr.setToolCallLedger(toolCallLedger);
+            robustMgr.setSandboxService(sandboxService);
 
+            // 统一重试（2026-10-24）：网络波动、5xx、429 只在请求层重试（ModelConnections，agent.model-failover.retry.*），
+            // 工具循环中途的请求也覆盖。不再叠加 Spring AI 默认的 10 次重试（2s 起指数退避到 3 分钟）。
             OpenAiChatModel chatModel = OpenAiChatModel.builder()
                     .openAiApi(openAiApi)
                     .defaultOptions(optionsBuilder.build())
                     .toolCallingManager(robustMgr)
+                    .retryTemplate(org.springframework.retry.support.RetryTemplate.builder().maxAttempts(1).build())
                     .build();
 
             // 注册 Bean 对象

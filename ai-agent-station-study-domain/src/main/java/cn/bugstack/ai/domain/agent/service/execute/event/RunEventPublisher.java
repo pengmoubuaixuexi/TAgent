@@ -46,6 +46,22 @@ public class RunEventPublisher {
     private final ConcurrentHashMap<String, String> sessionRunIds = new ConcurrentHashMap<>();
     private final AtomicLong localEventSequence = new AtomicLong();
 
+    /** Budget notices reach the run's chat card like a model fallback notice. */
+    @jakarta.annotation.PostConstruct
+    public void listenToBudgets() {
+        cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.listener(
+                new cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.Listener() {
+            @Override public void warned(cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.State state, long used, long budget) {
+                publishToRun(state.runId(), null, "run_budget_notice", Map.of("level", "WARNING",
+                        "notice", "本次任务已用掉 " + used * 100 / budget + "% 的 Token 预算；用完后会做完当前阶段，再基于已完成的结果作答"));
+            }
+            @Override public void reached(cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.State state, String reason) {
+                publishToRun(state.runId(), null, "run_budget_notice", Map.of("level", "REACHED",
+                        "notice", reason + "：当前阶段完成后不再开始新的步骤，直接基于已完成的结果作答"));
+            }
+        });
+    }
+
     public void registerRun(String runId, String sessionId) {
         if (!blank(runId) && !blank(sessionId)) sessionRunIds.putIfAbsent(sessionId, runId);
     }
@@ -120,6 +136,7 @@ public class RunEventPublisher {
         if (notificationProjector != null) {
             notificationProjector.project(runId, sessionId, eventType, payloadJson);
         }
+        cn.bugstack.ai.domain.agent.service.trace.RunTrace.event(runId, eventType, payloadJson);
 
         timeline(runId).append(record);
         List<Subscriber> current = subscribers.get(runId);
@@ -134,6 +151,14 @@ public class RunEventPublisher {
     public String publishCurrent(String sessionId, String eventType, Object payload) {
         String runId = currentRunId(sessionId);
         return runId == null ? null : publish(runId, sessionId, eventType, payload);
+    }
+
+    /** For request-layer sources that know the run but not always its session. */
+    public String publishToRun(String runId, String sessionId, String eventType, Object payload) {
+        if (blank(runId)) return null;
+        String session = !blank(sessionId) ? sessionId : sessionRunIds.entrySet().stream()
+                .filter(entry -> runId.equals(entry.getValue())).map(Map.Entry::getKey).findFirst().orElse(null);
+        return publish(runId, session, eventType, payload);
     }
 
     public void checkpoint(String runId) {
@@ -169,6 +194,7 @@ public class RunEventPublisher {
                         for (Subscriber subscriber : current) subscriber.complete();
                     }
                     sessionRunIds.entrySet().removeIf(entry -> runId.equals(entry.getValue()));
+                    cn.bugstack.ai.domain.agent.service.trace.RunTrace.finishRun(runId);
                 }
             }
         }

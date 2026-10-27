@@ -6,6 +6,8 @@
 <script defer src="/workspace-nav.js"></script>
 <link rel="stylesheet" href="/run-artifacts.css">
 <script src="/run-artifacts.js"></script>
+<link rel="stylesheet" href="/chat-attachments.css">
+<script src="/chat-attachments.js"></script>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI Agent Station</title>
@@ -17,7 +19,8 @@
 <style>
   * { box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
-  #chatScreen { height:calc(100vh - var(--workspace-nav-height,0px)); height:calc(100dvh - var(--workspace-nav-height,0px)); }
+  #chatScreen { height:calc(100vh - var(--workspace-nav-height,0px) - var(--site-footer-height,41px)); height:calc(100dvh - var(--workspace-nav-height,0px) - var(--site-footer-height,41px)); }
+  #loginScreen { min-height:calc(100vh - var(--site-footer-height,41px)); min-height:calc(100dvh - var(--site-footer-height,41px)); }
   .msg-content pre { background:#1e293b; color:#e2e8f0; padding:12px; border-radius:8px; overflow-x:auto; margin:8px 0; font-size:13px; }
   .msg-content code { background:#334155; color:#f1f5f9; padding:2px 6px; border-radius:4px; font-size:13px; }
   .msg-content pre code { background:transparent; padding:0; }
@@ -457,17 +460,18 @@
       <div id="runCommandPalette" class="hidden absolute left-0 right-0 bottom-full mb-2 bg-[#111827] border border-gray-700 rounded-lg shadow-2xl overflow-hidden z-30"></div>
       <div id="runRedoHint" class="hidden mb-2 text-xs text-cyan-200 bg-cyan-950/40 border border-cyan-800/70 rounded-md px-3 py-2"></div>
       <div id="imagePreviewStrip" class="hidden mb-2 flex gap-2 flex-wrap"></div>
-      <div class="flex gap-3">
+      <div id="fileAttachmentStrip" class="hidden mb-2 flex gap-2 flex-wrap"></div>
+      <div id="composerRow" class="flex gap-3">
       <button onclick="newSession()" title="新会话"
         class="bg-gray-800 hover:bg-gray-700 text-gray-400 px-3 py-3 rounded-lg transition text-sm shrink-0">
         + 新会话
       </button>
-      <input id="chatImageInput" type="file" accept="image/*" multiple class="hidden" onchange="onChatImagesSelected(event)">
-      <button onclick="document.getElementById('chatImageInput').click()" title="添加图片（最多 4 张，每张 10MB）"
+      <input id="chatFileInput" type="file" multiple class="hidden" onchange="onChatFilesSelected(event)">
+      <button id="attachBtn" onclick="openAttachMenu(this)" title="添加附件：文件、图片或我的产物"
         class="bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-3 rounded-lg transition text-sm shrink-0">
-        🖼️
+        📎
       </button>
-      <textarea id="msgInput" rows="1" placeholder="输入消息，也可粘贴图片..."
+      <textarea id="msgInput" rows="1" placeholder="输入消息，可粘贴图片，或把文件拖到这里..."
         class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition resize-none"
         onkeydown="onComposerKey(event)"
         onpaste="onChatImagePaste(event)"
@@ -624,12 +628,18 @@ async function doLogout() {
   state.userId = null; state.username = null; state.sessionId = null;
   state.pendingImages = [];
   renderPendingImages();
+  window.ChatAttachments?.clear();
   document.getElementById('messageArea').innerHTML = '<div class="text-center text-gray-600 text-sm py-8"><p class="text-4xl mb-3">👋</p><p>已退出登录</p></div>';
   showLogin();
 }
 
 // ==================== CHAT ====================
 async function showChat() {
+  await showChatView();
+  void window.ChatAttachments?.initFromUrl();
+}
+
+async function showChatView() {
   window.WorkspaceNav?.setUser({userId:state.userId,username:state.username,role:state.role});
   document.getElementById('loginScreen').style.display = 'none';
   document.getElementById('chatScreen').classList.remove('hidden');
@@ -722,6 +732,7 @@ async function refreshNotifications(silent = false, afterMarkAll = false) {
     if (owner !== state.userId || version !== notificationRefreshVersion) return;
     state.notifications = Array.isArray(body.data) ? body.data : [];
     renderNotifications();
+    window.TAgentModelAlerts?.show(state.notifications);
     await acknowledgeVisibleRunNotifications();
   } catch (e) {
     if (!silent && list) {
@@ -788,6 +799,8 @@ async function acknowledgeVisibleRunNotifications() {
 function notificationVisual(item) {
   const status = notificationEffectiveStatus(item);
   const type = String((item && item.type) || '').toUpperCase();
+  if (type === 'MODEL_RECOVERED' || type === 'MODEL_UNAVAILABLE' && status === 'RESOLVED') return { color:'#059669', label:'模型已恢复', icon:'✓' };
+  if (type === 'MODEL_UNAVAILABLE') return { color:'#dc2626', label:'模型不可用', icon:'!' };
   if (status === 'EXPIRED') return { color:'#d97706', label:'已过期', icon:'⌛' };
   if (status === 'TASK_FAILED' || type === 'TASK_FAILED' || status === 'FAILED') return { color:'#dc2626', label:'执行失败', icon:'✕' };
   if (status === 'TASK_COMPLETED' || type === 'TASK_COMPLETED' || status === 'RESOLVED' || status === 'COMPLETED') {
@@ -906,6 +919,13 @@ async function openNotification(notificationId) {
   }
   const panel = document.getElementById('notificationPanel');
   if (panel) panel.classList.add('hidden');
+  // Model health cards belong to the model pages, not to a conversation.
+  const link = item.metadata && typeof item.metadata.link === 'string' && item.metadata.link.startsWith('/') ? item.metadata.link : null;
+  if (link && ['MODEL_UNAVAILABLE', 'MODEL_RECOVERED'].includes(String(item.type || '').toUpperCase())) {
+    await ackNotification(null, notificationId);
+    location.href = link;
+    return true;
+  }
   if (!item.sessionId) {
     showNotificationToast('这条通知没有关联会话，无法跳转。', true);
     return false;
@@ -1144,6 +1164,8 @@ function newSession(options = {}) {
   hideApprovalModal();
   state.pendingImages = [];
   renderPendingImages();
+  // Unsent uploads do not follow the user into another conversation (sending the first message keeps them).
+  if (!options.preserveAttachments) window.ChatAttachments?.discard();
   state.sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
   document.getElementById('sessionInfo').textContent = 'Session: ' + state.sessionId.substring(0, 28) + '...';
   saveActiveConversation(state.sessionId);
@@ -2010,12 +2032,20 @@ async function consumeRestoredPlanSse(response, aiMsg, planCard, restoredPayload
         state.interventionEnabled = true;
         showAnswerNow(true);
       }
+    } else if (curEvent === 'model_fallback') {
+      renderModelFallback(aiMsg, payload);
+    } else if (curEvent === 'run_budget_notice') {
+      renderRunBudgetNotice(aiMsg, payload);
+    } else if (curEvent === 'attachment_notice') {
+      window.ChatAttachments?.notice(aiMsg, payload);
     } else if (curEvent === 'artifact_created') {
       window.RunArtifacts?.render(aiMsg, payload);
     } else if (curEvent === 'artifact_progress') {
       window.RunArtifacts?.progress(aiMsg, payload);
     } else if (curEvent === 'tool_call_start') {
       createRestoredToolCard(payload);
+    } else if (curEvent === 'tool_call_progress') {
+      showToolProgressMessage(toolProgressByName, payload);
     } else if (curEvent === 'tool_call_end') {
       finishRestoredToolCard(payload, payload.status || 'success', '');
     } else if (curEvent === 'tool_call_error') {
@@ -2550,11 +2580,23 @@ function escapeJsAttr(s) {
 const CHAT_IMAGE_MAX_COUNT = 4;
 const CHAT_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 
-async function onChatImagesSelected(event) {
+// 统一附件入口：图片走原有多模态流程，其余文件上传后由服务端解析，产物按 ID + 版本引用。
+function onChatFilesSelected(event) {
   const files = Array.from(event.target.files || []);
   event.target.value = '';
-  await appendChatImageFiles(files);
+  window.ChatAttachments?.select(files, images => appendChatImageFiles(images));
 }
+
+function openAttachMenu(anchor) {
+  const input = document.getElementById('chatFileInput');
+  window.ChatAttachments?.openMenu(anchor, () => input.click());
+}
+
+(() => {
+  const input = document.getElementById('chatFileInput');
+  if (input && window.ChatAttachments) input.accept = window.ChatAttachments.ACCEPT;
+  window.ChatAttachments?.bindDrop(document.getElementById('composerRow'), images => appendChatImageFiles(images));
+})();
 
 async function onChatImagePaste(event) {
   const items = Array.from((event.clipboardData && event.clipboardData.items) || []);
@@ -2758,6 +2800,7 @@ function consumeBackgroundTaskComposer() {
   }
   state.pendingImages = [];
   renderPendingImages();
+  window.ChatAttachments?.clear();
   hideRunCommandPalette();
 }
 
@@ -3064,16 +3107,21 @@ async function sendMessage() {
   const input = document.getElementById('msgInput');
   const rawMessage = input.value.trim();
   const messageImages = mergeMessageImages(state.pendingImages, extractImageUrls(rawMessage));
+  const attachmentWait = window.ChatAttachments ? window.ChatAttachments.blocking() : null;
+  if (attachmentWait) { alert(attachmentWait); return; }
+  const messageFiles = window.ChatAttachments ? window.ChatAttachments.payload() : [];
+  const messageFileCards = window.ChatAttachments ? window.ChatAttachments.cards() : [];
   const redoCommand = parseRunRedoCommand(rawMessage);
   const message = (redoCommand ? redoCommand.message : rawMessage)
-    || (messageImages.length ? '请查看并介绍我附带的图片。' : '');
-  if (!message && !messageImages.length) return;
+    || (messageImages.length ? '请查看并介绍我附带的图片。' : '')
+    || (messageFiles.length ? '请查看我附带的附件。' : '');
+  if (!message && !messageImages.length && !messageFiles.length) return;
   hideRunCommandPalette();
   state.selectedRunRedo = redoCommand || null;
   // aiAgentId 为空时走后端统一路由（自动模式）
-  if (!state.sessionId) newSession();
+  if (!state.sessionId) newSession({ preserveAttachments: true });
   saveActiveConversation(state.sessionId);
-  if (!redoCommand && await tryHandleBackgroundTaskCommand(message, messageImages)) {
+  if (!redoCommand && await tryHandleBackgroundTaskCommand(message, [...messageImages, ...messageFiles])) {
     return;
   }
   const runId = (window.crypto && crypto.randomUUID)
@@ -3090,6 +3138,7 @@ async function sendMessage() {
   input.value = ''; input.style.height = '';
   state.pendingImages = [];
   renderPendingImages();
+  window.ChatAttachments?.clear();
   renderRunRedoHint(null);
   const ac = new AbortController();
   state.abortController = ac;
@@ -3099,7 +3148,7 @@ async function sendMessage() {
   const userDisplayMessage = redoCommand
     ? `基于历史运行 ${shortRunId(redoCommand.sourceRunId)} 的 ${redoCommand.stepLabel || `Step${redoCommand.redoFromStep}`} 进行修正：${message}`
     : message;
-  addMessage('user', userDisplayMessage, false, null, null, messageImages);
+  addMessage('user', userDisplayMessage, false, null, null, messageImages, messageFileCards);
   // 添加 AI 占位
   const aiMsg = addMessage('assistant', '', true, null, runId);
   initializeRunEventLedger(aiMsg, runId, state.sessionId);
@@ -3131,6 +3180,7 @@ async function sendMessage() {
           mimeType: image.mimeType || null,
           size: image.size || null
         })),
+        attachments: messageFiles,
         sessionId: state.sessionId,
         runId: runId,
         userId: state.userId,
@@ -3345,6 +3395,8 @@ async function sendMessage() {
       if (shortName.includes('aisearch') || shortName.includes('search')) return '检索资料';
       if (shortName.includes('amap') || shortName.includes('route') || shortName.includes('geo')) return '查地图';
       if (shortName.includes('weather')) return '查天气';
+      if (shortName === 'run_python') return '运行代码';
+      if (shortName === 'read_attachment') return '读取附件';
       if (shortName.includes('calculate')) return '计算';
       if (shortName.includes('create') || shortName.includes('publish') || shortName.includes('update') || shortName.includes('delete')) return '写入操作';
       return '调用工具';
@@ -4051,6 +4103,12 @@ async function sendMessage() {
           state.interventionEnabled = true;
           showAnswerNow(true);
         }
+      } else if (curEvent === 'model_fallback') {
+        renderModelFallback(aiMsg, payload);
+      } else if (curEvent === 'run_budget_notice') {
+        renderRunBudgetNotice(aiMsg, payload);
+      } else if (curEvent === 'attachment_notice') {
+        window.ChatAttachments?.notice(aiMsg, payload);
       } else if (curEvent === 'agent_routed') {
         // 路由命中：把作者标题从「路由中…」替换成「名称(id)」
         if (aiAuthorEl) {
@@ -4066,6 +4124,8 @@ async function sendMessage() {
         window.RunArtifacts?.progress(aiMsg, payload);
       } else if (curEvent === 'tool_call_start') {
         createToolProgressCard(payload);
+      } else if (curEvent === 'tool_call_progress') {
+        showToolProgressMessage(toolProgressByName, payload);
       } else if (curEvent === 'tool_call_end') {
         finishToolProgress(payload, payload.status || 'success', '');
       } else if (curEvent === 'tool_call_error') {
@@ -4899,6 +4959,15 @@ function acceptRunEvent(aiMsg, payload, eventId) {
   return true;
 }
 
+// run_python 等长时间工具的状态行：排队位置、已运行秒数。只改仍在运行的卡片。
+function showToolProgressMessage(registry, payload) {
+  if (!payload || !payload.message) return;
+  const entry = findToolCallEntry(registry[payload.toolName || ''], payload, true);
+  if (!entry || entry.status !== 'running') return;
+  const statusEl = entry.card.querySelector('.tool-status');
+  if (statusEl) statusEl.textContent = payload.message;
+}
+
 function findToolCallEntry(entries, payload, matchRunning) {
   const queue = entries || [];
   if (payload && payload.callId) return queue.find(entry => entry.payload?.callId === payload.callId) || null;
@@ -5416,7 +5485,7 @@ function flashButtonText(btn, text, restoreText) {
   }, 1400);
 }
 
-function addMessage(role, content, isPlaceholder, agentId, runId, images) {
+function addMessage(role, content, isPlaceholder, agentId, runId, images, files) {
   const area = document.getElementById('messageArea');
   // 移除空状态。第 70 轮：排除历史顶部哨兵（它也带 .text-center），否则在历史会话里继续发消息会误删哨兵
   const empty = area.querySelector('.text-center:not(#historyTopSentinel)');
@@ -5443,7 +5512,7 @@ function addMessage(role, content, isPlaceholder, agentId, runId, images) {
         ${role === 'assistant' ? `<button type="button" class="msg-copy-run ${runId ? '' : 'hidden'} text-[11px] text-cyan-300 hover:text-white shrink-0" onclick="copyMessageRunId(this)">复制 runId</button>` : ''}
       </div>
       <div class="msg-content text-sm leading-relaxed ${isPlaceholder ? 'typing' : ''}">
-        ${isPlaceholder ? '<span class="text-gray-500">思考中...</span>' : renderMessageImages(images) + renderMarkdown(content)}
+        ${isPlaceholder ? '<span class="text-gray-500">思考中...</span>' : renderMessageImages(images) + renderMessageFiles(files) + renderMarkdown(content)}
       </div>
       ${role === 'assistant' ? '<div class="msg-actions mt-2 text-right flex justify-end gap-3"><button type="button" class="msg-evidence-map hidden text-[11px] text-violet-300 hover:text-white" onclick="openEvidenceMap(this)">生成证据地图</button><button type="button" class="msg-copy-final hidden text-[11px] text-gray-400 hover:text-white" onclick="copyFinalAnswerFromMessage(this)">复制回复</button></div>' : ''}
     </div>
@@ -5576,6 +5645,8 @@ function timelineToolActionText(toolName) {
   if (shortName.includes('aisearch') || shortName.includes('search')) return '检索资料';
   if (shortName.includes('amap') || shortName.includes('route') || shortName.includes('geo')) return '查地图';
   if (shortName.includes('weather')) return '查天气';
+  if (shortName === 'run_python') return '运行代码';
+  if (shortName === 'read_attachment') return '读取附件';
   if (shortName.includes('calculate')) return '计算';
   if (shortName.includes('create') || shortName.includes('publish')
       || shortName.includes('update') || shortName.includes('delete')) return '写入操作';
@@ -5751,6 +5822,44 @@ function timelineEvidence(view, payload, memory) {
   card.querySelector('.evidence-count').textContent = `${body.querySelectorAll('.evidence-item').length} 条`;
 }
 
+// 请求层模型降级：本次回答由备用模型完成时，在作者行下标注一行（同一对模型只标一次）。
+function renderModelFallback(aiMsg, payload) {
+  if (!aiMsg || !payload || !payload.notice) return;
+  const key = String(payload.requestedModel || '') + '>' + String(payload.actualModel || '');
+  let box = aiMsg.querySelector('.model-fallback-notes');
+  if (!box) {
+    const content = aiMsg.querySelector('.msg-content');
+    if (!content) return;
+    box = document.createElement('div');
+    box.className = 'model-fallback-notes text-[11px] text-amber-300/90 mb-1';
+    content.parentElement.insertBefore(box, content);
+  }
+  if ([...box.children].some(node => node.dataset.key === key)) return;
+  const line = document.createElement('div');
+  line.dataset.key = key;
+  line.textContent = '↻ ' + String(payload.notice);
+  box.appendChild(line);
+}
+
+// Budget notices: one line per level (80% warning, budget used up), shown above the answer.
+function renderRunBudgetNotice(aiMsg, payload) {
+  if (!aiMsg || !payload || !payload.notice) return;
+  const key = 'budget:' + String(payload.level || '');
+  let box = aiMsg.querySelector('.model-fallback-notes');
+  if (!box) {
+    const content = aiMsg.querySelector('.msg-content');
+    if (!content) return;
+    box = document.createElement('div');
+    box.className = 'model-fallback-notes text-[11px] text-amber-300/90 mb-1';
+    content.parentElement.insertBefore(box, content);
+  }
+  if ([...box.children].some(node => node.dataset.key === key)) return;
+  const line = document.createElement('div');
+  line.dataset.key = key;
+  line.textContent = (payload.level === 'REACHED' ? '⏹ ' : '⚠ ') + String(payload.notice);
+  box.appendChild(line);
+}
+
 function timelineInteraction(view, eventType, payload) {
   const id = payload && (payload.approvalId || payload.inputId);
   if (!id) return;
@@ -5828,6 +5937,12 @@ function applyRunTimelineEvent(view, eventType, payload, eventId, interactive) {
     timelineInteraction(view, eventType, payload || {});
     if (interactive && eventType === 'human_approval_required') enqueueApproval(payload);
     if (interactive && eventType === 'user_input_required') showUserInput(payload);
+  } else if (eventType === 'model_fallback') {
+    renderModelFallback(view.aiMsg, payload);
+  } else if (eventType === 'run_budget_notice') {
+    renderRunBudgetNotice(view.aiMsg, payload);
+  } else if (eventType === 'attachment_notice') {
+    window.ChatAttachments?.notice(view.aiMsg, payload);
   } else if (eventType === 'agent_routed' && payload) {
     const author = view.aiMsg.querySelector('.msg-author');
     if (author) author.textContent = payload.agentName || agentLabel(payload.agentId);
@@ -6221,7 +6336,8 @@ async function restoreRunTimelines(messages, renderedMessages, sessionId) {
           ? `${API}/attachments/${encodeURIComponent(image.attachmentId)}?userId=${encodeURIComponent(state.userId || '')}`
           : image.sourceUrl
       }));
-      addMessage('user', active.originalMessage || '运行中的任务', false, active.agentId, active.runId, activeImages);
+      const activeFiles = (active.attachments || []).map(file => ({ ...file, status: file.status || 'ACTIVE' }));
+      addMessage('user', active.originalMessage || '运行中的任务', false, active.agentId, active.runId, activeImages, activeFiles);
     }
     if (!pair) {
       pair = {node: addMessage('assistant', '', true, active.agentId, active.runId), message: {content: ''}};
@@ -6234,6 +6350,10 @@ async function restoreRunTimelines(messages, renderedMessages, sessionId) {
   } catch (e) {
     console.warn('restore run timeline failed', e);
   }
+}
+
+function renderMessageFiles(files) {
+  return window.ChatAttachments ? window.ChatAttachments.renderCards(files) : '';
 }
 
 function renderMessageImages(images) {
@@ -6569,7 +6689,7 @@ async function loadConversation(conversationId, options = {}) {
     area.innerHTML = '';
     // 先全部 append 消息（addMessage 会 scrollBottom，正常）
     const renderedMessages = messages.map(m =>
-      addMessage(m.messageType === 'USER' ? 'user' : 'assistant', m.content, false, m.agentId, m.runId, m.images)
+      addMessage(m.messageType === 'USER' ? 'user' : 'assistant', m.content, false, m.agentId, m.runId, m.images, m.files)
     );
     // 再插入哨兵到顶部（避免 addMessage 内部 querySelector('.text-center') 误删它）
     insertHistoryTopSentinel(area);
@@ -6670,7 +6790,7 @@ async function loadHistoryEarlier() {
     const sentinel = document.getElementById('historyTopSentinel');
     const fragment = document.createDocumentFragment();
     messages.forEach(m => {
-      const node = buildMessageNode(m.messageType === 'USER' ? 'user' : 'assistant', m.content, m.agentId, m.runId, m.images);
+      const node = buildMessageNode(m.messageType === 'USER' ? 'user' : 'assistant', m.content, m.agentId, m.runId, m.images, m.files);
       if (node) fragment.appendChild(node);
     });
     if (sentinel && sentinel.nextSibling) {
@@ -6704,7 +6824,7 @@ async function loadHistoryEarlier() {
 
 // 与 addMessage 同源的 DOM 构造，但只构造不挂载、不 scroll，供 prepend 使用。
 // 改 addMessage 时记得同步这里。
-function buildMessageNode(role, content, agentId, runId, images) {
+function buildMessageNode(role, content, agentId, runId, images, files) {
   const div = document.createElement('div');
   div.className = 'fade-in flex gap-3 ' + (role === 'user' ? 'flex-row-reverse' : '');
   div.dataset.messageRole = role;
@@ -6725,7 +6845,7 @@ function buildMessageNode(role, content, agentId, runId, images) {
         <div class="text-xs text-gray-500 msg-author flex-1 min-w-0 truncate">${role === 'user' ? state.username : escapeHtml(agentLabel(agentId))}</div>
         ${role === 'assistant' ? `<button type="button" class="msg-copy-run ${runId ? '' : 'hidden'} text-[11px] text-cyan-300 hover:text-white shrink-0" onclick="copyMessageRunId(this)">复制 runId</button>` : ''}
       </div>
-      <div class="msg-content text-sm leading-relaxed">${renderMessageImages(images)}${renderMarkdown(content)}</div>
+      <div class="msg-content text-sm leading-relaxed">${renderMessageImages(images)}${renderMessageFiles(files)}${renderMarkdown(content)}</div>
       ${role === 'assistant' ? '<div class="msg-actions mt-2 text-right flex justify-end gap-3"><button type="button" class="msg-evidence-map hidden text-[11px] text-violet-300 hover:text-white" onclick="openEvidenceMap(this)">生成证据地图</button><button type="button" class="msg-copy-final hidden text-[11px] text-gray-400 hover:text-white" onclick="copyFinalAnswerFromMessage(this)">复制回复</button></div>' : ''}
     </div>
   `;
@@ -6736,5 +6856,6 @@ function buildMessageNode(role, content, agentId, runId, images) {
 // ==================== START ====================
 init();
 </script>
+<footer id="site-footer"><a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">赣ICP备2026025840号-1</a></footer>
 </body>
 </html>

@@ -538,6 +538,13 @@ public class MeteredToolCallback implements ToolCallback, McpClientRegistry.Orig
                 ledger.record(runId, name, progressStatus,
                         rawResultChars >= 0 ? rawResultChars : 0, rawResultForTrace);
             }
+            // Run trace: the provider's complete result, before any projection for the model.
+            if (budget != null && cn.bugstack.ai.domain.agent.service.trace.RunTrace.enabled()) {
+                cn.bugstack.ai.domain.agent.service.trace.RunTrace.tool(new cn.bugstack.ai.domain.agent.service.trace.RunTrace.ToolExchange(
+                        budget.runId(), budget.ownerUserId(), activity != null ? activity.callLabel() : stepLabel, stepLabel,
+                        callId, name, effectiveInput, rawResultForTrace, returnedResultChars, progressStatus,
+                        failure == null ? null : summarizeFailure(failure), start, latency, "BUSINESS"));
+            }
         }
     }
 

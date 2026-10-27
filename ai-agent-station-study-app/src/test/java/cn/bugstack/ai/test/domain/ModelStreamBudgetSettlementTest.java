@@ -41,20 +41,18 @@ public class ModelStreamBudgetSettlementTest {
         } finally { RunBudgetRegistry.finish(run); ReasoningContentFilter.clearRun(run); }
     }
 
-    @Test public void exhaustedBudgetExplainsConfirmedAndHeldAmounts() {
+    @Test public void hardCeilingExplainsBudgetAndUsage() {
         String run = UUID.randomUUID().toString();
         var budget = RunBudgetRegistry.start(run, "owner",
                 new RunBudgetRegistry.Limits(Duration.ofSeconds(30), 5, 5, 1000));
         try {
-            budget.reserveModel(100, 100).settle(150L);
+            budget.reserveModel(100, 100).settle(1150L);
             budget.reserveModel(100, 100).settle(null);
-            budget.reserveModel(200, 200);
             var error = assertThrows(RunBudgetExceededException.class, () -> budget.reserveModel(200, 100));
-            assertTrue(error.getMessage().contains("1000"));
-            assertTrue(error.getMessage().contains("150"));
-            assertTrue(error.getMessage().contains("600"));
-            assertTrue(error.getMessage().contains("300"));
-            assertEquals(3, budget.snapshot().get("modelCalls"));
+            assertTrue(error.getMessage(), error.getMessage().contains("120%"));
+            assertTrue(error.getMessage(), error.getMessage().contains("预算 1000"));
+            assertTrue("unknown usage counts its input estimate", error.getMessage().contains("已用 1250"));
+            assertEquals(2, budget.snapshot().get("modelCalls"));
         } finally { RunBudgetRegistry.finish(run); }
     }
 }

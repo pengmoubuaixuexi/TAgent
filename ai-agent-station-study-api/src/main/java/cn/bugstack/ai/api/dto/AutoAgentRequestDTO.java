@@ -40,6 +40,9 @@ public class AutoAgentRequestDTO implements Serializable {
      */
     private List<ChatImageInputDTO> images;
 
+    /** Uploaded files and referenced artifacts of this message (at most 10). */
+    private List<ChatFileInputDTO> attachments;
+
     /**
      * 会话ID
      */

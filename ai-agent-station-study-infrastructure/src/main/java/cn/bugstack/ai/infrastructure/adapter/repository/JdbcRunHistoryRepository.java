@@ -86,11 +86,17 @@ public class JdbcRunHistoryRepository implements IRunHistoryRepository {
         return db.queryForList("SELECT * FROM ai_run_history WHERE "+EXACT_USER+" AND run_id=? AND CAST(run_id AS BINARY)=CAST(? AS BINARY) AND CHAR_LENGTH(run_id)=CHAR_LENGTH(?)",
                 user,user,user,run,run,run).stream().findFirst().map(this::view);
     }
-    @Override public List<Map<String,Object>> listOwned(String user,int offset,int limit) {
+    @Override public List<Map<String,Object>> listOwned(String user,String keyword,int offset,int limit) {
         require(user);
-        return db.queryForList("SELECT run_id,user_id,agent_id,agent_version,strategy,status,LEFT(question,300) question,last_error,created_at,updated_at,heartbeat_at FROM ai_run_history WHERE "+EXACT_USER+" ORDER BY created_at DESC,run_id DESC LIMIT ? OFFSET ?",
-                user,user,user,boundedLimit(limit),boundedOffset(offset)).stream().map(this::view).toList();
+        String word=keyword==null?"":keyword.strip();
+        if(word.length()>100)word=word.substring(0,100);
+        String sql="SELECT run_id,user_id,agent_id,agent_version,strategy,status,LEFT(question,300) question,last_error,created_at,updated_at,heartbeat_at FROM ai_run_history WHERE "+EXACT_USER
+                +(word.isEmpty()?"":" AND question LIKE ? ESCAPE '!'")+" ORDER BY created_at DESC,run_id DESC LIMIT ? OFFSET ?";
+        Object[] args=word.isEmpty()?new Object[]{user,user,user,boundedLimit(limit),boundedOffset(offset)}
+                :new Object[]{user,user,user,"%"+like(word)+"%",boundedLimit(limit),boundedOffset(offset)};
+        return db.queryForList(sql,args).stream().map(this::view).toList();
     }
+    static String like(String word){return word.replace("!","!!").replace("%","!%").replace("_","!_");}
     @Override public List<Map<String,Object>> listOwnedSession(String user,String session,int offset,int limit) {
         require(user);require(session);
         return db.queryForList("SELECT run_id,user_id,session_id,agent_id,agent_version,strategy,status,LEFT(question,300) question,last_error,created_at,updated_at,heartbeat_at FROM ai_run_history WHERE "+EXACT_USER+" AND "+EXACT_SESSION+" ORDER BY created_at DESC,run_id DESC LIMIT ? OFFSET ?",

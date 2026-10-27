@@ -18,20 +18,40 @@ public class PersonalModelConnectionService {
     private final PersonalModelEndpointPolicy endpoints;
     private final ModelProviderAccess credentials;
     private final ModelConnectionProbe probe;
+    /** Null only in narrow test contexts: then no catalog entry is written and no health is shown. */
+    private final ModelFailoverSettings failover;
+    @org.springframework.beans.factory.annotation.Autowired
     public PersonalModelConnectionService(@org.springframework.beans.factory.annotation.Qualifier("mysqlJdbcTemplate") JdbcTemplate db,
-            ModelSecretCipher cipher,PersonalModelEndpointPolicy endpoints,ModelProviderAccess credentials,ModelConnectionProbe probe) {
-        this.db=db;this.cipher=cipher;this.endpoints=endpoints;this.credentials=credentials;this.probe=probe;
+            ModelSecretCipher cipher,PersonalModelEndpointPolicy endpoints,ModelProviderAccess credentials,ModelConnectionProbe probe,
+            org.springframework.beans.factory.ObjectProvider<ModelFailoverSettings> failover) {
+        this(db,cipher,endpoints,credentials,probe,failover.getIfAvailable());
+    }
+    public PersonalModelConnectionService(JdbcTemplate db,ModelSecretCipher cipher,PersonalModelEndpointPolicy endpoints,
+            ModelProviderAccess credentials,ModelConnectionProbe probe) {
+        this(db,cipher,endpoints,credentials,probe,(ModelFailoverSettings)null);
+    }
+    public PersonalModelConnectionService(JdbcTemplate db,ModelSecretCipher cipher,PersonalModelEndpointPolicy endpoints,
+            ModelProviderAccess credentials,ModelConnectionProbe probe,ModelFailoverSettings failover) {
+        this.db=db;this.cipher=cipher;this.endpoints=endpoints;this.credentials=credentials;this.probe=probe;this.failover=failover;
     }
     public Map<String,Object> list(String user) {
         var rows=db.queryForList("""
             SELECT a.api_id AS apiId,a.base_url AS baseUrl,a.status,s.display_name AS name,
                    s.credential_version AS credentialVersion,s.verified_at AS verifiedAt,
-                   m.model_id AS modelId,m.model_name AS modelName,m.tier
+                   m.model_id AS modelId,m.model_name AS modelName,m.tier,
+                   c.tier AS failoverTier,c.sort_order AS sortOrder
             FROM ai_model_secret s JOIN ai_client_api a ON a.api_id=s.api_id AND a.owner_user_id=s.owner_user_id
             JOIN ai_client_model m ON m.api_id=a.api_id AND m.owner_user_id=s.owner_user_id AND m.source_model_id IS NULL
+            LEFT JOIN ai_model_catalog c ON c.owner_scope=s.owner_user_id AND c.api_id=a.api_id AND c.model_name=m.model_name
             WHERE s.owner_user_id=? ORDER BY s.create_time DESC
             """,user);
-        for(var row:rows){row.put("hasSecret",true);row.put("maskedKey","••••••••");row.put("providerSource","USER_BYOK");}
+        for(var row:rows){
+            row.put("hasSecret",true);row.put("maskedKey","••••••••");row.put("providerSource","USER_BYOK");
+            if(row.get("failoverTier")!=null)row.put("tier",row.remove("failoverTier"));else row.remove("failoverTier");
+            if(row.get("sortOrder")==null)row.put("sortOrder",100);
+            // The owner sees the redacted provider text of their own model.
+            row.put("health",failover==null?Map.of("state","UNKNOWN"):failover.health((String)row.get("apiId"),(String)row.get("modelName"),true));
+        }
         var policies=db.queryForList("SELECT platform_auxiliaries_enabled FROM ai_user_model_policy WHERE user_id=?",user);
         boolean allow=policies.isEmpty() || ((Number)policies.get(0).get("platform_auxiliaries_enabled")).intValue()==1;
         return Map.of("connections",rows,"secretsAvailable",cipher.configured(),"allowedHosts",endpoints.allowedHosts(),
@@ -60,8 +80,28 @@ public class PersonalModelConnectionService {
             INSERT INTO ai_client_model(model_id,api_id,owner_user_id,model_name,model_type,model_usage,tier,capabilities_json,status,platform_enabled,source_model_id,create_time,update_time)
             VALUES(?,?,?,?,'openai','chat','medium','{}',1,0,NULL,NOW(),NOW())
             """,modelId,api,user,model);
+        // Every personal model is a failover candidate for the owner's other personal models (never for platform ones).
+        if(failover!=null)failover.register(user,api,model);
         setAuxiliaryPolicy(user,input.path("allowPlatformAuxiliaries").asBoolean());
         return Map.of("apiId",api,"modelId",modelId,"credentialVersion",1,"hasSecret",true);
+    }
+    /** Tier and order among the owner's own models, used only when one of them is unavailable. */
+    @Transactional public void setFailover(String user,String api,JsonNode input) {
+        var row=owned(user,api,true);
+        String tier=WorkspaceService.text(input,"tier",4,8);
+        if(!cn.bugstack.ai.domain.agent.service.model.catalog.ModelCatalogEntry.TIERS.contains(tier))throw WorkspaceService.bad("档位只能是 small、medium 或 large");
+        int order=input.path("sortOrder").isInt()?input.path("sortOrder").asInt():100;
+        if(order<0||order>10000)throw WorkspaceService.bad("顺序需在 0 到 10000 之间");
+        String model=(String)row.get("model_name");
+        if(failover==null)throw new IllegalStateException("模型降级设置暂不可用");
+        db.update("UPDATE ai_client_model SET tier=?,update_time=NOW() WHERE api_id=? AND owner_user_id=? AND source_model_id IS NULL",tier,api,user);
+        failover.save(user,api,model,tier,order);
+    }
+    /** One minimal request (about ten tokens on the owner's key); also clears or confirms the health state. */
+    public Map<String,Object> checkHealth(String user,String api) {
+        var row=owned(user,api,false);
+        if(failover==null)throw new IllegalStateException("模型健康检测暂不可用");
+        return failover.check(api,(String)row.get("model_name"),true);
     }
     @Transactional public void rotate(String user,String api,JsonNode input) {
         var row=owned(user,api,true);

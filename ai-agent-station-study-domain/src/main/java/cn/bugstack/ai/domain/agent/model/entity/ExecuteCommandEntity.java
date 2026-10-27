@@ -30,6 +30,10 @@ public class ExecuteCommandEntity {
     @Builder.Default
     private List<ChatImageRef> images = List.of();
 
+    /** Files and artifact references attached to this user turn, already bound and owner-checked. */
+    @Builder.Default
+    private List<ChatFileRef> attachments = List.of();
+
     private String sessionId;
 
     /**

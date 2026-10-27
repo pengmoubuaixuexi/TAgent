@@ -8,14 +8,15 @@
     ]},
     {label: '运行与产物', links: [
       ['history', '运行历史', '/history.html'], ['outcomes', '产物与反馈', '/outcomes.html'],
-      ['eval', '我的评测', '/eval.html']
+      ['eval', '我的评测', '/eval.html'], ['improvements', '改进建议', '/improvements.html']
     ]},
     {label: '观测', links: [
       ['usage', '用量与额度', '/usage.html'], ['observe', 'LLM 观测', '/observe.html'],
       ['mcp', 'MCP 连接与工具', '/observe-mcp.html']
     ]},
     {label: '管理', admin: true, links: [
-      ['stats', '网站统计', '/admin-stats.html'], ['config', '配置详情', '/agent-config.html']
+      ['stats', '网站统计', '/admin-stats.html'], ['config', '配置详情', '/agent-config.html'],
+      ['modelCatalog', '模型清单', '/admin-models.html']
     ]}
   ];
   let mount, user, revision = 0, unread = 0;
@@ -94,6 +95,18 @@
     count.parentElement.setAttribute('aria-label', normalized ? '收件箱，' + normalized + ' 条未读' : '收件箱');
   }
   function initialize() {
+    // Filing information must also be visible before login or when auth is unavailable.
+    let footer = document.getElementById('site-footer');
+    if (!footer) {
+      footer = element('footer'); footer.id = 'site-footer';
+      const filing = element('a', '赣ICP备2026025840号-1');
+      filing.href = 'https://beian.miit.gov.cn/';
+      filing.target = '_blank'; filing.rel = 'noopener noreferrer';
+      footer.append(filing); document.body.append(footer);
+    }
+    const footerSize = () => document.documentElement.style.setProperty('--site-footer-height', footer.getBoundingClientRect().height + 'px');
+    if (typeof ResizeObserver === 'function') new ResizeObserver(footerSize).observe(footer);
+    footerSize();
     mount = document.querySelector('[data-workspace-nav]');
     if (!mount) return;
     mount.hidden = true;

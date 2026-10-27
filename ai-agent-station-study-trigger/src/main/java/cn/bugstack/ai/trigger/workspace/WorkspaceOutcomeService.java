@@ -10,6 +10,7 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.nio.charset.StandardCharsets;
 import java.sql.ResultSet;
@@ -34,17 +35,84 @@ public class WorkspaceOutcomeService {
         this.db=db;this.history=history;this.datasets=datasets;this.json=json;
     }
 
-    public List<Map<String,Object>> list(String user,String runId) {
-        if(runId!=null&&!runId.isBlank()) ownedRun(user,runId);
-        return db.query("SELECT * FROM ai_run_artifact WHERE owner_user_id=?"+
-                (runId==null||runId.isBlank()?"":" AND run_id=?")+" ORDER BY updated_at DESC,artifact_id LIMIT 100",
-                (rs,n)->head(rs),runId==null||runId.isBlank()?new Object[]{user}:new Object[]{user,runId});
+    /** FILE artifacts (sandbox outputs): bytes live in the attachment storage, the revision keeps a reference. */
+    private ArtifactFileStore fileStore;
+    private cn.bugstack.ai.infrastructure.adapter.repository.attachment.ChatFilePreviewer previewer;
+    private static final Set<String> INLINE_IMAGES=Set.of("image/png","image/jpeg","image/gif","image/webp");
+
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    public void setFileSupport(ArtifactFileStore fileStore,cn.bugstack.ai.infrastructure.adapter.repository.attachment.ChatFilePreviewer previewer) {
+        this.fileStore=fileStore;this.previewer=previewer;
+    }
+
+    public List<Map<String,Object>> list(String user,String runId) {return list(user,runId,null,0);}
+
+    /** Without a run: every artifact of the user, newest first, optionally filtered by title, 100 per page. */
+    public List<Map<String,Object>> list(String user,String runId,String keyword,int offset) {
+        if(runId==null||runId.isBlank()) {
+            String word=keyword==null?"":keyword.strip();
+            if(word.length()>100)word=word.substring(0,100);
+            String sql="SELECT a.*,LEFT(h.question,80) AS run_question FROM ai_run_artifact a LEFT JOIN ai_run_history h ON h.run_id=a.run_id "
+                    +"WHERE a.owner_user_id=?"+(word.isEmpty()?"":" AND a.title LIKE ? ESCAPE '!'")+" ORDER BY a.updated_at DESC,a.artifact_id LIMIT 100 OFFSET ?";
+            Object[] args=word.isEmpty()?new Object[]{user,Math.max(0,offset)}
+                    :new Object[]{user,"%"+word.replace("!","!!").replace("%","!%").replace("_","!_")+"%",Math.max(0,offset)};
+            return db.query(sql,(rs,n)->{Map<String,Object> row=head(rs);row.put("runQuestion",rs.getString("run_question"));return row;},args);
+        }
+        ownedRun(user,runId);
+        // A run's artifacts include the ones it created and the revisions it saved of artifacts the user attached.
+        List<Map<String,Object>> rows=db.query("SELECT a.*,(SELECT MAX(r.revision) FROM ai_run_artifact_revision r WHERE r.artifact_id=a.artifact_id AND r.source_run_id=?) AS run_revision "
+                        +"FROM ai_run_artifact a WHERE a.owner_user_id=? AND (a.run_id=? OR EXISTS(SELECT 1 FROM ai_run_artifact_revision r WHERE r.artifact_id=a.artifact_id AND r.source_run_id=?)) "
+                        +"ORDER BY a.updated_at DESC,a.artifact_id LIMIT 100",
+                (rs,n)->{
+                    Map<String,Object> row=head(rs);
+                    int revised=rs.getInt("run_revision");
+                    if(!rs.wasNull()&&!runId.equals(rs.getString("run_id"))) {
+                        row.put("revision",revised);row.put("sourceRunId",runId);
+                        row.put("baseRevision",db.query("SELECT base_revision FROM ai_run_artifact_revision WHERE artifact_id=? AND revision=?",
+                                (r,i)->r.getObject(1),rs.getString("artifact_id"),revised).stream().findFirst().orElse(null));
+                    }
+                    return row;
+                },runId,user,runId,runId);
+        rows.forEach(this::describeFile);
+        return rows;
+    }
+    /** Account deletion: FILE artifacts own stored bytes, so they leave with the account. Returns how many were removed. */
+    public int deleteFilesOf(String user) {
+        List<String> ids=db.queryForList("SELECT artifact_id FROM ai_run_artifact WHERE owner_user_id=? AND format='FILE'",String.class,user);
+        Set<String> keys=new LinkedHashSet<>();
+        for(String id:ids) {
+            db.query("SELECT content_json FROM ai_run_artifact_revision WHERE artifact_id=?",(rs,n)->read(rs.getString(1)),id)
+                    .forEach(content->{if(!content.path("storageKey").asText("").isEmpty())keys.add(content.path("storageKey").asText());});
+            db.update("DELETE FROM ai_run_artifact_revision WHERE artifact_id=?",id);
+            db.update("DELETE FROM ai_run_artifact WHERE artifact_id=?",id);
+        }
+        for(String key:keys) {
+            try {if(fileStore!=null)fileStore.delete(key);}
+            catch(java.io.IOException e){org.slf4j.LoggerFactory.getLogger(WorkspaceOutcomeService.class).warn("artifact file not deleted key={}: {}",key,e.toString());}
+        }
+        return ids.size();
+    }
+    /** Chat cards name a file without opening it: name, type and size of the listed revision. */
+    private void describeFile(Map<String,Object> row) {
+        String format=(String)row.get("format");
+        if(!"FILE".equals(format)&&!"CODE".equals(format))return;
+        Object revision=row.containsKey("revision")?row.get("revision"):row.get("currentRevision");
+        db.query("SELECT content_json FROM ai_run_artifact_revision WHERE artifact_id=? AND revision=?",(rs,n)->read(rs.getString(1)),
+                row.get("artifactId"),revision).stream().findFirst().ifPresent(content->{
+            row.put("filename",content.path("filename").asText());
+            if("CODE".equals(format))row.put("language",content.path("language").asText());
+            else {row.put("mimeType",content.path("mimeType").asText());row.put("size",content.path("size").asLong());}
+        });
     }
     public List<Map<String,Object>> revisions(String user,String id) {
         ownedHead(user,id,false);
-        return db.query("SELECT revision,title,format,content_hash,created_at FROM ai_run_artifact_revision WHERE artifact_id=? ORDER BY revision DESC",
-                (rs,n)->Map.<String,Object>of("revision",rs.getInt("revision"),"title",rs.getString("title"),"format",rs.getString("format"),
-                        "contentHash",rs.getString("content_hash"),"createdAt",rs.getTimestamp("created_at").toString()),id);
+        return db.query("SELECT revision,title,format,content_hash,created_at,source_kind,source_run_id,base_revision FROM ai_run_artifact_revision WHERE artifact_id=? ORDER BY revision DESC",
+                (rs,n)->{
+                    Map<String,Object> row=new LinkedHashMap<>();row.put("revision",rs.getInt("revision"));row.put("title",rs.getString("title"));
+                    row.put("format",rs.getString("format"));row.put("contentHash",rs.getString("content_hash"));
+                    row.put("createdAt",rs.getTimestamp("created_at").toString());row.put("sourceKind",rs.getString("source_kind"));
+                    row.put("sourceRunId",rs.getString("source_run_id"));row.put("baseRevision",rs.getObject("base_revision"));return row;
+                },id);
     }
     public Map<String,Object> artifact(String user,String id,int revision) {
         Map<String,Object> result=ownedHead(user,id,false);
@@ -53,7 +121,9 @@ public class WorkspaceOutcomeService {
             Map<String,Object> version=new LinkedHashMap<String,Object>();version.put("revision",rs.getInt("revision"));
             version.put("title",rs.getString("title"));version.put("format",rs.getString("format"));
             version.put("content",read(rs.getString("content_json")));version.put("contentHash",rs.getString("content_hash"));
-            version.put("versionCreatedAt",rs.getTimestamp("created_at").toString());return version;
+            version.put("versionCreatedAt",rs.getTimestamp("created_at").toString());
+            // A run may save a new revision of an artifact another run created; its card checks against this.
+            version.put("sourceRunId",rs.getString("source_run_id"));version.put("baseRevision",rs.getObject("base_revision"));return version;
         },id,chosen);
         if(rows.isEmpty())throw WorkspaceService.notFound();result.putAll(rows.get(0));return result;
     }
@@ -62,6 +132,8 @@ public class WorkspaceOutcomeService {
         lockUser(user);
         exactFields(input,Set.of("runId","title","format","content","revision"));
         String title=WorkspaceService.text(input,"title",1,160),format=WorkspaceService.text(input,"format",1,16);
+        if("FILE".equals(format)||id!=null&&"FILE".equals(ownedHead(user,id,false).get("format")))
+            throw WorkspaceService.bad("文件类产物不能在线编辑；请下载后修改，或在对话中让 Agent 处理");
         JsonNode content=validateContent(format,input.get("content"));String encoded=content.toString();
         long bytes=db.queryForObject("SELECT COALESCE(SUM(OCTET_LENGTH(r.content_json)),0) FROM ai_run_artifact_revision r JOIN ai_run_artifact a ON a.artifact_id=r.artifact_id WHERE a.owner_user_id=?",Long.class,user);
         if(bytes+encoded.getBytes(StandardCharsets.UTF_8).length>20L*1024*1024)throw WorkspaceService.bad("个人产物版本总大小已达到 20 MiB 上限");
@@ -82,8 +154,8 @@ public class WorkspaceOutcomeService {
             db.update("UPDATE ai_run_artifact SET title=?,format=?,current_revision=?,updated_at=CURRENT_TIMESTAMP(3) WHERE artifact_id=? AND owner_user_id=? AND current_revision=?",
                     title,format,revision,id,user,expected);
         }
-        db.update("INSERT INTO ai_run_artifact_revision(artifact_id,revision,title,format,content_json,content_hash) VALUES(?,?,?,?,?,?)",
-                id,revision,title,format,encoded,WorkspaceVersionStore.hash(encoded));
+        db.update("INSERT INTO ai_run_artifact_revision(artifact_id,revision,title,format,content_json,content_hash,source_kind,base_revision) VALUES(?,?,?,?,?,?,'USER',?)",
+                id,revision,title,format,encoded,WorkspaceVersionStore.hash(encoded),revision>1?revision-1:null);
         return artifact(user,id,revision);
     }
 
@@ -124,14 +196,185 @@ public class WorkspaceOutcomeService {
             throw WorkspaceService.bad("个人产物版本总大小已达到 20 MiB 上限");
         db.update("INSERT INTO ai_run_artifact(artifact_id,owner_user_id,run_id,agent_id,agent_version,title,format,current_revision) VALUES(?,?,?,?,?,?,?,1)",
                 id,user,runId,run.get("agentId"),run.get("agentVersion"),title,format);
-        db.update("INSERT INTO ai_run_artifact_revision(artifact_id,revision,title,format,content_json,content_hash) VALUES(?,1,?,?,?,?)",
-                id,title,format,encoded,hash);
+        db.update("INSERT INTO ai_run_artifact_revision(artifact_id,revision,title,format,content_json,content_hash,source_kind,source_run_id,source_call_hash) VALUES(?,1,?,?,?,?,'AGENT',?,?)",
+                id,title,format,encoded,hash,runId,callHash(user,runId,toolCallId));
         Map<String,Object> saved=artifact(user,id,1);saved.put("created",true);return saved;
+    }
+
+    /** A version conflict the run must report to the user instead of retrying blindly. */
+    public static final class VersionConflict extends ResponseStatusException {
+        public final String artifactId,title;public final int baseRevision,currentRevision;
+        VersionConflict(String artifactId,String title,int baseRevision,int currentRevision) {
+            super(org.springframework.http.HttpStatus.CONFLICT,"产物「"+title+"」已更新到第 "+currentRevision+" 版，本次基于第 "+baseRevision+" 版的修改没有保存");
+            this.artifactId=artifactId;this.title=title;this.baseRevision=baseRevision;this.currentRevision=currentRevision;
+        }
+    }
+
+    /**
+     * create_artifact with baseArtifactId/baseRevision: saves the next revision of an artifact the user attached to
+     * this conversation (or that this run created). The caller supplies verified runtime identity.
+     */
+    @Transactional
+    public Map<String,Object> reviseFromTool(String user,String runId,String sessionId,String toolCallId,JsonNode input) {
+        if(toolCallId==null||toolCallId.isBlank()||toolCallId.length()>256)throw WorkspaceService.bad("缺少有效工具调用标识");
+        exactFields(input,Set.of("title","format","content","baseArtifactId","baseRevision"));
+        String baseId=WorkspaceService.text(input,"baseArtifactId",1,64);
+        int baseRevision=WorkspaceService.requiredInt(input,"baseRevision",1,Integer.MAX_VALUE-1);
+        String title=WorkspaceService.text(input,"title",1,160),format=WorkspaceService.text(input,"format",1,16);
+        JsonNode content=validateContent(format,input.get("content"));
+        String encoded=canonicalContent(format,content).toString(),hash=WorkspaceVersionStore.hash(encoded),replay=callHash(user,runId,toolCallId);
+        lockUser(user);
+        Map<String,Object> run=ownedRun(user,runId);
+        if(!"RUNNING".equals(run.get("status")))throw WorkspaceService.conflict("只有当前正在执行的任务可以修改产物");
+        var heads=db.query("SELECT * FROM ai_run_artifact WHERE artifact_id=? AND owner_user_id=? FOR UPDATE",(rs,n)->head(rs),baseId,user);
+        if(heads.isEmpty())throw WorkspaceService.bad("产物不存在或无权修改，请检查 baseArtifactId");
+        Map<String,Object> head=heads.get(0);
+        String attachment=sessionId==null?null:db.query("SELECT attachment_id FROM ai_chat_file WHERE owner_user_id=? AND session_id=? AND kind='ARTIFACT' AND artifact_id=? AND status='ACTIVE' ORDER BY created_at DESC LIMIT 1",
+                (rs,n)->rs.getString(1),user,sessionId,baseId).stream().findFirst().orElse(null);
+        boolean fromThisRun=runId.equals(head.get("runId"))||db.queryForObject("SELECT COUNT(*) FROM ai_run_artifact_revision WHERE artifact_id=? AND source_run_id=?",Integer.class,baseId,runId)>0;
+        if(attachment==null&&!fromThisRun)throw WorkspaceService.forbidden("只能修改用户在本对话中引用的产物，或本次任务创建的产物");
+        var replayed=db.queryForList("SELECT revision,content_hash FROM ai_run_artifact_revision WHERE artifact_id=? AND source_call_hash=?",baseId,replay);
+        if(!replayed.isEmpty()) {
+            if(!hash.equals(replayed.get(0).get("content_hash")))throw WorkspaceService.conflict("同一次工具调用已保存不同内容，请使用新的调用");
+            Map<String,Object> saved=artifact(user,baseId,((Number)replayed.get(0).get("revision")).intValue());saved.put("created",false);return saved;
+        }
+        int current=((Number)head.get("currentRevision")).intValue();
+        // A stream retry can resend the same output under a new call ID.
+        var latest=db.queryForList("SELECT content_hash,source_run_id FROM ai_run_artifact_revision WHERE artifact_id=? AND revision=?",baseId,current);
+        if(!latest.isEmpty()&&runId.equals(latest.get(0).get("source_run_id"))&&hash.equals(latest.get(0).get("content_hash"))) {
+            Map<String,Object> saved=artifact(user,baseId,current);saved.put("created",false);return saved;
+        }
+        if(current!=baseRevision)throw new VersionConflict(baseId,String.valueOf(head.get("title")),baseRevision,current);
+        if(!format.equals(head.get("format")))throw WorkspaceService.bad("修改已有产物时 format 要与原产物一致（"+head.get("format")+"）；需要其他格式时请新建产物");
+        if(current>=100)throw WorkspaceService.bad("每个产物最多保留 100 个版本");
+        long bytes=db.queryForObject("SELECT COALESCE(SUM(OCTET_LENGTH(r.content_json)),0) FROM ai_run_artifact_revision r JOIN ai_run_artifact a ON a.artifact_id=r.artifact_id WHERE a.owner_user_id=?",Long.class,user);
+        if(bytes+encoded.getBytes(StandardCharsets.UTF_8).length>20L*1024*1024)throw WorkspaceService.bad("个人产物版本总大小已达到 20 MiB 上限");
+        int revision=current+1;
+        db.update("UPDATE ai_run_artifact SET title=?,current_revision=?,updated_at=CURRENT_TIMESTAMP(3) WHERE artifact_id=? AND owner_user_id=? AND current_revision=?",
+                title,revision,baseId,user,current);
+        db.update("INSERT INTO ai_run_artifact_revision(artifact_id,revision,title,format,content_json,content_hash,source_kind,source_run_id,base_revision,source_attachment_id,source_call_hash) VALUES(?,?,?,?,?,?,'AGENT',?,?,?,?)",
+                baseId,revision,title,format,encoded,hash,runId,current,attachment,replay);
+        Map<String,Object> saved=artifact(user,baseId,revision);saved.put("created",true);saved.put("baseRevision",current);return saved;
+    }
+
+    /** A file produced by run_python in the current run, saved as a FILE artifact. Replays of the same output are one artifact. */
+    @Transactional
+    public Map<String,Object> createFileFromTool(String user,String runId,String toolCallId,String filename,String mimeType,byte[] bytes) {
+        if(fileStore==null)throw new IllegalStateException("artifact file storage is not configured");
+        if(toolCallId==null||toolCallId.isBlank()||toolCallId.length()>256)throw WorkspaceService.bad("缺少有效工具调用标识");
+        String name=safeFilename(filename);
+        String mime=mimeType==null||!mimeType.matches("[a-z]+/[a-z0-9.+-]{1,100}")?"application/octet-stream":mimeType;
+        lockUser(user);
+        Map<String,Object> run=ownedRun(user,runId);
+        if(!"RUNNING".equals(run.get("status")))throw WorkspaceService.conflict("只有当前正在执行的任务可以保存文件产物");
+        String id=WorkspaceVersionStore.hash(json.createArrayNode().add("artifact-file-v1").add(user).add(runId).add(toolCallId).toString());
+        var existing=db.query("SELECT * FROM ai_run_artifact WHERE artifact_id=? AND owner_user_id=? FOR UPDATE",(rs,n)->head(rs),id,user);
+        if(!existing.isEmpty()){Map<String,Object> saved=artifact(user,id,1);saved.put("created",false);return saved;}
+        String call=callHash(user,runId,toolCallId),title=name.length()>160?name.substring(0,160):name;
+        // A replayed call that already saved a later revision of a same-named file returns that revision.
+        var replayed=db.queryForList("SELECT r.artifact_id,r.revision FROM ai_run_artifact_revision r JOIN ai_run_artifact a ON a.artifact_id=r.artifact_id "
+                +"WHERE a.owner_user_id=? AND r.source_run_id=? AND r.source_call_hash=?",user,runId,call);
+        if(!replayed.isEmpty()) {
+            Map<String,Object> saved=artifact(user,String.valueOf(replayed.get(0).get("artifact_id")),((Number)replayed.get(0).get("revision")).intValue());
+            saved.put("created",false);return saved;
+        }
+        // The same run writing the same file name again (e.g. a chart redrawn after a fix) revises that artifact.
+        var sameName=db.query("SELECT * FROM ai_run_artifact WHERE owner_user_id=? AND run_id=? AND format='FILE' AND title=? ORDER BY created_at DESC LIMIT 1 FOR UPDATE",
+                (rs,n)->head(rs),user,runId,title);
+        if(sameName.isEmpty()&&db.queryForObject("SELECT COUNT(*) FROM ai_run_artifact WHERE owner_user_id=?",Integer.class,user)>=100)
+            throw WorkspaceService.bad("最多保存 100 个个人产物");
+        if(!sameName.isEmpty()&&((Number)sameName.get(0).get("currentRevision")).intValue()>=100)
+            throw WorkspaceService.bad("每个产物最多保留 100 个版本");
+        ArtifactFileStore.Stored stored;
+        try {stored=fileStore.put(user,bytes,mime);}
+        catch(java.io.IOException e){throw new IllegalStateException("文件产物保存失败",e);}
+        var content=json.createObjectNode().put("filename",name).put("mimeType",mime).put("size",stored.size())
+                .put("sha256",stored.sha256()).put("storageKey",stored.key());
+        String encoded=content.toString(),hash=WorkspaceVersionStore.hash(encoded);
+        if(!sameName.isEmpty()) {
+            String baseId=String.valueOf(sameName.get(0).get("artifactId"));
+            int current=((Number)sameName.get(0).get("currentRevision")).intValue();
+            String currentHash=db.queryForObject("SELECT content_hash FROM ai_run_artifact_revision WHERE artifact_id=? AND revision=?",String.class,baseId,current);
+            if(hash.equals(currentHash)){Map<String,Object> saved=artifact(user,baseId,current);saved.put("created",false);return saved;}
+            int revision=current+1;
+            db.update("UPDATE ai_run_artifact SET current_revision=?,updated_at=CURRENT_TIMESTAMP(3) WHERE artifact_id=? AND owner_user_id=? AND current_revision=?",
+                    revision,baseId,user,current);
+            db.update("INSERT INTO ai_run_artifact_revision(artifact_id,revision,title,format,content_json,content_hash,source_kind,source_run_id,base_revision,source_call_hash) VALUES(?,?,?,'FILE',?,?,'AGENT',?,?,?)",
+                    baseId,revision,title,encoded,hash,runId,current,call);
+            Map<String,Object> saved=artifact(user,baseId,revision);saved.put("created",true);return saved;
+        }
+        db.update("INSERT INTO ai_run_artifact(artifact_id,owner_user_id,run_id,agent_id,agent_version,title,format,current_revision) VALUES(?,?,?,?,?,?,'FILE',1)",
+                id,user,runId,run.get("agentId"),run.get("agentVersion"),title);
+        db.update("INSERT INTO ai_run_artifact_revision(artifact_id,revision,title,format,content_json,content_hash,source_kind,source_run_id,source_call_hash) VALUES(?,1,?,'FILE',?,?,'AGENT',?,?)",
+                id,title,encoded,hash,runId,call);
+        Map<String,Object> saved=artifact(user,id,1);saved.put("created",true);return saved;
+    }
+
+    public record InlineFile(String filename,String mimeType,byte[] bytes) {}
+
+    /** Raster images may be shown inline; everything else is only ever downloaded. */
+    public InlineFile inlineImage(String user,String id,int revision) {
+        Map<String,Object> artifact=artifact(user,id,revision);
+        if(!"FILE".equals(artifact.get("format")))throw WorkspaceService.bad("只有图片文件可以直接预览");
+        JsonNode content=(JsonNode)artifact.get("content");
+        String mime=content.path("mimeType").asText();
+        if(!INLINE_IMAGES.contains(mime))throw WorkspaceService.bad("只有图片文件可以直接预览");
+        return new InlineFile(content.path("filename").asText(),mime,fileBytes(content));
+    }
+
+    /** Preview of a FILE artifact: an image link, the first rows of a table, or extracted text. */
+    public Map<String,Object> preview(String user,String id,int revision) {
+        Map<String,Object> artifact=artifact(user,id,revision);
+        Map<String,Object> out=new LinkedHashMap<>();
+        if(!"FILE".equals(artifact.get("format"))){out.put("kind","none");return out;}
+        JsonNode content=(JsonNode)artifact.get("content");
+        String mime=content.path("mimeType").asText(),name=content.path("filename").asText();
+        out.put("filename",name);out.put("mimeType",mime);out.put("size",content.path("size").asLong());
+        if(INLINE_IMAGES.contains(mime)) {
+            out.put("kind","image");
+            out.put("url","/api/v1/workspace/outcomes/artifacts/"+java.net.URLEncoder.encode(id,StandardCharsets.UTF_8)+"/inline?revision="+artifact.get("revision"));
+            return out;
+        }
+        if(previewer==null||fileStore==null){out.put("kind","none");return out;}
+        java.nio.file.Path copy=null;
+        try {
+            copy=fileStore.copy(content.path("storageKey").asText());
+            var preview=previewer.preview(name,copy);
+            out.put("kind",preview.kind());out.put("summary",preview.summary());out.put("truncated",preview.truncated());
+            if("table".equals(preview.kind()))out.put("sheets",preview.sheets());
+            if("text".equals(preview.kind()))out.put("text",preview.text());
+        } catch(java.io.IOException e) {
+            out.put("kind","none");out.put("summary","文件暂时无法读取");
+        } finally {
+            if(copy!=null)try{java.nio.file.Files.deleteIfExists(copy);}catch(java.io.IOException ignored){}
+        }
+        return out;
+    }
+
+    private byte[] fileBytes(JsonNode content) {
+        if(fileStore==null)throw WorkspaceService.bad("文件存储未配置");
+        try {return fileStore.read(content.path("storageKey").asText());}
+        catch(java.io.IOException e){throw WorkspaceService.notFound();}
+    }
+
+    public static String safeFilename(String filename) {
+        String name=filename==null?"":filename.replace('\\','/');
+        name=name.substring(name.lastIndexOf('/')+1).strip();
+        StringBuilder clean=new StringBuilder();
+        name.codePoints().filter(c->!Character.isISOControl(c)&&"<>:\"|?*".indexOf(c)<0).forEach(clean::appendCodePoint);
+        String result=clean.toString().strip();
+        if(result.isEmpty()||result.equals(".")||result.equals(".."))result="output";
+        return result.length()<=160?result:result.substring(result.length()-160);
+    }
+
+    private String callHash(String user,String runId,String toolCallId) {
+        return WorkspaceVersionStore.hash(json.createArrayNode().add("artifact-call-v1").add(user).add(runId).add(toolCallId).toString());
     }
 
     private JsonNode canonicalContent(String format,JsonNode content) {
         var canonical=json.createObjectNode();
         if("MARKDOWN".equals(format))canonical.set("markdown",content.get("markdown"));
+        else if("FILE".equals(format))for(String key:new String[]{"filename","mimeType","size","sha256","storageKey"})canonical.set(key,content.get(key));
         else if("CODE".equals(format)) {
             canonical.set("filename",content.get("filename"));canonical.set("language",content.get("language"));canonical.set("code",content.get("code"));
         }
@@ -184,6 +427,8 @@ public class WorkspaceOutcomeService {
     public record Export(String filename,String contentType,byte[] bytes) {}
     public Export export(String user,String id,int revision) {
         Map<String,Object> artifact=artifact(user,id,revision);JsonNode content=(JsonNode)artifact.get("content");
+        if("FILE".equals(artifact.get("format")))
+            return new Export(content.path("filename").asText("output"),"application/octet-stream",fileBytes(content));
         if("CODE".equals(artifact.get("format"))) {
             // Code is downloadable source, never executable content served by the application.
             validateContent("CODE",content);

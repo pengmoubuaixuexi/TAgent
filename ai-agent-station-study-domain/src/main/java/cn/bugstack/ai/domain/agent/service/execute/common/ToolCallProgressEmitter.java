@@ -105,6 +105,19 @@ public class ToolCallProgressEmitter {
         sendEvent(emitter, "tool_call_start", data, sessionId, toolName);
     }
 
+    /** A status line for a long-running call, e.g. the sandbox queue position. Callers throttle it. */
+    public void emitProgress(String sessionId, String toolName, String callId, String message) {
+        ResponseBodyEmitter emitter = lookupEmitter(sessionId);
+        if (emitter == null && !hasRun(sessionId)) return;
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("sessionId", sessionId);
+        data.put("toolName", toolName);
+        putIfPresent(data, "callId", callId);
+        data.put("message", message);
+        data.put("timestamp", System.currentTimeMillis());
+        sendEvent(emitter, "tool_call_progress", data, sessionId, toolName);
+    }
+
     public void emitEnd(String sessionId, String toolName, String status, long latencyMs, int resultChars) {
         emitEnd(sessionId, toolName, status, latencyMs, resultChars, null);
     }

@@ -10,18 +10,27 @@ import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
-/** One shared budget for routing, parallel steps, tool retries and model tool loops. */
+/**
+ * One shared budget for routing, parallel steps, tool retries and model tool loops.
+ * <p>Tokens are admitted on usage, not on a reservation of the output limit. Reaching the budget marks the
+ * run: Flow and Auto finish the phase in progress, start no new one and answer from what is done. Only
+ * usage beyond the hard ceiling ({@code overrun-ratio} above the budget) stops a run mid-phase.
+ */
 @Component
 public final class RunBudgetRegistry {
     private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(RunBudgetRegistry.class);
     private static final ConcurrentHashMap<String, State> RUNS = new ConcurrentHashMap<>();
     private static final ThreadLocal<State> MAINTENANCE_SCOPE = new ThreadLocal<>();
+    /** Share of the token budget a run may overrun to finish its current phase. */
+    private static volatile double overrunRatio = 0.2;
+    private static volatile Listener listener;
     @Value("${agent.run-budget.max-seconds:1800}") private long maxSeconds = 1800;
     @Value("${agent.run-budget.max-model-calls:60}") private int maxModels = 60;
     @Value("${agent.run-budget.max-tool-calls:100}") private int maxTools = 100;
     @Value("${agent.run-budget.max-tokens:500000}") private long maxTokens = 500000;
     @Value("${agent.context.max-input-tokens:${agent.context.max-input-estimate:128000}}") private int inputLimit = 128000;
     @Value("${agent.context.default-output-limit:8192}") private int outputLimit = 8192;
+    @Value("${agent.run-budget.overrun-ratio:0.2}") private double configuredOverrunRatio = 0.2;
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private ModelContextSettings contextSettings;
 
@@ -29,6 +38,37 @@ public final class RunBudgetRegistry {
     public void configure() {
         ModelRequestGuard.configure(inputLimit, outputLimit,
                 contextSettings == null ? Map.of() : contextSettings.getModelContextWindows());
+        overrunRatio(configuredOverrunRatio);
+    }
+
+    public static void overrunRatio(double ratio) {
+        if (ratio < 0 || ratio > 1) throw new IllegalArgumentException("overrun-ratio must be between 0 and 1");
+        overrunRatio = ratio;
+    }
+
+    public static double overrunRatio() { return overrunRatio; }
+
+    /** Notified outside the budget's lock when a run nears or reaches its budget. */
+    public interface Listener {
+        void warned(State state, long used, long budget);
+        void reached(State state, String reason);
+    }
+
+    public static void listener(Listener value) { listener = value; }
+
+    /** Notice above completed results delivered without a final model call. */
+    public static final String UNSUMMARIZED_NOTICE = "⚠️ 本次任务的 Token 用量已超过上限，无法再整理成完整回答。以下是已完成部分的原始结果：";
+
+    /** Whether a failure was the budget refusing a call (directly or as a cause). */
+    public static boolean isBudgetFailure(Throwable error) {
+        for (Throwable t = error; t != null; t = t.getCause()) if (t instanceof RunBudgetExceededException) return true;
+        return false;
+    }
+
+    /** Why this run should start no new phase, or null. */
+    public static String reachedFor(String runId) {
+        State state = find(runId);
+        return state == null ? null : state.budgetReached();
     }
 
     public State start(String runId, String userId) {
@@ -120,8 +160,12 @@ public final class RunBudgetRegistry {
         private int tools;
         private long reservedTokens;
         private long confirmedTokens;
+        /** Input estimate of calls whose usage the provider did not report. */
+        private long unknownTokens;
         private int unknownUsage;
         private String stopReason;
+        private String budgetReached;
+        private boolean warned;
         private boolean waitingForReview;
         private boolean cancelled;
         private boolean foregroundFinished;
@@ -163,27 +207,76 @@ public final class RunBudgetRegistry {
             tools++;
         }
 
+        /**
+         * Admits a call on usage so far; the output limit is not reserved. The input estimate is held
+         * until the call settles, and kept as usage when the provider reports none.
+         */
         public synchronized Reservation reserveModel(long inputEstimate, long outputLimit) {
             checkActive();
-            long requested = Math.addExact(Math.max(0, inputEstimate), Math.max(0, outputLimit));
+            long input = Math.max(0, inputEstimate);
             if (models >= limits.modelCalls()) exhaust("任务已达到模型请求次数上限");
-            if (requested > limits.tokens() - reservedTokens) {
-                long held = Math.max(0, reservedTokens - confirmedTokens);
-                log.warn("Run Token budget rejected: runId={} limit={} confirmed={} held={} requested={} modelCalls={} unknownUsageCalls={}",
-                        runId, limits.tokens(), confirmedTokens, held, requested, models, unknownUsage);
-                exhaust("任务剩余 Token 预算不足，已停止后续调用（单次任务上限 " + limits.tokens()
-                        + "，已确认 " + confirmedTokens + "，在途或未确认预留 " + held
-                        + "，下一次请求需预留 " + requested + "；累计模型请求 " + models + " 次）");
+            long used = used(), hard = hardTokens();
+            if (used >= hard) {
+                log.warn("Run Token hard ceiling reached: runId={} budget={} hard={} used={} modelCalls={} unknownUsageCalls={}",
+                        runId, limits.tokens(), hard, used, models, unknownUsage);
+                exhaust(overrunMessage() + "（预算 " + limits.tokens() + "，已用 " + used + "；累计模型请求 " + models + " 次）");
             }
             models++;
-            reservedTokens += requested;
-            return new Reservation(this, requested);
+            reservedTokens += input;
+            return new Reservation(this, input);
+        }
+
+        private long used() { return confirmedTokens + unknownTokens; }
+
+        private long hardTokens() { return limits.tokens() + (long) Math.floor(limits.tokens() * overrunRatio); }
+
+        private static String overrunMessage() {
+            return "任务 Token 用量已超过预算的 " + Math.round((1 + overrunRatio) * 100) + "%，已停止后续调用";
+        }
+
+        /** Why this run should start no new phase (its budget, or the owner's daily quota), or null. */
+        public synchronized String budgetReached() { return budgetReached; }
+
+        /** Marks the run so that it finishes the phase in progress and starts no new one. */
+        public void reach(String reason) {
+            boolean first;
+            synchronized (this) {
+                first = budgetReached == null;
+                if (first) budgetReached = reason;
+            }
+            Listener current = listener;
+            if (first && current != null) {
+                try { current.reached(this, reason); } catch (RuntimeException e) { log.warn("Budget listener failed runId={}", runId, e); }
+            }
+        }
+
+        /** After a call settles: warn once at 80%, mark the run at 100%, stop it beyond the hard ceiling. */
+        private void evaluate() {
+            long used, budget = limits.tokens();
+            boolean warn = false;
+            synchronized (this) {
+                used = used();
+                if (used >= hardTokens()) {
+                    stop(overrunMessage() + "（预算 " + budget + "，已用 " + used + "；累计模型请求 " + models + " 次）");
+                    return;
+                }
+                if (used < budget && used >= budget * 8 / 10 && !warned) { warned = true; warn = true; }
+            }
+            if (used >= budget) {
+                reach("本次任务的 Token 预算（" + budget + "）已用完");
+                return;
+            }
+            Listener current = listener;
+            if (warn && current != null) {
+                try { current.warned(this, used, budget); } catch (RuntimeException e) { log.warn("Budget listener failed runId={}", runId, e); }
+            }
         }
 
         public synchronized Map<String, Object> snapshot() {
             return Map.of("modelCalls", models, "toolAttempts", tools, "reservedTokens", reservedTokens,
                     "confirmedTokens", confirmedTokens, "unknownUsageCalls", unknownUsage,
-                    "maxTokens", limits.tokens(), "stopReason", stopReason == null ? "" : stopReason,
+                    "maxTokens", limits.tokens(), "hardTokens", hardTokens(), "stopReason", stopReason == null ? "" : stopReason,
+                    "budgetReached", budgetReached == null ? "" : budgetReached,
                     "remainingMillis", Math.max(0L, (deadline - System.nanoTime()) / 1_000_000L));
         }
 
@@ -240,7 +333,7 @@ public final class RunBudgetRegistry {
         private void exhaust(String reason) { stop(reason); throw new RunBudgetExceededException(reason); }
     }
 
-    /** Unknown usage conservatively retains the reserved amount instead of claiming a free call. */
+    /** Unknown usage counts the input estimate instead of claiming a free call. */
     public static final class Reservation {
         private final State state;
         private final long amount;
@@ -250,11 +343,15 @@ public final class RunBudgetRegistry {
             synchronized (state) {
                 if (settled) return;
                 settled = true;
-                if (actualTokens == null || actualTokens < 0) { state.unknownUsage++; return; }
-                state.confirmedTokens += actualTokens;
-                state.reservedTokens += actualTokens - amount;
-                if (state.reservedTokens > state.limits.tokens()) state.stop("实际用量已达到任务 Token 预算上限");
+                if (actualTokens == null || actualTokens < 0) {
+                    state.unknownUsage++;
+                    state.unknownTokens += amount;
+                } else {
+                    state.confirmedTokens += actualTokens;
+                    state.reservedTokens += actualTokens - amount;
+                }
             }
+            state.evaluate();
         }
     }
 }

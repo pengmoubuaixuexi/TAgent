@@ -33,8 +33,7 @@ public class WorkspaceOutcomeTest {
         var source=new DriverManagerDataSource("jdbc:h2:mem:"+UUID.randomUUID()+";MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1","sa","");
         db=new JdbcTemplate(source);tx=new TransactionTemplate(new DataSourceTransactionManager(source));
         db.execute("CREATE TABLE admin_user(user_id VARCHAR PRIMARY KEY,status INT)");db.update("INSERT INTO admin_user VALUES('alice',1),('bob',1)");
-        Path migration=Path.of("../docs/dev-ops/sql-migrations/V069__artifacts_feedback.sql");if(!Files.exists(migration))migration=Path.of("docs/dev-ops/sql-migrations/V069__artifacts_feedback.sql");
-        for(String sql:Files.readString(migration).replace("JSON NOT NULL","CLOB NOT NULL").replace(" ENGINE=InnoDB DEFAULT CHARSET=utf8mb4","").split(";"))if(!sql.isBlank())db.execute(sql);
+        ArtifactTestSchema.apply(db);
         history=mock(IRunHistoryRepository.class);datasets=mock(EvalDatasetService.class);
         when(history.findOwned(anyString(),anyString())).thenReturn(Optional.empty());
         when(history.findOwned("alice","run-a")).thenReturn(Optional.of(Map.of("runId","run-a","userId","alice","agentId","agent-a","agentVersion",7,"question","真正的问题","answer","原答不能自动成为金标")));
@@ -59,6 +58,13 @@ public class WorkspaceOutcomeTest {
         assertThrows(ResponseStatusException.class,()->transact(()->service.save("bob",null,markdown("steal"))));
         assertThrows(ResponseStatusException.class,()->transact(()->service.save("alice",null,markdown("forge").put("agentVersion",999))));
         assertTrue(service.list("bob",null).isEmpty());assertEquals(1,service.list("alice","run-a").size());
+        // The full list: every artifact of the owner, searchable by title, with the question of its run.
+        db.update("INSERT INTO ai_run_history VALUES('run-a','帮我规划北京三日游')");
+        List<Map<String,Object>> all=service.list("alice",null,"产物",0);
+        assertEquals(1,all.size());assertEquals("帮我规划北京三日游",all.get(0).get("runQuestion"));assertEquals("run-a",all.get(0).get("runId"));
+        assertTrue(service.list("alice",null,"周报",0).isEmpty());
+        assertTrue("LIKE wildcards are literal",service.list("alice",null,"%",0).isEmpty());
+        assertTrue(service.list("alice",null,null,100).isEmpty());
     }
     @Test public void csvEscapesFormulasQuotesAndNewlinesWithoutChangingStoredCells()throws Exception {
         JsonNode content=json.readTree("{\"columns\":[\"name\",\"value\"],\"rows\":[[\"=1+1\",\"  @cmd\"],[\"a,b\",\"quote\\\"\\nline\"]]}");
@@ -81,7 +87,8 @@ public class WorkspaceOutcomeTest {
         assertEquals("updated.py",service.export("alice",id,0).filename());
         assertThrows(ResponseStatusException.class,()->service.export("bob",id,1));
         var auth=new UsernamePasswordAuthenticationToken("alice","unused",List.of());
-        var response=new WorkspaceOutcomeController(service).export(auth,id,1);
+        @SuppressWarnings("unchecked") var noSandbox=(org.springframework.beans.factory.ObjectProvider<cn.bugstack.ai.trigger.sandbox.SandboxService>)org.mockito.Mockito.mock(org.springframework.beans.factory.ObjectProvider.class);
+        var response=new WorkspaceOutcomeController(service,noSandbox).export(auth,id,1,null);
         assertEquals("示例.py",response.getHeaders().getContentDisposition().getFilename());
         assertEquals("attachment",response.getHeaders().getContentDisposition().getType());
         assertEquals("nosniff",response.getHeaders().getFirst("X-Content-Type-Options"));

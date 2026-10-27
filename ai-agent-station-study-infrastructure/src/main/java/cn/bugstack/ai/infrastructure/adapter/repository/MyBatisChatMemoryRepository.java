@@ -156,6 +156,15 @@ public class MyBatisChatMemoryRepository implements ChatMemoryRepository {
     }
 
     private UserMessage toUserMessage(AiChatMemory row) {
+        UserMessage restored = toUserMessageWithImages(row);
+        // Earlier file attachments stay readable through read_attachment; the model sees which ones exist.
+        String note = cn.bugstack.ai.domain.agent.service.attachment.ChatFileManifest.historyNote(
+                ChatMessagePartsCodec.decodeFiles(row.getContentParts()));
+        if (note.isEmpty()) return restored;
+        return restored.mutate().text((restored.getText() == null ? "" : restored.getText()) + note).build();
+    }
+
+    private UserMessage toUserMessageWithImages(AiChatMemory row) {
         List<String> attachmentIds = ChatMessagePartsCodec.attachmentIds(row.getContentParts());
         if (attachmentIds.isEmpty()) return new UserMessage(row.getContent());
         List<cn.bugstack.ai.domain.agent.model.entity.ChatImageRef> refs =

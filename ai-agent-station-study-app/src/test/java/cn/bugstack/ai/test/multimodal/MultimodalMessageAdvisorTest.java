@@ -48,6 +48,25 @@ public class MultimodalMessageAdvisorTest {
     }
 
     @Test
+    public void textOnlyModelReportsOnlyWhenThisTurnHasImages() {
+        java.util.List<Map<String, Object>> notices = new java.util.ArrayList<>();
+        MultimodalMessageAdvisor advisor = new MultimodalMessageAdvisor(false, notices::add);
+        Map<String, Object> scope = Map.of("agent.run_id", "run-1", "sessionId", "s1");
+        org.springframework.ai.openai.OpenAiChatOptions options =
+                org.springframework.ai.openai.OpenAiChatOptions.builder().toolContext(scope).build();
+        advisor.before(ChatClientRequest.builder()
+                .prompt(Prompt.builder().messages(new UserMessage("介绍图片")).chatOptions(options).build())
+                .context(Map.of(MultimodalMessageAdvisor.CURRENT_IMAGES_CONTEXT_KEY, List.of(URL_IMAGE))).build(), null);
+        assertEquals(List.of(scope), notices);
+        advisor.before(ChatClientRequest.builder()
+                .prompt(Prompt.builder().messages(new UserMessage("没有图片")).chatOptions(options).build())
+                .context(Map.of()).build(), null);
+        assertEquals(1, notices.size());
+        new MultimodalMessageAdvisor(true, notices::add).before(request(List.of(URL_IMAGE)), null);
+        assertEquals(1, notices.size());
+    }
+
+    @Test
     public void capabilityJsonDefaultsToTextOnlyAndRecognizesImage() {
         assertFalse(AiClientModelVO.builder().build().supportsImageInput());
         assertFalse(AiClientModelVO.builder()

@@ -155,6 +155,8 @@ public class NotificationService {
             case TASK_FAILED -> AgentNotification.Status.TASK_FAILED;
             case TASK_COMPLETED -> AgentNotification.Status.TASK_COMPLETED;
             case PLAN_REVIEW -> AgentNotification.Status.PLAN_REVIEW;
+            case MODEL_UNAVAILABLE -> AgentNotification.Status.MODEL_UNAVAILABLE;
+            case MODEL_RECOVERED -> AgentNotification.Status.MODEL_RECOVERED;
             default -> AgentNotification.Status.WAITING;
         };
     }

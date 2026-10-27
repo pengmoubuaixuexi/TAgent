@@ -135,6 +135,71 @@ public class FlowDagFailurePropagationContractTest {
         verify(snapshots, never()).recordStep(any(), any(), any(), any(), any(), any(), any());
     }
 
+    @Test
+    public void usedUpBudgetSkipsUnstartedStepsAndLeavesTheAnswerToCompletedOnes() {
+        for (String method : List.of("executeStepsAsDag", "executeStepsSequentially")) {
+            String runId = "run-budget-" + method;
+            var budget = cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.start(runId, "owner",
+                    new cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.Limits(
+                            java.time.Duration.ofSeconds(30), 10, 10, 1000));
+            try {
+                budget.reach("本次任务的 Token 预算（1000）已用完");
+                RunSnapshotService snapshots = mock(RunSnapshotService.class);
+                Step4ExecuteStepsNode node = new Step4ExecuteStepsNode();
+                ReflectionTestUtils.setField(node, "runSnapshotService", snapshots);
+                ReflectionTestUtils.setField(node, "dagExecutor", (java.util.concurrent.Executor) Runnable::run);
+                DefaultFlowAgentExecuteStrategyFactory.DynamicContext context =
+                        new DefaultFlowAgentExecuteStrategyFactory.DynamicContext();
+                context.setValue("runId", runId);
+                context.setValue("sessionId", "session-budget");
+
+                // No failure: skipped steps are reported, and the answer is built from what completed.
+                ReflectionTestUtils.invokeMethod(node, method, null,
+                        Map.of("第1步：查询", "查询", "第2步：处理", "处理"),
+                        List.of(1, 2),
+                        Map.of(1, Set.of(), 2, Set.of(1)),
+                        context,
+                        ExecuteCommandEntity.builder().runId(runId).sessionId("session-budget").build());
+
+                assertTrue(method, "本次任务的 Token 预算（1000）已用完".equals(context.getValue("budgetStopReason")));
+                for (int step : List.of(1, 2)) {
+                    verify(snapshots).recordStep(eq(runId), eq("flow_step4_execute_step_" + step), any(),
+                            eq("flow_step4_execution"), eq(step), contains("未执行"), eq(RunSnapshotService.STATUS_BLOCKED));
+                }
+            } finally {
+                cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.finish(runId);
+            }
+        }
+    }
+
+    @Test
+    public void answerRefusedByTheHardCeilingStillDeliversTheCompletedSteps() throws Exception {
+        Step4ExecuteStepsNode node = new Step4ExecuteStepsNode();
+        org.springframework.context.ApplicationContext beans = mock(org.springframework.context.ApplicationContext.class);
+        org.mockito.Mockito.when(beans.getBean(org.mockito.ArgumentMatchers.anyString())).thenThrow(
+                new cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetExceededException("任务 Token 用量已超过预算的 120%"));
+        ReflectionTestUtils.setField(node, "applicationContext", beans);
+        org.springframework.web.servlet.mvc.method.annotation.ResponseBodyEmitter emitter =
+                mock(org.springframework.web.servlet.mvc.method.annotation.ResponseBodyEmitter.class);
+        DefaultFlowAgentExecuteStrategyFactory.DynamicContext context = new DefaultFlowAgentExecuteStrategyFactory.DynamicContext();
+        context.setAiAgentClientFlowConfigVOMap(Map.of(
+                cn.bugstack.ai.domain.agent.model.valobj.enums.AiClientTypeEnumVO.EXECUTOR_CLIENT.getCode(),
+                cn.bugstack.ai.domain.agent.model.valobj.AiAgentClientFlowConfigVO.builder().clientId("executor").build()));
+        context.setValue("emitter", emitter);
+        context.setValue("budgetStopReason", "本次任务的 Token 预算（1000）已用完");
+        context.setValue("step1Result", "Python 用 asyncio 和线程池做并发。");
+
+        String outcome = ReflectionTestUtils.invokeMethod(node, "finalizeNow",
+                ExecuteCommandEntity.builder().runId("run-ceiling").sessionId("s").build(), context);
+
+        assertTrue(outcome, outcome.contains("已交付"));
+        assertTrue(context.isCompleted());
+        org.mockito.ArgumentCaptor<Object> sent = org.mockito.ArgumentCaptor.forClass(Object.class);
+        verify(emitter, org.mockito.Mockito.atLeastOnce()).send(sent.capture());
+        String all = String.valueOf(sent.getAllValues());
+        assertTrue(all, all.contains("Python 用 asyncio") && all.contains("已超过上限"));
+    }
+
     private static void assertRejected(List<Integer> steps,
                                        Map<Integer, Set<Integer>> dependencies,
                                        String expectedMessage) {

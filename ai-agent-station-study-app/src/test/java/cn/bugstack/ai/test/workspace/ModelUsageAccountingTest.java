@@ -29,7 +29,7 @@ public class ModelUsageAccountingTest {
         clock=new MutableClock();dataSource=new DriverManagerDataSource("jdbc:h2:mem:usage_"+UUID.randomUUID()+";MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000","sa","");
         db=new JdbcTemplate(dataSource);access=mock(ModelProviderAccess.class);
         db.execute("CREATE TABLE ai_model_usage_account(user_id VARCHAR(64) PRIMARY KEY)");
-        db.execute("CREATE TABLE ai_model_usage_day(user_id VARCHAR(64),usage_date DATE,platform_calls BIGINT DEFAULT 0,platform_reserved_tokens BIGINT DEFAULT 0,confirmed_tokens BIGINT DEFAULT 0,unknown_calls BIGINT DEFAULT 0,PRIMARY KEY(user_id,usage_date))");
+        db.execute("CREATE TABLE ai_model_usage_day(user_id VARCHAR(64),usage_date DATE,platform_calls BIGINT DEFAULT 0,platform_reserved_tokens BIGINT DEFAULT 0,confirmed_tokens BIGINT DEFAULT 0,unknown_calls BIGINT DEFAULT 0,carried_tokens BIGINT DEFAULT 0,PRIMARY KEY(user_id,usage_date))");
         db.execute("CREATE TABLE ai_model_usage_run(run_id VARCHAR(128) PRIMARY KEY,user_id VARCHAR(64),billing_source VARCHAR(16),state VARCHAR(24),deadline_at TIMESTAMP,create_time TIMESTAMP DEFAULT NOW(),update_time TIMESTAMP DEFAULT NOW())");
         db.execute("CREATE TABLE ai_model_usage_attempt(attempt_id VARCHAR(64) PRIMARY KEY,run_id VARCHAR(128),user_id VARCHAR(64),api_id VARCHAR(64),provider_host VARCHAR(255),model_name VARCHAR(255),purpose VARCHAR(64),billing_source VARCHAR(16),usage_date DATE,input_estimate BIGINT,output_limit BIGINT,reserved_tokens BIGINT,actual_tokens BIGINT,usage_status VARCHAR(16),outcome VARCHAR(32),cost_amount DECIMAL(20,10),cost_currency VARCHAR(8),pricing_status VARCHAR(16),create_time TIMESTAMP DEFAULT NOW(),settled_at TIMESTAMP)");
         db.execute("CREATE TABLE ai_client_api(api_id VARCHAR(64) PRIMARY KEY,owner_user_id VARCHAR(64),secret_ref VARCHAR(64),status INT,base_url VARCHAR(255))");
@@ -52,7 +52,9 @@ public class ModelUsageAccountingTest {
     @Test public void unknownUsageAndPricingRemainNullAndSurviveRestart(){
         run("r","alice");ledger.begin(attempt("alice","r","platform",1000)).settle(null,"ERROR");
         ledger=newLedger(1000,20,2);
-        assertThrows(RunBudgetExceededException.class,()->ledger.begin(attempt("alice","r","platform",1)));
+        run("r2","alice");
+        assertThrows("unknown usage still counts: a new task is refused at the quota",
+                RunBudgetExceededException.class,()->ledger.begin(attempt("alice","r2","platform",1)));
         var row=db.queryForMap("SELECT actual_tokens,cost_amount,usage_status,pricing_status FROM ai_model_usage_attempt");
         assertNull(row.get("actual_tokens"));assertNull(row.get("cost_amount"));assertEquals("UNKNOWN",row.get("usage_status"));assertEquals("UNKNOWN",row.get("pricing_status"));
         assertEquals(Long.valueOf(1000),db.queryForObject("SELECT platform_reserved_tokens FROM ai_model_usage_day",Long.class));
@@ -65,8 +67,40 @@ public class ModelUsageAccountingTest {
                 try{service.begin(attempt("alice","r","platform",100));admitted.incrementAndGet();}catch(RunBudgetExceededException expected){}
             }));}
             for(var job:jobs)job.get(20,TimeUnit.SECONDS);
-            assertEquals(10,admitted.get());assertEquals(Long.valueOf(1000),db.queryForObject("SELECT platform_reserved_tokens FROM ai_model_usage_day",Long.class));
+            // The running task may overrun the quota by 20% to finish its phase, and never beyond.
+            assertEquals(12,admitted.get());assertEquals(Long.valueOf(1200),db.queryForObject("SELECT platform_reserved_tokens FROM ai_model_usage_day",Long.class));
         } finally {workers.shutdownNow();}
+    }
+    @Test public void outputLimitIsNotReservedAgainstTheDailyQuota(){
+        run("r","alice");
+        ledger.begin(new ModelUsageAccounting.Attempt("alice","r","platform","chat","MAIN","provider.test",100,25600));
+        assertEquals(Long.valueOf(100),db.queryForObject("SELECT platform_reserved_tokens FROM ai_model_usage_day",Long.class));
+        assertEquals(Long.valueOf(25600),db.queryForObject("SELECT output_limit FROM ai_model_usage_attempt",Long.class));
+    }
+    @Test public void atTheQuotaARunningTaskFinishesItsPhaseAndNewTasksAreRefused(){
+        ModelUsageLedger.install(ledger);String id=UUID.randomUUID().toString();
+        var state=RunBudgetRegistry.start(id,"alice",new RunBudgetRegistry.Limits(Duration.ofMinutes(1),100,100,1_000_000));
+        ledger.begin(attempt("alice",id,"platform",1000)).settle(1000L,"SUCCESS");
+        assertNull(state.budgetReached());
+        ledger.begin(attempt("alice",id,"platform",100)).settle(100L,"SUCCESS");
+        assertEquals("the running task is marked to start no new phase","今日平台试用额度已用完",state.budgetReached());
+        run("other","alice");
+        assertThrows(RunBudgetExceededException.class,()->ledger.begin(attempt("alice","other","platform",1)));
+        ledger.begin(attempt("alice",id,"platform",100)).settle(100L,"SUCCESS");
+        assertThrows("beyond 120% even the running task stops",RunBudgetExceededException.class,()->ledger.begin(attempt("alice",id,"platform",1)));
+    }
+    @Test public void overrunIsCarriedIntoTheNextDay(){
+        run("r","alice");ledger.begin(attempt("alice","r","platform",900)).settle(900L,"SUCCESS");
+        ledger.begin(attempt("alice","r","platform",300)).settle(300L,"SUCCESS");
+        clock.millis.addAndGet(Duration.ofDays(1).toMillis());
+        run("next","alice");ledger.begin(attempt("alice","next","platform",50)).settle(50L,"SUCCESS");
+        assertEquals(Long.valueOf(200),db.queryForObject("SELECT carried_tokens FROM ai_model_usage_day WHERE usage_date=?",Long.class,LocalDate.of(2026,10,10)));
+        var today=(Map<?,?>)ledger.overview("alice").get("today");
+        assertEquals(200L,((Number)today.get("carriedTokens")).longValue());
+        clock.millis.addAndGet(Duration.ofDays(1).toMillis());
+        run("later","alice");ledger.begin(attempt("alice","later","platform",1)).settle(1L,"SUCCESS");
+        assertEquals("a day within its quota carries nothing on",Long.valueOf(0),
+                db.queryForObject("SELECT carried_tokens FROM ai_model_usage_day WHERE usage_date=?",Long.class,LocalDate.of(2026,10,11)));
     }
     @Test public void personalKeyDoesNotConsumePlatformQuotaAndCannotCrossOwners(){
         db.update("INSERT INTO ai_client_api VALUES('personal','alice','secret',1,'https://provider.test')");db.update("INSERT INTO ai_model_secret VALUES('secret','alice',1)");

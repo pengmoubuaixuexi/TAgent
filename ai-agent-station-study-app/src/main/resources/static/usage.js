@@ -11,7 +11,10 @@
       if(!response.ok||result.code!=='0000')throw new Error(result.info||'用量加载失败');
       const d=result.data,t=d.today,l=d.limits;
       $('day').textContent=d.day+' · '+d.dayTimeZone;
-      $('tokenQuota').textContent=number(t.platformReservedTokens)+' / '+number(l.platformDailyTokens);
+      // Yesterday's overrun counts against today; at the quota new tasks wait, running ones finish their phase.
+      const carried=Number(t.carriedTokens||0);
+      $('tokenQuota').textContent=number(Number(t.platformReservedTokens||0)+carried)+' / '+number(l.platformDailyTokens)
+        +(carried>0?'（含昨日超出 '+number(carried)+'）':'');
       $('callQuota').textContent=number(t.platformCalls)+' / '+number(l.platformDailyCalls);
       $('runQuota').textContent=number(d.activeRuns)+' / '+number(l.concurrentRuns);
       $('confirmed').textContent=number(t.confirmedPlatformTokens);
@@ -27,7 +30,7 @@
         card.append(text('h3',a.model+' · '+sourceLabel(a.billingSource)));
         const actual=a.actualTokens===null||a.actualTokens===undefined?'未知':number(a.actualTokens);
         const price=a.pricingStatus==='KNOWN'&&a.costAmount!==null?a.costAmount+' '+a.currency:'价格未知';
-        card.append(text('p',`${a.purpose} · ${a.provider}\n实际 Token：${actual} · 预留：${number(a.reservedTokens)}\n用量状态：${a.usageStatus} · 请求结果：${a.outcome} · ${price}\n运行：${a.runId}\n${a.createdAt}`,'details'));
+        card.append(text('p',`${a.purpose} · ${a.provider}\n实际 Token：${actual} · 输入估算：${number(a.reservedTokens)}\n用量状态：${a.usageStatus} · 请求结果：${a.outcome} · ${price}\n运行：${a.runId}\n${a.createdAt}`,'details'));
         list.append(card);
       }
       if(!d.attempts.length)list.append(text('p','还没有模型请求记录。','muted'));

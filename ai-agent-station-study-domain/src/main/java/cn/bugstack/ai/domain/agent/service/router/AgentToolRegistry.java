@@ -121,14 +121,30 @@ public class AgentToolRegistry {
     }
 
     public String describeToolsForPrompt(String clientId, List<ToolCallback> extraCallbacks) {
+        return describeToolsForPrompt(clientId, extraCallbacks, false);
+    }
+
+    /**
+     * @param requestToolAvailable whether this request also carries request_tool. Without bound tools the old text
+     *                             told the model to answer from its own knowledge only, which overrode request_tool
+     *                             and made agents with only the public pool guess instead of fetching a tool.
+     */
+    public String describeToolsForPrompt(String clientId, List<ToolCallback> extraCallbacks, boolean requestToolAvailable) {
         List<ToolInfo> baseTools = getTools(clientId);
         List<ToolInfo> extraTools = toToolInfo(extraCallbacks, baseTools);
         List<ToolInfo> allTools = new ArrayList<>(baseTools);
         allTools.addAll(extraTools);
 
+        if (allTools.isEmpty() && requestToolAvailable) {
+            return "**当前 Agent (clientId=" + clientId + ") 没有预先绑定业务工具**。\n"
+                    + "回答需要实时数据、联网信息或其他外部能力时，先调用 request_tool：在 needs 里逐条用一句话描述所缺能力，"
+                    + "系统会按需装载真实工具，拿到工具结果后再作答。不需要外部数据的问题直接回答。"
+                    + "禁止虚构工具调用过程或返回数据。";
+        }
         if (allTools.isEmpty()) {
             return "**当前 Agent (clientId=" + clientId + ") 没有配置任何 MCP 工具**。\n"
-                    + "你没有任何外部工具可调用，请仅基于 LLM 自身知识回答用户问题，禁止虚构工具调用过程或返回数据。";
+                    + "请利用已有对话、附件及本轮实际提供的平台工具处理任务。需要实时或外部数据而无法获取时，"
+                    + "请明确说明缺少信息，不要用常识猜测替代查询，禁止虚构工具调用过程或返回数据。";
         }
 
         StringBuilder sb = new StringBuilder();
@@ -139,6 +155,9 @@ public class AgentToolRegistry {
         if (!extraTools.isEmpty()) {
             sb.append("\n**本次路由动态补充的工具（仅本次请求临时可用）**\n");
             appendToolLines(sb, extraTools);
+        }
+        if (requestToolAvailable) {
+            sb.append("\n以上工具都不能满足所需能力时，可以调用 request_tool，在 needs 里逐条用一句话描述所缺能力，按需装载真实工具。\n");
         }
 
         if (hasGithubRepositorySearchTool(allTools)) {

@@ -110,7 +110,7 @@ public class BackgroundTaskRoutingTest {
         ReflectionTestUtils.setField(dispatch, "threadPoolExecutor", executor);
         ReflectionTestUtils.setField(dispatch, "runEventPublisher", events);
         doAnswer(call -> { ((Runnable) call.getArgument(0)).run(); return null; }).when(executor).execute(any());
-        when(router.routeDecision(task.getActionPrompt()))
+        when(router.routeDecision(eq(task.getActionPrompt()), anySet()))
                 .thenReturn(new RouteDecision("routed-1", List.of(), 0.95, ""))
                 .thenReturn(new RouteDecision("routed-2", List.of(), 0.96, ""));
         when(repository.queryAiAgentByAgentId(anyString())).thenAnswer(call -> AiAgentVO.builder()
@@ -126,7 +126,7 @@ public class BackgroundTaskRoutingTest {
         assertEquals(selected == null ? "routed-1" : selected, commands.getAllValues().get(0).getAiAgentId());
         assertEquals(selected == null ? "routed-2" : selected, commands.getAllValues().get(1).getAiAgentId());
         assertEquals(selected, task.getActionAgentId());
-        verify(router, times(selected == null ? 2 : 0)).routeDecision(anyString());
+        verify(router, times(selected == null ? 2 : 0)).routeDecision(anyString(), anySet());
     }
 
     @Test

@@ -104,7 +104,9 @@ public class RedisRunSnapshotService implements RunSnapshotService {
             snapshot.setAgentName(agentName);
             snapshot.setAgentType(agentType);
             snapshot.setOriginalMessage(request.getMessage());
-            snapshot.setImages(request.getImages() == null ? List.of() : request.getImages().stream()
+            // Each list is its own instance: fastjson writes a repeated instance (e.g. the shared List.of())
+            // as {"$ref":…}, which broke the stored snapshot of every run without attachments.
+            snapshot.setImages(request.getImages() == null ? new ArrayList<>() : request.getImages().stream()
                     .filter(java.util.Objects::nonNull)
                     .map(image -> cn.bugstack.ai.domain.agent.model.entity.ChatImageRef.builder()
                             .attachmentId(image.getAttachmentId())
@@ -115,7 +117,23 @@ public class RedisRunSnapshotService implements RunSnapshotService {
                             .size(image.getSize())
                             .sha256(image.getSha256())
                             .build())
-                    .toList());
+                    .collect(java.util.stream.Collectors.toCollection(ArrayList::new)));
+            snapshot.setAttachments(request.getAttachments() == null ? new ArrayList<>() : request.getAttachments().stream()
+                    .filter(java.util.Objects::nonNull)
+                    .map(file -> cn.bugstack.ai.domain.agent.model.entity.ChatFileRef.builder()
+                            .attachmentId(file.getAttachmentId())
+                            .kind(file.getKind())
+                            .status(file.getStatus())
+                            .fileName(file.getFileName())
+                            .mimeType(file.getMimeType())
+                            .fileKind(file.getFileKind())
+                            .size(file.getSize())
+                            .artifactId(file.getArtifactId())
+                            .artifactRevision(file.getArtifactRevision())
+                            .artifactFormat(file.getArtifactFormat())
+                            .parseStatus(file.getParseStatus())
+                            .build())
+                    .collect(java.util.stream.Collectors.toCollection(ArrayList::new)));
             snapshot.setSourceRunId(request.getSourceRunId());
             snapshot.setRedoFromStep(request.getRedoFromStep());
             snapshot.setStatus(STATUS_RUNNING);

@@ -150,8 +150,31 @@ public class RobustToolCallingManager implements ToolCallingManager {
 
     private volatile ToolResultReferenceService toolResultReferenceService;
     private volatile RunArtifactService runArtifactService;
+    private volatile cn.bugstack.ai.domain.agent.service.attachment.IChatFileService chatFileService;
+    private volatile cn.bugstack.ai.domain.agent.service.attachment.RunAttachmentRegistry runAttachments;
+    private volatile ToolCallLedger toolCallLedger;
+
+    /** 单次模型调用（含其内部工具循环）最多读取附件的次数，防止逐行读大文件耗尽预算。 */
+    static final int MAX_ATTACHMENT_READS_PER_CALL = 40;
 
     public void setRunArtifactService(RunArtifactService service) { this.runArtifactService = service; }
+
+    /** read_attachment：只在本次运行或本会话确有附件时广播（见 {@link cn.bugstack.ai.domain.agent.service.attachment.RunAttachmentRegistry}）。 */
+    public void setChatFileService(cn.bugstack.ai.domain.agent.service.attachment.IChatFileService service,
+                                   cn.bugstack.ai.domain.agent.service.attachment.RunAttachmentRegistry registry) {
+        this.chatFileService = service;
+        this.runAttachments = registry;
+    }
+
+    /** Auto 质检取证：read_attachment 不走 MeteredToolCallback，由本 manager 记账。 */
+    public void setToolCallLedger(ToolCallLedger ledger) { this.toolCallLedger = ledger; }
+
+    private volatile cn.bugstack.ai.domain.agent.service.sandbox.ISandboxService sandboxService;
+
+    /** run_python：只在执行步骤（RUN_CODE）、沙箱可用且节点没有关闭代码运行时广播。 */
+    public void setSandboxService(cn.bugstack.ai.domain.agent.service.sandbox.ISandboxService service) {
+        this.sandboxService = service;
+    }
 
     public void setToolResultReferenceService(ToolResultReferenceService service) {
         this.toolResultReferenceService = service;
@@ -249,6 +272,12 @@ public class RobustToolCallingManager implements ToolCallingManager {
         if (policy.allows(ToolCapability.BUSINESS_TOOL) && toolResultReferenceService != null) {
             base.add(INSPECT_RESULT_DEFINITION);
         }
+        if (policy.allows(ToolCapability.READ_ATTACHMENT) && attachmentsReadable(options)) {
+            base.add(cn.bugstack.ai.domain.agent.service.attachment.ReadAttachmentTool.DEFINITION);
+        }
+        if (policy.allows(ToolCapability.RUN_CODE) && codeExecutionAllowed()) {
+            base.add(cn.bugstack.ai.domain.agent.service.sandbox.ISandboxService.DEFINITION);
+        }
         // policy ceiling 与运行期 availability 取交集；NONE/BUSINESS_ONLY 不得再泄出元工具。
         if (policy.allows(ToolCapability.ASK_USER) && askUserAvailable(options)) {
             base.add(ASK_USER_DEFINITION);
@@ -300,6 +329,17 @@ public class RobustToolCallingManager implements ToolCallingManager {
     private boolean askUserAvailable(ToolCallingChatOptions options) {
         if (userInputGate == null || !userInputGate.isEnabled()) return false;
         return userInputGate.remainingFor(toolIdentity(options, "sessionId")) > 0;
+    }
+
+    private boolean codeExecutionAllowed() {
+        var sandbox = this.sandboxService;
+        return sandbox != null && sandbox.available()
+                && (workspaceNodePolicy == null || workspaceNodePolicy.codeExecution());
+    }
+
+    private boolean attachmentsReadable(ToolCallingChatOptions options) {
+        return chatFileService != null && runAttachments != null && options != null
+                && runAttachments.readable(options.getToolContext());
     }
 
     /** request_tool 当前是否可广播：开关开且匹配服务在。预算在执行处限，不在此 gate。 */
@@ -403,7 +443,9 @@ public class RobustToolCallingManager implements ToolCallingManager {
         boolean askUserActive = userInputGate != null && userInputGate.isEnabled() && hasAskUserCall(normalized);
         boolean requestToolActive = requestToolAvailable() && hasRequestToolCall(normalized);
         if (askUserActive || requestToolActive || hasToolCall(normalized, this::isInspectResultName)
-                || hasToolCall(normalized, this::isCreateArtifactName)) {
+                || hasToolCall(normalized, this::isCreateArtifactName)
+                || hasToolCall(normalized, this::isReadAttachmentName)
+                || hasToolCall(normalized, this::isRunPythonName)) {
             return handleMetaToolCalls(prompt, normalized);
         }
 
@@ -456,6 +498,8 @@ public class RobustToolCallingManager implements ToolCallingManager {
                 ToolCapability needed = isAskUserName(tc.name()) ? ToolCapability.ASK_USER
                         : isRequestToolName(tc.name()) ? ToolCapability.REQUEST_TOOL
                         : isCreateArtifactName(tc.name()) ? ToolCapability.CREATE_ARTIFACT
+                        : isReadAttachmentName(tc.name()) ? ToolCapability.READ_ATTACHMENT
+                        : isRunPythonName(tc.name()) ? ToolCapability.RUN_CODE
                         : ToolCapability.BUSINESS_TOOL;
                 if (!policy.allows(needed)) denied.add(tc.name());
             }
@@ -504,7 +548,8 @@ public class RobustToolCallingManager implements ToolCallingManager {
     /** 该批响应是否「全是元工具(ask_user / request_tool)」——纯元工具轮不计工具预算。 */
     private boolean isMetaToolOnlyResponses(List<ToolResponseMessage.ToolResponse> responses) {
         for (ToolResponseMessage.ToolResponse r : responses) {
-            if (!isAskUserName(r.name()) && !isRequestToolName(r.name()) && !isInspectResultName(r.name())) return false;
+            if (!isAskUserName(r.name()) && !isRequestToolName(r.name()) && !isInspectResultName(r.name())
+                    && !isReadAttachmentName(r.name())) return false;
         }
         return true;
     }
@@ -519,6 +564,14 @@ public class RobustToolCallingManager implements ToolCallingManager {
 
     private boolean isInspectResultName(String name) {
         return name != null && ToolResultReferenceService.TOOL_NAME.equalsIgnoreCase(name);
+    }
+
+    private boolean isReadAttachmentName(String name) {
+        return cn.bugstack.ai.domain.agent.service.attachment.ReadAttachmentTool.isName(name);
+    }
+
+    private boolean isRunPythonName(String name) {
+        return cn.bugstack.ai.domain.agent.service.sandbox.ISandboxService.isName(name);
     }
 
     private boolean hasAskUserCall(ChatResponse chatResponse) {
@@ -582,9 +635,13 @@ public class RobustToolCallingManager implements ToolCallingManager {
         String stepLabel = currentStepLabel(prompt);
 
         List<ToolResponseMessage.ToolResponse> responses = new ArrayList<>(calls.size());
-        boolean artifactFailed = false, artifactSucceeded = false;
+        boolean artifactFailed = false, artifactSucceeded = false, artifactDecided = false;
+        // Platform tools handled here (business tools trace themselves in MeteredToolCallback).
+        Map<String, long[]> metaTimes = new HashMap<>();
         for (AssistantMessage.ToolCall tc : calls) {
             StreamingActivityTracker.checkActive(activityFor(prompt));
+            long callStarted = System.currentTimeMillis();
+            if (!realNames.contains(tc.name()) || isReservedMetaToolName(tc.name())) metaTimes.put(tc.id(), new long[]{callStarted, 0});
             if (askUserActive && isAskUserName(tc.name())) {
                 responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(), runAskUser(prompt, sessionId, tc, stepLabel)));
             } else if (requestToolActive && isRequestToolName(tc.name())) {
@@ -598,6 +655,12 @@ public class RobustToolCallingManager implements ToolCallingManager {
                         ? "{\"ok\":false,\"error\":\"RESULT_NOT_AVAILABLE\",\"message\":\"结果读取未启用\"}"
                         : toolResultReferenceService.inspect(tc.arguments(), scope);
                 responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(), result));
+            } else if (isReadAttachmentName(tc.name())) {
+                responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(),
+                        runReadAttachment(prompt, tc, sessionId, stepLabel)));
+            } else if (isRunPythonName(tc.name())) {
+                responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(),
+                        runPython(prompt, tc, sessionId, stepLabel)));
             } else if (isCreateArtifactName(tc.name())) {
                 Map<String, Object> scope = prompt.getOptions() instanceof ToolCallingChatOptions options
                         && options.getToolContext() != null ? options.getToolContext() : Map.of();
@@ -608,7 +671,10 @@ public class RobustToolCallingManager implements ToolCallingManager {
                         ? "{\"ok\":false,\"message\":\"当前运行不能保存产物，请直接提供正文，不要声称已生成下载文件\"}"
                         : runArtifactService.create(tc.id(), tc.arguments(), scope);
                 try {
-                    if (ASK_USER_JSON.readTree(result).path("ok").asBoolean(false)) artifactSucceeded = true;
+                    var body = ASK_USER_JSON.readTree(result);
+                    if (body.path("ok").asBoolean(false)) artifactSucceeded = true;
+                    // A version conflict is not malformed arguments: report it, do not count a repair attempt.
+                    else if (body.hasNonNull("nextAction")) artifactDecided = true;
                     else artifactFailed = true;
                 } catch (Exception invalidResult) { artifactFailed = true; }
                 responses.add(new ToolResponseMessage.ToolResponse(tc.id(), tc.name(), result));
@@ -629,6 +695,8 @@ public class RobustToolCallingManager implements ToolCallingManager {
                                     + "。请不要重复同样的无效调用，可基于已有信息回答。"));
                 }
             }
+            long[] time = metaTimes.get(tc.id());
+            if (time != null) time[1] = System.currentTimeMillis();
         }
 
         if (artifactFailed) {
@@ -640,6 +708,11 @@ public class RobustToolCallingManager implements ToolCallingManager {
                         var body = ASK_USER_JSON.readTree(result.responseData());
                         if (body.isObject() && !body.path("ok").asBoolean(false)) {
                             var error = (com.fasterxml.jackson.databind.node.ObjectNode) body;
+                            if (body.hasNonNull("nextAction")) {
+                                // The service already knows the right next step (e.g. a version conflict).
+                                updated.add(result);
+                                continue;
+                            }
                             error.put("retryable", retryable);
                             error.put("nextAction", retryable ? "按字段错误修正参数后再调用一次；不要改变正文事实。" : artifactFallbackMessage());
                             updated.add(new ToolResponseMessage.ToolResponse(result.id(), result.name(), error.toString()));
@@ -655,8 +728,12 @@ public class RobustToolCallingManager implements ToolCallingManager {
             if (state != null) state.succeeded();
             var activity = activityFor(prompt);
             if (activity != null) activity.clearArtifactPhase();
+        } else if (artifactDecided) {
+            var activity = activityFor(prompt);
+            if (activity != null) activity.clearArtifactPhase();
         }
 
+        traceMetaCalls(prompt, calls, responses, metaTimes, stepLabel);
         List<Message> conversationHistory = new ArrayList<>(prompt.getInstructions());
         conversationHistory.add(fullAm);
         conversationHistory.add(ToolResponseMessage.builder().responses(responses).metadata(Map.of()).build());
@@ -664,6 +741,32 @@ public class RobustToolCallingManager implements ToolCallingManager {
                 .conversationHistory(conversationHistory)
                 .returnDirect(false)
                 .build();
+    }
+
+    /** Run trace for platform tools: the arguments the model sent and the complete result it received. */
+    private void traceMetaCalls(Prompt prompt, List<AssistantMessage.ToolCall> calls,
+                                List<ToolResponseMessage.ToolResponse> responses, Map<String, long[]> times, String stepLabel) {
+        if (times.isEmpty() || !cn.bugstack.ai.domain.agent.service.trace.RunTrace.enabled()) return;
+        Map<String, Object> scope = prompt.getOptions() instanceof ToolCallingChatOptions options
+                && options.getToolContext() != null ? options.getToolContext() : Map.of();
+        RunBudgetRegistry.State budget = RunBudgetRegistry.find(scope);
+        if (budget == null) return;
+        StreamingActivityTracker.Activity activity = activityFor(prompt);
+        for (AssistantMessage.ToolCall call : calls) {
+            long[] time = times.get(call.id());
+            if (time == null) continue;
+            String result = responses.stream().filter(r -> java.util.Objects.equals(r.id(), call.id()))
+                    .map(ToolResponseMessage.ToolResponse::responseData).findFirst().orElse(null);
+            String status = "success";
+            try {
+                var body = ASK_USER_JSON.readTree(result == null ? "" : result);
+                if (body != null && body.isObject() && body.has("ok") && !body.path("ok").asBoolean(true)) status = "error";
+            } catch (Exception plainText) { /* a text result has no status field */ }
+            cn.bugstack.ai.domain.agent.service.trace.RunTrace.tool(new cn.bugstack.ai.domain.agent.service.trace.RunTrace.ToolExchange(
+                    budget.runId(), budget.ownerUserId(), activity != null ? activity.callLabel() : stepLabel, stepLabel,
+                    call.id(), call.name(), call.arguments(), result, result == null ? -1 : result.length(), status, null,
+                    time[0], Math.max(0, (time[1] == 0 ? System.currentTimeMillis() : time[1]) - time[0]), "META"));
+        }
     }
 
     /**
@@ -851,6 +954,110 @@ public class RobustToolCallingManager implements ToolCallingManager {
     }
 
     /** 调 gate 阻塞提问，把状态翻译成给 LLM 的工具结果文本；同时发 ask_user 元工具观察卡片。 */
+    /** read_attachment：只读，由本 manager 执行；归属只取请求自带的 ToolContext，不信任模型参数。 */
+    private String runReadAttachment(Prompt prompt, AssistantMessage.ToolCall tc, String sessionId, String stepLabel) {
+        Map<String, Object> scope = prompt.getOptions() instanceof ToolCallingChatOptions options
+                && options.getToolContext() != null ? options.getToolContext() : Map.of();
+        RunBudgetRegistry.State budget = RunBudgetRegistry.find(scope);
+        if (budget != null) budget.checkActive();
+        if (chatFileService == null || runAttachments == null || !runAttachments.readable(scope)) {
+            return "{\"ok\":false,\"error\":\"ATTACHMENT_NOT_AVAILABLE\",\"message\":\"本次任务没有可读取的附件\"}";
+        }
+        if (countPriorResponses(prompt, this::isReadAttachmentName) >= MAX_ATTACHMENT_READS_PER_CALL) {
+            return "{\"ok\":false,\"error\":\"ATTACHMENT_READ_LIMIT\",\"message\":\"本步骤读取附件的次数已达上限，"
+                    + "请基于已经读到的内容完成任务，并告诉用户哪些部分没有读取\"}";
+        }
+        ToolCallProgressEmitter progress = this.toolCallProgressEmitter;
+        long started = System.currentTimeMillis();
+        String tool = cn.bugstack.ai.domain.agent.service.attachment.ReadAttachmentTool.TOOL_NAME;
+        if (progress != null) progress.emitStart(sessionId, tool, tc.arguments(), stepLabel, tc.id());
+        String result;
+        try {
+            result = chatFileService.read(scope, tc.arguments());
+        } catch (RuntimeException failure) {
+            StreamingActivityTracker.rethrowCancellation(failure);
+            if (failure instanceof RunBudgetExceededException) throw failure;
+            log.warn("[RobustToolMgr] read_attachment failed: {}", failure.toString());
+            result = "{\"ok\":false,\"error\":\"ATTACHMENT_READ_FAILED\",\"message\":\"附件暂时无法读取，请稍后重试；仍失败时如实告诉用户\"}";
+        }
+        boolean ok;
+        try { ok = ASK_USER_JSON.readTree(result).path("ok").asBoolean(false); }
+        catch (Exception invalid) { ok = false; }
+        if (progress != null) progress.emitEnd(sessionId, tool, ok ? "success" : "error",
+                System.currentTimeMillis() - started, result.length(), stepLabel, tc.id());
+        ToolCallLedger ledger = this.toolCallLedger;
+        if (ledger != null && Boolean.TRUE.equals(scope.get(ToolCallLedger.CTX_ENABLED_KEY))
+                && scope.get("agent.run_id") instanceof String runId && !runId.isBlank()) {
+            ledger.record(runId, tool, ok ? ToolCallLedger.STATUS_SUCCESS : "error", result.length(), result);
+        }
+        return result;
+    }
+
+    /** run_python：计入本次任务的工具调用预算；排队位置和运行时长通过 tool_call_progress 推给页面。 */
+    private String runPython(Prompt prompt, AssistantMessage.ToolCall tc, String sessionId, String stepLabel) {
+        Map<String, Object> scope = prompt.getOptions() instanceof ToolCallingChatOptions options
+                && options.getToolContext() != null ? options.getToolContext() : Map.of();
+        if (!codeExecutionAllowed()) {
+            return "{\"ok\":false,\"error\":\"SANDBOX_UNAVAILABLE\",\"message\":\"当前不能运行代码"
+                    + "（沙箱未启用或本节点关闭了代码运行），请改用其他方式完成或如实告诉用户\"}";
+        }
+        RunBudgetRegistry.State budget = RunBudgetRegistry.find(scope);
+        if (budget != null) budget.reserveTool();
+        String tool = cn.bugstack.ai.domain.agent.service.sandbox.ISandboxService.TOOL_NAME;
+        ToolCallProgressEmitter progress = this.toolCallProgressEmitter;
+        long started = System.currentTimeMillis();
+        if (progress != null) progress.emitStart(sessionId, tool, tc.arguments(), stepLabel, tc.id());
+        long[] lastRunningReport = {Long.MIN_VALUE};
+        int[] lastQueued = {-1};
+        cn.bugstack.ai.domain.agent.service.sandbox.ISandboxService.Progress status =
+                new cn.bugstack.ai.domain.agent.service.sandbox.ISandboxService.Progress() {
+                    @Override public void queued(int ahead) {
+                        if (progress == null || ahead == lastQueued[0]) return;
+                        lastQueued[0] = ahead;
+                        progress.emitProgress(sessionId, tool, tc.id(), ahead > 0 ? "排队中，前面还有 " + ahead + " 个" : "排队中，马上开始");
+                    }
+                    @Override public void running(long elapsedMs) {
+                        long seconds = elapsedMs / 1000;
+                        if (progress == null || seconds - lastRunningReport[0] < 5 && lastRunningReport[0] != Long.MIN_VALUE) return;
+                        lastRunningReport[0] = seconds;
+                        progress.emitProgress(sessionId, tool, tc.id(), "运行中 " + seconds + " 秒");
+                    }
+                };
+        String result;
+        try {
+            result = sandboxService.run(tc.id(), tc.arguments(), scope, status);
+        } catch (RuntimeException failure) {
+            StreamingActivityTracker.rethrowCancellation(failure);
+            if (failure instanceof RunBudgetExceededException) throw failure;
+            log.warn("[RobustToolMgr] run_python failed: {}", failure.toString());
+            result = "{\"ok\":false,\"error\":\"SANDBOX_FAILED\",\"message\":\"代码运行服务暂时不可用，请稍后重试；仍失败时如实告诉用户\"}";
+        }
+        boolean ok;
+        try { ok = ASK_USER_JSON.readTree(result).path("ok").asBoolean(false); }
+        catch (Exception invalid) { ok = false; }
+        if (progress != null) progress.emitEnd(sessionId, tool, ok ? "success" : "error",
+                System.currentTimeMillis() - started, result.length(), stepLabel, tc.id());
+        ToolCallLedger ledger = this.toolCallLedger;
+        if (ledger != null && Boolean.TRUE.equals(scope.get(ToolCallLedger.CTX_ENABLED_KEY))
+                && scope.get("agent.run_id") instanceof String runId && !runId.isBlank()) {
+            ledger.record(runId, tool, ok ? ToolCallLedger.STATUS_SUCCESS : "error", result.length(), result);
+        }
+        return result;
+    }
+
+    private int countPriorResponses(Prompt prompt, java.util.function.Predicate<String> nameMatch) {
+        int count = 0;
+        if (prompt == null || prompt.getInstructions() == null) return 0;
+        for (Message message : prompt.getInstructions()) {
+            if (message instanceof ToolResponseMessage trm && trm.getResponses() != null) {
+                for (ToolResponseMessage.ToolResponse response : trm.getResponses()) {
+                    if (nameMatch.test(response.name())) count++;
+                }
+            }
+        }
+        return count;
+    }
+
     private String runAskUser(Prompt prompt, String sessionId, AssistantMessage.ToolCall tc, String stepLabel) {
         ToolCallProgressEmitter p = this.toolCallProgressEmitter;
         if (p != null) {
@@ -1271,7 +1478,8 @@ public class RobustToolCallingManager implements ToolCallingManager {
     }
 
     private boolean isReservedMetaToolName(String name) {
-        return isAskUserName(name) || isRequestToolName(name) || isInspectResultName(name) || isCreateArtifactName(name);
+        return isAskUserName(name) || isRequestToolName(name) || isInspectResultName(name) || isCreateArtifactName(name)
+                || isReadAttachmentName(name) || isRunPythonName(name);
     }
 
     private boolean isCreateArtifactName(String name) { return "create_artifact".equalsIgnoreCase(name); }

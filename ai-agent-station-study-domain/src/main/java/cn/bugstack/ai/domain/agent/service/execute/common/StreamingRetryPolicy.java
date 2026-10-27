@@ -25,7 +25,7 @@ public final class StreamingRetryPolicy {
                                    int attempt, int maxAttempts) {
         if (toolStarted || outputChars > 0 || attempt >= maxAttempts
                 || Thread.currentThread().isInterrupted() || budgetFailure(failure) != null
-                || cancellation(failure) != null) return false;
+                || cancellation(failure) != null || requestLayerDecided(failure) != null) return false;
         var seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Throwable, Boolean>());
         for (Throwable t = failure; t != null && seen.size() < 32 && seen.add(t); t = t.getCause()) {
             if (t instanceof ModelStreamException stream) return stream.canRetryAt(attempt);
@@ -44,6 +44,9 @@ public final class StreamingRetryPolicy {
         // Prefer this trusted, user-actionable reason without exposing arbitrary provider causes.
         RunBudgetExceededException budget = budgetFailure(cause);
         if (budget != null) return new IllegalStateException(budget.getMessage(), cause);
+        // Already retried or switched at the request layer; its wording lists safe reasons only.
+        RuntimeException decided = requestLayerDecided(cause);
+        if (decided != null) return new IllegalStateException(decided.getMessage(), cause);
         var seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Throwable, Boolean>());
         for (Throwable current = cause; current != null && seen.size() < 32 && seen.add(current); current = current.getCause()) {
             if (current instanceof ModelStreamException stream)
@@ -64,6 +67,16 @@ public final class StreamingRetryPolicy {
                 : cause == null ? "stream ended without an answer" : cause.getMessage();
         if (reason == null || reason.isBlank()) reason = cause == null ? "unknown" : cause.getClass().getSimpleName();
         return new IllegalStateException("Streaming step " + step + " failed: " + reason, cause);
+    }
+
+    /** The request layer retried transient failures and tried every candidate: never replay the prompt for it. */
+    private static RuntimeException requestLayerDecided(Throwable failure) {
+        var seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Throwable, Boolean>());
+        for (Throwable current = failure; current != null && seen.size() < 32 && seen.add(current); current = current.getCause()) {
+            if (current instanceof cn.bugstack.ai.domain.agent.service.model.failover.ModelRetriesExhaustedException exhausted) return exhausted;
+            if (current instanceof cn.bugstack.ai.domain.agent.service.model.failover.ModelsUnavailableException unavailable) return unavailable;
+        }
+        return null;
     }
 
     private static RunBudgetExceededException budgetFailure(Throwable failure) {

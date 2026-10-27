@@ -397,6 +397,8 @@ public class EvalRunService {
         trace.put("evalSpec", JSON.toJSON(config));
         trace.put("case", datasetService.caseView(evalCase));
         trace.put("agentRunId", agentRunId);
+        // The complete trace (every model request, full tool results) lives in ai_run_trace under the run id.
+        trace.put("runTrace", "/api/v1/history/" + agentRunId + "/trace");
         trace.put("sessionId", sessionId);
         trace.put("stmSnapshot", stmSnapshot);
         trace.put("finalAnswer", answer);

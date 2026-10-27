@@ -166,12 +166,17 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
                 && profile.allows(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapability.ASK_USER)
                 && userInputGate != null && userInputGate.isEnabled()
                 && userInputGate.remainingFor(sessionId) > 0;
-        boolean reqOn = profile != null
-                && profile.allows(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapability.REQUEST_TOOL)
-                && requestToolEnabled && dynamicMcpToolCatalogService != null;
+        boolean reqOn = requestToolAvailable(profile);
         if (!askOn && !reqOn) return "";
         return cn.bugstack.ai.domain.agent.service.prompt.RuntimeToolPromptComposer
                 .renderMetaToolHint(askOn, reqOn);
+    }
+
+    protected boolean requestToolAvailable(
+            cn.bugstack.ai.domain.agent.service.execute.common.ToolCapabilityProfile profile) {
+        return profile != null
+                && profile.allows(cn.bugstack.ai.domain.agent.service.execute.common.ToolCapability.REQUEST_TOOL)
+                && requestToolEnabled && dynamicMcpToolCatalogService != null;
     }
 
     /**
@@ -347,6 +352,9 @@ public abstract class AbstractExecuteSupport extends AbstractMultiThreadStrategy
             throw new CancellationException("SSE client disconnected or execution cancelled");
         }
     }
+
+    /** Context key holding why the run stopped starting new rounds (its budget or the daily quota). */
+    protected static final String BUDGET_STOP_KEY = "budgetStopReason";
 
     /**
      * 立即回答路由钩子：finalizeRequested 置位时直接跳汇总节点 Step4，返回其结果短路剩余步骤。

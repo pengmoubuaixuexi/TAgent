@@ -71,6 +71,14 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
     @Resource
     private McpToolCatalogService mcpToolCatalogService;
 
+    /** Same switch RobustToolCallingManager uses to offer request_tool; the tool list must agree with it. */
+    @Value("${agent.request-tool.enabled:false}")
+    private boolean requestToolEnabled;
+
+    private boolean requestToolAvailable() {
+        return requestToolEnabled && mcpToolCatalogService != null;
+    }
+
     /** V035 (2026-05-14)：fix 策略统一走 Prometheus / event_log / ES */
     @Resource
     private LlmObservationRecorder llmObservationRecorder;
@@ -203,7 +211,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
                             agentToolRegistry != null ? agentToolRegistry.getTools(clientId) : List.of())
                     : List.of();
             if (agentToolRegistry != null && clientId != null) {
-                userMessage += "\n\n**【可用工具清单】**\n" + agentToolRegistry.describeToolsForPrompt(clientId, dynamicToolCallbacks);
+                userMessage += "\n\n**【可用工具清单】**\n" + agentToolRegistry.describeToolsForPrompt(clientId, dynamicToolCallbacks, requestToolAvailable());
             }
             ChatClient.ChatClientRequestSpec spec = chatClient.prompt(userMessage)
                     .system(s -> s.param("current_date", ""))
@@ -767,7 +775,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             sb.append("**你刚才正在进行的思考（被中断，可能为半截）:**\n").append(pr).append("\n\n");
         }
         if (attachTools && agentToolRegistry != null) {
-            sb.append("**【可用工具清单】**\n").append(agentToolRegistry.describeToolsForPrompt(clientId, dyn))
+            sb.append("**【可用工具清单】**\n").append(agentToolRegistry.describeToolsForPrompt(clientId, dyn, requestToolAvailable()))
               .append("\n如需补足信息可调用上述工具后再作答；不需要则直接作答。\n\n");
         }
         sb.append("请基于以上内容直接给出最终答案。\n").append(answerNowNoThinkDirective);
@@ -903,7 +911,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             sb.append("**你刚才的思考（可能半截）:**\n").append(pr).append("\n\n");
         }
         if (attachTools && agentToolRegistry != null) {
-            sb.append("**【可用工具清单】**\n").append(agentToolRegistry.describeToolsForPrompt(clientId, dyn))
+            sb.append("**【可用工具清单】**\n").append(agentToolRegistry.describeToolsForPrompt(clientId, dyn, requestToolAvailable()))
               .append("\n如需补足信息可调用上述工具。\n\n");
         }
         sb.append("请结合新想法重做回答。");

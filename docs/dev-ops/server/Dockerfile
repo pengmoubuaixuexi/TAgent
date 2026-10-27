@@ -8,7 +8,8 @@ WORKDIR /app
 # Strip private profiles before copying the JAR into the final image's layers.
 FROM runtime-base AS sanitize
 COPY ai-agent-station-study-app/target/ai-agent-station-study-app.jar /app/app.jar
-RUN zip -d /app/app.jar BOOT-INF/classes/application-dev.yml BOOT-INF/classes/application-test.yml BOOT-INF/classes/application-prod.yml
+# zip exits 12 when an already-sanitized input has none of these entries; other errors still fail.
+RUN zip -d /app/app.jar BOOT-INF/classes/application-dev.yml BOOT-INF/classes/application-test.yml BOOT-INF/classes/application-prod.yml || [ "$?" -eq 12 ]
 
 FROM runtime-base
 COPY --from=sanitize /app/app.jar /app/app.jar

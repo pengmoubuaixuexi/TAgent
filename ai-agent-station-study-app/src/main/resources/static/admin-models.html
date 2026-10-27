@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>模型清单 · TAgent</title><link rel="stylesheet" href="/models.css"><link rel="stylesheet" href="/admin-models.css"><script src="/auth.js"></script><script defer src="/admin-models.js"></script><link rel="stylesheet" href="/workspace-nav.css"><script defer src="/workspace-nav.js"></script>
+</head>
+<body>
+<div data-workspace-nav hidden></div><main>
+<h1>模型清单</h1><p class="intro">平台模型的自动降级候选。某个平台模型下线、密钥失效或余额不足时，任务按「同档位 → 更高档位 → 更低档位」改用清单里的其他模型；网络波动和服务端 5xx 只重试，不切换。个人模型只在用户自己的模型之间切换，不会用到这里的模型。</p>
+<div id="message" role="status" aria-live="polite"></div>
+<section><div class="section-heading"><h2>平台模型</h2><button id="refresh" type="button" class="secondary">刷新</button></div>
+<div class="table-wrap"><table id="catalog"><thead><tr><th>模型</th><th>档位</th><th>顺序</th><th>启用</th><th>健康状态</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+<p class="muted">只有已开放给用户的平台模型才会被当作备用；未开放的条目会标出，不参与切换。「立即检测」发送一次最小请求（约 10 个 Token，由平台密钥计费），检测通过即恢复为可用。</p></section>
+<section><h2>添加模型</h2><form id="addForm"><div class="grid"><label>已开放的平台模型<select name="model" id="addable" required></select></label><label>档位<select name="tier"><option value="small">small</option><option value="medium" selected>medium</option><option value="large">large</option></select></label><label>顺序（同档位内小的优先）<input name="sortOrder" type="number" min="0" max="10000" value="100" required></label></div><button type="submit" id="addButton">加入清单</button></form></section>
+</main></body></html>

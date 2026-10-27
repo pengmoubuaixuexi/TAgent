@@ -68,8 +68,10 @@ public class JdbcModelUsageAccounting implements ModelUsageAccounting {
         identity(attempt.runId(),attempt.userId());
         if(attempt.model()==null||attempt.model().isBlank()||attempt.providerHost()==null||attempt.providerHost().isBlank())
             throw new SecurityException("模型请求缺少可核验的提供商或模型信息");
-        long requested=Math.addExact(Math.max(0,attempt.inputEstimate()),Math.max(0,attempt.outputLimit()));
+        // Admitted on usage: only the input estimate is held until the call settles, never the output limit.
+        long requested=Math.max(0,attempt.inputEstimate());
         String id=UUID.randomUUID().toString();
+        boolean[] quotaReached={false};
         transaction.executeWithoutResult(status->{
             String user=attempt.userId();lockUser(user);expireRuns(user);
             var runs=db.queryForList("SELECT user_id,billing_source,state,deadline_at FROM ai_model_usage_run WHERE run_id=?",attempt.runId());
@@ -80,10 +82,16 @@ public class JdbcModelUsageAccounting implements ModelUsageAccounting {
             String source=source(attempt,"SYSTEM".equals(run.get("billing_source")));
             LocalDate day=LocalDate.now(clock);
             if("PLATFORM".equals(source)) {
-                db.update("INSERT INTO ai_model_usage_day(user_id,usage_date) VALUES(?,?) ON DUPLICATE KEY UPDATE user_id=VALUES(user_id)",user,day);
-                var usage=db.queryForMap("SELECT platform_calls,platform_reserved_tokens FROM ai_model_usage_day WHERE user_id=? AND usage_date=? FOR UPDATE",user,day);
-                if(((Number)usage.get("platform_calls")).longValue()>=dailyCalls||requested>dailyTokens-((Number)usage.get("platform_reserved_tokens")).longValue())
-                    throw new RunBudgetExceededException("今日平台试用额度不足，未发送模型请求；可在模型连接页查看用量或使用个人模型");
+                var usage=usageDay(user,day);
+                long calls=number(usage.get("platform_calls")),used=number(usage.get("platform_reserved_tokens"))+number(usage.get("carried_tokens"));
+                if(calls>=ceiling(dailyCalls)||used>=ceiling(dailyTokens))
+                    throw new RunBudgetExceededException("今日平台试用额度已超出上限，未发送模型请求；明天恢复，或在模型连接页改用个人模型");
+                if(calls>=dailyCalls||used>=dailyTokens) {
+                    // At the quota a new task is refused; a running one finishes its current phase.
+                    if(db.queryForObject("SELECT COUNT(*) FROM ai_model_usage_attempt WHERE run_id=?",Long.class,attempt.runId())==0)
+                        throw new RunBudgetExceededException("今日平台试用额度已用完，未开始新任务；明天恢复，或在模型连接页改用个人模型");
+                    quotaReached[0]=true;
+                }
                 db.update("UPDATE ai_model_usage_day SET platform_calls=platform_calls+1,platform_reserved_tokens=platform_reserved_tokens+? WHERE user_id=? AND usage_date=?",requested,user,day);
             }
             db.update("""
@@ -93,6 +101,10 @@ public class JdbcModelUsageAccounting implements ModelUsageAccounting {
                 """,id,attempt.runId(),user,attempt.apiId(),attempt.providerHost(),attempt.model(),purpose(attempt.purpose()),source,
                     day,Math.max(0,attempt.inputEstimate()),Math.max(0,attempt.outputLimit()),requested);
         });
+        if(quotaReached[0]) {
+            var budget=cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.find(attempt.runId());
+            if(budget!=null)budget.reach("今日平台试用额度已用完");
+        }
         return new Ticket() {
             private boolean settled;
             @Override public synchronized void settle(Long actual,String outcome) {
@@ -119,10 +131,24 @@ public class JdbcModelUsageAccounting implements ModelUsageAccounting {
                 throw new SecurityException("模型未开放给当前账号");
         } else if(!Set.of("EMBEDDING","RERANK").contains(purpose(attempt.purpose())))
             throw new SecurityException("模型请求缺少已配置的API归属");
-        if(!system && Set.of("CHAT_HELPER","EMBEDDING","RERANK","EVAL_JUDGE").contains(purpose(attempt.purpose())))
+        if(!system && Set.of("CHAT_HELPER","EMBEDDING","RERANK","EVAL_JUDGE","RUN_REVIEW").contains(purpose(attempt.purpose())))
             access.requirePlatformAuxiliary(attempt.userId(),attempt.purpose());
         return system?"SYSTEM":"PLATFORM";
     }
+    /** Today's row, created with the overrun carried from yesterday (its usage and own carry beyond the quota). */
+    private Map<String,Object> usageDay(String user,LocalDate day) {
+        var rows=db.queryForList("SELECT platform_calls,platform_reserved_tokens,carried_tokens FROM ai_model_usage_day WHERE user_id=? AND usage_date=? FOR UPDATE",user,day);
+        if(!rows.isEmpty())return rows.get(0);
+        var previous=db.queryForList("SELECT platform_reserved_tokens,carried_tokens FROM ai_model_usage_day WHERE user_id=? AND usage_date=?",user,day.minusDays(1));
+        long carried=previous.isEmpty()?0:Math.max(0,number(previous.get(0).get("platform_reserved_tokens"))+number(previous.get(0).get("carried_tokens"))-dailyTokens);
+        db.update("INSERT INTO ai_model_usage_day(user_id,usage_date,carried_tokens) VALUES(?,?,?)",user,day,carried);
+        return Map.of("platform_calls",0L,"platform_reserved_tokens",0L,"carried_tokens",carried);
+    }
+    /** The hard ceiling: the quota plus the share a running task may overrun to finish its phase. */
+    private static long ceiling(long quota) {
+        return quota+(long)Math.floor(quota*cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry.overrunRatio());
+    }
+    private static long number(Object value){return value==null?0:((Number)value).longValue();}
     private void settle(String id,String user,Long actual,String outcome) {
         transaction.executeWithoutResult(status->{
             lockUser(user);
@@ -151,8 +177,8 @@ public class JdbcModelUsageAccounting implements ModelUsageAccounting {
         final String filteredRun=run;
         return transaction.execute(status->{
             lockUser(user);expireRuns(user);LocalDate day=LocalDate.now(clock);
-            var usage=db.queryForList("SELECT platform_calls AS platformCalls,platform_reserved_tokens AS platformReservedTokens,confirmed_tokens AS confirmedPlatformTokens FROM ai_model_usage_day WHERE user_id=? AND usage_date=?",user,day);
-            var today=usage.isEmpty()?Map.<String,Object>of("platformCalls",0,"platformReservedTokens",0,"confirmedPlatformTokens",0):usage.get(0);
+            var usage=db.queryForList("SELECT platform_calls AS platformCalls,platform_reserved_tokens AS platformReservedTokens,confirmed_tokens AS confirmedPlatformTokens,carried_tokens AS carriedTokens FROM ai_model_usage_day WHERE user_id=? AND usage_date=?",user,day);
+            var today=usage.isEmpty()?Map.<String,Object>of("platformCalls",0,"platformReservedTokens",0,"confirmedPlatformTokens",0,"carriedTokens",0):usage.get(0);
             String predicate=" WHERE user_id=?"+(filteredRun==null?"":" AND run_id=?");
             Object[] arguments=filteredRun==null?new Object[]{user}:new Object[]{user,filteredRun};
             var attempts=db.queryForList("""
@@ -164,7 +190,8 @@ public class JdbcModelUsageAccounting implements ModelUsageAccounting {
             Long running=db.queryForObject("SELECT COUNT(*) FROM ai_model_usage_run WHERE user_id=? AND state IN ('ACTIVE','WAITING_REVIEW')",Long.class,user);
             var result=new LinkedHashMap<String,Object>();
             result.put("day",day.toString());result.put("dayTimeZone","UTC");result.put("today",today);result.put("activeRuns",running);
-            result.put("limits",Map.of("platformDailyTokens",dailyTokens,"platformDailyCalls",dailyCalls,"concurrentRuns",concurrentRuns));
+            result.put("limits",Map.of("platformDailyTokens",dailyTokens,"platformDailyCalls",dailyCalls,"concurrentRuns",concurrentRuns,
+                    "platformHardTokens",ceiling(dailyTokens)));
             result.put("attempts",attempts);result.put("filteredRunId",filteredRun);
             if(filteredRun!=null){
                 var aggregate=db.queryForMap("""

@@ -1,0 +1,7 @@
+backend: Agg
+font.family: sans-serif
+font.sans-serif: WenQuanYi Micro Hei, Noto Sans CJK JP, DejaVu Sans
+axes.unicode_minus: False
+figure.dpi: 100
+savefig.dpi: 150
+savefig.bbox: tight

@@ -26,7 +26,10 @@ public class AgentNotification {
         TOOL_APPROVAL,
         PLAN_REVIEW,
         TASK_FAILED,
-        TASK_COMPLETED
+        TASK_COMPLETED,
+        /** A platform model (to administrators) or a personal model (to its owner) stopped answering. */
+        MODEL_UNAVAILABLE,
+        MODEL_RECOVERED
     }
 
     public enum Status {
@@ -35,7 +38,9 @@ public class AgentNotification {
         EXPIRED,
         TASK_FAILED,
         TASK_COMPLETED,
-        PLAN_REVIEW
+        PLAN_REVIEW,
+        MODEL_UNAVAILABLE,
+        MODEL_RECOVERED
     }
 
     public enum ReadStatus {

@@ -5,10 +5,13 @@ import org.springframework.ai.tool.ToolCallback;
 import cn.bugstack.ai.domain.agent.service.execute.common.MeteredToolCallback;
 import java.util.*;
 
-/** Server-authored, immutable ceiling on a private node's business capabilities. */
+/**
+ * Server-authored, immutable ceiling on a private node's business capabilities.
+ * {@code codeExecution} is the node's switch for run_python (on unless the owner turned it off).
+ */
 public record WorkspaceNodePolicy(String agentId, String clientId, String taskPrompt,
                                   Map<String, Set<String>> tools, Set<String> allTools, Set<String> publicMcpIds,
-                                  Set<String> onDemandMcpIds) {
+                                  Set<String> onDemandMcpIds, boolean codeExecution) {
     private static final ObjectMapper JSON = new ObjectMapper();
     public WorkspaceNodePolicy {
         Map<String,Set<String>> copy=new LinkedHashMap<>();
@@ -16,6 +19,10 @@ public record WorkspaceNodePolicy(String agentId, String clientId, String taskPr
         tools=Collections.unmodifiableMap(copy); allTools=Set.copyOf(allTools);
         publicMcpIds=Set.copyOf(publicMcpIds);
         onDemandMcpIds=Set.copyOf(onDemandMcpIds);
+    }
+    public WorkspaceNodePolicy(String agentId,String clientId,String taskPrompt,Map<String,Set<String>> tools,Set<String> allTools,
+                               Set<String> publicMcpIds,Set<String> onDemandMcpIds) {
+        this(agentId,clientId,taskPrompt,tools,allTools,publicMcpIds,onDemandMcpIds,true);
     }
     public WorkspaceNodePolicy(String agentId,String clientId,String taskPrompt,Map<String,Set<String>> tools,Set<String> allTools,Set<String> publicMcpIds) {
         this(agentId,clientId,taskPrompt,tools,allTools,publicMcpIds,Set.of());
@@ -40,7 +47,7 @@ public record WorkspaceNodePolicy(String agentId, String clientId, String taskPr
             }
             Set<String> publicIds=new HashSet<>();node.path("publicMcpIds").forEach(id->publicIds.add(id.asText()));
             return new WorkspaceNodePolicy(node.path("agentId").asText(),node.path("clientId").asText(),
-                    node.path("taskPrompt").asText(""),tools,all,publicIds,onDemand);
+                    node.path("taskPrompt").asText(""),tools,all,publicIds,onDemand,node.path("codeExecution").asBoolean(true));
         } catch (Exception e) { throw new IllegalStateException("Invalid workspace node policy",e); }
     }
     public boolean eager(String mcpId) { return !onDemandMcpIds.contains(mcpId); }
