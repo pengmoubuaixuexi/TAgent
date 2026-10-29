@@ -13,7 +13,7 @@
 
 [中文文档](./README.md) | **English**
 
-[![Watch the Dynamic MCP Demo](https://img.shields.io/badge/Watch-Dynamic%20MCP%20demo-0ea5e9?style=for-the-badge&logo=github)](./docs/demo-videos/03-%E6%89%A7%E8%A1%8C%E6%9C%9F%E5%8A%A8%E6%80%81%E8%A1%A5%E6%8C%82%E5%B7%A5%E5%85%B7.webm)
+[![Watch the Dynamic MCP Demo](https://img.shields.io/badge/Watch-Dynamic%20MCP%20demo-0ea5e9?style=for-the-badge&logo=github)](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/06-dynamic-tools.mp4)
 
 </div>
 
@@ -21,7 +21,7 @@ TAgent is an enterprise-level AI Agent implementation project built with **Java 
 
 It is not another one-call model wrapper. TAgent makes the complete Agent-request lifecycle concrete and inspectable: ingestion, routing, runtime assembly, planning and execution, RAG, memory, MCP tool governance, human approval, in-execution intervention, SSE streaming, recovery, and end-to-end observability.
 
-[Watch the Dynamic MCP demo](./docs/demo-videos/03-%E6%89%A7%E8%A1%8C%E6%9C%9F%E5%8A%A8%E6%80%81%E8%A1%A5%E6%8C%82%E5%B7%A5%E5%85%B7.webm). The current v2.0 architecture is shown below.
+[Watch the Dynamic MCP demo](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/06-dynamic-tools.mp4). The current v2.0 architecture is shown below.
 
 **What you can verify in the demo:** the model detects a missing capability during execution, calls `request_tool`, matches a real MCP tool through PgVector, and continues the same run with the newly attached tool. See the [full demo catalogue](./docs/demo-videos/README.md) for planning review, human approval, step-level redo, resilient runs, multimodal input, and background tasks.
 
@@ -60,16 +60,15 @@ Shared navigation connects models, Agents, knowledge, history, artifacts/feedbac
 
 ## 🎬 Feature Demos
 
-The repository includes focused recordings for the features below. Some were recorded on earlier releases; v2.0.0 interfaces and stage permissions have since changed:
+The October 2026 collection selects the strongest Codex / Muse recordings and adds the reviewed supplemental takes: **34 clips — 32 scoped feature demos and 2 engineering field tests**. Videos are hosted on the [v2.2.1 GitHub Release](https://github.com/pengmoubuaixuexi/TAgent/releases/tag/v2.2.1), replacing the early recordings as the recommended entry point. All are silent, subtitled recordings of the real UI.
 
-- [Fixed / Auto / Flow execution modes](./docs/demo-videos/01-%E4%B8%89%E7%A7%8D%E7%AD%96%E7%95%A5%E5%9F%BA%E7%A1%80%E9%97%AE%E7%AD%94.mp4)
-- [Dynamic MCP tool attachment during execution](./docs/demo-videos/03-%E6%89%A7%E8%A1%8C%E6%9C%9F%E5%8A%A8%E6%80%81%E8%A1%A5%E6%8C%82%E5%B7%A5%E5%85%B7.webm)
-- [Flow plan review and editing](./docs/demo-videos/05-%E6%B5%81%E7%A8%8B%E8%AE%A1%E5%88%92%E7%A1%AE%E8%AE%A4%E7%BC%96%E8%BE%91.webm)
-- [Human approval for high-risk tools](./docs/demo-videos/08-%E9%AB%98%E5%8D%B1%E5%B7%A5%E5%85%B7%E4%BA%BA%E5%B7%A5%E5%AE%A1%E6%89%B9.mp4)
-- [Step-level redo by run ID](./docs/demo-videos/09-%E8%BF%90%E8%A1%8C%E7%BC%96%E5%8F%B7%E6%AD%A5%E9%AA%A4%E9%87%8D%E5%81%9A.mp4)
-- [Disconnect, reconnect, and continue in the background](./docs/demo-videos/12-%E6%96%AD%E7%BA%BF%E9%87%8D%E8%BF%9E%E5%90%8E%E5%8F%B0%E7%BB%AD%E4%BD%9C.mp4)
-- [Multimodal image understanding](./docs/demo-videos/13-%E5%9B%BE%E7%89%87%E7%90%86%E8%A7%A3%E8%83%BD%E5%8A%9B.mp4)
-- [Scheduled tasks and file-change monitoring](./docs/demo-videos/14-%E5%AE%9A%E6%97%B6%E4%BB%BB%E5%8A%A1%E5%92%8C%E5%AF%B9%E8%B1%A1%E7%9B%91%E8%A7%86%E5%99%A8%E5%8A%9F%E8%83%BD.mp4)
+- [Create a personal Agent](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/04-personal-agent.mp4) and [compare / restore versions](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/05-agent-versions.mp4)
+- [Ask the user](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/07-ask-user.mp4) and [steer an active run](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/09a-steer.mp4)
+- [Retrieve three knowledge documents](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/13-rag-three-documents.mp4) and [inspect tool-result pages](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/14b-tool-result-inspection.mp4)
+- [Revise downloadable artifacts](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/17-artifact-revisions.mp4) and [run Python with Chinese charts](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/18-python-charts.mp4)
+- [Create a model connection, immediately check it and test failover](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/21b-new-model-health-failover.mp4)
+
+See the [complete catalogue, durations and scope notes](docs/demo-videos/README.md), with SHA-256 hashes and a subtitle package. Clips 24/25 are engineering field tests, not an all-correct answer certification. Clip 19 demonstrates server-local file monitoring; clip 20 demonstrates read-only search approval. The recipe-provider failure is excluded as requested.
 
 ### Main Request Flow
 

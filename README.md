@@ -60,7 +60,11 @@ TAgent 是一个基于 **Java 17**、**Spring Boot**、**Spring AI** 和 **DDD �
 
 ## 🎬 功能演示
 
-已有录屏覆盖三种策略、动态工具补充、主动追问、计划确认、人工审批、通知收件箱、运行编号重做、长期记忆管理、断线续作、图片理解、后台任务与观测页面。部分录屏来自早期版本，界面与阶段权限以 v2.0.0 当前实现为准：[查看功能演示录屏](docs/demo-videos/README.md)。
+2026 年 10 月重新录制并从 Codex / Muse 两批择优，加入最新补录，共 **34 段：32 段功能演示 + 2 段工程实测**。覆盖个人 Agent、版本、追问与干预、知识库、附件、产物、沙箱、个人模型、运行轨迹与评测改进。视频已上传 GitHub Release，替代早期录屏作为当前演示入口。
+
+**推荐先看：** [创建个人 Agent](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/04-personal-agent.mp4) · [版本比较与恢复](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/05-agent-versions.mp4) · [主动追问](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/07-ask-user.mp4) · [运行中引导](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/09a-steer.mp4) · [产物修订](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/17-artifact-revisions.mp4) · [Python 图表与下载](https://github.com/pengmoubuaixuexi/TAgent/releases/download/v2.2.1/18-python-charts.mp4)
+
+[完整演示目录、时长与范围说明](docs/demo-videos/README.md) · [Release 视频与字幕下载](https://github.com/pengmoubuaixuexi/TAgent/releases/tag/v2.2.1)。全部为真实 UI 字幕录屏；24/25 是工程实测，运行完成不等于答案全部正确。19 仅展示服务器本地文件监视，20 仅展示只读搜索审批。
 
 ### 主链路
 
