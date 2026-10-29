@@ -15,3 +15,7 @@ server:
       cookie:
         http-only: true
         same-site: lax
+agent:
+  model-connections:
+    # Exact HTTPS provider hosts only; public DNS and same-origin request checks still apply.
+    allowed-hosts: ${PERSONAL_MODEL_ALLOWED_HOSTS:api.openai.com,api.deepseek.com,api.siliconflow.cn,api.xiaomimimo.com}

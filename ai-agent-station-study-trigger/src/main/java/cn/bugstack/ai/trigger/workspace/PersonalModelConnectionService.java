@@ -109,11 +109,13 @@ public class PersonalModelConnectionService {
         String encrypted=cipher.encrypt(user,(String)row.get("secret_ref"),version,secret(input));
         db.update("UPDATE ai_model_secret SET ciphertext=?,credential_version=?,status=1,verified_at=NULL,update_time=NOW() WHERE api_id=? AND owner_user_id=?",encrypted,version,api,user);
         db.update("UPDATE ai_client_api SET status=1,update_time=NOW() WHERE api_id=? AND owner_user_id=?",api,user);
+        if(failover!=null)failover.refreshAfterCommit();
     }
     @Transactional public void revoke(String user,String api) {
         owned(user,api,true);
         db.update("UPDATE ai_model_secret SET status=0,credential_version=credential_version+1,verified_at=NULL,update_time=NOW() WHERE api_id=? AND owner_user_id=?",api,user);
         db.update("UPDATE ai_client_api SET status=0,update_time=NOW() WHERE api_id=? AND owner_user_id=?",api,user);
+        if(failover!=null)failover.refreshAfterCommit();
     }
     public void verify(String user,String api) {
         var row=owned(user,api,false);

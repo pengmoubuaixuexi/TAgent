@@ -41,9 +41,22 @@ public class MdcTraceFilter extends OncePerRequestFilter {
     public static final String HEADER_USER_ID = "X-User-Id";
     public static final String HEADER_TENANT_ID = "X-Tenant-Id";
 
+    // Servlet threads are reused. A chat controller may leave its Run identifiers behind;
+    // a later management request must not inherit that Run's owner, budget or terminal state.
+    // Micrometer's traceId/spanId belong to the surrounding tracing scope and are preserved.
+    private static final String[] REQUEST_CONTEXT_KEYS = {
+            REQUEST_ID, USER_ID, TENANT_ID, "runId", "agent.run_id",
+            "agentId", "sessionId", "step", "modelPurpose"
+    };
+
+    private static void clearRequestContext() {
+        for (String key : REQUEST_CONTEXT_KEYS) MDC.remove(key);
+    }
+
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
+        clearRequestContext();
         String requestId = request.getHeader(HEADER_TRACE_ID);
         if (requestId == null || requestId.isBlank()) {
             requestId = UUID.randomUUID().toString().replace("-", "");
@@ -64,9 +77,7 @@ public class MdcTraceFilter extends OncePerRequestFilter {
         try {
             chain.doFilter(request, response);
         } finally {
-            MDC.remove(REQUEST_ID);
-            MDC.remove(USER_ID);
-            MDC.remove(TENANT_ID);
+            clearRequestContext();
         }
     }
 }

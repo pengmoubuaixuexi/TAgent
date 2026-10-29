@@ -39,7 +39,7 @@ spring:
     mysql:
       username: ${MYSQL_USER:tagent}
       password: ${MYSQL_PASSWORD}
-      url: jdbc:mysql://mysql:3306/ai-agent-station-study?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
+      url: jdbc:mysql://mysql:3306/ai-agent-station-study?useUnicode=true&characterEncoding=utf8&connectionTimeZone=SERVER&allowPublicKeyRetrieval=true&useSSL=false
       driver-class-name: com.mysql.cj.jdbc.Driver
       type: com.zaxxer.hikari.HikariDataSource
       hikari:
@@ -91,6 +91,8 @@ spring:
         enabled: true
         preload-enabled: false
 agent:
+  model-connections:
+    allowed-hosts: ${PERSONAL_MODEL_ALLOWED_HOSTS:api.openai.com,api.deepseek.com,api.siliconflow.cn,api.xiaomimimo.com}
   run-budget:
     # 按已用量准入、不预扣输出上限；预算用完后做完当前阶段再停并基于已完成结果作答，
     # 超过预算 20% 才当场停止。每日平台额度同样处理，超出部分记到第二天（V075）。

@@ -231,7 +231,7 @@ public class RagEvidenceEmitter {
     }
 
     /** 从 metadata 按优先级找 source；都没有用 Document.id 或 doc-N fallback。 */
-    static String extractSource(Document doc, int ref) {
+    public static String extractSource(Document doc, int ref) {
         Map<String, Object> meta = doc.getMetadata();
         if (meta != null) {
             for (String key : SOURCE_METADATA_KEYS) {

@@ -56,8 +56,42 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
     /** 立即回答：per-session finalize 标记 + 断流触发器（fixed 无 DynamicContext，用 map 承载）。 */
     private final ConcurrentHashMap<String, AtomicBoolean> finalizeFlags = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, reactor.core.publisher.Sinks.One<Object>> cancelTriggers = new ConcurrentHashMap<>();
-    /** 引导回复：per-session 新想法收件箱。 */
-    private final ConcurrentHashMap<String, String> steerInbox = new ConcurrentHashMap<>();
+    /** 每次 Fixed 运行独立的引导收件箱；其他策略的广播不创建条目。 */
+    private final ConcurrentHashMap<String, FixedSteerState> activeSteers = new ConcurrentHashMap<>();
+
+    private static final class FixedSteerState {
+        private boolean closed;
+        private String idea;
+        private reactor.core.publisher.Sinks.One<Object> trigger;
+
+        synchronized SteerSignal offer(String value) {
+            if (closed) return null;
+            idea = value;
+            return new SteerSignal(trigger);
+        }
+
+        synchronized boolean hasIdea() { return idea != null; }
+
+        synchronized String drain() {
+            String value = idea;
+            idea = null;
+            return value;
+        }
+
+        synchronized boolean installTrigger(reactor.core.publisher.Sinks.One<Object> value) {
+            if (closed) return false;
+            trigger = value;
+            return idea != null;
+        }
+
+        synchronized void close() {
+            closed = true;
+            idea = null;
+            trigger = null;
+        }
+    }
+
+    private record SteerSignal(reactor.core.publisher.Sinks.One<Object> trigger) { }
 
     @Resource
     private IAgentRepository repository;
@@ -180,6 +214,8 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         }
         // 设置 agentId 到 ThreadLocal，供 MyBatisChatMemoryRepository.saveAll() 写入 ai_chat_memory.agent_id
         cn.bugstack.ai.domain.agent.service.memory.ChatMemoryContext.setAgentId(requestParameter.getAiAgentId());
+        FixedSteerState steerState = new FixedSteerState();
+        if (sessionId != null) activeSteers.put(sessionId, steerState);
         try {
         // 2026-05-07：fixed 策略只有一个 step（fixed），整体按 fixed_strategy 折叠
         // 多 client 场景下用 fixed_strategy_{idx} 区分
@@ -272,6 +308,8 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
                         // 立即回答 mid-stream 截断触发器：answer_now emit 它 → takeUntilOther 优雅完成 → 拿到半截
                         reactor.core.publisher.Sinks.One<Object> __trigger = reactor.core.publisher.Sinks.one();
                         if (sessionId != null) cancelTriggers.put(sessionId, __trigger);
+                        // 引导可能发生在运行注册和流订阅之间；挂上触发器后补发，避免整条流跑完才处理。
+                        if (steerState.installTrigger(__trigger)) __trigger.tryEmitValue(Boolean.TRUE);
                         Flux<ChatClientResponse> flux = spec.toolContext(java.util.Map.of(
                             cn.bugstack.ai.domain.agent.service.execute.common.StreamingActivityTracker.CONTEXT_KEY, __activity))
                             .stream().chatClientResponse()
@@ -301,7 +339,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
                         if (__fin0 != null && __fin0.get()) {
                             sendTokenEvent(emitter, "[DONE]", stepId, sessionId);
                         }
-                        boolean steeringNow = sessionId != null && steerInbox.containsKey(sessionId);
+                        boolean steeringNow = steerState.hasIdea();
                         if (buf.toString().isBlank() && !cancelled.get() && !(__fin0 != null && __fin0.get()) && !steeringNow) {
                             throw cn.bugstack.ai.domain.agent.service.execute.common.ModelStreamException.emptyAnswer();
                         }
@@ -365,7 +403,7 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
             }
 
             // 引导回复：折入新想法重做本回答（思考不关、工具保留），content 更新后继续 client 循环
-            String __steer = sessionId != null ? steerInbox.remove(sessionId) : null;
+            String __steer = steerState.drain();
             if (__steer != null && !__steer.isBlank()) {
                 content = fixedSteerRerun(chatClient, config.getClientId(), requestParameter, stepResult, sessionId, __steer, emitter);
             }
@@ -392,12 +430,13 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
         }
         sendCompleteResult(emitter, requestParameter.getSessionId());
         } finally {
+            steerState.close();
+            if (sessionId != null) activeSteers.remove(sessionId, steerState);
             longTermMemoryTurnSnapshot.clearSession(sessionId);
             cn.bugstack.ai.domain.agent.service.memory.ChatMemoryContext.clear();
             if (sessionId != null) cancelFlags.remove(sessionId);
             if (sessionId != null) finalizeFlags.remove(sessionId);
             if (sessionId != null) cancelTriggers.remove(sessionId);
-            if (sessionId != null) steerInbox.remove(sessionId);
             if (sessionId != null && mcpToolCatalogService != null) mcpToolCatalogService.clearNeeds(sessionId);
             if (runId != null && mcpToolCatalogService != null) mcpToolCatalogService.cleanupRun(runId);
             cn.bugstack.ai.domain.agent.service.execute.common.ReasoningContentFilter.clearLatestReasoning(sessionId);
@@ -434,9 +473,11 @@ public class FixedAgentExecuteStrategy implements IExecuteStrategy {
     @Override
     public void steerExecute(String sessionId, String idea) {
         if (sessionId == null || idea == null || idea.isBlank()) return;
-        steerInbox.put(sessionId, idea);
-        reactor.core.publisher.Sinks.One<Object> t = cancelTriggers.get(sessionId);
-        if (t != null) t.tryEmitValue(Boolean.TRUE);
+        FixedSteerState state = activeSteers.get(sessionId);
+        if (state == null) return;
+        SteerSignal signal = state.offer(idea);
+        if (signal == null) return;
+        if (signal.trigger() != null) signal.trigger().tryEmitValue(Boolean.TRUE);
         log.info("[FixedAgent] steerExecute sessionId={} ideaLen={}", sessionId, idea.length());
     }
 

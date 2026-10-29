@@ -378,6 +378,16 @@ public class MeteredToolCallback implements ToolCallback, McpClientRegistry.Orig
                 return result;
             }
 
+            if (toolResultReferenceService != null) {
+                String rejected = toolResultReferenceService.validateMapArguments(name, effectiveInput, resultScope);
+                if (rejected != null) {
+                    rawResultChars = returnedResultChars = rejected.length();
+                    rawResultForTrace = returnedResultForEvidence = rejected;
+                    success = true; progressStatus = STATUS_BLOCKED;
+                    return rejected;
+                }
+            }
+
             // G1-C：高风险工具人工审批 hook。gate==null 时 no-op 放行（保护机制），
             // 装配点未注入 gate 不应影响现有 agent 运行。审批拒绝/超时/通道缺失 → 结构化错误返 LLM 不抛异常，
             // Agent 流程继续，LLM 可据此说明原因或换路径。

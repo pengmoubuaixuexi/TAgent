@@ -48,6 +48,15 @@ public class LlmRagRouter implements IRagRouter {
             - Simple opinions or subjective questions without factual need
             - Follow-ups that don't need new facts ("repeat that", "say it again")
 
+            ## Available context:
+            You receive only the current query, not conversation history or retrieved document passages.
+            Do not assume that source text is available merely because the user says "already provided",
+            "this knowledge-base context", "the above documents", or "本次已提供的知识库上下文".
+            Requests to read, summarize, quote, compare or cite knowledge-base documents need retrieval
+            unless the actual source passages to transform are included in the query itself.
+            A reference to documents is not the documents. In particular, a reading-summary request
+            with no pasted source text is NOT a fact-free follow-up; default to retrieval when unsure.
+
             ## If retrieval IS needed (shouldRetrieve=true), pick exactly ONE strategy and fill its payload:
             - SIMPLE: a clear factual/general question. Fill "rewrittenQuery" with a concise, retrieval-friendly
               restatement of the query (keep original language; strip filler/politeness).

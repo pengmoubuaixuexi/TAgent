@@ -389,7 +389,9 @@ public class ImprovementService {
         command.setTenantId("default");
         // The owner's own agent and models; an isolated evaluation user could not run them.
         command.setMemoryPolicy("FIXED_USER");
-        command.setConcurrency(2);
+        // Both evaluations start together. One worker per side uses two foreground slots,
+        // rather than four competing for the normal three-run account limit.
+        command.setConcurrency(1);
         command.setName(name);
         return String.valueOf(evalRuns.createRun(command).get("evalRunId"));
     }

@@ -39,7 +39,7 @@ public class WorkspaceRunArtifactService implements RunArtifactService {
 
     @Override public ToolDefinition definition() {
         return ToolDefinition.builder().name(TOOL_NAME)
-                .description("保存当前任务的完整成果，返回可预览、下载的个人产物卡片。MARKDOWN 文档下载为 .md；TABLE 表格下载为 .csv；CODE 保存单个源码文件，不执行或验证代码。"
+                .description("在用户要求文件、文档、表格、下载成果、修改已有产物或任务确需文件交付时，保存完整成果，返回可预览、下载的个人产物卡片。普通概念问答或代码解释直接回答，无需调用。保存前不要先输出同一份完整正文，成功后简短说明产物，避免重复全文。MARKDOWN 文档下载为 .md；TABLE 表格下载为 .csv；CODE 保存单个源码文件，不执行或验证代码。"
                         +"必须通过工具调用提交一个完整 JSON 对象，content 也必须是对象，不能直接把 Markdown 或源码写在冒号后。正文中的换行、双引号和反斜杠须按 JSON 字符串转义，不要在参数外包代码围栏。"
                         +"MARKDOWN 示例：{\"title\":\"行程\",\"format\":\"MARKDOWN\",\"content\":{\"markdown\":\"# 行程\\n正文\"}}。"
                         +"TABLE 示例：{\"title\":\"预算\",\"format\":\"TABLE\",\"content\":{\"columns\":[\"项目\",\"金额\"],\"rows\":[[\"交通\",\"100\"]]}}。"

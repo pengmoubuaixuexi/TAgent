@@ -272,7 +272,7 @@
         if(!state.run)throw new Error('请先选择来源运行');
         const saved=await api(path+'/runs/'+encode(state.run.runId)+'/feedback','PUT',{revision:state.feedback.revision||0,rating:$('rating').value,comment:$('feedback-comment').value,correctedAnswer:$('corrected-answer').value,createEvalDraft:$('create-eval').checked});
         state.feedback=saved;$('create-eval').checked=false;$('eval-link').hidden=!saved.evalDatasetId;
-        $('feedback-saved').textContent=saved.evalDatasetId?'已生成个人评测草稿，题目未启用。后续修改反馈不会覆盖评测草稿。':'反馈已保存 · v'+saved.revision;
+        $('feedback-saved').textContent=saved.evalDatasetId?'已生成个人评测草稿（生成时默认未启用）。后续修改反馈不会覆盖评测草稿。':'反馈已保存 · v'+saved.revision;
         notice('反馈已保存'+(saved.evalDatasetId?'，可前往我的评测审阅草稿。':'。'));
     });};
     window.addEventListener('beforeunload',e=>{if(state.dirty){e.preventDefault();e.returnValue='';}});

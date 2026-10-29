@@ -233,7 +233,9 @@ public class WorkspaceService {
                 entry.put("topK",a.has("topK")?requiredInt(a,"topK",1,20):4);
             if (type.equals("RagAnswer")) {
                 String tag=text(a,"knowledgeTag",1,128);
-                if (!tag.matches("[\\p{L}\\p{N}_ .-]+")) throw bad("知识库标签包含不支持的字符");
+                // These display punctuation marks are safe inside the quoted legacy filter literal.
+                // Quotes, backslashes and control characters remain rejected.
+                if (!tag.matches("[\\p{L}\\p{N}_ .·()（）-]+")) throw bad("知识库标签包含不支持的字符");
                 if (db.queryForObject("SELECT COUNT(*) FROM ai_client_rag_order WHERE user_id=? AND knowledge_tag=? AND status=1",Integer.class,user,tag)==0)
                     throw bad("只能使用本人的知识库");
                 entry.put("knowledgeTag",tag);

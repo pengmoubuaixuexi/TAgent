@@ -2,6 +2,8 @@ package cn.bugstack.ai.domain.agent.service.evidence;
 
 import cn.bugstack.ai.domain.agent.model.valobj.enums.AiAgentEnumVO;
 import cn.bugstack.ai.domain.agent.service.execute.common.LlmCallGateway;
+import cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry;
+import cn.bugstack.ai.domain.agent.service.model.ModelInvocationScope;
 import cn.bugstack.ai.domain.agent.service.execute.event.RunEventRecord;
 import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot;
 import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService;
@@ -11,6 +13,7 @@ import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
 import com.alibaba.fastjson.serializer.SerializerFeature;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -88,6 +91,9 @@ public class EvidenceMapService {
     @Autowired
     private LlmCallGateway llmCallGateway;
 
+    @Autowired
+    private RunBudgetRegistry runBudgets;
+
     @Autowired(required = false)
     private RunSnapshotService runSnapshotService;
 
@@ -110,6 +116,7 @@ public class EvidenceMapService {
             Map<String, Object> retained = runSnapshotService.findEvidenceMap(runId).orElse(null);
             if (!forceRegenerate) {
                 if (retained != null) {
+                    normalizeVerificationCompleteness(retained);
                     retained.put("cached", true);
                     retained.put("snapshotAvailable", false);
                     retained.put("regenerateAvailable", false);
@@ -138,6 +145,7 @@ public class EvidenceMapService {
         if (!forceRegenerate) {
             Map<String, Object> cached = runSnapshotService.findEvidenceMap(runId, signature).orElse(null);
             if (cached != null) {
+                normalizeVerificationCompleteness(cached);
                 cached.put("cached", true);
                 cached.put("snapshotAvailable", true);
                 cached.put("regenerateAvailable", true);
@@ -197,7 +205,13 @@ public class EvidenceMapService {
                 + VERIFICATION_PROTOCOL_V4;
         log.info("[EvidenceMap] model call start runId={} model={} promptChars={} evidenceCount={}",
                 runId, clientId, prompt.length(), evidences.size());
-        ChatResponse chatResponse = llmCallGateway.call(() -> client.prompt(prompt).call());
+        // This is a new authenticated HTTP operation after the source chat has finished.
+        // Do not borrow its completed Run or bypass provider authorization/usage limits.
+        // Cache hits above remain free of model calls and budget allocation.
+        ChatResponse chatResponse;
+        try (var scope = ModelInvocationScope.open(runBudgets, MDC.get("userId"), "EVIDENCE_MAP")) {
+            chatResponse = llmCallGateway.call(() -> client.prompt(prompt).call());
+        }
         String modelOutput = chatResponse != null && chatResponse.getResult() != null
                 && chatResponse.getResult().getOutput() != null
                 ? chatResponse.getResult().getOutput().getText() : null;
@@ -247,6 +261,7 @@ public class EvidenceMapService {
         result.put("stats", buildStats(claims));
         result.put("diagnostics", diagnostics == null ? Map.of() : diagnostics);
         result.put("cached", cached);
+        normalizeVerificationCompleteness(result);
         return result;
     }
 
@@ -765,15 +780,18 @@ public class EvidenceMapService {
             claim.put("links", List.of());
             claim.put("requiredChecks", minimumChecksForBlock(text));
             claim.put("coveredChecks", 0);
-            claim.put("status", "unsupported");
+            claim.put("status", "unverified");
             claims.add(claim);
         }
+        long unverified = claims.stream().filter(claim -> "unverified".equals(claim.get("status"))).count();
         String stage = modelClaims == 0 ? "MODEL_RETURNED_NO_CLAIMS"
-                : (claims.isEmpty() ? "CLAIMS_REJECTED" : "COMPLETED");
+                : (unverified > 0 ? "MODEL_INCOMPLETE" : (claims.isEmpty() ? "CLAIMS_REJECTED" : "COMPLETED"));
         Map<String, Object> validationDiagnostics = diagnostics(claimCandidates, evidences, modelClaims,
                 rejectedClaims, duplicateClaims, unknownEvidenceLinks, quoteMismatchLinks, acceptedLinks, stage);
         validationDiagnostics.put("rejectedChecks", rejectedChecks);
-        validationDiagnostics.put("acceptedClaims", claims.size());
+        validationDiagnostics.put("acceptedClaims", claims.size() - unverified);
+        validationDiagnostics.put("displayedClaims", claims.size());
+        validationDiagnostics.put("unverifiedClaims", unverified);
         return new ValidationResult(claims, validationDiagnostics);
     }
 
@@ -815,7 +833,7 @@ public class EvidenceMapService {
     }
 
     private String blockStatus(List<Map<String, Object>> checks, int requiredChecks) {
-        if (checks.isEmpty()) return "unsupported";
+        if (checks.isEmpty()) return "unverified";
         List<String> statuses = checks.stream().map(check -> String.valueOf(check.get("status"))).toList();
         boolean enough = checks.size() >= requiredChecks;
         boolean allUser = statuses.stream().allMatch("user_specified"::equals);
@@ -893,12 +911,53 @@ public class EvidenceMapService {
     private record ValidationResult(List<Map<String, Object>> claims, Map<String, Object> diagnostics) {
     }
 
+    /** Also upgrade already-paid cached maps without generating or inventing missing checks. */
+    private void normalizeVerificationCompleteness(Map<String, Object> result) {
+        if (!(result.get("claims") instanceof List<?> original)) return;
+        List<Map<String, Object>> claims = new ArrayList<>();
+        int unverified = 0;
+        for (Object item : original) {
+            Map<String, Object> claim = new LinkedHashMap<>(castMap(item));
+            if (claim.containsKey("checks")) claim.put("checks", copyCachedEmptyArray(claim.get("checks"), original));
+            if (claim.containsKey("links")) claim.put("links", copyCachedEmptyArray(claim.get("links"), original));
+            if (claim.get("checks") instanceof List<?> checks && checks.isEmpty()
+                    && sizeOf(claim.get("links")) == 0) claim.put("status", "unverified");
+            if ("unverified".equals(claim.get("status"))) unverified++;
+            claims.add(claim);
+        }
+        result.put("claims", claims);
+        result.put("stats", buildStats(claims));
+        Map<String, Object> diagnostics = new LinkedHashMap<>(castMap(result.get("diagnostics")));
+        diagnostics.put("unverifiedClaims", unverified);
+        diagnostics.put("displayedClaims", claims.size());
+        diagnostics.put("acceptedClaims", claims.size() - unverified);
+        if (unverified > 0) diagnostics.put("stage",
+                Number.class.isInstance(diagnostics.get("modelClaims"))
+                        && ((Number) diagnostics.get("modelClaims")).intValue() == 0
+                        ? "MODEL_RETURNED_NO_CLAIMS" : "MODEL_INCOMPLETE");
+        result.put("diagnostics", diagnostics);
+    }
+
+    /** Old Fastjson caches shared List.of() placeholders as local $ref objects. Resolve only
+     * references to a known empty checks/links list, never arbitrary JSON paths or evidence text. */
+    private Object copyCachedEmptyArray(Object value, List<?> claims) {
+        if (value instanceof List<?> list && list.isEmpty()) return new ArrayList<>();
+        if (!(value instanceof Map<?, ?> map) || !(map.get("$ref") instanceof String ref)) return value;
+        var matcher = java.util.regex.Pattern.compile("\\$\\.(?:data\\.)?claims\\[(\\d{1,3})\\]\\.(checks|links)").matcher(ref);
+        if (!matcher.matches()) return value;
+        int index = Integer.parseInt(matcher.group(1));
+        if (index >= claims.size()) return value;
+        Object target = castMap(claims.get(index)).get(matcher.group(2));
+        return target instanceof List<?> list && list.isEmpty() ? new ArrayList<>() : value;
+    }
+
     private Map<String, Object> buildStats(List<Map<String, Object>> claims) {
         int supported = 0;
         int partial = 0;
         int userSpecified = 0;
         int contextOnly = 0;
         int unsupported = 0;
+        int unverified = 0;
         int links = 0;
         int checks = 0;
         int coveredChecks = 0;
@@ -908,6 +967,7 @@ public class EvidenceMapService {
             else if ("partial".equals(status)) partial++;
             else if ("user_specified".equals(status)) userSpecified++;
             else if ("context_only".equals(status)) contextOnly++;
+            else if ("unverified".equals(status)) unverified++;
             else unsupported++;
             links += sizeOf(claim.get("links"));
             checks += sizeOf(claim.get("checks"));
@@ -921,6 +981,7 @@ public class EvidenceMapService {
         stats.put("userSpecifiedClaims", userSpecified);
         stats.put("contextOnlyClaims", contextOnly);
         stats.put("unsupportedClaims", unsupported);
+        stats.put("unverifiedClaims", unverified);
         stats.put("links", links);
         stats.put("checks", checks);
         stats.put("coveredChecks", coveredChecks);

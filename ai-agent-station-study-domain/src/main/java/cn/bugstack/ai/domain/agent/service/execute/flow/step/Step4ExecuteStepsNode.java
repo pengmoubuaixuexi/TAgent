@@ -259,7 +259,8 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
                                           Map<Integer, Set<Integer>> deps,
                                           DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
                                           ExecuteCommandEntity request) {
-        List<Integer> executionOrder = validateAndTopologicallySort(stepNumbers, deps);
+        Set<Integer> inherited = inheritedCompletedSteps(dynamicContext, request);
+        List<Integer> executionOrder = validateAndTopologicallySort(stepNumbers, deps, inherited);
         Map<Integer, DagStepOutcome> outcomes = new LinkedHashMap<>();
         for (Integer stepNumber : executionOrder) {
             if (dynamicContext.isCancelled() || Thread.currentThread().isInterrupted()) {
@@ -330,7 +331,8 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         java.util.Map<Integer, CompletableFuture<DagStepOutcome>> futures = new java.util.HashMap<>();
 
         // 1. 先完成整图校验。不能执行一半后才发现环，也不能把非法 DAG 静默改成串行语义。
-        List<Integer> topoOrder = validateAndTopologicallySort(stepNumbers, deps);
+        Set<Integer> inherited = inheritedCompletedSteps(dynamicContext, request);
+        List<Integer> topoOrder = validateAndTopologicallySort(stepNumbers, deps, inherited);
 
         // 2. 按拓扑序为每步建 future：依赖 Future 结束后还要检查业务结果，不能把 FAILED 当成成功完成。
         //    依赖一旦全部完成就立即在 dagExecutor 上启动，无整层屏障。
@@ -339,7 +341,9 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
             final Set<Integer> d = deps.getOrDefault(n, Collections.emptySet());
             final Map<Integer, CompletableFuture<DagStepOutcome>> dependencyFutures = new LinkedHashMap<>();
             for (Integer dependency : d) {
-                dependencyFutures.put(dependency, futures.get(dependency));
+                dependencyFutures.put(dependency, futures.containsKey(dependency)
+                        ? futures.get(dependency)
+                        : CompletableFuture.completedFuture(DagStepOutcome.succeeded(dependency)));
             }
             CompletableFuture<?>[] depFutures = dependencyFutures.values().toArray(new CompletableFuture[0]);
             final String stepKey = "第" + n + "步";
@@ -401,6 +405,24 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
 
     private static List<Integer> validateAndTopologicallySort(List<Integer> stepNumbers,
                                                                Map<Integer, Set<Integer>> deps) {
+        return validateAndTopologicallySort(stepNumbers, deps, Collections.emptySet());
+    }
+
+    /** Only verified successful source steps can satisfy dependencies outside the redo subgraph. */
+    private Set<Integer> inheritedCompletedSteps(
+            DefaultFlowAgentExecuteStrategyFactory.DynamicContext context, ExecuteCommandEntity request) {
+        if (request.getSourceRunId() == null || request.getSourceRunId().isBlank()) return Set.of();
+        Set<Integer> inherited = context.getValue(RootNode.INHERITED_COMPLETED_STEPS_KEY);
+        if (inherited == null) return Set.of();
+        return inherited.stream().filter(step -> {
+            String result = context.getValue("step" + step + "Result");
+            return result != null && !result.isBlank();
+        }).collect(java.util.stream.Collectors.toSet());
+    }
+
+    private static List<Integer> validateAndTopologicallySort(List<Integer> stepNumbers,
+                                                               Map<Integer, Set<Integer>> deps,
+                                                               Set<Integer> inheritedCompleted) {
         LinkedHashSet<Integer> nodes = new LinkedHashSet<>(stepNumbers != null ? stepNumbers : List.of());
         if (nodes.size() != (stepNumbers != null ? stepNumbers.size() : 0)) {
             throw new InvalidFlowDagException("Flow plan contains duplicate step numbers");
@@ -414,6 +436,7 @@ public class Step4ExecuteStepsNode extends AbstractExecuteSupport {
         for (Integer node : nodes) {
             for (Integer dependency : deps.getOrDefault(node, Collections.emptySet())) {
                 if (!nodes.contains(dependency)) {
+                    if (inheritedCompleted.contains(dependency)) continue;
                     throw new InvalidFlowDagException(
                             "Flow step " + node + " depends on missing step " + dependency);
                 }

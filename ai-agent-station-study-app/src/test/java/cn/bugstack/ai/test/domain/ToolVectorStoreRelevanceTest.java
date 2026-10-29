@@ -46,6 +46,34 @@ public class ToolVectorStoreRelevanceTest {
                 row("search_papers",.544,"在 arXiv 上根据关键词搜索学术论文，快速找到相关研究文献。")).isEmpty());
     }
 
+    @Test public void realDddRequestKeepsGenericWebSearchWhileRejectingHigherDrivingAndPaperHits() {
+        assertEquals(List.of("AIsearch","webSearch"),search(
+                "联网搜索网页资料，查找领域驱动设计（DDD）入门教程、官方文档与权威学习资源",
+                row("maps_direction_driving",.564,"根据起终点经纬度规划小客车或轿车驾车出行方案，返回通勤数据。"),
+                row("AIsearch",.553,"执行通用搜索，帮助用户快速查找网络上的各类信息、资料和知识。"),
+                row("search_papers",.549,"在 arXiv 上根据关键词搜索学术论文，快速找到相关研究文献。"),
+                row("webSearch",.521,"搜索实时网页信息，根据用户提问获取最新的网络内容。")));
+    }
+
+    @Test public void webSearchCorroborationDoesNotDependOnKnownToolOrProviderNames() {
+        assertEquals(List.of("source_lookup"),search("从互联网搜索DDD入门教程",
+                row("source_lookup",.52,"Search the web for publicly available documentation and tutorials.")));
+        assertEquals(List.of("source_lookup"),search("Search the web for beginner-friendly DDD tutorials",
+                row("source_lookup",.52,"搜索实时网页信息，根据用户提问获取最新的网络内容。")));
+    }
+
+    @Test public void fetchingAUrlOrDiagnosingANetworkIsNotWebSearch() {
+        assertTrue(search("获取网页内容以确认教程来源链接的有效性与内容简介",
+                row("webSearch",.524,"搜索实时网页信息，根据用户提问获取最新的网络内容。")).isEmpty());
+        assertTrue(search("Search the web for DDD tutorials",
+                row("network_lookup",.55,"Search the network routing table for an IP address.")).isEmpty());
+        assertTrue(search("联网搜索网页资料，查找DDD入门教程",
+                row("offline_lookup",.55,"不支持网页搜索，仅处理本地文本。"),
+                row("offline_docs",.54,"Does not search the web; reads local documentation.")).isEmpty());
+        assertTrue(search("网页搜索",row("offline_lookup",.55,"不支持网页搜索，仅处理本地文本。")).isEmpty());
+        assertTrue(search("web search",row("offline_docs",.54,"Does not search the web; reads local documentation.")).isEmpty());
+    }
+
     @Test public void csvCreationDoesNotBecomeNutritionDownloadOrPaperMetadata() {
         assertTrue(search("创建CSV格式的数据文件并提供下载链接",
                 row("nutrition_seed",.501,"为本地数据库初始化超过32.6万条食品数据，后台下载约60MB，可重复调用以查看进度，已初始化则无操作。"),

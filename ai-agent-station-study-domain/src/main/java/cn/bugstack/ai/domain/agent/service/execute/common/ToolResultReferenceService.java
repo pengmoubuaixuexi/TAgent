@@ -74,7 +74,8 @@ public class ToolResultReferenceService {
     public String project(String toolName, String raw, String compacted, StoredResult stored) {
         if (raw == null) return compacted;
         int limit = inlineLimit();
-        String preview = compacted == null ? "" : compacted;
+        String forecast = WeatherForecastResultAnnotator.annotate(toolName, raw, json);
+        String preview = !raw.equals(forecast) ? forecast : compacted == null ? "" : compacted;
         // POI responses are often below the generic 6k ceiling but contain 20 candidates and photos.
         // Select useful fields before repeated searches accumulate in one model request.
         String poiSummary = AmapPoiResultCompactor.compact(toolName, raw);
@@ -133,6 +134,24 @@ public class ToolResultReferenceService {
             encoded = output.toString();
         }
         return encoded;
+    }
+
+    /** Only the current owner's live run can establish map-coordinate provenance. */
+    public String validateMapArguments(String toolName, String arguments, Map<String, Object> scope) {
+        if (!AmapMapEvidenceGuard.supports(toolName)) return null;
+        String runId = runId(scope), userId = userId(scope);
+        if (snapshots == null || runId == null || userId == null)
+            return error("POI_COORDINATES_NOT_VERIFIED", "缺少可校验的本次运行证据，请改为文字行程，不能猜坐标生成地图");
+        try {
+            var snapshot = snapshots.find(runId).filter(s -> runId.equals(s.getRunId()) && userId.equals(s.getUserId()))
+                    .filter(s -> s.getExpiresAt() == null || s.getExpiresAt() > System.currentTimeMillis()).orElse(null);
+            if (snapshot == null) return error("POI_COORDINATES_NOT_VERIFIED", "本次运行的 POI 证据已过期或不可用");
+            String rejection = AmapMapEvidenceGuard.rejection(arguments, snapshot.getToolEvidences(), json);
+            return rejection == null ? null : error("POI_COORDINATES_NOT_VERIFIED", rejection);
+        } catch (RuntimeException unavailable) {
+            StreamingActivityTracker.rethrowCancellation(unavailable);
+            return error("POI_COORDINATES_NOT_VERIFIED", "暂时无法核验地点坐标，请改为文字行程，勿猜测后重复提交");
+        }
     }
 
     public String inspect(String arguments, Map<String, Object> scope) {

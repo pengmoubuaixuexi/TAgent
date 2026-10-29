@@ -5,7 +5,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
+import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ProxySelector;
@@ -13,9 +13,18 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
+import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.Locale;
 import java.util.Map;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Flow;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 @Component
 class RemoteImageDownloader {
@@ -93,69 +102,124 @@ class RemoteImageDownloader {
     }
 
     DownloadedImage download(String value, long maxBytes) {
+        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
         URI current = requirePublicHttpUri(value);
         for (int redirect = 0; redirect <= MAX_REDIRECTS; redirect++) {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) throw new IllegalArgumentException("下载 URL 图片超时（含响应体）");
             HttpRequest request = HttpRequest.newBuilder(current)
-                    .timeout(Duration.ofSeconds(30))
+                    .timeout(Duration.ofNanos(remaining))
                     .header("Accept", "image/*")
                     .header("User-Agent", "TAgent-Image-Importer/1.0")
                     .GET()
                     .build();
-            HttpResponse<InputStream> response;
+            HttpResponse<byte[]> response;
             try {
-                response = client.send(request, HttpResponse.BodyHandlers.ofInputStream());
+                response = sendBounded(client, request, maxBytes);
+            } catch (HttpTimeoutException e) {
+                throw new IllegalArgumentException("下载 URL 图片超时（含响应体）", e);
             } catch (Exception e) {
+                if (e instanceof InterruptedException) Thread.currentThread().interrupt();
                 throw new IllegalArgumentException("下载 URL 图片失败: " + safeMessage(e), e);
             }
 
             int status = response.statusCode();
             if (status >= 300 && status < 400) {
-                closeQuietly(response.body());
                 String location = response.headers().firstValue("location")
                         .orElseThrow(() -> new IllegalArgumentException("图片重定向缺少 Location"));
                 current = requirePublicHttpUri(current.resolve(location).toString());
                 continue;
             }
             if (status < 200 || status >= 300) {
-                closeQuietly(response.body());
                 throw new IllegalArgumentException("下载 URL 图片失败，HTTP " + status);
             }
 
             long declared = response.headers().firstValueAsLong("content-length").orElse(-1);
             if (declared > maxBytes) {
-                closeQuietly(response.body());
                 throw new IllegalArgumentException("URL 图片超过大小限制");
             }
             String mimeType = response.headers().firstValue("content-type")
                     .map(RemoteImageDownloader::normalizeMimeType)
                     .orElse("");
             if (!mimeType.startsWith("image/")) {
-                closeQuietly(response.body());
                 throw new IllegalArgumentException("URL 返回的不是图片: " + mimeType);
             }
-            byte[] data = readLimited(response.body(), maxBytes);
+            byte[] data = response.body();
             if (data.length == 0) throw new IllegalArgumentException("URL 图片内容为空");
             return new DownloadedImage(current.toString(), mimeType, data);
         }
         throw new IllegalArgumentException("图片重定向次数超过 " + MAX_REDIRECTS);
     }
 
-    private static byte[] readLimited(InputStream input, long maxBytes) {
-        try (InputStream in = input; ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            byte[] buffer = new byte[8192];
-            long total = 0;
-            int read;
-            while ((read = in.read(buffer)) >= 0) {
-                total += read;
-                if (total > maxBytes) throw new IllegalArgumentException("URL 图片超过大小限制");
-                out.write(buffer, 0, read);
+    // The request timeout alone does not bound reads from BodyHandlers.ofInputStream().
+    // Await a bounded subscriber's complete body and cancel the exchange at the deadline.
+    static HttpResponse<byte[]> sendBounded(HttpClient client, HttpRequest request, long maxBytes)
+            throws IOException, InterruptedException {
+        var future = client.sendAsync(request, info -> {
+            boolean discard = info.statusCode() < 200 || info.statusCode() >= 300;
+            if (!discard) {
+                long declared = info.headers().firstValueAsLong("content-length").orElse(-1);
+                if (declared > maxBytes) throw new IllegalArgumentException("URL 图片超过大小限制");
+                String type = normalizeMimeType(info.headers().firstValue("content-type").orElse(""));
+                if (!type.startsWith("image/")) throw new IllegalArgumentException("URL 返回的不是图片: " + type);
             }
-            return out.toByteArray();
-        } catch (IllegalArgumentException e) {
+            return new LimitedImageBody(maxBytes, discard);
+        });
+        try {
+            return future.get(request.timeout().orElse(Duration.ofSeconds(30)).toNanos(), TimeUnit.NANOSECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            throw new HttpTimeoutException("URL image response body exceeded deadline");
+        } catch (InterruptedException e) {
+            future.cancel(true);
             throw e;
-        } catch (Exception e) {
-            throw new IllegalArgumentException("读取 URL 图片失败: " + safeMessage(e), e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException io) throw io;
+            if (cause instanceof IllegalArgumentException invalid) throw invalid;
+            throw new IOException("URL image exchange failed", cause);
         }
+    }
+
+    private static final class LimitedImageBody implements HttpResponse.BodySubscriber<byte[]> {
+        private final CompletableFuture<byte[]> result = new CompletableFuture<>();
+        private final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        private final long maxBytes;
+        private final boolean discard;
+        private Flow.Subscription subscription;
+
+        private LimitedImageBody(long maxBytes, boolean discard) {
+            this.maxBytes = maxBytes;
+            this.discard = discard;
+        }
+
+        public CompletionStage<byte[]> getBody() { return result; }
+
+        public void onSubscribe(Flow.Subscription subscription) {
+            this.subscription = subscription;
+            if (discard) {
+                subscription.cancel();
+                result.complete(new byte[0]);
+            } else subscription.request(1);
+        }
+
+        public void onNext(List<ByteBuffer> buffers) {
+            if (result.isDone()) return;
+            for (ByteBuffer buffer : buffers) {
+                if (buffer.remaining() > maxBytes - bytes.size()) {
+                    subscription.cancel();
+                    result.completeExceptionally(new IllegalArgumentException("URL 图片超过大小限制"));
+                    return;
+                }
+                byte[] chunk = new byte[buffer.remaining()];
+                buffer.get(chunk);
+                bytes.writeBytes(chunk);
+            }
+            subscription.request(1);
+        }
+
+        public void onError(Throwable error) { result.completeExceptionally(error); }
+        public void onComplete() { result.complete(bytes.toByteArray()); }
     }
 
     private static URI requirePublicHttpUri(String value) {
@@ -198,13 +262,6 @@ class RemoteImageDownloader {
 
     private static String safeMessage(Exception error) {
         return error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage();
-    }
-
-    private static void closeQuietly(InputStream input) {
-        try {
-            input.close();
-        } catch (Exception ignored) {
-        }
     }
 
     record DownloadedImage(String finalUrl, String mimeType, byte[] data) {

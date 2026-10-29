@@ -11,7 +11,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI Agent Station</title>
-<script src="https://cdn.tailwindcss.com"></script>
+<script src="/vendor/tailwind-3.4.17.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
 <script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <!-- 2026-05-07：用成熟 marked.js 替换自写 renderMarkdown，避免边界 bug -->
@@ -455,6 +455,7 @@
         💬 引导
       </button>
       <span id="interveneHint" class="text-xs text-gray-400">运行中 · 在下方输入框补充引导后回车 / 点「引导」，或点「立即回答」收尾</span>
+      <span id="interveneStatus" role="status" class="hidden text-xs"></span>
     </div>
     <div class="max-w-4xl mx-auto relative">
       <div id="runCommandPalette" class="hidden absolute left-0 right-0 bottom-full mb-2 bg-[#111827] border border-gray-700 rounded-lg shadow-2xl overflow-hidden z-30"></div>
@@ -4284,13 +4285,52 @@ async function sendMessage() {
   }
 }
 
+// 限定前端状态更新所属于的当前运行；后端干预接口仍只使用 sessionId。
+let pendingIntervention = null;
+function isCurrentIntervention(context) {
+  return state.sending && state.sessionId === context.sessionId
+    && state.activeRunId === context.runId && state.runUiGeneration === context.generation;
+}
+function setInterventionStatus(message, isError = false) {
+  const el = document.getElementById('interveneStatus');
+  if (!el) return;
+  el.className = message ? `text-xs ${isError ? 'text-red-300' : 'text-emerald-300'}` : 'hidden text-xs';
+  el.textContent = message || '';
+}
+async function postIntervention(path, payload) {
+  const controller = new AbortController();
+  let timer;
+  // 限制整个请求和响应体读取时间；超时只能说明前端未确认，后端仍可能已处理。
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error('等待服务器响应超时'));
+    }, 15000);
+  });
+  try {
+    const res = await Promise.race([fetch(API + path, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    }), timeout]);
+    const body = await Promise.race([res.json().catch(() => null), timeout]);
+    if (!res.ok || !body || body.code !== '0000' || body.data !== true) {
+      throw new Error((body && body.info) || (res.ok ? '服务器响应无效' : `HTTP ${res.status}`));
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
 // 立即回答 + 引导：流式中且开启干预时，浮现输入框上方的半透明浮条；引导复用下方输入框
 function showAnswerNow(show) {
   const visible = show && state.sending && state.interventionEnabled;
   const bar = document.getElementById('interveneBar');
   if (bar) bar.classList.toggle('hidden', !visible);
   // 终态（已点立即回答）下不再点亮按钮；Flow Step4 后端不消费引导，前端同步置灰引导。
-  const answerEnable = visible && !state.finalizing;
+  const pending = pendingIntervention && isCurrentIntervention(pendingIntervention);
+  const answerEnable = visible && !state.finalizing && !pending;
+  if (!show) setInterventionStatus('');
   const steerEnable = answerEnable && !state.flowStep4Active;
   const an = document.getElementById('answerNowBtn');
   if (an) {
@@ -4375,52 +4415,50 @@ function onComposerKey(e) {
 
 // 引导：复用主输入框的内容，POST /steer，后端在当前步重做并纳入想法（不丢弃进度、不关思考）
 async function steer() {
-  if (!state.sessionId || !state.sending) return;
-  if (state.flowStep4Active) return;
+  if (!state.sessionId || !state.sending || !state.interventionEnabled || state.flowStep4Active || state.finalizing) return;
+  if (pendingIntervention && isCurrentIntervention(pendingIntervention)) return;
   const box = document.getElementById('msgInput');
-  const idea = ((box && box.value) || '').trim();
-  if (!idea) { if (box) box.focus(); return; }  // 空则聚焦输入框，提示用户先输入
-  const btn = document.getElementById('steerBtn');
+  const original = (box && box.value) || '';
+  const idea = original.trim();
+  if (!idea) { if (box) box.focus(); return; }
+  const context = {sessionId: state.sessionId, runId: state.activeRunId, generation: state.runUiGeneration};
+  pendingIntervention = context;
+  setInterventionStatus('正在提交引导…');
+  showAnswerNow(true);
   try {
-    if (btn) { btn.disabled = true; btn.textContent = '💬 已提交'; }
-    await fetch(API + '/steer', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ sessionId: state.sessionId, idea })
-    });
-    if (box) { box.value = ''; box.style.height = ''; }  // 发出后清空并复位高度
+    await postIntervention('/steer', {sessionId: context.sessionId, idea});
+    if (!isCurrentIntervention(context)) return;
+    // 请求期间用户可能继续编辑，不能清掉新内容。
+    if (box && box.value === original) { box.value = ''; box.style.height = ''; }
+    setInterventionStatus('引导请求已提交，请留意后续执行结果。');
   } catch (e) {
-    if (btn) { btn.disabled = false; btn.textContent = '💬 引导'; }
+    if (isCurrentIntervention(context)) setInterventionStatus('引导提交未确认：' + (e.message || '网络错误') + '。请查看运行状态后重试。', true);
   } finally {
-    // 引导后流会继续，1.5s 后恢复按钮（仍在流式中时）
-    setTimeout(() => {
-      if (btn && state.sending && !state.flowStep4Active && !state.finalizing) {
-        btn.disabled = false;
-        btn.textContent = '💬 引导';
-      }
-    }, 1500);
+    if (pendingIntervention === context) pendingIntervention = null;
+    if (isCurrentIntervention(context)) showAnswerNow(true);
   }
 }
 
 // 立即回答：POST /answer_now，后端中止剩余步骤、跳 finalize 基于半成品作答
 async function answerNow() {
-  if (!state.sessionId || !state.sending) return;
-  const btn = document.getElementById('answerNowBtn');
-  const st = document.getElementById('steerBtn');
-  // 进入终态：立即回答优先且不可逆，引导自此失效（后端 callStepWithSteer 会无视后续 steerIdea）→ 把引导按钮一并置灰
+  if (!state.sessionId || !state.sending || !state.interventionEnabled || state.finalizing) return;
+  if (pendingIntervention && isCurrentIntervention(pendingIntervention)) return;
+  const context = {sessionId: state.sessionId, runId: state.activeRunId, generation: state.runUiGeneration};
+  pendingIntervention = context;
   state.finalizing = true;
-  if (st) { st.disabled = true; st.textContent = '💬 引导'; }
+  setInterventionStatus('正在提交立即回答请求…');
+  showAnswerNow(true);
   try {
-    if (btn) { btn.disabled = true; btn.textContent = '⚡ 收尾中…'; }
-    await fetch(API + '/answer_now', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ sessionId: state.sessionId })
-    });
+    await postIntervention('/answer_now', {sessionId: context.sessionId});
+    if (isCurrentIntervention(context)) setInterventionStatus('立即回答请求已提交，请留意后续执行结果。');
   } catch (e) {
-    // 仅网络层失败才回滚终态；请求成功后保持引导/立即回答置灰
-    state.finalizing = false;
-    showAnswerNow(true);
+    if (isCurrentIntervention(context)) {
+      state.finalizing = false;
+      setInterventionStatus('立即回答提交未确认：' + (e.message || '网络错误') + '。请查看运行状态后重试。', true);
+    }
+  } finally {
+    if (pendingIntervention === context) pendingIntervention = null;
+    if (isCurrentIntervention(context)) showAnswerNow(true);
   }
 }
 
@@ -5208,7 +5246,7 @@ function evidenceRelationColor(relation) {
 }
 
 function evidenceCheckStatusLabel(status) {
-  const labels = {supported:'完整依据', partial:'部分/推导', user_specified:'用户设定', context_only:'上下文影响', unsupported:'缺少证据'};
+  const labels = {supported:'完整依据', partial:'部分/推导', user_specified:'用户设定', context_only:'上下文影响', unsupported:'缺少证据', unverified:'尚未核验'};
   return labels[status] || '缺少证据';
 }
 
@@ -5248,7 +5286,8 @@ function renderEvidenceMap(data) {
   const diagnostics = data.diagnostics || {};
   const coverage = Number(stats.traceability != null ? stats.traceability : (stats.coverage || 0));
   const cacheLabel = data.cached ? '缓存结果' : '刚刚生成';
-  meta.textContent = `${cacheLabel} · 来源 ${evidences.length} 条 · 审计 ${claims.length} 个内容块 · ${data.model || 'router-small'}`;
+  const unverified = Number(stats.unverifiedClaims || 0);
+  meta.textContent = `${cacheLabel} · 来源 ${evidences.length} 条 · 已核验 ${claims.length - unverified}/${claims.length} 个内容块 · ${data.model || 'router-small'}`;
   if (sourcesBtn) {
     sourcesBtn.textContent = `全部来源（${evidences.length}）`;
     sourcesBtn.classList.toggle('hidden', !evidences.length);
@@ -5270,14 +5309,16 @@ function renderEvidenceMap(data) {
     </div>`;
     return;
   }
-  const summary = `<div class="grid grid-cols-2 md:grid-cols-5 gap-2">
+  const incompleteNotice = unverified > 0 ? `<div class="rounded-lg border border-amber-900 bg-amber-950/20 p-3 text-sm text-amber-200">核验未完成：${unverified} 个内容块尚未获得可用核验结果，不能据此判断它们缺少证据。现有来源仍可查看；不会自动重新调用模型。</div>` : '';
+  const summary = `<div class="grid grid-cols-2 md:grid-cols-6 gap-2">
     <div class="rounded-lg border border-gray-800 bg-gray-900 p-3"><div class="text-[10px] text-gray-500">可追溯率</div><div class="text-lg text-cyan-300 mt-1">${(Math.max(0, Math.min(1, coverage)) * 100).toFixed(0)}%</div></div>
     <div class="rounded-lg border border-emerald-900 bg-emerald-950/20 p-3"><div class="text-[10px] text-emerald-400">完整依据</div><div class="text-lg text-emerald-200 mt-1">${Number(stats.supportedClaims || 0)}</div></div>
     <div class="rounded-lg border border-cyan-900 bg-cyan-950/20 p-3"><div class="text-[10px] text-cyan-400">部分/推导</div><div class="text-lg text-cyan-200 mt-1">${Number(stats.partialClaims || 0)}</div></div>
     <div class="rounded-lg border border-blue-900 bg-blue-950/20 p-3"><div class="text-[10px] text-blue-400">用户设定</div><div class="text-lg text-blue-200 mt-1">${Number(stats.userSpecifiedClaims || 0)}</div></div>
     <div class="rounded-lg border border-amber-900 bg-amber-950/20 p-3"><div class="text-[10px] text-amber-400">缺少证据</div><div class="text-lg text-amber-200 mt-1">${Number(stats.unsupportedClaims || 0)}</div></div>
+    <div class="rounded-lg border border-gray-700 bg-gray-900 p-3"><div class="text-[10px] text-gray-400">尚未核验</div><div class="text-lg text-gray-200 mt-1">${unverified}</div></div>
   </div><div class="text-[11px] text-gray-500">按回答结构逐块关联 ${evidences.length} 条运行来源；部分依据会明确保留尚未核验的缺口。</div>`;
-  graph.innerHTML = summary + claims.map(claim => {
+  graph.innerHTML = incompleteNotice + summary + claims.map(claim => {
     const legacyLinks = Array.isArray(claim.links) ? claim.links : [];
     const suppliedChecks = Array.isArray(claim.checks) ? claim.checks : [];
     const checks = suppliedChecks.length ? suppliedChecks
@@ -5285,7 +5326,7 @@ function renderEvidenceMap(data) {
         ? [{text:'该内容块的来源关联', links:legacyLinks, status:claim.status || 'supported'}]
         : []);
     const status = claim.status || (checks.length ? 'supported' : 'unsupported');
-    const statusLabel = status === 'supported' ? '完整依据' : (status === 'partial' ? '部分/推导依据' : (status === 'user_specified' ? '用户设定' : (status === 'context_only' ? '仅上下文影响' : '证据不足')));
+    const statusLabel = status === 'unverified' ? '尚未核验' : status === 'supported' ? '完整依据' : (status === 'partial' ? '部分/推导依据' : (status === 'user_specified' ? '用户设定' : (status === 'context_only' ? '仅上下文影响' : '证据不足')));
     const statusColor = status === 'supported' ? 'text-emerald-300' : (status === 'partial' ? 'text-cyan-300' : (status === 'user_specified' ? 'text-blue-300' : (status === 'context_only' ? 'text-violet-300' : 'text-amber-300')));
     const checksHtml = checks.map((check, checkIndex) => {
       const checkStatus = String((check && check.status) || 'unsupported');

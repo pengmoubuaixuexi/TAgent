@@ -1,10 +1,13 @@
 package cn.bugstack.ai.trigger.background;
 
 import cn.bugstack.ai.domain.agent.model.valobj.enums.AiAgentEnumVO;
+import cn.bugstack.ai.domain.agent.service.execute.common.RunBudgetRegistry;
+import cn.bugstack.ai.domain.agent.service.model.ModelInvocationScope;
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationContext;
@@ -90,6 +93,9 @@ public class BackgroundTaskCommandRouter {
     @Resource
     private ApplicationContext applicationContext;
 
+    @Resource
+    private RunBudgetRegistry runBudgets;
+
     @Value("${agent.background-task.router-client-id:${agent.intent-router.client-id:router-small}}")
     private String routerClientId;
 
@@ -112,7 +118,9 @@ public class BackgroundTaskCommandRouter {
             return BackgroundTaskCommand.builder().matched(false).confidence(1.0).build();
         }
         String raw = null;
-        try {
+        // Interpreting a task is an authenticated operation before a chat Run exists.
+        // Give it normal metering/limits without borrowing the future task's Run.
+        try (var scope = ModelInvocationScope.open(runBudgets, MDC.get("userId"), "BACKGROUND_TASK_ROUTER")) {
             ChatClient client = applicationContext.getBean(
                     AiAgentEnumVO.AI_CLIENT.getBeanName(routerClientId), ChatClient.class);
             String prompt = PROMPT.formatted(

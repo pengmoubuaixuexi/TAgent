@@ -51,12 +51,19 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
             【事实来源】只抽取用户主动陈述、在提问中透露、或明确同意采纳的信息。
             助手的建议、推测、方案、评价，若用户没有明确采纳，绝不要当成用户的事实或决定。
             下面的"助手"文本仅用于帮你理解用户在指什么，它本身不是事实来源。
+            用户问过、讨论过、纠正过某知识点，不代表用户已掌握该知识点。不得根据提问的专业程度推断技能或熟练程度，
+            不得因为助手解释过或用户要求自检就把知识转为用户能力；只有本轮用户明确自述会、熟悉、掌握等能力时才抽技能。
 
             【必须丢弃】一次性或当下状态，不要抽：今天的心情、今天吃什么、本回合的临时请求、
             临时请假、此刻正在做的单次操作——这些不是长期记忆。
 
             每条信息输出一行，格式严格为：
             TOPIC: <主题> | CONTENT: <一句话事实>
+            技能类还必须加第三段：| EVIDENCE: <本轮用户逐字说出的能力自述原文，不加引号>。
+            EVIDENCE 必须是用户文本中的连续原句或短句，不能来自助手、引用示例、假设、计划或疑问，不升级熟练程度。
+            例如用户说“我熟悉Java，但还没学Python”：仅抽技能:Java，EVIDENCE 写“我熟悉Java”；不能抽技能:Python。
+            用户只说“解释一下volatile”或“请核对DCL示例”时，不抽任何技能；没有能力自述原文则丢弃该技能。
+            非技能主题仍使用原来的 TOPIC 和 CONTENT 两段格式。
 
             主题(TOPIC)必须用中文，只能从下面的受控词表里选，逐字照抄；
             不许自创主题、不许把数值/状态/姓名写进主题（必须"画像:姓名"而不是"画像:姓名:张伟"，值一律放 CONTENT）、不许中英混用。
@@ -375,10 +382,16 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
                     int pipeIdx = line.indexOf('|');
                     String topic;
                     String content;
+                    String skillEvidence = null;
 
                     if (pipeIdx >= 0) {
                         String topicPart = line.substring(0, pipeIdx).trim();
                         String contentPart = line.substring(pipeIdx + 1).trim();
+                        int evidenceIdx = contentPart.indexOf("| EVIDENCE:");
+                        if (evidenceIdx >= 0) {
+                            skillEvidence = contentPart.substring(evidenceIdx + "| EVIDENCE:".length()).trim();
+                            contentPart = contentPart.substring(0, evidenceIdx).trim();
+                        }
                         topic = extractTopic(topicPart);
                         content = extractContent(contentPart);
                     } else {
@@ -397,6 +410,14 @@ public class LongTermMemoryAdvisor implements BaseAdvisor {
 
                     if (topic.isBlank()) topic = "general";
                     if (content.isBlank()) continue;
+                    if (cn.bugstack.ai.domain.agent.service.memory.longterm.SkillMemoryEvidence.isSkillTopic(topic)) {
+                        content = cn.bugstack.ai.domain.agent.service.memory.longterm.SkillMemoryEvidence
+                                .verifiedContent(finalUserText, skillEvidence);
+                        if (content == null) {
+                            log.debug("[LTM] skip skill without explicit user-source assertion topic={}", topic);
+                            continue;
+                        }
+                    }
 
                     // 脏抽取防护（2026-05-31）：LLM 偶尔把值粘进 topic（画像:姓名:张伟）或把多条记忆挤进一行
                     // （CONTENT 又长得像一条"类别:主体"记录）。这类行整条丢弃，避免污染库（下一轮会重新干净抽取）。

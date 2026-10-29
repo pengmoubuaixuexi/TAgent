@@ -66,7 +66,7 @@ public final class AmapPoiResultCompactor {
         return raw;
     }
 
-    private static boolean supports(String name) {
+    static boolean supports(String name) {
         if (name == null) return false;
         String normalized = name.toLowerCase(Locale.ROOT);
         return TOOLS.stream().anyMatch(tool -> normalized.equals(tool) || normalized.endsWith("__" + tool)
@@ -101,7 +101,7 @@ public final class AmapPoiResultCompactor {
         return out;
     }
 
-    private static JsonNode findPois(JsonNode node, int depth) throws Exception {
+    static JsonNode findPois(JsonNode node, int depth) throws Exception {
         if (node == null || depth > 8) return null;
         if (node.isTextual()) return findPois(embedded(node.textValue()), depth + 1);
         if (node.isObject()) {
@@ -122,7 +122,7 @@ public final class AmapPoiResultCompactor {
         return null;
     }
 
-    private static boolean containsError(JsonNode node, int depth) throws Exception {
+    static boolean containsError(JsonNode node, int depth) throws Exception {
         if (node == null || depth > 8) return false;
         if (node.isTextual()) return containsError(embedded(node.textValue()), depth + 1);
         if (node.isArray()) {

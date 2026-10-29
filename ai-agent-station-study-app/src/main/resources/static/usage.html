@@ -6,6 +6,6 @@
 <h1>用量与额度</h1><p class="intro">这里记录模型请求的实际尝试，包括重试和辅助服务。平台额度每天按 UTC 日期重置，历史消费不会因应用重启清空。</p>
 <div id="message" role="status" aria-live="polite"></div>
 <section><div class="section-heading"><h2>今日平台试用</h2><button id="refresh" type="button">刷新</button></div><p id="day" class="muted"></p><div class="grid"><article><h3>Token 额度占用</h3><p id="tokenQuota">加载中…</p></article><article><h3>请求次数</h3><p id="callQuota">加载中…</p></article><article><h3>同时前台运行</h3><p id="runQuota">加载中…</p></article><article><h3>已确认平台 Token</h3><p id="confirmed">加载中…</p></article></div>
-<p class="muted">请求发出前预留输入估算和最大输出 Token。提供商返回实际用量后结算；超时、断流或缺少 usage 时保留预留额并显示“未知”，不会当作零消费。等待人工审核的任务仍占并发，原运行时限到期后释放。前台完成后已排队的摘要等维护任务仍计入原运行预算与日额度，但不占前台并发槽。</p></section>
+<p class="muted">请求发出前按输入 Token 估算预留额度。提供商返回实际用量后结算；超时、断流或缺少 usage 时保留预留额并显示“未知”，不会当作零消费。等待人工审核的任务仍占并发，原运行时限到期后释放。前台完成后已排队的摘要等维护任务仍计入原运行预算与日额度，但不占前台并发槽。</p></section>
 <section><h2>最近 100 次模型请求</h2><div id="runFilter" hidden><p id="filterLabel"></p><p id="runSummary" class="muted"></p><a href="/usage.html">查看全部运行</a></div><p class="muted">个人模型由你的提供商账号计费，不扣平台试用 Token；平台主模型和已授权辅助服务扣平台试用额度。金额统一显示“价格未知”，不表示免费。</p><div id="attempts" class="connections"></div></section>
 </main></body></html>

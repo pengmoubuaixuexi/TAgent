@@ -8,6 +8,8 @@ import cn.bugstack.ai.domain.agent.service.model.health.ModelHealthProbe;
 import cn.bugstack.ai.domain.agent.service.model.health.ModelHealthRecord;
 import cn.bugstack.ai.domain.agent.service.model.health.ModelHealthRegistry;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -30,17 +32,17 @@ public class ModelFailoverSettings {
 
     public void register(String scope, String apiId, String model) {
         catalog.upsert(new ModelCatalogEntry(scope, apiId, model, "medium", 100, Set.of("TEXT"), true, true, false));
-        planner.invalidate();
+        refreshAfterCommit();
     }
 
     public void add(ModelCatalogEntry entry) {
         catalog.upsert(entry);
-        planner.invalidate();
+        refreshAfterCommit();
     }
 
     public boolean delete(String scope, String apiId, String model) {
         boolean deleted = catalog.delete(scope, apiId, model);
-        planner.invalidate();
+        refreshAfterCommit();
         return deleted;
     }
 
@@ -51,7 +53,19 @@ public class ModelFailoverSettings {
     public void save(String scope, String apiId, String model, String tier, int sortOrder, boolean enabled) {
         if (!catalog.update(scope, apiId, model, tier, sortOrder, enabled))
             catalog.upsert(new ModelCatalogEntry(scope, apiId, model, tier, sortOrder, Set.of("TEXT"), true, enabled, false));
-        planner.invalidate();
+        refreshAfterCommit();
+    }
+
+    /** Reloading before commit can cache the absence of a newly created connection for 30 seconds. */
+    public void refreshAfterCommit() {
+        if (TransactionSynchronizationManager.isActualTransactionActive()
+                && TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override public void afterCommit() { planner.refreshNow(); }
+            });
+        } else {
+            planner.refreshNow();
+        }
     }
 
     /** @param withDetail include the redacted provider text: only for administrators or the model owner */
@@ -75,6 +89,8 @@ public class ModelFailoverSettings {
     }
 
     public Map<String, Object> check(String apiId, String model, boolean withDetail) {
+        // A manual availability check must consult current configuration, not an old request snapshot.
+        planner.refreshNow();
         var result = probe.check(new ModelTarget(apiId, model));
         Map<String, Object> view = new LinkedHashMap<>();
         view.put("available", result.available());

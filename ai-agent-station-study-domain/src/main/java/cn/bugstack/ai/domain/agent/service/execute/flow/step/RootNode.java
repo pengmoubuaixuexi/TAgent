@@ -34,6 +34,8 @@ import java.util.regex.Pattern;
 @Service("flowRootNode")
 public class RootNode extends AbstractExecuteSupport {
 
+    static final String INHERITED_COMPLETED_STEPS_KEY = "flowInheritedCompletedSteps";
+
     @Resource
     private Step1McpToolsAnalysisNode step1McpToolsAnalysisNode;
 
@@ -715,6 +717,9 @@ public class RootNode extends AbstractExecuteSupport {
     private void seedRedoInheritedStepResults(DefaultFlowAgentExecuteStrategyFactory.DynamicContext dynamicContext,
                                              ExecuteCommandEntity requestParameter,
                                              Integer targetFlowStepNo) {
+        if (dynamicContext != null) {
+            dynamicContext.setValue(INHERITED_COMPLETED_STEPS_KEY, Collections.emptySet());
+        }
         if (dynamicContext == null || requestParameter == null || targetFlowStepNo == null || targetFlowStepNo <= 0
                 || runSnapshotService == null || requestParameter.getSourceRunId() == null || requestParameter.getSourceRunId().isBlank()) {
             return;
@@ -729,19 +734,23 @@ public class RootNode extends AbstractExecuteSupport {
         Set<Integer> redoSet = depsByNo.isEmpty()
                 ? Collections.singleton(targetFlowStepNo)
                 : collectRedoTargets(targetFlowStepNo, depsByNo);
+        Set<Integer> inheritedCompleted = new LinkedHashSet<>();
         for (RunStepSnapshot step : snapshot.getSteps()) {
             if (step == null || step.getStepNo() == null || redoSet.contains(step.getStepNo())) {
                 continue;
             }
             String stepId = step.getStepId();
-            if (stepId == null || !stepId.startsWith("flow_step4_execute_step_")) {
+            if (!java.util.Objects.equals(stepId, "flow_step4_execute_step_" + step.getStepNo())
+                    || !cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService.STATUS_COMPLETED.equals(step.getStatus())) {
                 continue;
             }
             String content = step.getContent();
             if (content != null && !content.isBlank()) {
                 dynamicContext.setValue("step" + step.getStepNo() + "Result", content);
+                inheritedCompleted.add(step.getStepNo());
             }
         }
+        dynamicContext.setValue(INHERITED_COMPLETED_STEPS_KEY, Set.copyOf(inheritedCompleted));
     }
 
     private enum FlowRedoTarget {

@@ -142,6 +142,26 @@ public class ImprovementServiceTest {
     }
 
     @Test
+    public void aComparisonDoesNotRequestFourForegroundSlotsForTheSameOwner() {
+        String id = seedSuggestion("PENDING_VALIDATION");
+        prepareValidation(config.deepCopy(), 2);
+
+        assertEquals("VALIDATING", service.validate("alice", id).get("status"));
+
+        ArgumentCaptor<EvalRunService.RunCommand> commands = ArgumentCaptor.forClass(EvalRunService.RunCommand.class);
+        verify(evalRuns, times(2)).createRun(commands.capture());
+        List<EvalRunService.RunCommand> pair = commands.getAllValues();
+        assertEquals("wa_1", pair.get(0).getSelectedAgentId());
+        assertEquals("wa_candidate", pair.get(1).getSelectedAgentId());
+        for (EvalRunService.RunCommand command : pair) {
+            assertEquals("alice", command.getUserId());
+            assertEquals("FIXED_USER", command.getMemoryPolicy());
+            assertEquals(Integer.valueOf(1), command.getConcurrency());
+        }
+        assertTrue(pair.stream().mapToInt(EvalRunService.RunCommand::getConcurrency).sum() <= 3);
+    }
+
+    @Test
     public void changedPromptsAndDeletedNodesCannotBeOverwrittenByOldSuggestions() {
         String id = seedSuggestion("PENDING_VALIDATION");
         ObjectNode latest = config.deepCopy();

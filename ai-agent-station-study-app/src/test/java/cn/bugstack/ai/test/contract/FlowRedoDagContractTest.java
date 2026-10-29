@@ -2,6 +2,7 @@ package cn.bugstack.ai.test.contract;
 
 import cn.bugstack.ai.domain.agent.model.entity.ExecuteCommandEntity;
 import cn.bugstack.ai.domain.agent.service.execute.flow.step.RootNode;
+import cn.bugstack.ai.domain.agent.service.execute.flow.step.Step4ExecuteStepsNode;
 import cn.bugstack.ai.domain.agent.service.execute.flow.step.factory.DefaultFlowAgentExecuteStrategyFactory;
 import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshot;
 import cn.bugstack.ai.domain.agent.service.execute.snapshot.RunSnapshotService;
@@ -22,6 +23,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -161,6 +163,99 @@ public class FlowRedoDagContractTest {
         assertNull(context.getValue("step1Result"));
         assertNull(context.getValue("step2Result"));
         assertNull(context.getValue("step4Result"));
+    }
+
+    @Test
+    public void redoThirdStepAcceptsCompletedPredecessorsInBothSchedulers() {
+        Map<Integer, Set<Integer>> deps = Map.of(1, Set.of(), 2, Set.of(1),
+                3, Set.of(1, 2), 4, Set.of(1, 2, 3));
+        RunSnapshotService snapshots = mock(RunSnapshotService.class);
+        when(snapshots.find("source-run")).thenReturn(Optional.of(RunSnapshot.builder()
+                .runId("source-run").flowPlanDependencies(deps)
+                .steps(List.of(step(4, 1, "flow_step4_execute_step_1", "requirements"),
+                        step(5, 2, "flow_step4_execute_step_2", "architecture"),
+                        step(6, 3, "flow_step4_execute_step_3", "old deployment"),
+                        step(7, 4, "flow_step4_execute_step_4", "old acceptance"))).build()));
+        RootNode root = new RootNode();
+        ReflectionTestUtils.setField(root, "runSnapshotService", snapshots);
+        ExecuteCommandEntity request = ExecuteCommandEntity.builder().sourceRunId("source-run").build();
+        for (String scheduler : List.of("executeStepsAsDag", "executeStepsSequentially")) {
+            var context = new DefaultFlowAgentExecuteStrategyFactory.DynamicContext();
+            ReflectionTestUtils.invokeMethod(root, "seedRedoInheritedStepResults", context, request, 3);
+            assertEquals("architecture", context.getValue("step2Result"));
+            assertNull(context.getValue("step3Result"));
+            assertNull(context.getValue("step4Result"));
+            context.requestFinalize();
+            Step4ExecuteStepsNode node = new Step4ExecuteStepsNode();
+            ReflectionTestUtils.setField(node, "dagExecutor", (java.util.concurrent.Executor) Runnable::run);
+            // Even when finalization is requested, validation/future wiring must accept the
+            // two real completed predecessors without scheduling them again.
+            ReflectionTestUtils.invokeMethod(node, scheduler, null,
+                    Map.of("第3步：部署", "new deployment", "第4步：验收", "new acceptance"),
+                    List.of(3, 4), deps, context, request);
+        }
+    }
+
+    @Test
+    public void failedBlockedCancelledAndEmptySourceResultsAreNotInherited() {
+        for (String status : List.of("FAILED", "BLOCKED", "CANCELLED", "RUNNING", "COMPLETED")) {
+            RunStepSnapshot predecessor = step(4, 1, "flow_step4_execute_step_1",
+                    "COMPLETED".equals(status) ? " " : "failure text is not a completed result");
+            predecessor.setStatus(status);
+            RunSnapshotService snapshots = mock(RunSnapshotService.class);
+            when(snapshots.find("source-run")).thenReturn(Optional.of(RunSnapshot.builder()
+                    .flowPlanDependencies(Map.of(1, Set.of(), 2, Set.of(1)))
+                    .steps(List.of(predecessor)).build()));
+            RootNode root = new RootNode();
+            ReflectionTestUtils.setField(root, "runSnapshotService", snapshots);
+            var context = new DefaultFlowAgentExecuteStrategyFactory.DynamicContext();
+            ExecuteCommandEntity request = ExecuteCommandEntity.builder().sourceRunId("source-run").build();
+            ReflectionTestUtils.invokeMethod(root, "seedRedoInheritedStepResults", context, request, 2);
+            assertNull(status, context.getValue("step1Result"));
+            assertMissingPredecessor(context, request);
+        }
+    }
+
+    @Test
+    public void arbitraryContextTextCannotSatisfyAMissingDependency() {
+        var context = new DefaultFlowAgentExecuteStrategyFactory.DynamicContext();
+        context.setValue("step1Result", "unverified text");
+        assertMissingPredecessor(context, ExecuteCommandEntity.builder().sourceRunId("source-run").build());
+        context.setValue("flowInheritedCompletedSteps", Set.of(1));
+        assertMissingPredecessor(context, ExecuteCommandEntity.builder().build());
+    }
+
+    @SuppressWarnings("unchecked")
+    @Test
+    public void inheritedStepsDoNotHideCyclesInsideTheRedoSubgraph() {
+        try {
+            ReflectionTestUtils.invokeMethod(Step4ExecuteStepsNode.class, "validateAndTopologicallySort",
+                    List.of(3, 4), Map.of(3, Set.of(1, 4), 4, Set.of(3)), Set.of(1, 3));
+            fail("a step being rerun cannot be treated as an inherited successful step");
+        } catch (RuntimeException expected) {
+            assertTrue(rootMessage(expected).contains("cycle"));
+        }
+    }
+
+    private static void assertMissingPredecessor(
+            DefaultFlowAgentExecuteStrategyFactory.DynamicContext context, ExecuteCommandEntity request) {
+        context.requestFinalize();
+        for (String scheduler : List.of("executeStepsAsDag", "executeStepsSequentially")) {
+            Step4ExecuteStepsNode node = new Step4ExecuteStepsNode();
+            ReflectionTestUtils.setField(node, "dagExecutor", (java.util.concurrent.Executor) Runnable::run);
+            try {
+                ReflectionTestUtils.invokeMethod(node, scheduler, null, Map.of("第2步：修改", "new result"),
+                        List.of(2), Map.of(2, Set.of(1)), context, request);
+                fail("missing or unsuccessful predecessor must fail closed: " + scheduler);
+            } catch (RuntimeException expected) {
+                assertTrue(rootMessage(expected), rootMessage(expected).contains("depends on missing step 1"));
+            }
+        }
+    }
+
+    private static String rootMessage(Throwable error) {
+        while (error.getCause() != null && error.getCause() != error) error = error.getCause();
+        return error.getMessage() == null ? error.toString() : error.getMessage();
     }
 
     private static RunStepSnapshot step(int ordinal, Integer stepNo, String stepId, String content) {

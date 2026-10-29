@@ -54,7 +54,8 @@ public class ToolPromptHintRegistry {
         toolHint.putIfAbsent("aisearch",
                 "不要传 `model`、`instruction`、`temperature`，这些是服务端 LLM 控制参数，会被剥离；这里只需要提供用户查询内容。");
         toolHint.putIfAbsent("maps_schema_personal_map",
-                "创建个人地图前，pointList 中每个地点必须有非空 poiId，使用地点搜索结果返回的真实 POI ID。"
+                "创建个人地图前，lineList[].pointInfoList[] 中每个地点必须有非空 poiId，使用地点搜索结果返回的真实 POI ID。"
+                        + "每个地点的 lon/lat 也必须来自该 poiId 本次运行的真实查询结果；搜索未返回坐标时先用 maps_search_detail 查询各地点，不能把景区中心坐标填给其他景点。"
                         + "只有经纬度或地名不够，不能编造 poiId 或用坐标代替。缺少 ID 时先查询地点；"
                         + "仍无法取得则说明无法生成地图，并继续提供已有资料支持的文字行程，不重复提交相同的无效参数。");
         log.info("[ToolPromptHintRegistry] initialized with {} hints (yml-config + built-in defaults)", toolHint.size());

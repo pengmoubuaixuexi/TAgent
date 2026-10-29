@@ -115,7 +115,7 @@ public class EvidenceMapServiceTest {
         assertEquals(3, claims.size());
         assertEquals("user_specified", claims.get(0).get("status"));
         assertEquals("partial", claims.get(1).get("status"));
-        assertEquals("unsupported", claims.get(2).get("status"));
+        assertEquals("unverified", claims.get(2).get("status"));
         assertEquals("部分/推导关系应保留说明", "只查询到单程价格，往返金额为推导值",
                 ((Map<?, ?>) ((List<?>) claims.get(1).get("links")).get(0)).get("note"));
     }

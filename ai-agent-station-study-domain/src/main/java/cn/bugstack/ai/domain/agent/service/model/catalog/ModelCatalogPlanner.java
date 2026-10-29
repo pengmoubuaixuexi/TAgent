@@ -103,6 +103,13 @@ public class ModelCatalogPlanner implements ModelFallbackPlanner {
         refreshAsync();
     }
 
+    /** Management writes wait for committed configuration to become visible before returning. */
+    public synchronized void refreshNow() {
+        Snapshot current = snapshot;
+        if (current != null) snapshot = new Snapshot(current.scopes(), current.byScope(), 0);
+        load();
+    }
+
     private Snapshot snapshot() {
         Snapshot current = snapshot;
         if (current == null) return load();

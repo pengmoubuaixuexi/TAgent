@@ -451,7 +451,8 @@ public class RedisRunSnapshotService implements RunSnapshotService {
             // Only overwrite after the caller has a complete, validated map.
             // A failed regeneration therefore leaves the previous value untouched.
             stringRedisTemplate.opsForValue().set(
-                    evidenceMapKey(runId), JSON.toJSONString(cached), evidenceMapTtl());
+                    evidenceMapKey(runId), JSON.toJSONString(cached,
+                            com.alibaba.fastjson.serializer.SerializerFeature.DisableCircularReferenceDetect), evidenceMapTtl());
         } catch (Exception error) {
             log.warn("[RunSnapshot] saveEvidenceMap failed runId={} err={}", runId, error.getMessage());
         }
