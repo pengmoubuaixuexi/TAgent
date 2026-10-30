@@ -187,6 +187,7 @@ services:
       SANDBOX_VOLUME: tagent-sandbox-work
       SANDBOX_WORKERS: ${SANDBOX_WORKERS:-3}
       SANDBOX_MIN_FREE_DISK_MB: ${SANDBOX_MIN_FREE_DISK_MB:-512}
+      SANDBOX_DISK_CHECK_INTERVAL_MS: ${SANDBOX_DISK_CHECK_INTERVAL_MS:-500}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - sandbox-work:/sandbox-root

@@ -275,7 +275,7 @@ class Executor:
         disk_failure = []
 
         def monitor_disk():
-            while not monitor_stop.wait(0.1):
+            while not monitor_stop.wait(s.disk_check_interval_ms / 1000.0):
                 try:
                     reason = self.disk_limit_reason(base)
                 except OSError:

@@ -35,6 +35,8 @@ class Settings:
     result_ttl: int
     run_ttl: int
     min_free_disk_mb: int = 512
+    # Each check walks the run directory; the per-file size limit still applies between checks.
+    disk_check_interval_ms: int = 500
 
     @staticmethod
     def load() -> "Settings":
@@ -64,4 +66,5 @@ class Settings:
             result_ttl=_int("SANDBOX_RESULT_TTL_SECONDS", 900, 60, 86400),
             run_ttl=_int("SANDBOX_RUN_TTL_SECONDS", 7200, 300, 604800),
             min_free_disk_mb=_int("SANDBOX_MIN_FREE_DISK_MB", 512, 64, 16384),
+            disk_check_interval_ms=_int("SANDBOX_DISK_CHECK_INTERVAL_MS", 500, 50, 5000),
         )

@@ -35,6 +35,8 @@ public class SiteSecurityConfig {
                         .requestMatchers("/", "/index.html", "/auth.js", "/favicon.ico", "/error",
                                 "/workspace-nav.js", "/workspace-nav.css", "/workspace-inbox.js", "/workspace-inbox.css",
                                 "/run-artifacts.js", "/run-artifacts.css", "/chat-attachments.js", "/chat-attachments.css").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/vendor/tailwind-3.4.17.min.js").permitAll()
+                        .requestMatchers(HttpMethod.HEAD, "/vendor/tailwind-3.4.17.min.js").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/v1/auth/csrf").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/v1/auth/login", "/api/v1/auth/register").permitAll()
                         .requestMatchers("/admin-stats.html", "/admin-models.html", "/api/v1/observe/site-stats", "/agent-config.html",

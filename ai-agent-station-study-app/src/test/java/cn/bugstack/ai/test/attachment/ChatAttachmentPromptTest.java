@@ -169,6 +169,29 @@ public class ChatAttachmentPromptTest {
         assertNotNull("purged entries still explain why a file cannot be read", registry.find("run", "alice"));
     }
 
+    @Test
+    public void indexListsEachArtifactRevisionOnceAndOnlyTheLatestThirtyFiles() {
+        List<ChatFileRef> session = new java.util.ArrayList<>();
+        // The same artifact revision referenced in twenty messages is one entry, under the latest reference.
+        for (int i = 0; i < 20; i++) session.add(upload("f_ref" + i, "body").toBuilder()
+                .kind(ChatFileRef.KIND_ARTIFACT).artifactId("art-1").artifactRevision(2).build());
+        session.add(upload("f_rev3", "body").toBuilder().kind(ChatFileRef.KIND_ARTIFACT).artifactId("art-1").artifactRevision(3).build());
+        String few = ChatFileManifest.renderSessionIndex("run", session, List.of());
+        assertEquals(2, few.split("artifactId=art-1", -1).length - 1);
+        assertTrue(few.contains("attachmentId=f_ref19") && !few.contains("attachmentId=f_ref18"));
+        assertFalse(few.contains("更早的附件"));
+        // Referencing it again in this message hides that revision from the index.
+        ChatFileRef again = upload("f_now", "body").toBuilder().kind(ChatFileRef.KIND_ARTIFACT).artifactId("art-1").artifactRevision(3).build();
+        assertFalse(ChatFileManifest.renderSessionIndex("run", session, List.of(again)).contains("revision=3"));
+
+        List<ChatFileRef> many = new java.util.ArrayList<>();
+        for (int i = 0; i < 35; i++) many.add(upload("f_up" + i, "body"));
+        String capped = ChatFileManifest.renderSessionIndex("run", many, List.of());
+        assertEquals(30, capped.split("attachmentId=", -1).length - 1);
+        assertTrue("the newest files are kept", capped.contains("attachmentId=f_up34") && !capped.contains("attachmentId=f_up4 "));
+        assertTrue(capped.contains("另有 5 个更早的附件未列出"));
+    }
+
     private static ChatClientRequest request(List<Message> messages, String user) {
         return ChatClientRequest.builder().prompt(Prompt.builder().messages(messages).chatOptions(options(user)).build())
                 .context(Map.of()).build();

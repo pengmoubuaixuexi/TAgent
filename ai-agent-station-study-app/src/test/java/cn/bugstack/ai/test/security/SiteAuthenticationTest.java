@@ -17,6 +17,8 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.context.WebApplicationContext;
 import org.springframework.web.servlet.config.annotation.EnableWebMvc;
+import org.springframework.web.servlet.config.annotation.ResourceHandlerRegistry;
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -35,7 +37,10 @@ public class SiteAuthenticationTest {
     @Import({SiteSecurityConfig.class, AccountService.class, AccountController.class,
             AuthenticatedBodyAdvice.class, ProbeController.class,
             cn.bugstack.ai.trigger.http.SiteStatsController.class})
-    static class Config {
+    static class Config implements WebMvcConfigurer {
+        @Override public void addResourceHandlers(ResourceHandlerRegistry registry) {
+            registry.addResourceHandler("/vendor/**").addResourceLocations("classpath:/static/vendor/");
+        }
         @Bean IAdminUserDao users() { return mock(IAdminUserDao.class); }
         @Bean ConversationAccess access() { return mock(ConversationAccess.class); }
         @Bean ObjectMapper json() { return new ObjectMapper(); }
@@ -46,7 +51,7 @@ public class SiteAuthenticationTest {
     }
     @RestController static class ProbeController {
         @GetMapping({"/observe.html", "/observe-mcp.html", "/agent-config.html", "/eval.html", "/admin-stats.html", "/user-agents.html",
-                "/api/v1/observe/test", "/api/v1/admin/test", "/api/v1/eval/test"})
+                "/api/v1/observe/test", "/api/v1/admin/test", "/api/v1/eval/test", "/vendor/private-probe.js"})
         String admin() { return "ok"; }
         @PostMapping({"/api/v1/agent/probe", "/api/v1/agent/auto_agent"}) Map<String, Object> echo(@RequestBody Map<String,Object> body,
                 @RequestHeader("X-User-Id") String header, @RequestParam("userId") String query) {
@@ -59,6 +64,18 @@ public class SiteAuthenticationTest {
     @Autowired cn.bugstack.ai.domain.agent.adapter.repository.IWorkspaceAccessRepository workspaceAccess;
     @Autowired org.springframework.security.crypto.password.PasswordEncoder passwords;
     MockMvc mvc;
+    @Test public void anonymousLoginStylesReturnRealScriptWithoutOpeningOtherVendorRoutes() throws Exception {
+        String path = "/vendor/tailwind-3.4.17.min.js";
+        try (var script = getClass().getResourceAsStream("/static" + path)) {
+            assertNotNull(script);
+            mvc.perform(get(path)).andExpect(status().isOk())
+                    .andExpect(content().bytes(script.readAllBytes()));
+        }
+        mvc.perform(head(path)).andExpect(status().isOk());
+        mvc.perform(get("/vendor/private-probe.js")).andExpect(status().isUnauthorized());
+        mvc.perform(post(path).with(csrf())).andExpect(status().isUnauthorized());
+        mvc.perform(get("/api/v1/workspace/outcomes/artifacts")).andExpect(status().isUnauthorized());
+    }
     @Test public void sharedWorkspaceAssetsLoadBeforeLoginButArtifactApiRemainsProtected() throws Exception {
         for(String path:java.util.List.of("/workspace-nav.js","/workspace-nav.css","/workspace-inbox.js",
                 "/workspace-inbox.css","/run-artifacts.js","/run-artifacts.css")) {
